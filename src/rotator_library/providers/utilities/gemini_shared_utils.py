@@ -387,6 +387,10 @@ TIER_ID_TO_FULL_NAME: Dict[str, str] = {
     "g1-pro-tier": "Google One AI PRO",
     "g1-ultra-tier": "Google One AI ULTRA",
     "g1-free-tier": TIER_FREE,  # Free tiers are just "FREE"
+    # GCP / Google Workspace tiers (from currentTier API response)
+    "gcp-standard-tier": "Code Assist Standard",
+    "gcp-enterprise-tier": "Code Assist Enterprise",
+    "gcp-free-tier": TIER_FREE,
     # Gemini Code Assist subscription tiers
     "gemini-code-assist-pro": "Code Assist PRO",
     "gemini-code-assist-ultra": "Code Assist ULTRA",
@@ -414,6 +418,11 @@ TIER_NAME_TO_CANONICAL: Dict[str, str] = {
     "pro-tier": TIER_PRO,
     "ultra-tier": TIER_ULTRA,
     "enterprise-tier": TIER_ULTRA,
+    # GCP / Google Workspace tier names (from currentTier API response)
+    # Code Assist Standard = 1500 RPD, Enterprise = 2000 RPD
+    "gcp-standard-tier": TIER_PRO,
+    "gcp-enterprise-tier": TIER_ULTRA,
+    "gcp-free-tier": TIER_FREE,
     # Google One AI tier names (from paidTier API response)
     "g1-pro-tier": TIER_PRO,
     "g1-ultra-tier": TIER_ULTRA,
@@ -446,10 +455,13 @@ TIER_PRIORITIES: Dict[str, int] = {
     TIER_PRO: 2,  # Standard paid tier - Google One AI
     TIER_FREE: 3,  # Free tier
     # API/legacy names mapped to same priorities for backwards compatibility
+    "gcp-enterprise-tier": 1,
+    "gcp-standard-tier": 2,
     "g1-ultra-tier": 1,
     "g1-pro-tier": 2,
     "standard-tier": 2,
     "free-tier": 3,
+    "gcp-free-tier": 3,
     "legacy-tier": 10,  # Legacy/unknown treated as lowest
     "unknown": 10,
 }

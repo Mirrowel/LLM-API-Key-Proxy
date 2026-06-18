@@ -660,6 +660,9 @@ async def lifespan(app: FastAPI):
     client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
 
+    from proxy_app.api.oauth import set_app_ref
+    set_app_ref(app)
+
     # Warn if no provider credentials are configured
     if not client.all_credentials:
         logging.warning("=" * 70)

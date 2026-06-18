@@ -1006,6 +1006,7 @@ class UsageManager:
         # Compute hidden groups and defined groups once for the entire response
         hidden_groups: frozenset = frozenset()
         defined_groups: frozenset = frozenset()
+        defined_group_order: list = []
         plugin_class = self._provider_plugins.get(self.provider)
         if plugin_class:
             plugin_instance = self._get_provider_plugin_instance()
@@ -1014,6 +1015,8 @@ class UsageManager:
                     hidden_groups = plugin_instance.hidden_quota_groups
                 if hasattr(plugin_instance, "model_quota_groups"):
                     defined_groups = frozenset(plugin_instance.model_quota_groups.keys())
+                    # Preserve definition order for deterministic UI display
+                    defined_group_order = list(plugin_instance.model_quota_groups.keys())
 
         for stable_id, state in self._states.items():
             # Skip credentials not currently active in the proxy
@@ -1462,27 +1465,21 @@ class UsageManager:
                     "cycle_request_count": fc_state.cycle_request_count,
                 }
 
-            # Sort group_usage by quota limit (lowest first), then alphabetically
-            # This ensures detail view matches the global summary sort order
-            def group_sort_key(item):
-                group_name, group_data = item
-                windows = group_data.get("windows", {})
-                if not windows:
-                    return (float("inf"), group_name)  # No windows = sort last
-
-                # Find minimum limit across windows
-                min_limit = float("inf")
-                for window_data in windows.values():
-                    limit = window_data.get("limit")
-                    if limit is not None and limit > 0:
-                        min_limit = min(min_limit, limit)
-
-                return (min_limit, group_name)
-
-            sorted_group_usage = dict(
-                sorted(cred_stats["group_usage"].items(), key=group_sort_key)
-            )
-            cred_stats["group_usage"] = sorted_group_usage
+            # Sort group_usage to match the provider's model_quota_groups
+            # definition order (e.g. pro → flash → flash-lite) for consistent
+            # display.  Groups not in the definition sort to the end alphabetically.
+            if defined_group_order:
+                order_index = {g: i for i, g in enumerate(defined_group_order)}
+                sorted_group_usage = dict(
+                    sorted(
+                        cred_stats["group_usage"].items(),
+                        key=lambda item: (
+                            order_index.get(item[0], len(defined_group_order)),
+                            item[0],
+                        ),
+                    )
+                )
+                cred_stats["group_usage"] = sorted_group_usage
 
             stats["credentials"][stable_id] = cred_stats
 
@@ -1496,6 +1493,19 @@ class UsageManager:
                         * 100,
                         1,
                     )
+
+        # Sort provider-level quota_groups to match definition order
+        if defined_group_order:
+            order_index = {g: i for i, g in enumerate(defined_group_order)}
+            stats["quota_groups"] = dict(
+                sorted(
+                    stats["quota_groups"].items(),
+                    key=lambda item: (
+                        order_index.get(item[0], len(defined_group_order)),
+                        item[0],
+                    ),
+                )
+            )
 
         total_input = (
             stats["tokens"]["input_cached"] + stats["tokens"]["input_uncached"]
@@ -1898,6 +1908,12 @@ class UsageManager:
             window = model_stats.windows.get(primary_def.name)
 
         return window.request_count if window else None
+
+    def get_credential_tier(self, accessor: str) -> Optional[str]:
+        """Return the persisted tier for a credential, or None."""
+        stable_id = self._registry.get_stable_id(accessor, self.provider)
+        state = self._states.get(stable_id)
+        return state.tier if state else None
 
     # =========================================================================
     # WINDOW CLEANUP

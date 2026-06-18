@@ -3,10 +3,13 @@
 import asyncio
 import hashlib
 import base64
+import json as _json_mod
+import re as _re_mod
 import secrets
 import time
 import logging
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException
@@ -19,6 +22,14 @@ from rotator_library.provider_factory import (
 from rotator_library.utils.paths import get_oauth_dir
 
 lib_logger = logging.getLogger("rotator_library")
+
+_app_ref: Optional[Any] = None
+
+
+def set_app_ref(app) -> None:
+    """Called once at startup so background OAuth tasks can hot-load credentials."""
+    global _app_ref
+    _app_ref = app
 
 router = APIRouter(prefix="/v1/admin", tags=["admin-oauth"])
 
@@ -48,6 +59,11 @@ PROVIDER_META = {
         "name": "GitHub Copilot",
         "flow_type": "device_code",
         "description": "GitHub Copilot via device flow. Enter code at GitHub.",
+    },
+    "x-ai": {
+        "name": "xAI Grok",
+        "flow_type": "device_code",
+        "description": "xAI Grok via device flow. Enter code at auth.x.ai.",
     },
 }
 
@@ -109,6 +125,8 @@ async def start_oauth_flow(req: OAuthStartRequest):
 
     if provider == "copilot":
         return await _start_copilot_device_flow(flow_id, flow)
+    elif provider == "x-ai":
+        return await _start_xai_device_flow(flow_id, flow)
     elif provider in ("codex", "gemini_cli", "anthropic"):
         return _start_paste_flow(flow_id, flow, provider)
     else:
@@ -265,6 +283,162 @@ async def _finalize_copilot(flow_id: str, flow: dict, github_token: str, client:
         "login": new_creds["_proxy_metadata"].get("login", "unknown"),
         "provider": "copilot",
     }
+
+
+# ---------------------------------------------------------------------------
+# xAI Grok: device flow
+# ---------------------------------------------------------------------------
+async def _start_xai_device_flow(flow_id: str, flow: dict):
+    # Reuse xAI provider constants — public client, no client_secret.
+    from rotator_library.providers.x_ai_auth_base import (
+        XAI_CLIENT_ID,
+        XAI_OAUTH_SCOPES,
+        XAI_DEVICE_CODE_URL,
+    )
+
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            XAI_DEVICE_CODE_URL,
+            data={
+                "client_id": XAI_CLIENT_ID,
+                "scope": " ".join(XAI_OAUTH_SCOPES),
+            },
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            timeout=30.0,
+        )
+        if not resp.is_success:
+            raise HTTPException(
+                502, f"xAI device code request failed: {resp.text}"
+            )
+
+        data = resp.json()
+
+    flow["device_code"] = data["device_code"]
+    flow["interval"] = data.get("interval", 5)
+    flow["expires_in"] = data.get("expires_in", 600)
+    flow["client_id"] = XAI_CLIENT_ID
+    _pending_flows[flow_id] = flow
+
+    # Start background polling
+    asyncio.create_task(_poll_xai_device(flow_id))
+
+    return {
+        "flow_id": flow_id,
+        "flow_type": "device_code",
+        "verification_uri": data.get("verification_uri", "https://auth.x.ai/device"),
+        "user_code": data.get("user_code", ""),
+        "expires_in": data.get("expires_in", 600),
+    }
+
+
+async def _poll_xai_device(flow_id: str):
+    flow = _pending_flows.get(flow_id)
+    if not flow:
+        return
+
+    from rotator_library.providers.x_ai_auth_base import XAI_TOKEN_URL
+
+    client_id = flow["client_id"]
+    device_code = flow["device_code"]
+    interval = flow["interval"]
+    max_polls = flow["expires_in"] // interval
+
+    async with httpx.AsyncClient() as client:
+        for _ in range(max_polls):
+            await asyncio.sleep(interval)
+            if flow_id not in _pending_flows:
+                return
+
+            try:
+                resp = await client.post(
+                    XAI_TOKEN_URL,
+                    data={
+                        "client_id": client_id,
+                        "device_code": device_code,
+                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                    },
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "Accept": "application/json",
+                    },
+                    timeout=30.0,
+                )
+                if not resp.is_success:
+                    continue
+
+                token_data = resp.json()
+                if "access_token" in token_data:
+                    await _finalize_xai(flow_id, flow, token_data, client)
+                    return
+
+                error = token_data.get("error", "")
+                if error == "expired_token":
+                    flow["status"] = "error"
+                    flow["error"] = "Device code expired. Please try again."
+                    return
+            except Exception as e:
+                lib_logger.debug(f"xAI poll error: {e}")
+                continue
+
+    flow["status"] = "error"
+    flow["error"] = "Device flow timed out."
+
+
+async def _finalize_xai(
+    flow_id: str, flow: dict, token_data: dict, client: httpx.AsyncClient
+):
+    """Persist xAI credentials and mark flow complete.
+
+    Credential shape mirrors XAiAuthBase._build_credentials_from_token_data
+    so the existing provider loader picks them up unchanged.
+    """
+    from rotator_library.providers.x_ai_auth_base import XAI_USERINFO_URL
+
+    access_token = token_data.get("access_token", "")
+    refresh_token = token_data.get("refresh_token", "")
+
+    # Email discovery: id_token JWT → userinfo → sub fallback
+    id_claims = _decode_jwt_payload(token_data.get("id_token", "")) or {}
+    email = id_claims.get("email", "")
+    sub = id_claims.get("sub", "")
+
+    if not email and access_token:
+        try:
+            userinfo_resp = await client.get(
+                XAI_USERINFO_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=10.0,
+            )
+            if userinfo_resp.is_success:
+                userinfo = userinfo_resp.json()
+                email = userinfo.get("email", "") or email
+                sub = sub or userinfo.get("sub", "")
+        except Exception as e:
+            lib_logger.debug(f"xAI userinfo fetch failed: {e}")
+
+    if not email:
+        email = sub or f"xai-user-{int(time.time())}"
+
+    expires_in = token_data.get("expires_in", 3600)
+
+    new_creds: Dict[str, Any] = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expiry_date": time.time() + expires_in,
+        "account_id": sub or email,
+        "_proxy_metadata": {
+            "email": email,
+            "account_id": sub or email,
+            "last_check_timestamp": time.time(),
+        },
+    }
+
+    _save_credential_file(flow, new_creds)
+    flow["status"] = "complete"
+    flow["result"] = {"login": email, "provider": "x-ai"}
 
 
 # ---------------------------------------------------------------------------
@@ -562,10 +736,41 @@ def _enrich_anthropic_creds(creds: dict, token_data: dict):
 
 
 # ---------------------------------------------------------------------------
-# Save credential file
+# Save credential file (with replacement and hot-load)
 # ---------------------------------------------------------------------------
+def _extract_identity(creds: dict) -> str:
+    """Return a stable identity string for matching existing credentials."""
+    meta = creds.get("_proxy_metadata", {})
+    return (
+        meta.get("email")
+        or meta.get("login")
+        or creds.get("account_id")
+        or ""
+    )
+
+
+def _find_existing_credential(
+    oauth_dir: Path, prefix: str, new_identity: str,
+) -> Optional[Path]:
+    """Find an existing credential file for the same account."""
+    if not new_identity:
+        return None
+
+    for f in sorted(oauth_dir.glob(f"{prefix}_oauth_*.json")):
+        m = _re_mod.search(r"_oauth_(\d+)\.json$", f.name)
+        if not m:
+            continue
+        try:
+            data = _json_mod.loads(f.read_text())
+            existing_identity = _extract_identity(data)
+            if existing_identity and existing_identity == new_identity:
+                return f
+        except Exception:
+            continue
+    return None
+
+
 def _save_credential_file(flow: dict, creds: dict):
-    import json
     provider = flow["provider"]
     oauth_dir = get_oauth_dir()
     oauth_dir.mkdir(parents=True, exist_ok=True)
@@ -577,20 +782,114 @@ def _save_credential_file(flow: dict, creds: dict):
         "copilot": "copilot",
     }
     prefix = prefix_map.get(provider, provider)
+    new_identity = _extract_identity(creds)
 
-    existing = sorted(oauth_dir.glob(f"{prefix}_oauth_*.json"))
-    numbers = []
-    import re
-    for f in existing:
-        m = re.search(r"_oauth_(\d+)\.json$", f.name)
-        if m:
-            numbers.append(int(m.group(1)))
+    replaced_path = _find_existing_credential(oauth_dir, prefix, new_identity)
 
-    next_num = (max(numbers) + 1) if numbers else 1
-    filepath = oauth_dir / f"{prefix}_oauth_{next_num}.json"
+    if replaced_path:
+        # Back up the old file and overwrite in-place
+        bak = replaced_path.with_suffix(
+            f".json.bak.{time.strftime('%Y%m%d_%H%M%S')}"
+        )
+        replaced_path.rename(bak)
+        filepath = replaced_path
+        lib_logger.info(
+            f"Replacing existing credential {replaced_path.name} for "
+            f"'{new_identity}' (backup: {bak.name})"
+        )
+    else:
+        existing = sorted(oauth_dir.glob(f"{prefix}_oauth_*.json"))
+        numbers = []
+        for f in existing:
+            m = _re_mod.search(r"_oauth_(\d+)\.json$", f.name)
+            if m:
+                numbers.append(int(m.group(1)))
+        next_num = (max(numbers) + 1) if numbers else 1
+        filepath = oauth_dir / f"{prefix}_oauth_{next_num}.json"
 
     with open(filepath, "w") as f:
-        json.dump(creds, f, indent=2)
+        _json_mod.dump(creds, f, indent=2)
 
+    resolved = str(filepath.resolve())
     lib_logger.info(f"Saved OAuth credential: {filepath}")
-    flow["saved_path"] = str(filepath)
+    flow["saved_path"] = resolved
+
+    _hot_load_credential(provider, resolved, replaced_path if replaced_path else None)
+
+
+def _hot_load_credential(
+    provider: str,
+    new_path: str,
+    replaced_path: Optional[Path],
+) -> None:
+    """Register a newly saved credential in the running RotatingClient."""
+    if _app_ref is None:
+        return
+    try:
+        client = _app_ref.state.rotating_client
+    except Exception:
+        return
+
+    old_resolved = str(replaced_path.resolve()) if replaced_path else None
+
+    # Update oauth_credentials
+    if provider not in client.oauth_credentials:
+        client.oauth_credentials[provider] = []
+    if old_resolved and old_resolved in client.oauth_credentials[provider]:
+        idx = client.oauth_credentials[provider].index(old_resolved)
+        client.oauth_credentials[provider][idx] = new_path
+    elif new_path not in client.oauth_credentials[provider]:
+        client.oauth_credentials[provider].append(new_path)
+
+    # Update all_credentials
+    if provider not in client.all_credentials:
+        client.all_credentials[provider] = []
+    if old_resolved and old_resolved in client.all_credentials[provider]:
+        idx = client.all_credentials[provider].index(old_resolved)
+        client.all_credentials[provider][idx] = new_path
+    elif new_path not in client.all_credentials[provider]:
+        client.all_credentials[provider].append(new_path)
+
+    # Ensure provider is tracked as an OAuth provider
+    if hasattr(client, "oauth_providers"):
+        client.oauth_providers.add(provider)
+
+    # Update usage manager: swap or register
+    usage_manager = client.get_usage_manager(provider)
+    if usage_manager:
+        asyncio.ensure_future(_update_usage_manager(
+            usage_manager, provider, client, new_path, old_resolved,
+        ))
+
+    lib_logger.info(
+        f"Hot-loaded credential into running proxy for {provider}: "
+        f"{Path(new_path).name}"
+        + (f" (replaced {replaced_path.name})" if replaced_path else " (new)")
+    )
+
+
+async def _update_usage_manager(
+    usage_manager, provider: str, client, new_path: str,
+    old_path: Optional[str],
+) -> None:
+    """Async helper to update usage manager after a hot-load."""
+    try:
+        if old_path:
+            await usage_manager.remove_credential(old_path)
+
+        credentials = client.all_credentials.get(provider, [])
+        priorities, tiers = {}, {}
+        plugin = client._get_provider_instance(provider)
+        if plugin:
+            if hasattr(plugin, "get_credential_priority"):
+                p = plugin.get_credential_priority(new_path)
+                if p is not None:
+                    priorities[new_path] = p
+            if hasattr(plugin, "get_credential_tier_name"):
+                t = plugin.get_credential_tier_name(new_path)
+                if t:
+                    tiers[new_path] = t
+
+        await usage_manager.initialize(credentials, priorities=priorities, tiers=tiers)
+    except Exception as e:
+        lib_logger.warning(f"Failed to update usage manager for {provider}: {e}")

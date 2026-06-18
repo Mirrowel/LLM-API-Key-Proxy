@@ -142,6 +142,7 @@ tests/*
 !tests/test_classifier_scoped_routing.py
 !tests/test_session_tracking.py
 !tests/test_selection_engine.py
+!tests/test_xai_oauth_flow.py
 !tests/test_usage_reconciliation.py
 docs/ignored/
 .env

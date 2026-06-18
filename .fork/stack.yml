@@ -189,4 +189,5 @@ features:
     files:
       - "src/rotator_library/providers/xai*"
       - "src/rotator_library/providers/utilities/xai*"
+      - "src/proxy_app/api/oauth.py"
       - "webui/**/xai*"

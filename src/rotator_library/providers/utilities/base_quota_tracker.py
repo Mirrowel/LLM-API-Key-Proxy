@@ -537,8 +537,18 @@ class BaseQuotaTracker:
             if quota_data.get("status") != "success":
                 continue
 
-            # Get tier for this credential
-            tier = self.project_tier_cache.get(cred_path, "PRO")
+            # Get tier for this credential — prefer the value returned in the
+            # quota response (which may come from a previous API discovery),
+            # then fall back to the project_tier_cache, then the usage
+            # manager's persisted tier (survives restarts).
+            tier = (
+                quota_data.get("tier")
+                or self.project_tier_cache.get(cred_path)
+            )
+            if not tier and usage_manager:
+                tier = usage_manager.get_credential_tier(cred_path) or "PRO"
+            elif not tier:
+                tier = "PRO"
 
             # Extract model quota data using subclass implementation
             model_quotas = self._extract_model_quota_from_response(quota_data, tier)

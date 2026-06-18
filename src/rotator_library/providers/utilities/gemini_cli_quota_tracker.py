@@ -43,6 +43,7 @@ from .gemini_shared_utils import (
     GEMINI_CLI_GL_NODE_VERSION,
     GEMINI_CLI_PLATFORM_ARCH,
     GEMINI_CLI_ACCEPT_ENCODING,
+    normalize_tier_name,
 )
 
 if TYPE_CHECKING:
@@ -61,48 +62,40 @@ lib_logger = logging.getLogger("rotator_library")
 # Verified 2026-01-07 via quota verification tests (see GEMINI_CLI_QUOTA_REPORT.md)
 # Learned values (from file) override these defaults if available.
 
+# Upstream quota docs (geminicli.com/docs/resources/quota-and-pricing):
+#   FREE (Code Assist Individual)  = 1,000 RPD across all models
+#   PRO  (AI Pro / CA Standard)    = 1,500 RPD across all models
+#   ULTRA (AI Ultra / CA Enterprise) = 2,000 RPD across all models
+#
+# The daily limit applies per-user across the entire Gemini model family,
+# not per-model.  All models within a tier share the same pool.
+
+_ALL_MODELS = [
+    "gemini-2.5-pro",
+    "gemini-3-pro-preview",
+    "gemini-3.1-pro-preview",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3-flash-preview",
+    "gemini-3-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-flash-lite",
+    "gemini-3.1-flash-lite-preview",
+]
+
 DEFAULT_MAX_REQUESTS: Dict[str, Dict[str, int]] = {
-    # Canonical tier names
-    "PRO": {
-        # Pro group (verified: 0.4% per request = 250 requests)
-        "gemini-2.5-pro": 250,
-        "gemini-3-pro-preview": 250,
-        "gemini-3.1-pro-preview": 250,
-        # Flash group — all flash models share a single daily quota pool
-        # (verified via matching reset timestamps on live quota API)
-        "gemini-2.0-flash": 1500,
-        "gemini-2.5-flash": 1500,
-        "gemini-2.5-flash-lite": 1500,
-        "gemini-3-flash-preview": 1500,
-        "gemini-3-flash": 1500,
-        "gemini-3.5-flash": 1500,
-        # 3.1 Flash Lite group (assumed same limits until verified)
-        "gemini-3.1-flash-lite": 1500,
-        "gemini-3.1-flash-lite-preview": 1500,
-    },
-    "FREE": {
-        # Pro group (verified: 1.0% per request = 100 requests)
-        "gemini-2.5-pro": 100,
-        "gemini-3-pro-preview": 100,
-        "gemini-3.1-pro-preview": 100,
-        # Flash group — all flash models share a single daily quota pool
-        "gemini-2.0-flash": 1000,
-        "gemini-2.5-flash": 1000,
-        "gemini-2.5-flash-lite": 1000,
-        "gemini-3-flash-preview": 1000,
-        "gemini-3-flash": 1000,
-        "gemini-3.5-flash": 1000,
-        # 3.1 Flash Lite group (assumed same limits until verified)
-        "gemini-3.1-flash-lite": 1000,
-        "gemini-3.1-flash-lite-preview": 1000,
-    },
+    "ULTRA": {m: 2000 for m in _ALL_MODELS},
+    "PRO": {m: 1500 for m in _ALL_MODELS},
+    "FREE": {m: 1000 for m in _ALL_MODELS},
 }
 
 # Legacy tier name aliases (backwards compatibility)
 DEFAULT_MAX_REQUESTS["standard-tier"] = DEFAULT_MAX_REQUESTS["PRO"]
 DEFAULT_MAX_REQUESTS["free-tier"] = DEFAULT_MAX_REQUESTS["FREE"]
+DEFAULT_MAX_REQUESTS["enterprise-tier"] = DEFAULT_MAX_REQUESTS["ULTRA"]
 
-# Default max requests for unknown models (1% = 100 requests)
+# Default max requests for unknown models/tiers
 DEFAULT_MAX_REQUESTS_UNKNOWN = 1000
 
 
@@ -262,7 +255,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
             tier: Account tier
 
         Returns:
-            Max requests (e.g., 250 for Pro on standard-tier)
+            Max requests (e.g., 1500 for Pro tier)
         """
         # Ensure learned values are loaded
         self._load_learned_costs()
@@ -270,20 +263,24 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
         # Strip provider prefix if present
         clean_model = model.split("/")[-1] if "/" in model else model
 
-        # Check learned values first (stored as max_requests integers)
-        if tier in self._learned_costs:
-            if clean_model in self._learned_costs[tier]:
-                return self._learned_costs[tier][clean_model]
+        # Normalize tier name (e.g. gcp-enterprise-tier → ULTRA)
+        canonical_tier = normalize_tier_name(tier) or tier
 
-        # Fall back to defaults
-        if tier in DEFAULT_MAX_REQUESTS:
-            if clean_model in DEFAULT_MAX_REQUESTS[tier]:
-                return DEFAULT_MAX_REQUESTS[tier][clean_model]
+        # Check learned values first (try both raw and canonical tier)
+        for t in (tier, canonical_tier):
+            if t in self._learned_costs:
+                if clean_model in self._learned_costs[t]:
+                    return self._learned_costs[t][clean_model]
 
-        # Unknown model - use conservative default
+        # Fall back to defaults (try both raw and canonical tier)
+        for t in (tier, canonical_tier):
+            if t in DEFAULT_MAX_REQUESTS:
+                if clean_model in DEFAULT_MAX_REQUESTS[t]:
+                    return DEFAULT_MAX_REQUESTS[t][clean_model]
+
         lib_logger.debug(
-            f"Unknown max requests for model={clean_model}, tier={tier}. "
-            f"Using default {DEFAULT_MAX_REQUESTS_UNKNOWN}"
+            f"Unknown max requests for model={clean_model}, tier={tier} "
+            f"(canonical={canonical_tier}). Using default {DEFAULT_MAX_REQUESTS_UNKNOWN}"
         )
         return DEFAULT_MAX_REQUESTS_UNKNOWN
 

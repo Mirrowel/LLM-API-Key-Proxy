@@ -266,8 +266,9 @@ async def get_credentials(request: Request):
     env_vars = _get_env_vars()
     oauth_dir = _oauth_dir()
 
-    # Build a lookup of runtime credential status from the proxy's quota stats
+    # Build lookups of runtime credential status and tier from quota stats
     runtime_status: dict[str, str] = {}
+    runtime_tiers: dict[str, str] = {}
     loaded_providers: set[str] = set()
     try:
         client = request.app.state.rotating_client
@@ -277,7 +278,11 @@ async def get_credentials(request: Request):
             for cred_data in pstats.get("credentials", {}).values():
                 full_path = cred_data.get("full_path", "")
                 if full_path:
-                    runtime_status[Path(full_path).name] = cred_data.get("status", "unknown")
+                    fname = Path(full_path).name
+                    runtime_status[fname] = cred_data.get("status", "unknown")
+                    tier = cred_data.get("tier")
+                    if tier:
+                        runtime_tiers[fname] = tier
     except Exception:
         pass
 
@@ -326,7 +331,12 @@ async def get_credentials(request: Request):
                     data = await asyncio.to_thread(_read_json, f)
                     meta = data.get("_proxy_metadata", {})
                     info["email"] = meta.get("email") or meta.get("login") or data.get("email")
-                    info["tier"] = meta.get("tier") or meta.get("plan_type") or meta.get("sku")
+                    info["tier"] = (
+                        meta.get("tier")
+                        or meta.get("plan_type")
+                        or meta.get("sku")
+                        or runtime_tiers.get(f.name)
+                    )
                     file_status = meta.get("status", "unknown")
                     # Runtime status takes precedence, then file metadata,
                     # then infer "active" if the provider is loaded in the proxy
@@ -437,11 +447,17 @@ async def delete_oauth_credential(provider: str, filename: str, request: Request
                     if not c.endswith(filename)
                 ]
                 removed_from_proxy = len(client.all_credentials[provider_lower]) < before
+                if not client.all_credentials[provider_lower]:
+                    del client.all_credentials[provider_lower]
             if provider_lower in client.oauth_credentials:
                 client.oauth_credentials[provider_lower] = [
                     c for c in client.oauth_credentials[provider_lower]
                     if not c.endswith(filename)
                 ]
+                if not client.oauth_credentials[provider_lower]:
+                    del client.oauth_credentials[provider_lower]
+                    if hasattr(client, "oauth_providers"):
+                        client.oauth_providers.discard(provider_lower)
 
             # Remove from usage manager so stale state isn't persisted on shutdown
             usage_manager = client.get_usage_manager(provider_lower)

@@ -4,7 +4,6 @@
 # src/rotator_library/providers/gemini_auth_base.py
 
 import asyncio
-import json
 import logging
 import os
 from pathlib import Path
@@ -23,7 +22,6 @@ from .utilities.gemini_shared_utils import (
     # Tier utilities
     normalize_tier_name,
     is_free_tier,
-    is_paid_tier,
     get_tier_full_name,
     # Project ID extraction
     extract_project_id_from_response,
@@ -490,12 +488,11 @@ class GeminiAuthBase(GoogleOAuthBase):
                             project_id = None
 
                     if project_id:
-                        # Cache tier info - use canonical tier name for consistency
-                        canonical = (
-                            normalize_tier_name(effective_tier_id) or effective_tier_id
-                        )
-                        self.project_tier_cache[credential_path] = canonical
-                        discovered_tier = canonical
+                        # Cache the raw API tier ID (e.g. gcp-enterprise-tier)
+                        # so it can be displayed as-is; normalization to canonical
+                        # form (ULTRA/PRO/FREE) happens at quota-lookup time.
+                        self.project_tier_cache[credential_path] = effective_tier_id
+                        discovered_tier = effective_tier_id
 
                         # Get and cache full tier name for display
                         tier_full = get_tier_full_name(effective_tier_id)
@@ -670,17 +667,17 @@ class GeminiAuthBase(GoogleOAuthBase):
                     f"Successfully extracted project ID from onboarding response: {project_id}"
                 )
 
-                # Cache tier info - use canonical tier name for consistency
-                canonical_tier = normalize_tier_name(tier_id) or tier_id
-                self.project_tier_cache[credential_path] = canonical_tier
-                discovered_tier = canonical_tier
+                # Cache the raw API tier ID for display; normalization
+                # to canonical form happens at quota-lookup time.
+                self.project_tier_cache[credential_path] = tier_id
+                discovered_tier = tier_id
 
                 # Get and cache full tier name for display
                 tier_full = get_tier_full_name(tier_id)
                 self.tier_full_cache[credential_path] = tier_full
                 discovered_tier_full = tier_full
                 lib_logger.debug(
-                    f"Cached tier information: {canonical_tier} (full: {tier_full})"
+                    f"Cached tier information: {tier_id} (full: {tier_full})"
                 )
 
                 # Log with full tier name for onboarding messages
