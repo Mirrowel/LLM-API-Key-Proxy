@@ -62,6 +62,13 @@ features:
       - "src/rotator_library/providers/nanogpt*"
       - "src/rotator_library/providers/utilities/nanogpt*"
 
+  - id: umans
+    prefix: "feat(umans)"
+    subject: "feat(umans): add Umans provider with request-based quota tracking"
+    files:
+      - "src/rotator_library/providers/umans*"
+      - "src/rotator_library/providers/utilities/umans*"
+
   - id: gemini-cli
     prefix: "feat(gemini-cli)"
     subject: "feat(gemini-cli): expose gemini-3.5-flash, unify quota groups, fix token counts"
