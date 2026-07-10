@@ -30,6 +30,7 @@ Reference: https://player2.game/api/api.yaml
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Callable, Optional
@@ -127,20 +128,24 @@ async def device_code_login(
         The p2Key string once the user approves access.
 
     Raises:
-        Player2AuthError: if the flow times out or the API returns an
-            unexpected/terminal error.
+        Player2AuthError: if the flow times out, is denied, or the API
+            returns an unexpected/terminal error.
 
     Note:
         Player2's documented responses for `/login/device/token` only list
-        200 (success) and 500 (server error) - the exact status used to
-        signal "still waiting for user approval" isn't spelled out in the
-        public API reference. This implementation follows the standard
-        OAuth 2.0 Device Authorization Grant convention (RFC 8628), treating
-        non-200/500 client errors as "still pending" and retrying until
-        `expiresIn`/`poll_timeout` elapses. If Player2's real behavior
-        differs, this loop may need adjusting - test against a live
-        `client_id` before relying on it in production.
+        200 (success) and 500 (server error) - the exact error format used
+        while waiting for approval isn't spelled out in the public API
+        reference. This implementation assumes the standard RFC 8628 error
+        body (`{"error": "authorization_pending"}`, `"slow_down"`,
+        `"expired_token"`, `"access_denied"`, etc.) on non-200/500 responses:
+        only "authorization_pending" and "slow_down" are treated as
+        "keep waiting"; anything else fails immediately with Player2's own
+        error message instead of silently polling until timeout.
     """
+    # RFC 8628 §3.5 - errors that mean "keep polling", not "give up".
+    PENDING_ERRORS = {"authorization_pending"}
+    SLOW_DOWN_ERRORS = {"slow_down"}
+
     async with httpx.AsyncClient(timeout=15.0, base_url=PLAYER2_API_BASE) as client:
         new_resp = await client.post("/login/device/new", json={"client_id": client_id})
         new_resp.raise_for_status()
@@ -148,7 +153,11 @@ async def device_code_login(
 
         device_code = data["deviceCode"]
         user_code = data["userCode"]
-        verification_uri = data.get("verificationUriComplete") or data["verificationUri"]
+        verification_uri = data.get("verificationUriComplete") or data.get("verificationUri")
+        if not verification_uri:
+            raise Player2AuthError(
+                "Player2 did not return a verification URI for the device login."
+            )
         interval = max(float(data.get("interval", 5)), MIN_POLL_INTERVAL)
         expires_in = float(data.get("expiresIn", poll_timeout))
 
@@ -173,25 +182,46 @@ async def device_code_login(
                 if p2_key:
                     lib_logger.info("Obtained Player2 key via device authorization flow.")
                     return p2_key
-                # 200 without a key would be unexpected; keep polling once more
-                # rather than failing outright.
-                continue
+                # A 200 with no key is not a valid "success" response - fail
+                # rather than silently keep polling on something unexpected.
+                raise Player2AuthError(
+                    "Player2 returned a successful response with no p2Key."
+                )
 
             if token_resp.status_code == 500:
                 raise Player2AuthError(
                     f"Player2 device login failed with a server error: {token_resp.text}"
                 )
 
-            # Anything else (400/403/404/428, etc.) is treated as "authorization
-            # pending" per RFC 8628 convention. See the docstring note above.
-            lib_logger.debug(
-                f"Player2 device login still pending (status {token_resp.status_code})."
+            # Try to read a standard RFC 8628 error body to tell "still
+            # waiting" apart from a real, terminal failure.
+            try:
+                error_code = token_resp.json().get("error")
+            except (json.JSONDecodeError, ValueError):
+                error_code = None
+
+            if error_code in PENDING_ERRORS:
+                lib_logger.debug("Player2 device login still pending.")
+                continue
+
+            if error_code in SLOW_DOWN_ERRORS:
+                interval += 5.0
+                lib_logger.debug(
+                    f"Player2 asked us to slow down; polling interval is now {interval}s."
+                )
+                continue
+
+            # Anything else (access_denied, expired_token, invalid client_id,
+            # or an unrecognized/undocumented error) is a real, terminal
+            # failure - fail fast instead of polling until timeout.
+            raise Player2AuthError(
+                f"Player2 device login failed (status {token_resp.status_code}): "
+                f"{token_resp.text}"
             )
 
         raise Player2AuthError(
             "Timed out waiting for Player2 login approval. Please try again."
         )
-
 
 async def get_p2_key(
     client_id: str,

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 import httpx
@@ -64,6 +65,10 @@ SUPPORTED_PARAMS = {
     "response_format",
 }
 
+# Player2 doesn't document a reset timestamp for "insufficient credits" (402)
+# responses, so a fixed, conservative cooldown is used instead of retrying
+# an out-of-credits key like a transient rate limit would be.
+INSUFFICIENT_CREDITS_COOLDOWN_SECONDS = 86400  # 24 hours
 
 class Player2Provider(ProviderInterface):
     """First-party Player2 provider using its native OpenAI-compatible API."""
@@ -91,7 +96,7 @@ class Player2Provider(ProviderInterface):
         return {"Authorization": f"Bearer {credential_identifier}"}
 
     def _api_base(self, override: Optional[str] = None) -> str:
-        return (override or DEFAULT_API_BASE).rstrip("/")
+        return (override or os.getenv("PLAYER2_API_BASE") or DEFAULT_API_BASE).rstrip("/")
 
     def _chat_url(self, api_base: Optional[str] = None) -> str:
         return f"{self._api_base(api_base)}/chat/completions"
@@ -103,6 +108,11 @@ class Player2Provider(ProviderInterface):
         if "max_completion_tokens" in kwargs and "max_tokens" not in payload:
             payload["max_tokens"] = kwargs["max_completion_tokens"]
 
+        # Unlike some sibling providers, extra_body is filtered (not merged
+        # wholesale) because Player2's schema is strict about which fields
+        # it accepts - passing through an unrecognized field risks a 4xx
+        # from Player2 itself. Any new Player2 param needs to be added to
+        # SUPPORTED_PARAMS above to be forwarded via extra_body.
         extra_body = kwargs.get("extra_body")
         if isinstance(extra_body, dict):
             payload.update({k: v for k, v in extra_body.items() if k in SUPPORTED_PARAMS})
@@ -191,6 +201,31 @@ class Player2Provider(ProviderInterface):
                 chunk["model"] = model
                 yield litellm.ModelResponseStream(**chunk)
 
+    @staticmethod
+    def parse_quota_error(
+        error: Exception, error_body: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Distinguishes a genuine "insufficient credits" (402) condition from
+        an ordinary rate limit, so it gets a long cooldown instead of being
+        retried again within seconds. See the comment in _raise_for_status
+        for why a custom attribute (rather than the exception's status_code)
+        is what we check here.
+
+        Player2 doesn't document a reset timestamp for insufficient-credits
+        responses, so a conservative fixed 24h cooldown is used instead of
+        retrying an out-of-credits key like a transient rate limit.
+        """
+        if getattr(error, "player2_error_reason", None) != "insufficient_credits":
+            return None
+
+        return {
+            "retry_after": INSUFFICIENT_CREDITS_COOLDOWN_SECONDS,
+            "reason": "INSUFFICIENT_CREDITS",
+            "reset_timestamp": None,
+            "quota_reset_timestamp": None,
+        }
+
     async def _raise_for_status(self, response: httpx.Response, model: str) -> None:
         if response.status_code < 400:
             return
@@ -207,15 +242,22 @@ class Player2Provider(ProviderInterface):
             )
 
         if response.status_code == 402:
-            # Insufficient credits - treat like a quota/rate-limit condition
-            # so the credential is rotated instead of the request just
-            # failing outright.
-            raise RateLimitError(
+            # Insufficient credits - this is a persistent condition (it won't
+            # clear after a short rate-limit-style cooldown, unlike a real
+            # 429), so it's surfaced as a RateLimitError too (for credential
+            # rotation) but tagged with a custom attribute. litellm's
+            # RateLimitError normalizes response.status_code to 429
+            # internally, so this tag is the only reliable way for
+            # parse_quota_error() above to tell "out of credits" apart from
+            # an actual rate limit and apply a much longer cooldown.
+            exc = RateLimitError(
                 f"Player2 insufficient credits: {error_text}",
                 llm_provider="player2",
                 model=model,
                 response=response,
             )
+            exc.player2_error_reason = "insufficient_credits"
+            raise exc
 
         raise httpx.HTTPStatusError(
             f"Player2 HTTP {response.status_code}: {error_text}",

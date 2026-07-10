@@ -1186,8 +1186,10 @@ async def _setup_player2_credential(api_key_var: str):
     # or enter their own. An env var override is supported for forks/self-hosters
     # who register their own Player2 game for separate usage attribution.
     client_id = (
-        get_key(str(env_file), "PLAYER2_CLIENT_ID") if env_file.is_file() else None
-    ) or DEFAULT_CLIENT_ID
+        os.environ.get("PLAYER2_CLIENT_ID")
+        or (get_key(str(env_file), "PLAYER2_CLIENT_ID") if env_file.is_file() else None)
+        or DEFAULT_CLIENT_ID
+    )
 
     console.print()
     console.print("[bold]How would you like to sign in?[/bold]")
@@ -1198,7 +1200,7 @@ async def _setup_player2_credential(api_key_var: str):
     p2_key: Optional[str] = None
 
     if choice == "2":
-        p2_key = Prompt.ask("[bold]Enter your p2Key[/bold]").strip() or None
+        p2_key = Prompt.ask("[bold]Enter your p2Key[/bold]", password=True).strip() or None
     else:
         def on_verification(uri: str, user_code: str) -> None:
             console.print()
