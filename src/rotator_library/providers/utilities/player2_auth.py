@@ -147,12 +147,26 @@ async def device_code_login(
     SLOW_DOWN_ERRORS = {"slow_down"}
 
     async with httpx.AsyncClient(timeout=15.0, base_url=PLAYER2_API_BASE) as client:
-        new_resp = await client.post("/login/device/new", json={"client_id": client_id})
-        new_resp.raise_for_status()
-        data = new_resp.json()
+        try:
+            new_resp = await client.post("/login/device/new", json={"client_id": client_id})
+            new_resp.raise_for_status()
+            data = new_resp.json()
+            device_code = data["deviceCode"]
+            user_code = data["userCode"]
+        except httpx.HTTPStatusError as e:
+            raise Player2AuthError(
+                f"Player2 rejected the device login request "
+                f"(status {e.response.status_code}): {e.response.text}"
+            ) from e
+        except httpx.RequestError as e:
+            raise Player2AuthError(
+                f"Could not reach Player2 to start the device login: {e}"
+            ) from e
+        except (ValueError, KeyError) as e:
+            raise Player2AuthError(
+                f"Player2 returned an unexpected response starting the device login: {e}"
+            ) from e
 
-        device_code = data["deviceCode"]
-        user_code = data["userCode"]
         verification_uri = data.get("verificationUriComplete") or data.get("verificationUri")
         if not verification_uri:
             raise Player2AuthError(
