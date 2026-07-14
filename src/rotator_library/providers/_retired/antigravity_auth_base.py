@@ -24,7 +24,7 @@ from .google_oauth_base import GoogleOAuthBase
 
 # Import tier utilities from shared module
 # These are re-exported here for backwards compatibility with existing imports
-from .utilities.gemini_shared_utils import (
+from .gemini_shared_utils import (
     # Tier constants
     TIER_ULTRA,
     TIER_PRO,
@@ -195,7 +195,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
         Returns:
             Tuple of (response_data, successful_endpoint) or (None, None) on failure
         """
-        from .utilities.gemini_shared_utils import ANTIGRAVITY_LOAD_ENDPOINT_ORDER
+        from .gemini_shared_utils import ANTIGRAVITY_LOAD_ENDPOINT_ORDER
 
         core_client_metadata = {
             "ideType": "IDE_UNSPECIFIED",
@@ -257,7 +257,7 @@ class AntigravityAuthBase(GoogleOAuthBase):
         Returns:
             Response data dict or None on failure
         """
-        from .utilities.gemini_shared_utils import ANTIGRAVITY_ENDPOINT_FALLBACKS
+        from .gemini_shared_utils import ANTIGRAVITY_ENDPOINT_FALLBACKS
 
         last_error = None
         for endpoint in ANTIGRAVITY_ENDPOINT_FALLBACKS:

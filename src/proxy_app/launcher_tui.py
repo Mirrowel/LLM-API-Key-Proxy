@@ -185,9 +185,7 @@ class SettingsDetector:
         # Scan for env-based OAuth credentials
         # Maps provider name to the ENV_PREFIX used by the provider
         # (duplicated from credential_manager to avoid heavy imports)
-        env_oauth_providers = {
-            "gemini_cli": "GEMINI_CLI",
-        }
+        env_oauth_providers = {}
 
         for provider, env_prefix in env_oauth_providers.items():
             oauth_count = 0
@@ -313,7 +311,7 @@ class SettingsDetector:
 
     @staticmethod
     def detect_provider_settings() -> dict:
-        """Detect provider-specific settings (Gemini CLI)"""
+        """Detect provider-specific settings."""
         try:
             from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
         except ImportError:

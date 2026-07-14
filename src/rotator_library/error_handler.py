@@ -90,7 +90,7 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
     Extract the retry-after time from an API error response body.
 
     Handles various error formats including:
-    - Gemini CLI: "Your quota will reset after 39s."
+    - Provider text: "Your quota will reset after 39s."
     - Google RPC: "quota will reset after 156h14m36s"
     - Generic: "quota will reset after 120s", "retry after 60s"
 
@@ -167,7 +167,7 @@ class EmptyResponseError(Exception):
     Treated as a transient server-side issue (503 equivalent).
 
     Attributes:
-        provider: The provider name (e.g., "gemini_cli")
+        provider: The provider name (e.g., "openai")
         model: The model that was requested
         message: Human-readable message about the error
     """
@@ -193,7 +193,7 @@ class TransientQuotaError(Exception):
     Treated as a transient server-side issue (503 equivalent), same as EmptyResponseError.
 
     Attributes:
-        provider: The provider name (e.g., "gemini_cli")
+        provider: The provider name (e.g., "openai")
         model: The model that was requested
         message: Human-readable message about the error
     """

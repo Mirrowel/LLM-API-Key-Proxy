@@ -164,6 +164,7 @@
 
 - Error classification: `src/rotator_library/core/errors.py` — `classify_error()`, `should_rotate_on_error()`, `should_retry_same_key()`
 - Error handler with cooldown parsing: `src/rotator_library/error_handler.py` — parses retry-after headers, duration strings, sets provider cooldowns
+- No-reset quota exhaustion: Authoritative quota APIs that report an exhausted bucket with no reset timestamp (e.g., account lacks model-group entitlement) are handled by `UsageManager._handle_no_reset_quota_exhaustion()` in `src/rotator_library/usage/manager.py` — policy `warn_only` | `cooldown` | `disable_scope` from `ProviderUsageConfig.no_reset_exhaustion_policy` applies a scoped fallback cooldown instead of repeated retries
 - Streaming errors: `StreamedAPIError` raised mid-stream to trigger credential rotation
 - Credential reauth: `CredentialNeedsReauthError` triggers background OAuth refresh
 
@@ -173,7 +174,7 @@
 
 **Caching:** Provider instances are singletons via `SingletonABCMeta`. Provider-level HTTP caching via `provider_cache.py`. Model info cached by `ModelInfoService` with async refresh.
 
-**Storage:** JSON file persistence for usage data (`usage/usage_*.json`), OAuth credentials in `oauth_creds/`, transaction logs in `logs/transactions/`. Session state persisted to JSON via `ResilientStateWriter` when disk persistence is enabled. Config via `.env` files and environment variables.
+**Storage:** JSON file persistence for usage data (`usage/usage_*.json`), OAuth credentials in `oauth_creds/`, transaction logs in `logs/transactions/` written by `TransactionLogger` (`src/rotator_library/transaction_logger.py`) with per-request directories containing client/provider I/O and a JSON-safe payload converter (`_make_json_safe`) for Pydantic/dataclass/timestamp objects. Session state persisted to JSON via `ResilientStateWriter` when disk persistence is enabled. Config via `.env` files and environment variables.
 
 **Background Tasks:** `BackgroundRefresher` manages periodic OAuth token refresh (default 10 min) and provider-specific background jobs (quota refresh, etc.) with independent timers.
 

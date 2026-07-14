@@ -26,7 +26,6 @@ from .litellm_providers import (
     get_provider_api_key_var,
     get_provider_display_name,
 )
-from .providers.utilities.gemini_shared_utils import format_tier_for_display
 
 
 def _get_oauth_base_dir() -> Path:
@@ -61,9 +60,7 @@ def _ensure_providers_loaded():
 
 
 # OAuth provider display names mapping (no "(OAuth)" suffix - context makes it clear)
-OAUTH_FRIENDLY_NAMES = {
-    "gemini_cli": "Gemini CLI",
-}
+OAUTH_FRIENDLY_NAMES = {}
 
 
 def _extract_key_number(key_name: str) -> int:
@@ -78,8 +75,10 @@ def _extract_key_number(key_name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
-# Note: _normalize_tier_name was replaced with format_tier_for_display
-# from providers.utilities.gemini_shared_utils for centralized tier handling
+def format_tier_for_display(tier: str) -> str:
+    """Format a stored provider tier for compact credential summaries."""
+
+    return tier.replace("_", "-").replace("-tier", "").lower()
 
 
 def _count_tiers(credentials: list) -> dict:
@@ -263,10 +262,10 @@ def _get_oauth_credentials_summary() -> dict:
 
     Returns:
         Dict mapping provider names to lists of credential info dicts.
-        Example: {"gemini_cli": [{"email": "user@example.com", "tier": "free-tier", ...}, ...]}
+        Example: {"provider": [{"email": "user@example.com", "tier": "free-tier", ...}, ...]}
     """
     provider_factory, _ = _ensure_providers_loaded()
-    oauth_providers = ["gemini_cli"]
+    oauth_providers = provider_factory.get_available_providers()
     oauth_summary = {}
 
     for provider_name in oauth_providers:
@@ -505,7 +504,7 @@ def _display_provider_credentials(provider_name: str):
     Display all credentials for a specific OAuth provider.
 
     Args:
-        provider_name: The provider key (e.g., "gemini_cli")
+        provider_name: The provider key.
     """
     provider_factory, _ = _ensure_providers_loaded()
 
@@ -529,22 +528,10 @@ def _display_provider_credentials(provider_name: str):
     table.add_column("File", style="yellow")
     table.add_column("Email/Identifier", style="cyan")
 
-    # Add tier/project columns for Google OAuth providers
-    if provider_name == "gemini_cli":
-        table.add_column("Tier", style="green")
-        table.add_column("Project", style="dim")
     for i, cred in enumerate(credentials, 1):
         file_name = Path(cred["file_path"]).name
         email = cred.get("email", "unknown")
-
-        if provider_name == "gemini_cli":
-            tier = cred.get("tier", "-")
-            project = cred.get("project_id", "-")
-            if project and len(project) > 20:
-                project = project[:17] + "..."
-            table.add_row(str(i), file_name, email, tier or "-", project or "-")
-        else:
-            table.add_row(str(i), file_name, email)
+        table.add_row(str(i), file_name, email)
 
     console.print(table)
     console.print("")
@@ -555,7 +542,7 @@ async def _edit_oauth_credential_email(provider_name: str):
     Edit the email field of an OAuth credential.
 
     Args:
-        provider_name: The provider key (e.g., "gemini_cli")
+        provider_name: The provider key.
     """
     provider_factory, _ = _ensure_providers_loaded()
 
@@ -769,24 +756,10 @@ async def _view_oauth_credentials_detail(provider_name: str):
     table.add_column("File", style="yellow")
     table.add_column("Email/Identifier", style="cyan")
 
-    # Add tier/project columns for Google OAuth providers
-    if provider_name == "gemini_cli":
-        table.add_column("Tier", style="green")
-        table.add_column("Project", style="dim")
     for i, cred in enumerate(credentials, 1):
         file_name = Path(cred["file_path"]).name
         email = cred.get("email", "unknown")
-
-        if provider_name == "gemini_cli":
-            tier = (
-                format_tier_for_display(cred.get("tier")) if cred.get("tier") else "-"
-            )
-            project = cred.get("project_id", "-")
-            if project and len(project) > 25:
-                project = project[:22] + "..."
-            table.add_row(str(i), file_name, email, tier, project or "-")
-        else:
-            table.add_row(str(i), file_name, email)
+        table.add_row(str(i), file_name, email)
 
     console.print(table)
     console.print(f"\n[dim]Total: {len(credentials)} credential(s)[/dim]")
@@ -1032,8 +1005,8 @@ async def _edit_oauth_credential_menu():
         Panel(
             Text.from_markup(
                 "[bold yellow]Warning:[/bold yellow] Editing OAuth credentials is generally not recommended.\n"
-                "For Gemini CLI OAuth credentials, the email is automatically\n"
-                "retrieved during authentication and changing it may cause confusion."
+                "OAuth provider metadata is usually retrieved during authentication,\n"
+                "and changing it manually may cause confusion."
             ),
             style="yellow",
             title="Edit OAuth Credential",
@@ -1188,9 +1161,7 @@ async def setup_api_key():
             litellm_api_keys.add(api_key_var)
 
     # OAuth-only providers to exclude entirely from API key setup
-    oauth_only_providers = {
-        "gemini_cli",  # OAuth-only
-    }
+    oauth_only_providers = set()
 
     # Base classes to exclude
     base_classes = {
@@ -1703,10 +1674,7 @@ async def setup_new_credential(provider_name: str):
         auth_instance = auth_class()
 
         # Build display name for better user experience
-        oauth_friendly_names = {
-            "gemini_cli": "Gemini CLI (OAuth)",
-        }
-        display_name = oauth_friendly_names.get(
+        display_name = OAUTH_FRIENDLY_NAMES.get(
             provider_name, provider_name.replace("_", " ").title()
         )
 
@@ -1756,101 +1724,6 @@ async def setup_new_credential(provider_name: str):
                 f"An error occurred during setup for {provider_name}: {e}",
                 style="bold red",
                 title="Error",
-            )
-        )
-
-
-async def export_gemini_cli_to_env():
-    """
-    Export a Gemini CLI credential JSON file to .env format.
-    Uses the auth class's build_env_lines() and list_credentials() methods.
-    """
-    clear_screen("Export Gemini CLI Credential")
-
-    # Get auth instance for this provider
-    provider_factory, _ = _ensure_providers_loaded()
-    auth_class = provider_factory.get_provider_auth_class("gemini_cli")
-    auth_instance = auth_class()
-
-    # List available credentials using auth class
-    credentials = auth_instance.list_credentials(_get_oauth_base_dir())
-
-    if not credentials:
-        console.print(
-            Panel(
-                "No Gemini CLI credentials found. Please add one first using 'Add OAuth Credential'.",
-                style="bold red",
-                title="No Credentials",
-            )
-        )
-        return
-
-    # Display available credentials
-    cred_text = Text()
-    for i, cred_info in enumerate(credentials):
-        cred_text.append(
-            f"  {i + 1}. {Path(cred_info['file_path']).name} ({cred_info['email']})\n"
-        )
-
-    console.print(
-        Panel(
-            cred_text,
-            title="Available Gemini CLI Credentials",
-            style="bold blue",
-        )
-    )
-
-    choice = Prompt.ask(
-        Text.from_markup(
-            "[bold]Please select a credential to export or type [red]'b'[/red] to go back[/bold]"
-        ),
-        choices=[str(i + 1) for i in range(len(credentials))] + ["b"],
-        show_choices=False,
-    )
-
-    if choice.lower() == "b":
-        return
-
-    try:
-        choice_index = int(choice) - 1
-        if 0 <= choice_index < len(credentials):
-            cred_info = credentials[choice_index]
-
-            # Use auth class to export
-            env_path = auth_instance.export_credential_to_env(
-                cred_info["file_path"], _get_oauth_base_dir()
-            )
-
-            if env_path:
-                numbered_prefix = f"GEMINI_CLI_{cred_info['number']}"
-                success_text = Text.from_markup(
-                    f"Successfully exported credential to [bold yellow]'{Path(env_path).name}'[/bold yellow]\n\n"
-                    f"[bold]Environment variable prefix:[/bold] [cyan]{numbered_prefix}_*[/cyan]\n\n"
-                    f"[bold]To use this credential:[/bold]\n"
-                    f"1. Copy the contents to your main .env file, OR\n"
-                    f"2. Source it: [bold cyan]source {Path(env_path).name}[/bold cyan] (Linux/Mac)\n"
-                    f"3. Or on Windows: [bold cyan]Get-Content {Path(env_path).name} | ForEach-Object {{ $_ -replace '^([^#].*)$', 'set $1' }} | cmd[/bold cyan]\n\n"
-                    f"[bold]To combine multiple credentials:[/bold]\n"
-                    f"Copy lines from multiple .env files into one file.\n"
-                    f"Each credential uses a unique number ({numbered_prefix}_*)."
-                )
-                console.print(Panel(success_text, style="bold green", title="Success"))
-            else:
-                console.print(
-                    Panel(
-                        "Failed to export credential", style="bold red", title="Error"
-                    )
-                )
-        else:
-            console.print("[bold red]Invalid choice. Please try again.[/bold red]")
-    except ValueError:
-        console.print(
-            "[bold red]Invalid input. Please enter a number or 'b'.[/bold red]"
-        )
-    except Exception as e:
-        console.print(
-            Panel(
-                f"An error occurred during export: {e}", style="bold red", title="Error"
             )
         )
 
@@ -2018,10 +1891,8 @@ async def combine_all_credentials():
     """
     clear_screen("Combine All Credentials")
 
-    # List of providers that support OAuth credentials
-    oauth_providers = ["gemini_cli"]
-
     provider_factory, _ = _ensure_providers_loaded()
+    oauth_providers = provider_factory.get_available_providers()
 
     combined_lines = [
         "# Combined All Provider Credentials",
@@ -2116,18 +1987,25 @@ async def export_credentials_submenu():
     while True:
         clear_screen("Export Credentials")
 
+        provider_factory, _ = _ensure_providers_loaded()
+        oauth_providers = provider_factory.get_available_providers()
+        if not oauth_providers:
+            console.print(
+                Panel(
+                    "No active OAuth credential providers are available.",
+                    style="bold yellow",
+                    title="No OAuth Providers",
+                )
+            )
+            console.print("\n[dim]Press Enter to go back...[/dim]")
+            input()
+            return
+
         console.print(
             Panel(
                 Text.from_markup(
-                    "[bold]Individual Exports:[/bold]\n"
-                    "1. Export Gemini CLI credential\n"
-                    "\n"
-                    "[bold]Bulk Exports (per provider):[/bold]\n"
-                    "2. Export ALL Gemini CLI credentials\n"
-                    "\n"
                     "[bold]Combine Credentials:[/bold]\n"
-                    "3. Combine all Gemini CLI into one file\n"
-                    "4. Combine ALL providers into one file"
+                    "1. Combine ALL providers into one file"
                 ),
                 title="Choose export option",
                 style="bold blue",
@@ -2138,36 +2016,14 @@ async def export_credentials_submenu():
             Text.from_markup(
                 "[bold]Please select an option or type [red]'b'[/red] to go back[/bold]"
             ),
-            choices=[
-                "1",
-                "2",
-                "3",
-                "4",
-                "b",
-            ],
+            choices=["1", "b"],
             show_choices=False,
         )
 
         if export_choice.lower() == "b":
             break
 
-        # Individual exports
         if export_choice == "1":
-            await export_gemini_cli_to_env()
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        # Bulk exports (all credentials for a provider)
-        elif export_choice == "2":
-            await export_all_provider_credentials("gemini_cli")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        # Combine per provider
-        elif export_choice == "3":
-            await combine_provider_credentials("gemini_cli")
-            console.print("\n[dim]Press Enter to return to export menu...[/dim]")
-            input()
-        # Combine all providers
-        elif export_choice == "4":
             await combine_all_credentials()
             console.print("\n[dim]Press Enter to return to export menu...[/dim]")
             input()
@@ -2227,6 +2083,17 @@ async def main(clear_on_start=True):
 
             provider_factory, _ = _ensure_providers_loaded()
             available_providers = provider_factory.get_available_providers()
+            if not available_providers:
+                console.print(
+                    Panel(
+                        "No active OAuth credential providers are available.",
+                        style="bold yellow",
+                        title="No OAuth Providers",
+                    )
+                )
+                console.print("\n[dim]Press Enter to return to main menu...[/dim]")
+                input()
+                continue
 
             provider_text = Text()
             for i, provider in enumerate(available_providers):

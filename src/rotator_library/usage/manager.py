@@ -1385,7 +1385,7 @@ class UsageManager:
 
         Returns:
             List of normalized, deduplicated model names with provider prefix
-            (e.g., ["gemini_cli/gemini-2.5-pro", "gemini_cli/gemini-3-pro-preview"])
+            (e.g., ["provider/model-a", "provider/model-b"])
         """
         plugin_instance = self._get_provider_plugin_instance()
 
