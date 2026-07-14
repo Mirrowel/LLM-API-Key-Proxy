@@ -33,8 +33,8 @@
 
 **`src/rotator_library/`:**
 - Purpose: Portable resilience library for multi-provider API key rotation
-- Contains: Client facade, provider plugins, usage tracking, Anthropic compatibility, credential management, session tracking
-- Key files: `__init__.py`, `rotating_client.py` (in `client/`), `provider_interface.py` (in `providers/`), `usage_manager.py`, `session_tracking.py`
+- Contains: Client facade, provider plugins, usage tracking, Anthropic compatibility, credential management, session tracking, transaction logging
+- Key files: `__init__.py`, `rotating_client.py` (in `client/`), `provider_interface.py` (in `providers/`), `usage_manager.py`, `session_tracking.py`, `transaction_logger.py`, `error_handler.py`
 
 **`src/rotator_library/session_tracking.py`:**
 - Purpose: Evidence-based session inference with scoped anchors, confidence scoring, compaction probe detection, and deterministic affinity routing
@@ -45,6 +45,13 @@
 - Compaction probes: Separate anchor path (`_build_compaction_probe_anchors()`) identifies lineage parents from large early messages or explicit summarization markers; probe indexes are suppressed from normal continuity anchors; system/developer prompts excluded from continuity evidence
 - Persistence: Schema-versioned JSON disk storage via `ResilientStateWriter` with generation-based write deduplication (`_dirty_generation` / `_save_io_lock`) and configurable flush interval
 - Configuration: `TRUSTED_SESSION_ID_FIELDS` env var for trusted explicit ID fields; `max_anchor_records`, `max_anchors_per_session`, `persistence_flush_interval_seconds` constructor args
+
+**`src/rotator_library/transaction_logger.py`:**
+- Purpose: Unified transaction logging between the OpenAI-compatible client layer and provider implementations; each API transaction gets a unique directory with client-level and provider-level I/O
+- Contains: `TransactionLogger` class; `_make_json_safe` recursive converter for Pydantic/dataclass/`Path`/timestamp objects with circular-reference tracking; helpers `assemble_streaming_response()`, `_strip_framework_keys()`
+- Output layout: `logs/transactions/MMDD_HHMMSS_{provider}_{model}_{request_id}/` containing `request.json`, `response.json`, `streaming_chunks.jsonl`, `metadata.json`, and an optional `provider/` subdir (`request_payload.json`, `response_stream.log`, `final_response.json`, `error.log`)
+- Integration: Instantiated by `RequestContextBuilder` and `AnthropicHandler` when request logging is enabled; threaded through `RequestContext.transaction_logger` into the executor, streaming handler, field cache engine, and adapter base
+- Toggle: Enabled via proxy `--enable-request-logging` flag
 
 **`src/rotator_library/client/`:**
 - Purpose: Client-side request execution with retry and rotation
@@ -70,9 +77,9 @@
 - Key files: `__init__.py`, `manager.py`, `config.py`, `types.py`
 
 **`src/rotator_library/usage/config.py`:**
-- Purpose: Per-provider usage configuration with session sticky settings
-- Contains: `ProviderUsageConfig` with session sticky controls: `session_sticky_wait_seconds`, `session_sticky_entry_ttl_seconds`, `session_sticky_max_entries`
-- Configuration: Per-provider `SESSION_STICKY_WAIT_SECONDS_{PROVIDER}` or global `SESSION_STICKY_WAIT_SECONDS` env vars; similarly for `SESSION_STICKY_ENTRY_TTL_SECONDS` and `SESSION_STICKY_MAX_ENTRIES`
+- Purpose: Per-provider usage configuration with session sticky settings and quota-exhaustion policies
+- Contains: `ProviderUsageConfig` with session sticky controls (`session_sticky_wait_seconds`, `session_sticky_entry_ttl_seconds`, `session_sticky_max_entries`) and no-reset exhaustion controls (`no_reset_exhaustion_policy` ∈ {`warn_only`, `cooldown`, `disable_scope`}, `no_reset_exhaustion_cooldown_seconds`)
+- Configuration: Per-provider `SESSION_STICKY_WAIT_SECONDS_{PROVIDER}` or global `SESSION_STICKY_WAIT_SECONDS` env vars; similarly for `SESSION_STICKY_ENTRY_TTL_SECONDS` and `SESSION_STICKY_MAX_ENTRIES`. Per-provider `QUOTA_NO_RESET_EXHAUSTION_POLICY_{PROVIDER}` / global `QUOTA_NO_RESET_EXHAUSTION_POLICY`, and `QUOTA_NO_RESET_COOLDOWN_SECONDS_{PROVIDER}` / global `QUOTA_NO_RESET_COOLDOWN_SECONDS`; provider classes may set `default_no_reset_exhaustion_policy` / `default_no_reset_exhaustion_cooldown_seconds` as baseline
 
 **`src/rotator_library/usage/tracking/`:**
 - Purpose: Usage recording engine and window management

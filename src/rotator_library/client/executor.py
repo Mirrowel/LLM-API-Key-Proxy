@@ -220,7 +220,7 @@ class RequestExecutor:
         Check if provider has tier/priority configuration.
 
         Providers with tier support define tier_priorities mapping
-        (e.g., GeminiCli, NanoGpt).
+        (e.g., NanoGpt).
 
         Args:
             provider: Provider name

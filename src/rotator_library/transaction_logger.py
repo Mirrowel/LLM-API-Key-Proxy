@@ -163,7 +163,7 @@ class TransactionContext:
     """Whether logging is enabled."""
 
     provider: str
-    """Provider name (e.g., 'gemini_cli', 'openai')."""
+    """Provider name (e.g., 'openai', 'anthropic')."""
 
     model: str
     """Model name (sanitized for filesystem use)."""
@@ -228,7 +228,7 @@ class TransactionLogger:
         Initialize transaction logger.
 
         Args:
-            provider: Provider name (e.g., 'gemini_cli', 'openai')
+            provider: Provider name (e.g., 'openai', 'anthropic')
             model: Model name (will be sanitized for filesystem)
             enabled: Whether logging is enabled
             api_format: API format prefix ('oai' for OpenAI, 'ant' for Anthropic)
@@ -245,7 +245,7 @@ class TransactionLogger:
         self.api_format = api_format
 
         # Strip provider prefix from model if present
-        # e.g., "gemini_cli/gemini-2.5-pro" -> "gemini-2.5-pro"
+        # e.g., "openai/gpt-4.1" -> "gpt-4.1"
         model_name = model
         if "/" in model_name and model_name.split("/")[0] == provider:
             model_name = model_name.split("/", 1)[1]

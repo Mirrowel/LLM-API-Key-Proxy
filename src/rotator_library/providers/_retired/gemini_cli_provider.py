@@ -10,12 +10,12 @@ import logging
 import time
 import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
-from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
+from ..provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .gemini_auth_base import GeminiAuthBase
-from .provider_cache import ProviderCache
-from ..field_cache import FieldCacheInjection, FieldCacheRule
-from .utilities.gemini_cli_quota_tracker import GeminiCliQuotaTracker
-from .utilities.gemini_shared_utils import (
+from ..provider_cache import ProviderCache
+from ...field_cache import FieldCacheInjection, FieldCacheRule
+from .gemini_cli_quota_tracker import GeminiCliQuotaTracker
+from .gemini_shared_utils import (
     env_bool,
     env_int,
     inline_schema_refs,
@@ -34,16 +34,16 @@ from .utilities.gemini_shared_utils import (
     TIER_PRIORITIES,
     DEFAULT_TIER_PRIORITY,
 )
-from ..transaction_logger import ProviderLogger
-from .utilities.gemini_tool_handler import GeminiToolHandler
-from .utilities.gemini_credential_manager import GeminiCredentialManager
-from ..model_definitions import ModelDefinitions
-from ..timeout_config import TimeoutConfig
-from ..utils.paths import get_cache_dir
-from ..session_tracking import SessionTrackingHints
+from ...transaction_logger import ProviderLogger
+from .gemini_tool_handler import GeminiToolHandler
+from .gemini_credential_manager import GeminiCredentialManager
+from ...model_definitions import ModelDefinitions
+from ...timeout_config import TimeoutConfig
+from ...utils.paths import get_cache_dir
+from ...session_tracking import SessionTrackingHints
 import litellm
 from litellm.exceptions import RateLimitError
-from ..error_handler import extract_retry_after_from_body
+from ...error_handler import extract_retry_after_from_body
 import os
 from pathlib import Path
 import uuid

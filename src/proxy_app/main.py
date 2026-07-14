@@ -74,7 +74,7 @@ else:
 # Load main .env first
 load_dotenv(_root_dir / ".env")
 
-# Load any additional .env files (e.g., gemini_cli_all_combined.env)
+# Load any additional .env files (e.g., provider_credentials.env)
 _env_files_found = list(_root_dir.glob("*.env"))
 for _env_file in sorted(_root_dir.glob("*.env")):
     if _env_file.name != ".env":  # Skip main .env (already loaded)
@@ -567,10 +567,9 @@ async def lifespan(app: FastAPI):
         logging.info("OAuth credential processing complete.")
         oauth_credentials = final_oauth_credentials
 
-    # [NEW] Load provider-specific params
-    litellm_provider_params = {
-        "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
-    }
+    # Provider-specific LiteLLM params. API-key Gemini remains configured through
+    # normal provider environment keys.
+    litellm_provider_params = {}
 
     # Load global timeout from environment (default 30 seconds)
     global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
@@ -1523,8 +1522,8 @@ async def refresh_quota_stats(
         {
             "action": "reload" | "force_refresh",
             "scope": "all" | "provider" | "credential",
-            "provider": "gemini_cli",  // required if scope != "all"
-            "credential": "gemini_cli_oauth_1.json"  // required if scope == "credential"
+            "provider": "openai",  // required if scope != "all"
+            "credential": "openai_key_1"  // required if scope == "credential"
         }
 
     Actions:

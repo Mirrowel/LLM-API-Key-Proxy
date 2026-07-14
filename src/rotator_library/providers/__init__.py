@@ -101,7 +101,7 @@ def _register_providers():
                 and issubclass(attribute, ProviderInterface)
                 and attribute is not ProviderInterface
             ):
-                # Derives 'gemini_cli' from 'gemini_cli_provider.py'
+                # Derives 'openrouter' from 'openrouter_provider.py'
                 # Remap 'nvidia' to 'nvidia_nim' to align with litellm's provider name
                 provider_name = module_name.replace("_provider", "")
                 if provider_name == "nvidia":

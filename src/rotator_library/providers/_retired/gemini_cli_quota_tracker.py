@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
-from .base_quota_tracker import BaseQuotaTracker
+from ..utilities.base_quota_tracker import BaseQuotaTracker
 from .gemini_shared_utils import (
     CODE_ASSIST_ENDPOINT,
     GEMINI_CLI_UA_VERSION,

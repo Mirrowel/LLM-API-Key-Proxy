@@ -135,7 +135,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # TIER CONFIGURATION - Override in subclass
     # =========================================================================
 
-    # Provider name for env var lookups (e.g., "gemini_cli")
+    # Provider name for env var lookups (e.g., "openai")
     # Used for: QUOTA_GROUPS_{provider_env_name}_{GROUP}
     provider_env_name: str = ""
 
@@ -572,9 +572,8 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             Minimum required priority level or None if no restrictions
 
         Example:
-            For Gemini CLI:
-            - gemini-3-*: requires priority 1 (paid tier only)
-            - gemini-2.5-*: no restriction (None)
+            A provider may restrict high-capability models to priority 1
+            credentials while allowing lower-cost models for all priorities.
         """
         return None
 
@@ -620,7 +619,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         then falls back to the class's default_rotation_mode.
 
         Args:
-            provider_name: The provider name (e.g., "gemini_cli")
+            provider_name: The provider name (e.g., "openai")
 
         Returns:
             "balanced" or "sequential"
