@@ -25,11 +25,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import threading
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -96,6 +98,7 @@ class _SessionState:
     affinity_key: Optional[str] = None
     anchors: set[str] = field(default_factory=set)
     last_seen: float = 0.0
+    history_signatures: tuple[str, ...] = field(default_factory=tuple)
 
 
 @dataclass
@@ -119,6 +122,7 @@ class _MatchCandidate:
     medium_groups: set[str] = field(default_factory=set)
     provider_matches: int = 0
     response_matches: int = 0
+    response_groups: set[str] = field(default_factory=set)
     last_seen: float = 0.0
 
     @property
@@ -145,6 +149,20 @@ class _MatchCandidate:
         return self.confidence in {"strong", "probable"}
 
 
+@dataclass(frozen=True)
+class _CompactionDecision:
+    """Validated structural replacement of a known parent history."""
+
+    parent_session_id: Optional[str] = None
+    marker_compaction: bool = False
+    retained_history_ratio: Optional[float] = None
+    response_group_count: int = 0
+
+    @property
+    def possible_compaction(self) -> bool:
+        return self.parent_session_id is not None
+
+
 class SessionTracker:
     """TTL-based session inference with scoped, compounding evidence anchors.
 
@@ -158,7 +176,11 @@ class SessionTracker:
     _STRONG_SCORE = 100
     _MEDIUM_SCORE = 35
     _WEAK_SCORE = 5
-    _PERSISTENCE_SCHEMA_VERSION = 1
+    _PERSISTENCE_SCHEMA_VERSION = 2
+    _COMPACTION_MAX_RETAINED_HISTORY_RATIO = 0.5
+    _MIN_UNMARKED_RESPONSE_GROUPS = 2
+    _COMPACTION_PROBE_ROLES = {"user", "system", "developer"}
+    _MAX_PERSISTED_HISTORY_SIGNATURES = 4096
 
     def __init__(
         self,
@@ -242,23 +264,70 @@ class SessionTracker:
             scope_key=scope_key,
             session_scope=hints.session_scope if hints else None,
         )
-        compaction_probe_anchors = self._build_compaction_probe_anchors(request_data, namespace)
+        history_signatures = self._request_history_signatures(request_data)
+        probe_indexes = self._compaction_probe_indexes(request_data)
+        compaction_probe_anchors = self._build_compaction_probe_anchors(
+            request_data,
+            namespace,
+            probe_indexes=probe_indexes,
+        )
+
+        replay_record = self._find_compaction_replay(
+            compaction_probe_anchors,
+            history_signatures,
+            namespace,
+            now,
+        )
+        if replay_record:
+            replay_anchor = self._compaction_replay_anchor(
+                compaction_probe_anchors,
+                history_signatures,
+                namespace,
+                parent_session_id=replay_record.group,
+            )
+            normal_anchors = self._build_anchors(
+                request_data,
+                namespace,
+                hints,
+                suppressed_continuity_indexes=probe_indexes,
+            )
+            normal_anchors = self._dedupe_anchors([*normal_anchors, replay_anchor])
+            state = self._refresh_and_bridge(
+                replay_record.session_id,
+                namespace,
+                normal_anchors,
+                now,
+                affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
+                history_signatures=history_signatures,
+            )
+            return SessionInference(
+                session_id=state.session_id,
+                affinity_key=state.affinity_key,
+                confidence="strong",
+                match_score=self._STRONG_SCORE,
+                possible_compaction=True,
+                lineage_parent_session_id=replay_record.group,
+                tracking_namespace=namespace,
+            )
+
         compaction_match = (
             self._best_match(compaction_probe_anchors, namespace, now)
             if compaction_probe_anchors
             else None
         )
         marker_compaction = self._looks_like_compaction(request_data)
-        possible_compaction = marker_compaction or self._is_compaction_parent_match(
+        compaction = self._evaluate_compaction(
             compaction_match,
             marker_compaction=marker_compaction,
+            history_signatures=history_signatures,
         )
+        possible_compaction = compaction.possible_compaction
         normal_anchors = self._build_anchors(
             request_data,
             namespace,
             hints,
             suppressed_continuity_indexes=(
-                self._compaction_probe_indexes(request_data) if possible_compaction else None
+                probe_indexes if possible_compaction else None
             ),
         )
 
@@ -278,6 +347,7 @@ class SessionTracker:
                 normal_anchors,
                 now,
                 affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
+                history_signatures=history_signatures,
             )
             return SessionInference(
                 session_id=state.session_id,
@@ -288,14 +358,19 @@ class SessionTracker:
                 tracking_namespace=namespace,
             )
 
-        parent_id = (
-            compaction_match.session_id
-            if self._is_compaction_parent_match(
-                compaction_match,
-                marker_compaction=marker_compaction,
+        parent_id = compaction.parent_session_id
+        if possible_compaction:
+            normal_anchors = self._dedupe_anchors(
+                [
+                    *normal_anchors,
+                    self._compaction_replay_anchor(
+                        compaction_probe_anchors,
+                        history_signatures,
+                        namespace,
+                        parent_session_id=parent_id,
+                    ),
+                ]
             )
-            else (match.session_id if match and possible_compaction else None)
-        )
         session_id = str(uuid.uuid4())
         state = self._create_session(
             session_id,
@@ -303,13 +378,18 @@ class SessionTracker:
             normal_anchors,
             now,
             affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
+            history_signatures=history_signatures,
         )
         if parent_id:
             lib_logger.info(
-                "Session tracker: possible compacted descendant %s -> %s for %s",
+                "Session tracker: possible compacted descendant %s -> %s for %s "
+                "(kind=%s, retained_history=%.3f, response_events=%d)",
                 parent_id,
                 session_id,
                 namespace,
+                "marker" if compaction.marker_compaction else "size",
+                compaction.retained_history_ratio or 0.0,
+                compaction.response_group_count,
             )
         return SessionInference(
             session_id=state.session_id,
@@ -339,16 +419,16 @@ class SessionTracker:
         """
         save_job = None
         with self._lock:
-            if not session_id or response is None or session_id not in self._sessions:
-                return
             now = time.time()
-            state = self._sessions[session_id]
-            namespace = tracking_namespace or state.namespace or self._namespace(
-                provider, model, scope_key=scope_key
-            )
-            anchors = self._anchors_from_response(response, namespace)
-            if anchors:
-                self._refresh_and_bridge(session_id, namespace, anchors, now)
+            self._prune(now)
+            if session_id and response is not None and session_id in self._sessions:
+                state = self._sessions[session_id]
+                namespace = tracking_namespace or state.namespace or self._namespace(
+                    provider, model, scope_key=scope_key
+                )
+                anchors = self._anchors_from_response(response, namespace)
+                if anchors:
+                    self._refresh_and_bridge(session_id, namespace, anchors, now)
             save_job = self._prepare_save_locked()
         self._write_save_job(save_job)
 
@@ -366,6 +446,7 @@ class SessionTracker:
         now: float,
         *,
         affinity_key: Optional[str],
+        history_signatures: tuple[str, ...] = (),
     ) -> _SessionState:
         state = _SessionState(
             session_id=session_id,
@@ -375,7 +456,14 @@ class SessionTracker:
             last_seen=now,
         )
         self._sessions[session_id] = state
-        self._refresh_and_bridge(session_id, namespace, anchors, now, affinity_key=affinity_key)
+        self._refresh_and_bridge(
+            session_id,
+            namespace,
+            anchors,
+            now,
+            affinity_key=affinity_key,
+            history_signatures=history_signatures,
+        )
         return state
 
     def _refresh_and_bridge(
@@ -386,6 +474,7 @@ class SessionTracker:
         now: float,
         *,
         affinity_key: Optional[str] = None,
+        history_signatures: Optional[tuple[str, ...]] = None,
     ) -> _SessionState:
         expires_at = now + self.ttl_seconds
         state = self._sessions.setdefault(
@@ -397,15 +486,36 @@ class SessionTracker:
         state.last_seen = now
         if affinity_key and not state.affinity_key:
             state.affinity_key = affinity_key
+        if history_signatures and len(history_signatures) >= len(state.history_signatures):
+            # Keep the largest observed request as the structural baseline. Equal
+            # fixed-window histories advance to the newest normal conversation.
+            state.history_signatures = history_signatures
 
         for anchor in anchors:
+            existing = self._anchors.get(anchor.value)
+            if existing and existing.session_id != session_id:
+                # A shared prompt/chunk is not proof that a newer independent
+                # session owns it. Preserve the first live owner until TTL expiry.
+                continue
+            strength = (
+                self._strongest(anchor.strength, existing.strength)
+                if existing
+                else anchor.strength
+            )
+            source = anchor.source
+            group = anchor.group
+            if existing and existing.source == "response" and anchor.source != "response":
+                # Responses commonly return as ordinary assistant history. Keep
+                # their response-event provenance for future lineage decisions.
+                source = existing.source
+                group = existing.group
             state.anchors.add(anchor.value)
             self._anchors[anchor.value] = _AnchorRecord(
                 session_id=session_id,
                 namespace=namespace,
-                strength=anchor.strength,
-                source=anchor.source,
-                group=anchor.group,
+                strength=strength,
+                source=source,
+                group=group,
                 expires_at=expires_at,
                 last_seen=now,
             )
@@ -440,8 +550,14 @@ class SessionTracker:
                     candidate.medium_groups.add(group)
                 if anchor.source == "provider" or record.source == "provider":
                     candidate.provider_matches += 1
-                if anchor.source == "response" or record.source == "response":
+                response_overlap = anchor.source == "response" or record.source == "response"
+                if response_overlap and self._allows_response_bridge(anchor, record):
                     candidate.response_matches += 1
+                    response_group = (
+                        anchor.group if anchor.source == "response" else record.group
+                    )
+                    if response_group:
+                        candidate.response_groups.add(response_group)
             else:
                 candidate.score += self._WEAK_SCORE
                 candidate.weak_matches += 1
@@ -455,6 +571,7 @@ class SessionTracker:
                 item.strong_matches,
                 item.medium_matches,
                 len(item.medium_groups),
+                len(item.response_groups),
                 item.response_matches,
                 item.provider_matches,
                 item.last_seen,
@@ -507,27 +624,31 @@ class SessionTracker:
         self,
         request_data: Dict[str, Any],
         namespace: str,
+        *,
+        probe_indexes: Optional[set[int]] = None,
     ) -> List[SessionAnchor]:
         """Build temporary anchors for compaction lineage lookup only.
 
         Compaction summaries often replace prior user/assistant history and may
-        be sent as system, developer, user, or assistant messages. These anchors
-        are compared against existing response/message anchors to identify a
-        likely parent, but they are not stored on the newly-created child session.
+        be sent as system, developer, or user messages. Assistant/tool history is
+        deliberately excluded because replaying it is ordinary continuity. These
+        anchors are compared against existing response/message anchors to identify
+        a likely parent, but they are not stored on the newly-created child session.
         """
         messages = request_data.get("messages") or []
         if not isinstance(messages, list) or not messages:
             return []
 
         anchors: List[SessionAnchor] = []
-        probe_indexes = self._compaction_probe_indexes(request_data)
+        if probe_indexes is None:
+            probe_indexes = self._compaction_probe_indexes(request_data)
         for index, message in enumerate(messages[:2]):
             if index not in probe_indexes:
                 continue
             if not isinstance(message, dict):
                 continue
             text = self._normalize_text(self._extract_text(message.get("content")))
-            role = str(message.get("role", ""))
+            role = str(message.get("role", "")).lower()
             anchors.append(
                 SessionAnchor(
                     self._scoped(namespace, f"message:{role}:{self._hash_text(text)}"),
@@ -555,27 +676,118 @@ class SessionTracker:
         for index, message in enumerate(messages[:2]):
             if not isinstance(message, dict):
                 continue
+            role = str(message.get("role", "")).lower()
+            if role not in self._COMPACTION_PROBE_ROLES:
+                continue
             text = self._normalize_text(self._extract_text(message.get("content")))
             if self._is_compaction_probe_text(text):
                 indexes.add(index)
         return indexes
 
-    def _is_compaction_parent_match(
+    def _evaluate_compaction(
         self,
         match: Optional[_MatchCandidate],
         *,
         marker_compaction: bool,
-    ) -> bool:
+        history_signatures: tuple[str, ...],
+    ) -> _CompactionDecision:
+        """Require parent evidence and replacement of most known history.
+
+        One response overlap is intentionally insufficient for unmarked input:
+        side-channel classifiers often quote the latest response verbatim. A real
+        unmarked summary must span distinct response events and remove more than
+        half of the parent's high-water request history.
+        """
+
         if not match:
-            return False
-        # Explicit summary markers are allowed to produce weaker lineage because
-        # the result is telemetry and still starts a new live sticky session.
-        if marker_compaction:
-            return match.score > 0
-        # Size-only probes are much noisier. Require overlap with prior response
-        # anchors so ordinary long repeated prompts/history are not classified as
-        # compaction descendants from normal message overlap alone.
-        return match.response_matches > 0
+            return _CompactionDecision()
+        parent = self._sessions.get(match.session_id)
+        if not parent or not parent.history_signatures:
+            return _CompactionDecision()
+        retained_ratio = self._retained_history_ratio(
+            history_signatures,
+            parent.history_signatures,
+        )
+        if retained_ratio >= self._COMPACTION_MAX_RETAINED_HISTORY_RATIO:
+            lib_logger.debug(
+                "Session tracker rejected compaction candidate for %s: "
+                "retained_history=%.3f",
+                match.session_id,
+                retained_ratio,
+            )
+            return _CompactionDecision()
+
+        response_group_count = len(match.response_groups)
+        qualifies = (
+            match.score > 0
+            if marker_compaction
+            else response_group_count >= self._MIN_UNMARKED_RESPONSE_GROUPS
+        )
+        if not qualifies:
+            lib_logger.debug(
+                "Session tracker rejected compaction candidate for %s: "
+                "marker=%s, response_events=%d",
+                match.session_id,
+                marker_compaction,
+                response_group_count,
+            )
+            return _CompactionDecision()
+        return _CompactionDecision(
+            parent_session_id=match.session_id,
+            marker_compaction=marker_compaction,
+            retained_history_ratio=retained_ratio,
+            response_group_count=response_group_count,
+        )
+
+    def _compaction_replay_anchor(
+        self,
+        probe_anchors: List[SessionAnchor],
+        history_signatures: tuple[str, ...],
+        namespace: str,
+        *,
+        parent_session_id: Optional[str],
+    ) -> SessionAnchor:
+        """Build an opaque exact-replay key for a validated compacted payload."""
+
+        digest = self._hash_json(
+            {
+                "probe_anchors": sorted(anchor.value for anchor in probe_anchors),
+                "history_signatures": list(history_signatures),
+            }
+        )
+        return SessionAnchor(
+            self._scoped(namespace, f"compaction_replay:{digest}"),
+            "strong",
+            source="compaction_replay",
+            group=parent_session_id,
+        )
+
+    def _find_compaction_replay(
+        self,
+        probe_anchors: List[SessionAnchor],
+        history_signatures: tuple[str, ...],
+        namespace: str,
+        now: float,
+    ) -> Optional[_AnchorRecord]:
+        if not probe_anchors:
+            return None
+        anchor = self._compaction_replay_anchor(
+            probe_anchors,
+            history_signatures,
+            namespace,
+            parent_session_id=None,
+        )
+        record = self._anchors.get(anchor.value)
+        if (
+            not record
+            or record.source != "compaction_replay"
+            or record.namespace != namespace
+            or record.expires_at <= now
+            or record.session_id not in self._sessions
+            or not record.group
+        ):
+            return None
+        return record
 
     def _anchors_from_provider_hints(
         self,
@@ -647,6 +859,7 @@ class SessionTracker:
         namespace: str,
         *,
         source: str = "message",
+        evidence_group: Optional[str] = None,
         allow_system_continuity: bool = False,
         suppressed_continuity_indexes: Optional[set[int]] = None,
     ) -> List[SessionAnchor]:
@@ -719,7 +932,7 @@ class SessionTracker:
                             self._scoped(namespace, f"message:{role}:{self._hash_text(normalized_text)}"),
                             "medium",
                             source=source,
-                            group=f"{source}:{index}",
+                            group=evidence_group or f"{source}:{index}:{role.lower()}",
                         )
                     )
                     for chunk_hash in self._content_chunk_hashes(normalized_text):
@@ -728,7 +941,7 @@ class SessionTracker:
                                 self._scoped(namespace, f"chunk:{chunk_hash}"),
                                 "medium",
                                 source=source,
-                                group=f"{source}:{index}",
+                                group=evidence_group or f"{source}:{index}:{role.lower()}",
                             )
                         )
 
@@ -798,7 +1011,17 @@ class SessionTracker:
                 response_message.setdefault("role", "assistant")
                 messages.append(response_message)
         if messages:
-            anchors.extend(self._anchors_from_messages(messages, namespace, source="response"))
+            response_group = "response_event:" + self._hash_json(
+                [self._message_signature(message) for message in messages]
+            )
+            anchors.extend(
+                self._anchors_from_messages(
+                    messages,
+                    namespace,
+                    source="response",
+                    evidence_group=response_group,
+                )
+            )
         return anchors
 
     def _affinity_from_anchors(
@@ -865,7 +1088,7 @@ class SessionTracker:
             return
         sorted_anchors = sorted(
             state.anchors,
-            key=lambda value: self._anchors.get(value, _AnchorRecord("", "", "weak", "", None, 0, 0)).last_seen,
+            key=lambda value: self._anchor_eviction_key(self._anchors.get(value)),
         )
         for value in sorted_anchors[: len(state.anchors) - self.max_anchors_per_session]:
             state.anchors.discard(value)
@@ -877,24 +1100,36 @@ class SessionTracker:
         if len(self._anchors) <= self.max_anchor_records:
             return
         overage = len(self._anchors) - self.max_anchor_records
-        for value, record in sorted(self._anchors.items(), key=lambda item: item[1].last_seen)[:overage]:
+        for value, record in sorted(
+            self._anchors.items(),
+            key=lambda item: self._anchor_eviction_key(item[1]),
+        )[:overage]:
             state = self._sessions.get(record.session_id)
             if state:
                 state.anchors.discard(value)
             del self._anchors[value]
 
     def _prune(self, now: Optional[float] = None) -> None:
-        now = now or time.time()
+        if now is None:
+            now = time.time()
+        changed = False
         expired_sessions = [key for key, state in self._sessions.items() if state.expires_at <= now]
         for session_id in expired_sessions:
             state = self._sessions.pop(session_id)
+            changed = True
             for anchor in list(state.anchors):
                 record = self._anchors.get(anchor)
                 if record and record.session_id == session_id:
                     del self._anchors[anchor]
         expired_anchors = [key for key, record in self._anchors.items() if record.expires_at <= now]
         for anchor in expired_anchors:
-            del self._anchors[anchor]
+            record = self._anchors.pop(anchor)
+            changed = True
+            state = self._sessions.get(record.session_id)
+            if state:
+                state.anchors.discard(anchor)
+        if changed:
+            self._mark_dirty()
 
     def _load(self) -> None:
         if not self.persistence_path:
@@ -908,43 +1143,83 @@ class SessionTracker:
                 "Ignoring unsupported session_stickiness.json format; session persistence will rebuild in memory."
             )
             return
-        sessions = data.get("sessions", {})
-        anchors = data.get("anchors", {})
+        sessions = data.get("sessions")
+        anchors = data.get("anchors")
+        if not isinstance(sessions, dict) or not isinstance(anchors, dict):
+            lib_logger.info(
+                "Ignoring malformed session_stickiness.json containers; "
+                "session persistence will rebuild in memory."
+            )
+            return
         for session_id, payload in sessions.items():
             if not isinstance(payload, dict):
                 continue
-            expires_at = float(payload.get("expires_at", 0.0))
-            if expires_at <= now:
+            expires_at = self._finite_float(payload.get("expires_at"))
+            if expires_at is None or expires_at <= now:
                 continue
+            namespace = payload.get("namespace")
+            if not isinstance(namespace, str) or not namespace:
+                continue
+            last_seen = self._finite_float(payload.get("last_seen"))
+            history_payload = payload.get("history_signatures") or []
+            history_signatures = (
+                tuple(
+                    value
+                    for value in history_payload[: self._MAX_PERSISTED_HISTORY_SIGNATURES]
+                    if isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value)
+                )
+                if isinstance(history_payload, list)
+                else ()
+            )
+            affinity_key = payload.get("affinity_key")
+            if affinity_key is not None and not isinstance(affinity_key, str):
+                affinity_key = None
             self._sessions[session_id] = _SessionState(
                 session_id=session_id,
-                namespace=str(payload.get("namespace") or "global"),
+                namespace=namespace,
                 expires_at=expires_at,
-                affinity_key=payload.get("affinity_key"),
-                anchors=set(payload.get("anchors") or []),
-                last_seen=float(payload.get("last_seen", now)),
+                affinity_key=affinity_key,
+                anchors=set(),
+                last_seen=last_seen if last_seen is not None else now,
+                history_signatures=history_signatures,
             )
         for value, payload in anchors.items():
             if not isinstance(payload, dict):
                 continue
             session_id = payload.get("session_id")
-            expires_at = float(payload.get("expires_at", 0.0))
-            if not session_id or expires_at <= now:
+            state = self._sessions.get(session_id) if isinstance(session_id, str) else None
+            expires_at = self._finite_float(payload.get("expires_at"))
+            if not state or expires_at is None or expires_at <= now:
                 continue
-            namespace = str(payload.get("namespace") or "global")
+            namespace = payload.get("namespace")
+            if namespace != state.namespace:
+                continue
+            if not isinstance(value, str) or not value.startswith(f"{namespace}:"):
+                continue
+            strength = payload.get("strength")
+            source = payload.get("source")
+            group = payload.get("group")
+            if strength not in {"weak", "medium", "strong"}:
+                continue
+            if not isinstance(source, str) or not source:
+                continue
+            if group is not None and not isinstance(group, str):
+                continue
+            last_seen = self._finite_float(payload.get("last_seen"))
             self._anchors[value] = _AnchorRecord(
                 session_id=session_id,
                 namespace=namespace,
-                strength=str(payload.get("strength") or "medium"),
-                source=str(payload.get("source") or "generic"),
-                group=payload.get("group"),
-                expires_at=expires_at,
-                last_seen=float(payload.get("last_seen", now)),
+                strength=strength,
+                source=source,
+                group=group,
+                expires_at=min(expires_at, state.expires_at),
+                last_seen=last_seen if last_seen is not None else now,
             )
-            self._sessions.setdefault(
-                session_id,
-                _SessionState(session_id=session_id, namespace=namespace, expires_at=expires_at),
-            ).anchors.add(value)
+            state.anchors.add(value)
+
+        for state in self._sessions.values():
+            self._trim_session_anchors(state)
+        self._trim_global_anchors()
 
     def _prepare_save_locked(
         self,
@@ -964,8 +1239,8 @@ class SessionTracker:
                     "namespace": state.namespace,
                     "expires_at": state.expires_at,
                     "affinity_key": state.affinity_key,
-                    "anchors": sorted(state.anchors),
                     "last_seen": state.last_seen,
+                    "history_signatures": list(state.history_signatures),
                 }
                 for session_id, state in self._sessions.items()
             },
@@ -1000,7 +1275,11 @@ class SessionTracker:
         with self._save_io_lock:
             if generation < self._last_persisted_generation:
                 return
-            success = writer.write(payload)
+            try:
+                success = writer.write(payload)
+            except Exception as exc:
+                lib_logger.warning("Failed to persist session tracking state: %s", exc)
+                success = False
             if success:
                 self._last_persisted_generation = generation
         if not success:
@@ -1039,8 +1318,101 @@ class SessionTracker:
         order = {"weak": 0, "medium": 1, "strong": 2}
         return left if order.get(left, 0) >= order.get(right, 0) else right
 
+    def _anchor_eviction_key(
+        self,
+        record: Optional[_AnchorRecord],
+    ) -> tuple[int, int, float]:
+        """Evict weak/ordinary evidence before strong replay/tool identity."""
+
+        if record is None:
+            return (-1, 0, 0.0)
+        strength_rank = {"weak": 0, "medium": 1, "strong": 2}.get(record.strength, 0)
+        replay_rank = 1 if record.source == "compaction_replay" else 0
+        return (strength_rank, replay_rank, record.last_seen)
+
+    def _allows_response_bridge(
+        self,
+        anchor: SessionAnchor,
+        record: _AnchorRecord,
+    ) -> bool:
+        """Only assistant-role request history may bridge from one response.
+
+        Compaction probes are evaluated separately and may summarize responses in
+        a user/system message. Ordinary user prompts that merely quote a response
+        must not become sticky to the producer session.
+        """
+
+        message_group = None
+        if anchor.source == "message":
+            message_group = anchor.group
+        elif record.source == "message":
+            message_group = record.group
+        return message_group is None or message_group.endswith(":assistant")
+
+    def _finite_float(self, value: Any) -> Optional[float]:
+        """Parse persisted numeric metadata without allowing NaN or infinity."""
+
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if math.isfinite(parsed) else None
+
     def _is_substantial_text(self, text: str) -> bool:
         return len(text) >= 24 and len(text.split()) >= 4
+
+    def _request_history_signatures(self, request_data: Dict[str, Any]) -> tuple[str, ...]:
+        """Return content-free signatures for structural history comparison."""
+
+        messages = request_data.get("messages") or []
+        if not isinstance(messages, list):
+            return ()
+        return tuple(
+            signature
+            for message in messages
+            if isinstance(message, dict)
+            for signature in [self._message_signature(message)]
+            if signature
+        )
+
+    def _message_signature(self, message: Dict[str, Any]) -> str:
+        """Hash the normalized message shape without retaining raw content."""
+
+        payload: Dict[str, Any] = {
+            "role": str(message.get("role", "")).lower(),
+            "content": self._normalize_content(message.get("content")),
+        }
+        tool_call_id = message.get("tool_call_id")
+        if tool_call_id:
+            payload["tool_call_id"] = str(tool_call_id)
+        tool_calls = message.get("tool_calls") or []
+        if isinstance(tool_calls, list):
+            normalized_calls = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                normalized_calls.append(
+                    {
+                        key: call.get(key)
+                        for key in ("id", "type", "function", "name")
+                        if call.get(key) is not None
+                    }
+                )
+            if normalized_calls:
+                payload["tool_calls"] = normalized_calls
+        return self._hash_json(payload)
+
+    def _retained_history_ratio(
+        self,
+        current: tuple[str, ...],
+        previous: tuple[str, ...],
+    ) -> float:
+        """Measure how much of the parent's high-water history remains."""
+
+        if not previous:
+            return 1.0
+        retained = sum((Counter(current) & Counter(previous)).values())
+        return retained / len(previous)
 
     def _content_chunk_hashes(self, text: str) -> List[str]:
         words = text.split()

@@ -80,7 +80,7 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
    - Resolve an exact replay before creating another child.
 
 5. State integrity.
-   - Remove overwritten anchors from their former owner's anchor set.
+   - Preserve the first live owner of shared content anchors instead of letting an auxiliary request steal them.
    - Keep pruning and both trim paths bidirectionally consistent.
    - Preserve stronger/provenance-rich metadata when refreshing the same anchor in one session.
    - Verify every stored anchor has one live owner and every session anchor points back to that owner.
@@ -146,7 +146,7 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - TTL equality expires state.
 - Late response recording after expiry does not resurrect a session.
 - Per-session/global trimming preserves ownership invariants.
-- Anchor transfer removes stale former ownership.
+- Shared anchors keep one live owner and never create stale secondary ownership.
 - Affinity is deterministic across fresh trackers and restart.
 - Flush throttling, forced flush, writer failure/recovery, stale generation ordering, and mutation during a blocked write are deterministic.
 - Concurrent infer/record/flush operations preserve invariants and do not hold the main lock during disk I/O.
@@ -157,6 +157,7 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - Internal credential retries reuse the existing request context/session.
 - Successful non-streaming responses record response provenance.
 - Completed streams record response provenance.
+- Clean EOF without an explicit provider completion signal does not record response provenance.
 - Failed, partial, and disconnected streams do not record response provenance.
 - Corrected session and affinity values reach sequential selection.
 
