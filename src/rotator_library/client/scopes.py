@@ -6,9 +6,51 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+
+
+def derive_session_isolation_key(
+    classifier: Optional[str],
+    request_api_keys: Any,
+    request_providers: Any,
+    private: bool,
+) -> str:
+    """Return a stable provider-independent caller/credential domain key."""
+
+    # A named classifier is the caller's explicit isolation boundary. Rotating
+    # credentials or provider overrides inside it must not create hidden domains.
+    if classifier:
+        digest = hashlib.sha256(str(classifier).encode("utf-8")).hexdigest()[:24]
+        return f"classifier:{digest}"
+    if not request_api_keys and not request_providers:
+        return "public"
+
+    normalized_api_keys = ScopeManager.normalize_api_key_map(request_api_keys)
+    normalized_providers = ScopeManager.normalize_provider_map(request_providers)
+
+    def canonical(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): canonical(item)
+                for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            }
+        if isinstance(value, (list, tuple, set)):
+            items = [canonical(item) for item in value]
+            return sorted(items, key=lambda item: json.dumps(item, sort_keys=True, default=str))
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
+
+    payload = {
+        "api_keys": canonical(normalized_api_keys),
+        "providers": canonical(normalized_providers),
+        "private": bool(private),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return "bundle:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 class ScopeManager:
@@ -150,7 +192,20 @@ class ScopeManager:
             raw_credentials = list(credential_entry.get("keys", []))
             credential_private = bool(credential_entry.get("private", True))
 
-        scope_name = classifier or "default"
+        session_domain = derive_session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
+        )
+        # Ad hoc bundles need their own usage manager as well as their own
+        # session namespace. Otherwise cooldowns, sticky entries, and credential
+        # registries from unrelated private bundles would share "default".
+        scope_name = (
+            session_domain
+            if session_domain.startswith("bundle:")
+            else (classifier or "default")
+        )
         credentials: List[str] = []
         credential_secrets: Dict[str, str] = {}
         if credential_private:

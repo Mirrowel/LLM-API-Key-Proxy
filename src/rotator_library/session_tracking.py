@@ -61,14 +61,19 @@ class SessionTrackingHints:
     """Provider-supplied tracking evidence.
 
     Providers should return evidence, not routing decisions. Core routing still
-    owns credential selection. This lets providers expose stable native markers
-    or provider-specific request structure while keeping sticky policy centralized.
+    owns credential selection. Provider anchors and affinity are automatically
+    qualified by provider and optional ``session_scope``; global anchors are
+    reserved for proxy-owned/client-global identity such as Responses IDs.
     """
 
     strong_anchors: List[str] = field(default_factory=list)
     medium_anchors: List[str] = field(default_factory=list)
     weak_anchors: List[str] = field(default_factory=list)
+    global_strong_anchors: List[str] = field(default_factory=list)
+    global_medium_anchors: List[str] = field(default_factory=list)
+    global_weak_anchors: List[str] = field(default_factory=list)
     affinity_key: Optional[str] = None
+    # Partitions provider-native anchors only; it never changes logical identity.
     session_scope: Optional[str] = None
 
 
@@ -181,11 +186,27 @@ class SessionTracker:
     _STRONG_SCORE = 100
     _MEDIUM_SCORE = 35
     _WEAK_SCORE = 5
-    _PERSISTENCE_SCHEMA_VERSION = 2
+    _PERSISTENCE_SCHEMA_VERSION = 3
     _COMPACTION_MAX_RETAINED_HISTORY_RATIO = 0.5
     _MIN_UNMARKED_RESPONSE_GROUPS = 2
     _COMPACTION_PROBE_ROLES = {"user", "system", "developer"}
     _MAX_PERSISTED_HISTORY_SIGNATURES = 4096
+    _MAX_PERSISTED_FILE_BYTES = 16 * 1024 * 1024
+    _MAX_PERSISTED_SESSIONS = 10000
+    _MAX_PERSISTED_STRING_LENGTH = 1024
+    _PERSISTED_ANCHOR_SOURCES = {
+        "compaction_context",
+        "compaction_replay",
+        "explicit",
+        "first_user",
+        "global_hint",
+        "message",
+        "provider",
+        "response",
+        "tool",
+        "tool_event",
+        "window",
+    }
 
     def __init__(
         self,
@@ -236,6 +257,7 @@ class SessionTracker:
         model: Optional[str] = None,
         scope_key: Optional[str] = None,
         hints: Optional[Any] = None,
+        _trusted_isolation_key: bool = False,
     ) -> SessionInference:
         """Infer live session and deterministic affinity from a request payload."""
         with self._lock:
@@ -245,6 +267,7 @@ class SessionTracker:
                 model=model,
                 scope_key=scope_key,
                 hints=hints,
+                trusted_isolation_key=_trusted_isolation_key,
             )
             save_job = self._prepare_save_locked()
         self._write_save_job(save_job)
@@ -258,6 +281,7 @@ class SessionTracker:
         model: Optional[str],
         scope_key: Optional[str],
         hints: Optional[Any],
+        trusted_isolation_key: bool,
     ) -> SessionInference:
         now = time.time()
         self._prune(now)
@@ -268,6 +292,7 @@ class SessionTracker:
             model,
             scope_key=scope_key,
             session_scope=hints.session_scope if hints else None,
+            trusted_isolation_key=trusted_isolation_key,
         )
         history_signatures = self._request_history_signatures(request_data)
         probe_indexes = self._compaction_probe_indexes(request_data)
@@ -280,6 +305,7 @@ class SessionTracker:
             request_data,
             namespace,
             hints,
+            provider=provider,
         )
         compaction_match = (
             self._best_match(compaction_probe_anchors, namespace, now)
@@ -314,6 +340,7 @@ class SessionTracker:
                     request_data,
                     namespace,
                     hints,
+                    provider=provider,
                     suppressed_continuity_indexes=probe_indexes,
                 )
                 if possible_compaction
@@ -330,7 +357,7 @@ class SessionTracker:
             return self._log_inference_decision(
                 SessionInference(
                     session_id=state.session_id,
-                    affinity_key=state.affinity_key,
+                    affinity_key=self._effective_affinity(state, hints, provider),
                     confidence=authoritative_match.confidence,
                     match_score=authoritative_match.score,
                     possible_compaction=possible_compaction,
@@ -339,6 +366,8 @@ class SessionTracker:
                 action="compaction_continue" if possible_compaction else "continue",
                 matched_session_id=state.session_id,
                 compaction=compaction if possible_compaction else None,
+                provider=provider,
+                model=model,
             )
 
         has_authoritative_identity = bool(authoritative_anchors)
@@ -372,6 +401,7 @@ class SessionTracker:
                 request_data,
                 namespace,
                 hints,
+                provider=provider,
                 suppressed_continuity_indexes=probe_indexes,
             )
             context_anchors = (
@@ -393,7 +423,7 @@ class SessionTracker:
             return self._log_inference_decision(
                 SessionInference(
                     session_id=state.session_id,
-                    affinity_key=state.affinity_key,
+                    affinity_key=self._effective_affinity(state, hints, provider),
                     confidence="strong",
                     match_score=self._STRONG_SCORE,
                     possible_compaction=True,
@@ -402,6 +432,8 @@ class SessionTracker:
                 ),
                 action="compaction_replay",
                 matched_session_id=state.session_id,
+                provider=provider,
+                model=model,
             )
 
         if context_binding:
@@ -410,6 +442,7 @@ class SessionTracker:
                 request_data,
                 namespace,
                 hints,
+                provider=provider,
                 suppressed_continuity_indexes=probe_indexes,
             )
             normal_anchors = self._dedupe_anchors([*normal_anchors, context_anchor])
@@ -424,7 +457,7 @@ class SessionTracker:
             return self._log_inference_decision(
                 SessionInference(
                     session_id=state.session_id,
-                    affinity_key=state.affinity_key,
+                    affinity_key=self._effective_affinity(state, hints, provider),
                     confidence="strong",
                     match_score=self._STRONG_SCORE,
                     possible_compaction=False,
@@ -433,6 +466,8 @@ class SessionTracker:
                 ),
                 action="compaction_continue",
                 matched_session_id=state.session_id,
+                provider=provider,
+                model=model,
             )
 
         possible_compaction = compaction.possible_compaction
@@ -441,6 +476,7 @@ class SessionTracker:
                 request_data,
                 namespace,
                 hints,
+                provider=provider,
                 suppressed_continuity_indexes=probe_indexes,
             )
             if possible_compaction
@@ -451,6 +487,8 @@ class SessionTracker:
             return self._log_inference_decision(
                 SessionInference(session_id=None, tracking_namespace=namespace),
                 action="untracked",
+                provider=provider,
+                model=model,
             )
 
         match = self._best_match(normal_anchors, namespace, now) if normal_anchors else None
@@ -471,7 +509,7 @@ class SessionTracker:
             return self._log_inference_decision(
                 SessionInference(
                     session_id=state.session_id,
-                    affinity_key=state.affinity_key,
+                    affinity_key=self._effective_affinity(state, hints, provider),
                     confidence=match.confidence,
                     match_score=match.score,
                     possible_compaction=possible_compaction,
@@ -486,6 +524,8 @@ class SessionTracker:
                 action="compaction_continue" if possible_compaction else "continue",
                 matched_session_id=match.session_id,
                 compaction=compaction,
+                provider=provider,
+                model=model,
             )
 
         parent_id = compaction.parent_session_id
@@ -520,7 +560,7 @@ class SessionTracker:
         return self._log_inference_decision(
             SessionInference(
                 session_id=state.session_id,
-                affinity_key=state.affinity_key,
+                affinity_key=self._effective_affinity(state, hints, provider),
                 confidence="weak" if match else "none",
                 match_score=match.score if match else 0,
                 possible_compaction=possible_compaction,
@@ -530,6 +570,8 @@ class SessionTracker:
             action="compaction_child" if parent_id else "new",
             candidate_session_id=match.session_id if match else None,
             compaction=compaction,
+            provider=provider,
+            model=model,
         )
 
     def _log_inference_decision(
@@ -540,6 +582,8 @@ class SessionTracker:
         matched_session_id: Optional[str] = None,
         candidate_session_id: Optional[str] = None,
         compaction: Optional[_CompactionDecision] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> SessionInference:
         """Emit temporary warning-level lineage diagnostics for every request."""
 
@@ -559,7 +603,7 @@ class SessionTracker:
         lib_logger.warning(
             "Session tracker decision: action=%s session_id=%s matched_session_id=%s "
             "candidate_session_id=%s parent_session_id=%s namespace=%s "
-            "confidence=%s score=%d origin=%s "
+            "provider=%s model=%s confidence=%s score=%d origin=%s "
             "possible_compaction=%s marker=%s retained_history=%s response_events=%d",
             action,
             inference.session_id or "-",
@@ -567,6 +611,8 @@ class SessionTracker:
             candidate_session_id or "-",
             inference.lineage_parent_session_id or "-",
             inference.tracking_namespace or "-",
+            provider or "-",
+            model or "-",
             inference.confidence,
             inference.match_score,
             origin,
@@ -728,7 +774,14 @@ class SessionTracker:
             candidate.last_seen = max(candidate.last_seen, record.last_seen)
             if anchor.source == "compaction_probe" and anchor.group:
                 candidate.matched_probe_groups.add(anchor.group)
-            strength = self._strongest(anchor.strength, record.strength)
+            # Closure belongs to the current request. A previously closed event
+            # must not upgrade a later unpaired copy merely because the stored
+            # anchor retained medium strength.
+            strength = (
+                anchor.strength
+                if anchor.source == "tool_event"
+                else self._strongest(anchor.strength, record.strength)
+            )
             if strength == "strong":
                 candidate.score += self._STRONG_SCORE
                 candidate.strong_matches += 1
@@ -783,6 +836,9 @@ class SessionTracker:
                 strong_anchors=list(hints.get("strong_anchors") or []),
                 medium_anchors=list(hints.get("medium_anchors") or []),
                 weak_anchors=list(hints.get("weak_anchors") or []),
+                global_strong_anchors=list(hints.get("global_strong_anchors") or []),
+                global_medium_anchors=list(hints.get("global_medium_anchors") or []),
+                global_weak_anchors=list(hints.get("global_weak_anchors") or []),
                 affinity_key=hints.get("affinity_key"),
                 session_scope=hints.get("session_scope"),
             )
@@ -794,11 +850,12 @@ class SessionTracker:
         namespace: str,
         hints: Optional[Any],
         *,
+        provider: Optional[str] = None,
         allow_system_continuity: bool = False,
         suppressed_continuity_indexes: Optional[set[int]] = None,
     ) -> List[SessionAnchor]:
         anchors: List[SessionAnchor] = []
-        anchors.extend(self._anchors_from_provider_hints(hints, namespace))
+        anchors.extend(self._anchors_from_provider_hints(hints, namespace, provider))
         anchors.extend(self._anchors_from_explicit_ids(request_data, namespace))
 
         messages = request_data.get("messages") or []
@@ -1029,6 +1086,7 @@ class SessionTracker:
 
         return anchor.strength == "strong" and anchor.source in {
             "explicit",
+            "global_hint",
             "provider",
         }
 
@@ -1097,32 +1155,57 @@ class SessionTracker:
         self,
         hints: Optional[SessionTrackingHints],
         namespace: str,
+        provider: Optional[str],
     ) -> List[SessionAnchor]:
         if not hints:
             return []
         anchors: List[SessionAnchor] = []
+        # A provider may partition only its native evidence/affinity domain. This
+        # never fragments the global logical session or caller isolation domain.
+        native_scope = hints.session_scope or "provider"
+        provider_key = self._hash_text(f"{provider or 'unknown'}:{native_scope}")
         for strength, attr in (
             ("strong", "strong_anchors"),
             ("medium", "medium_anchors"),
             ("weak", "weak_anchors"),
         ):
             for value in getattr(hints, attr, []) or []:
+                value_hash = self._hash_text(str(value))
                 anchors.append(
                     SessionAnchor(
-                        self._scoped(namespace, f"provider:{value}"),
+                        self._scoped(namespace, f"provider:{provider_key}:{value_hash}"),
                         strength,
                         source="provider",
-                        group=f"provider:{value}",
+                        group=f"provider:{provider_key}:{value_hash}",
+                    )
+                )
+        for strength, attr in (
+            ("strong", "global_strong_anchors"),
+            ("medium", "global_medium_anchors"),
+            ("weak", "global_weak_anchors"),
+        ):
+            for value in getattr(hints, attr, []) or []:
+                value_hash = self._hash_text(str(value))
+                anchors.append(
+                    SessionAnchor(
+                        self._scoped(namespace, f"global:{value_hash}"),
+                        strength,
+                        source="global_hint",
+                        group=f"global:{value_hash}",
                     )
                 )
         affinity_key = getattr(hints, "affinity_key", None)
         if affinity_key:
+            affinity_hash = self._hash_text(str(affinity_key))
             anchors.append(
                 SessionAnchor(
-                    self._scoped(namespace, f"provider_affinity:{affinity_key}"),
+                    self._scoped(
+                        namespace,
+                        f"provider:{provider_key}:affinity:{affinity_hash}",
+                    ),
                     "strong",
                     source="provider",
-                    group="provider_affinity",
+                    group=f"provider:{provider_key}:affinity",
                 )
             )
         return anchors
@@ -1146,10 +1229,11 @@ class SessionTracker:
         ):
             value = request_data.get(key)
             if value:
+                value_hash = self._hash_text(str(value))
                 strength = "strong" if key in self.trusted_explicit_fields else "weak"
                 anchors.append(
                     SessionAnchor(
-                        self._scoped(namespace, f"explicit:{key}:{value}"),
+                        self._scoped(namespace, f"explicit:{key}:{value_hash}"),
                         strength,
                         source="explicit",
                         group=f"explicit:{key}",
@@ -1171,6 +1255,7 @@ class SessionTracker:
         normalized_messages: List[Dict[str, Any]] = []
         tool_ids: List[str] = []
         first_user_text: Optional[str] = None
+        closed_tool_calls = self._closed_tool_call_positions(messages)
 
         for index, message in enumerate(messages):
             if not isinstance(message, dict):
@@ -1183,36 +1268,56 @@ class SessionTracker:
             tool_call_id = message.get("tool_call_id")
             if tool_call_id:
                 tool_id = str(tool_call_id)
+                tool_id_hash = self._hash_text(tool_id)
                 tool_ids.append(tool_id)
                 normalized["tool_call_id"] = tool_id
                 anchors.append(
                     SessionAnchor(
-                        self._scoped(namespace, f"tool:{tool_id}"),
+                        self._scoped(namespace, f"tool:{tool_id_hash}"),
                         "weak",
                         source="tool",
-                        group=f"tool:{tool_id}",
+                        group=f"tool:{tool_id_hash}",
                     )
                 )
 
             tool_calls = message.get("tool_calls") or []
             if isinstance(tool_calls, list) and tool_calls:
                 call_ids: List[str] = []
-                for tool_call in tool_calls:
+                for tool_call_index, tool_call in enumerate(tool_calls):
                     if not isinstance(tool_call, dict):
                         continue
                     call_id = tool_call.get("id")
                     if call_id:
                         call_id = str(call_id)
+                        call_id_hash = self._hash_text(call_id)
                         call_ids.append(call_id)
                         tool_ids.append(call_id)
                         anchors.append(
                             SessionAnchor(
-                                self._scoped(namespace, f"tool:{call_id}"),
+                                self._scoped(namespace, f"tool:{call_id_hash}"),
                                 "weak",
                                 source="tool",
-                                group=f"tool:{call_id}",
+                                group=f"tool:{call_id_hash}",
                             )
                         )
+                        event = self._tool_event_descriptor(tool_call)
+                        if role.lower() == "assistant" and event is not None:
+                            event_hash = self._hash_json(event)
+                            anchors.append(
+                                SessionAnchor(
+                                    self._scoped(
+                                        namespace,
+                                        f"tool_event:{event_hash}",
+                                    ),
+                                    (
+                                        "medium"
+                                        if (index, tool_call_index) in closed_tool_calls
+                                        else "weak"
+                                    ),
+                                    source="tool_event",
+                                    group=f"tool_event:{event_hash}",
+                                )
+                            )
                 if call_ids:
                     normalized["tool_calls"] = call_ids
 
@@ -1293,13 +1398,19 @@ class SessionTracker:
         anchors: List[SessionAnchor] = []
         response_id = data.get("id")
         if response_id:
+            response_id_hash = self._hash_text(
+                f"responses_previous_response_id:{response_id}"
+            )
             # Responses API continuations identify their parent with
             # previous_response_id. Record the emitted response id as strong
             # response evidence so the next request can route back to the exact
             # session/credential that produced it.
             anchors.append(
                 SessionAnchor(
-                    self._scoped(namespace, f"provider:responses_previous_response_id:{response_id}"),
+                    self._scoped(
+                        namespace,
+                        f"global:{response_id_hash}",
+                    ),
                     "strong",
                     source="response",
                     group="responses_previous_response_id",
@@ -1328,15 +1439,88 @@ class SessionTracker:
             )
         return anchors
 
+    @staticmethod
+    def _closed_tool_call_positions(
+        messages: List[Dict[str, Any]],
+    ) -> set[tuple[int, int]]:
+        """Pair each tool result with one earlier assistant call of the same ID."""
+
+        pending: Dict[str, List[tuple[int, int]]] = {}
+        closed: set[tuple[int, int]] = set()
+        for message_index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).lower()
+            if role == "assistant":
+                tool_calls = message.get("tool_calls") or []
+                if not isinstance(tool_calls, list):
+                    continue
+                for tool_call_index, tool_call in enumerate(tool_calls):
+                    if not isinstance(tool_call, dict) or not tool_call.get("id"):
+                        continue
+                    pending.setdefault(str(tool_call["id"]), []).append(
+                        (message_index, tool_call_index)
+                    )
+                continue
+            if role not in {"tool", "function"} or not message.get("tool_call_id"):
+                continue
+            candidates = pending.get(str(message["tool_call_id"]))
+            if candidates:
+                closed.add(candidates.pop(0))
+        return closed
+
+    def _tool_event_descriptor(
+        self,
+        tool_call: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Return stable call structure used by pending and closed tool events."""
+
+        call_id = tool_call.get("id")
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            name = function.get("name") or tool_call.get("name")
+            arguments = function.get("arguments")
+        else:
+            name = tool_call.get("name")
+            arguments = tool_call.get("arguments")
+        if not call_id or not name:
+            return None
+        return {
+            "id": str(call_id),
+            "name": str(name),
+            "arguments": self._canonical_tool_arguments(arguments),
+        }
+
+    def _canonical_tool_arguments(self, arguments: Any) -> Any:
+        """Normalize JSON arguments without retaining their plaintext in anchors."""
+
+        if not isinstance(arguments, str):
+            return arguments
+        stripped = arguments.strip()
+        if not stripped:
+            return ""
+        try:
+            return json.loads(stripped)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return self._normalize_text(stripped)
+
     def _affinity_from_anchors(
         self,
         anchors: List[SessionAnchor],
         namespace: str,
     ) -> Optional[str]:
-        strong = sorted(anchor.value for anchor in anchors if anchor.strength == "strong")
+        strong = sorted(
+            anchor.value
+            for anchor in anchors
+            if anchor.strength == "strong" and anchor.source != "provider"
+        )
         if strong:
             return self._scoped(namespace, "affinity:" + self._hash_json(strong[:4]))
-        medium_anchors = [anchor for anchor in anchors if anchor.strength == "medium"]
+        medium_anchors = [
+            anchor
+            for anchor in anchors
+            if anchor.strength == "medium" and anchor.source != "provider"
+        ]
         medium_groups = {
             anchor.group
             for anchor in medium_anchors
@@ -1349,6 +1533,26 @@ class SessionTracker:
         if len(medium) >= 2 and (len(medium_groups) >= 2 or has_provider_or_response):
             return self._scoped(namespace, "affinity:" + self._hash_json(medium[:8]))
         return None
+
+    @staticmethod
+    def _effective_affinity(
+        state: _SessionState,
+        hints: Optional[SessionTrackingHints],
+        provider: Optional[str],
+    ) -> Optional[str]:
+        """Use provider affinity only for the provider handling this request."""
+
+        if hints:
+            if hints.affinity_key:
+                return hints.affinity_key
+            native = sorted(str(value) for value in hints.strong_anchors if value)
+            if native:
+                payload = json.dumps(
+                    [provider or "unknown", hints.session_scope or "provider", native],
+                    separators=(",", ":"),
+                )
+                return "provider-affinity:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return state.affinity_key
 
     def _is_compaction_probe_text(self, text: str) -> bool:
         if not text:
@@ -1426,6 +1630,15 @@ class SessionTracker:
     def _load(self) -> None:
         if not self.persistence_path:
             return
+        try:
+            if (
+                self.persistence_path.exists()
+                and self.persistence_path.stat().st_size > self._MAX_PERSISTED_FILE_BYTES
+            ):
+                lib_logger.warning("Ignoring oversized session_stickiness.json")
+                return
+        except OSError:
+            return
         data = safe_read_json(self.persistence_path, lib_logger)
         if not isinstance(data, dict):
             return
@@ -1443,14 +1656,29 @@ class SessionTracker:
                 "session persistence will rebuild in memory."
             )
             return
-        for session_id, payload in sessions.items():
+        def persisted_last_seen(item: tuple[Any, Any]) -> float:
+            payload = item[1]
             if not isinstance(payload, dict):
+                return 0.0
+            return self._finite_float(payload.get("last_seen")) or 0.0
+
+        ordered_sessions = sorted(
+            sessions.items(),
+            key=persisted_last_seen,
+            reverse=True,
+        )[: self._MAX_PERSISTED_SESSIONS]
+        for session_id, payload in ordered_sessions:
+            if not isinstance(session_id, str) or not session_id or not isinstance(payload, dict):
+                continue
+            if len(session_id) > self._MAX_PERSISTED_STRING_LENGTH:
                 continue
             expires_at = self._finite_float(payload.get("expires_at"))
             if expires_at is None or expires_at <= now:
                 continue
             namespace = payload.get("namespace")
-            if not isinstance(namespace, str) or not namespace:
+            if not isinstance(namespace, str) or not namespace.startswith("session-domain:"):
+                continue
+            if len(namespace) > self._MAX_PERSISTED_STRING_LENGTH:
                 continue
             last_seen = self._finite_float(payload.get("last_seen"))
             history_payload = payload.get("history_signatures") or []
@@ -1465,6 +1693,8 @@ class SessionTracker:
             )
             affinity_key = payload.get("affinity_key")
             if affinity_key is not None and not isinstance(affinity_key, str):
+                affinity_key = None
+            if isinstance(affinity_key, str) and len(affinity_key) > self._MAX_PERSISTED_STRING_LENGTH:
                 affinity_key = None
             self._sessions[session_id] = _SessionState(
                 session_id=session_id,
@@ -1489,14 +1719,18 @@ class SessionTracker:
                 continue
             if not isinstance(value, str) or not value.startswith(f"{namespace}:"):
                 continue
+            if len(value) > self._MAX_PERSISTED_STRING_LENGTH:
+                continue
             strength = payload.get("strength")
             source = payload.get("source")
             group = payload.get("group")
             if strength not in {"weak", "medium", "strong"}:
                 continue
-            if not isinstance(source, str) or not source:
+            if source not in self._PERSISTED_ANCHOR_SOURCES:
                 continue
             if group is not None and not isinstance(group, str):
+                continue
+            if isinstance(group, str) and len(group) > self._MAX_PERSISTED_STRING_LENGTH:
                 continue
             last_seen = self._finite_float(payload.get("last_seen"))
             self._anchors[value] = _AnchorRecord(
@@ -1592,13 +1826,36 @@ class SessionTracker:
         *,
         scope_key: Optional[str] = None,
         session_scope: Optional[str] = None,
+        trusted_isolation_key: bool = False,
     ) -> str:
-        # The resolved usage/classifier scope is part of the namespace so sticky
-        # evidence never leaks between private/classifier-scoped credential pools.
-        allowed_scope = scope_key or "default"
-        provider_key = provider or "global"
-        model_key = session_scope or model or "default"
-        return f"scope:{allowed_scope}:provider:{provider_key}:model:{model_key}"
+        # Logical sessions cross providers and models, but never caller/credential
+        # isolation domains. Provider-native evidence is qualified separately.
+        allowed_scope = self._normalize_isolation_key(
+            scope_key,
+            provider,
+            trusted=trusted_isolation_key,
+        )
+        return f"session-domain:{allowed_scope}"
+
+    @staticmethod
+    def _normalize_isolation_key(
+        scope_key: Optional[str],
+        provider: Optional[str],
+        *,
+        trusted: bool,
+    ) -> str:
+        """Accept internal domain markers only from RequestContextBuilder."""
+
+        scope = str(scope_key or provider or "public")
+        provider_key = (provider or "").strip().lower()
+        if not scope_key or scope.strip().lower() in {"public", provider_key}:
+            return "public"
+        if trusted and (
+            re.fullmatch(r"classifier:[0-9a-f]{24}", scope)
+            or re.fullmatch(r"bundle:[0-9a-f]{64}", scope)
+        ):
+            return scope
+        return "scope:" + hashlib.sha256(scope.encode("utf-8")).hexdigest()
 
     def _trusted_fields_from_env(self) -> List[str]:
         raw = os.getenv("TRUSTED_SESSION_ID_FIELDS", "")
@@ -1615,7 +1872,7 @@ class SessionTracker:
         self,
         record: Optional[_AnchorRecord],
     ) -> tuple[int, int, float]:
-        """Evict weak/ordinary evidence before strong replay/tool identity."""
+        """Evict weak/ordinary evidence before strong replay/context identity."""
 
         if record is None:
             return (-1, 0, 0.0)

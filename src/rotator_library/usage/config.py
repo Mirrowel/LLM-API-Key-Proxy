@@ -527,7 +527,9 @@ class ProviderUsageConfig:
     # is only blocked by concurrency. Configuring this keeps cache-locality
     # deployments from forcing the same latency tradeoff on low-latency ones.
     session_sticky_wait_seconds: float = 15.0
-    session_sticky_entry_ttl_seconds: int = 3600
+    # Five minutes matches the common idle lifetime of upstream prompt caches.
+    # Providers and per-provider environment settings can override this default.
+    session_sticky_entry_ttl_seconds: int = 300
     session_sticky_max_entries: int = 10000
 
     def get_effective_multiplier(self, priority: int) -> int:
@@ -695,7 +697,7 @@ def load_provider_usage_config(
         if hasattr(plugin_class, "default_session_sticky_entry_ttl_seconds"):
             sticky_ttl = plugin_class.default_session_sticky_entry_ttl_seconds
             if sticky_ttl is not None:
-                config.session_sticky_entry_ttl_seconds = max(1, int(sticky_ttl))
+                config.session_sticky_entry_ttl_seconds = max(0, int(sticky_ttl))
 
         if hasattr(plugin_class, "default_session_sticky_max_entries"):
             sticky_max = plugin_class.default_session_sticky_max_entries
@@ -838,7 +840,7 @@ def load_provider_usage_config(
         env_sticky_ttl = os.getenv("SESSION_STICKY_ENTRY_TTL_SECONDS")
     if env_sticky_ttl:
         try:
-            config.session_sticky_entry_ttl_seconds = max(1, int(env_sticky_ttl))
+            config.session_sticky_entry_ttl_seconds = max(0, int(env_sticky_ttl))
         except ValueError:
             lib_logger.warning(
                 f"Invalid session sticky entry TTL value '{env_sticky_ttl}'. Keeping default."

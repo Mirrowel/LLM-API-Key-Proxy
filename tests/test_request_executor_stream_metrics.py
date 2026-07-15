@@ -210,3 +210,58 @@ async def test_streaming_handler_does_not_duplicate_direct_done_sentinel(monkeyp
     chunks = [chunk async for chunk in StreamingHandler().wrap_stream(done_stream(), "cred", "openai/gpt-test")]
 
     assert chunks == ["data: [DONE]\n\n"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_handler_splits_mixed_reasoning_and_content_delta() -> None:
+    """Clients receive the reasoning-to-answer transition as distinct events."""
+
+    async def mixed_stream():
+        yield {
+            "id": "chatcmpl-diffusion",
+            "model": "google/diffusiongemma-26b-a4b-it",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": None,
+                    "delta": {
+                        "reasoning_content": "end of thought",
+                        "content": "beginning of answer",
+                    },
+                }
+            ],
+        }
+        yield {
+            "id": "chatcmpl-diffusion",
+            "choices": [{"index": 0, "finish_reason": "stop", "delta": {}}],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "total_tokens": 3,
+            },
+        }
+
+    completed_responses = []
+    chunks = [
+        chunk
+        async for chunk in StreamingHandler().wrap_stream(
+            mixed_stream(),
+            "cred",
+            "nvidia_nim/google/diffusiongemma-26b-a4b-it",
+            response_callback=completed_responses.append,
+        )
+    ]
+
+    reasoning_chunk = json.loads(chunks[0][len("data: ") :])
+    content_chunk = json.loads(chunks[1][len("data: ") :])
+    reasoning_delta = reasoning_chunk["choices"][0]["delta"]
+    content_delta = content_chunk["choices"][0]["delta"]
+
+    assert reasoning_delta["reasoning_content"] == "end of thought"
+    assert "content" not in reasoning_delta
+    assert reasoning_chunk["choices"][0]["finish_reason"] is None
+    assert "usage" not in reasoning_chunk
+    assert content_delta["content"] == "beginning of answer"
+    assert "reasoning_content" not in content_delta
+    assert completed_responses[0]["choices"][0]["message"]["content"] == "beginning of answer"
+    assert chunks[-1] == "data: [DONE]\n\n"

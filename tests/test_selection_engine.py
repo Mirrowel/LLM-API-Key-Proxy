@@ -293,6 +293,103 @@ class SelectionEngineTests(unittest.TestCase):
         self.assertEqual(config.session_sticky_entry_ttl_seconds, 123)
         self.assertEqual(config.session_sticky_max_entries, 456)
 
+    def test_session_sticky_default_matches_five_minute_cache_idle_window(self):
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_provider_usage_config("gemini", {})
+
+        self.assertEqual(config.session_sticky_entry_ttl_seconds, 300)
+
+    def test_provider_can_override_default_binding_idle_ttl(self):
+        class ProviderPolicy:
+            default_session_sticky_entry_ttl_seconds = 90
+
+        with patch.dict(os.environ, {}, clear=True):
+            config = load_provider_usage_config("custom", {"custom": ProviderPolicy})
+
+        self.assertEqual(config.session_sticky_entry_ttl_seconds, 90)
+
+    def test_zero_binding_ttl_disables_sticky_entries(self):
+        strategy = SequentialStrategy(sticky_entry_ttl_seconds=0)
+        states = {
+            "cred_a": self._make_state("cred_a", "a"),
+            "cred_b": self._make_state("cred_b", "b"),
+        }
+        context = SelectionContext(
+            provider="custom",
+            model="model",
+            quota_group=None,
+            candidates=list(states),
+            priorities={key: 1 for key in states},
+            usage_counts={key: 0 for key in states},
+            rotation_mode=RotationMode.SEQUENTIAL,
+            rotation_tolerance=0.0,
+            deadline=0.0,
+            session_id="session",
+        )
+
+        strategy.select(context, states)
+
+        self.assertIsNone(strategy.get_current("custom", "model", "session"))
+        self.assertFalse(strategy._current)
+
+    def test_provider_binding_idle_clocks_are_independent(self):
+        session_id = "global-session"
+        deepseek = SequentialStrategy(sticky_entry_ttl_seconds=300)
+        anthropic = SequentialStrategy(sticky_entry_ttl_seconds=300)
+        deepseek_states = {
+            "deepseek_a": self._make_state("deepseek_a", "da"),
+            "deepseek_b": self._make_state("deepseek_b", "db"),
+        }
+        anthropic_states = {
+            "anthropic_a": self._make_state("anthropic_a", "aa"),
+            "anthropic_b": self._make_state("anthropic_b", "ab"),
+        }
+
+        def context(provider: str, model: str, states) -> SelectionContext:
+            return SelectionContext(
+                provider=provider,
+                model=model,
+                quota_group=None,
+                candidates=list(states),
+                priorities={key: 1 for key in states},
+                usage_counts={key: 0 for key in states},
+                rotation_mode=RotationMode.SEQUENTIAL,
+                rotation_tolerance=0.0,
+                deadline=0.0,
+                session_id=session_id,
+                session_affinity_key="shared-global-affinity",
+            )
+
+        with patch("rotator_library.usage.selection.strategies.sequential.time.time", return_value=1000.0):
+            deepseek_selected = deepseek.select(
+                context("deepseek", "deepseek/chat", deepseek_states),
+                deepseek_states,
+            )
+            anthropic_selected = anthropic.select(
+                context("anthropic", "anthropic/claude", anthropic_states),
+                anthropic_states,
+            )
+        self.assertNotEqual(deepseek_selected, anthropic_selected)
+
+        with patch("rotator_library.usage.selection.strategies.sequential.time.time", return_value=1200.0):
+            self.assertEqual(
+                anthropic.select(
+                    context("anthropic", "anthropic/claude", anthropic_states),
+                    anthropic_states,
+                ),
+                anthropic_selected,
+            )
+
+        with patch("rotator_library.usage.selection.strategies.sequential.time.time", return_value=1300.0):
+            self.assertIsNone(
+                deepseek.get_current("deepseek", "deepseek/chat", session_id)
+            )
+            self.assertEqual(
+                anthropic.get_current("anthropic", "anthropic/claude", session_id),
+                anthropic_selected,
+            )
+            self.assertIsNotNone(deepseek_selected)
+
 
 if __name__ == "__main__":
     unittest.main()

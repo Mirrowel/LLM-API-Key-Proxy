@@ -1040,6 +1040,29 @@ def _responses_error_response(error: ResponsesServiceError) -> dict[str, Any]:
     return {"error": {"message": str(error), "type": error.error_type, "code": error.status_code}}
 
 
+def _responses_session_domain(request_data: dict[str, Any]) -> str:
+    """Derive the opaque caller/credential domain used by Responses storage."""
+
+    from rotator_library.client.scopes import derive_session_isolation_key
+
+    return derive_session_isolation_key(
+        request_data.get("classifier"),
+        request_data.get("api_keys"),
+        request_data.get("providers"),
+        bool(request_data.get("private", False)),
+    )
+
+
+def _responses_request_for_logging(request_data: dict[str, Any]) -> dict[str, Any]:
+    """Remove scoped credential containers from optional raw request logs."""
+
+    return {
+        key: value
+        for key, value in request_data.items()
+        if key not in {"api_keys", "providers"}
+    }
+
+
 @app.post("/v1/responses")
 async def responses_create(
     request: Request,
@@ -1059,7 +1082,10 @@ async def responses_create(
     except json.JSONDecodeError:
         return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON in request body.", "type": "invalid_request_error", "code": 400}})
     if logger:
-        logger.log_request(headers=dict(request.headers), body=request_data)
+        logger.log_request(
+            headers=dict(request.headers),
+            body=_responses_request_for_logging(request_data),
+        )
     transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
     try:
         if request_data.get("stream"):
@@ -1067,12 +1093,20 @@ async def responses_create(
             return StreamingResponse(
                 service.stream_response(request_data, client, request=request, transaction_logger=transaction_logger),
                 media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Proxy-Session-Domain": _responses_session_domain(request_data),
+                },
             )
         result = await service.create_response(request_data, client, request=request, transaction_logger=transaction_logger)
         if logger:
             logger.log_final_response(status_code=200, headers=None, body=result)
-        return JSONResponse(content=result)
+        return JSONResponse(
+            content=result,
+            headers={"X-Proxy-Session-Domain": _responses_session_domain(request_data)},
+        )
     except ResponsesServiceError as e:
         payload = _responses_error_response(e)
         if logger:
@@ -1088,13 +1122,19 @@ async def responses_create(
 @app.get("/v1/responses/{response_id}")
 async def responses_get(
     response_id: str,
+    request: Request,
     service: ResponsesService = Depends(get_responses_service),
     _=Depends(verify_api_key),
 ):
     """Retrieve a stored Responses object by ID."""
 
     try:
-        return JSONResponse(content=await service.get_response(response_id))
+        return JSONResponse(
+            content=await service.get_response(
+                response_id,
+                scope_key=request.headers.get("X-Proxy-Session-Domain", "public"),
+            )
+        )
     except ResponsesServiceError as e:
         return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
 
@@ -1102,13 +1142,19 @@ async def responses_get(
 @app.delete("/v1/responses/{response_id}")
 async def responses_delete(
     response_id: str,
+    request: Request,
     service: ResponsesService = Depends(get_responses_service),
     _=Depends(verify_api_key),
 ):
     """Delete a stored Responses object by ID."""
 
     try:
-        return JSONResponse(content=await service.delete_response(response_id))
+        return JSONResponse(
+            content=await service.delete_response(
+                response_id,
+                scope_key=request.headers.get("X-Proxy-Session-Domain", "public"),
+            )
+        )
     except ResponsesServiceError as e:
         return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
 
@@ -1116,13 +1162,19 @@ async def responses_delete(
 @app.get("/v1/responses/{response_id}/input_items")
 async def responses_input_items(
     response_id: str,
+    request: Request,
     service: ResponsesService = Depends(get_responses_service),
     _=Depends(verify_api_key),
 ):
     """Return stored input items for a Responses object."""
 
     try:
-        return JSONResponse(content=await service.list_input_items(response_id))
+        return JSONResponse(
+            content=await service.list_input_items(
+                response_id,
+                scope_key=request.headers.get("X-Proxy-Session-Domain", "public"),
+            )
+        )
     except ResponsesServiceError as e:
         return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
 

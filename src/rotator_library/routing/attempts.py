@@ -42,19 +42,10 @@ def clone_context_for_target(
         provider_config=provider_config if provider_config is not None else context.provider_config,
         credential_secrets=dict(credential_secrets) if credential_secrets is not None else dict(context.credential_secrets),
         routing_target_index=target_index,
-        session_tracking_namespace=_namespace_for_target(context.session_tracking_namespace, target, scope_key=next_usage_key),
+        session_tracking_namespace=context.session_tracking_namespace,
+        session_affinity_key=(
+            context.session_affinity_key
+            if target.provider == context.provider and target.prefixed_model == context.model
+            else None
+        ),
     )
-
-
-def _namespace_for_target(namespace: str | None, target: RouteTarget, *, scope_key: str) -> str | None:
-    """Rewrite standard session namespaces for the fallback target provider/model."""
-
-    if not namespace or ":provider:" not in namespace or ":model:" not in namespace:
-        return namespace
-    prefix, _, rest = namespace.partition(":provider:")
-    if not prefix.startswith("scope:"):
-        return namespace
-    _provider, sep, _model = rest.partition(":model:")
-    if not sep:
-        return namespace
-    return f"scope:{scope_key}:provider:{target.provider}:model:{target.prefixed_model}"

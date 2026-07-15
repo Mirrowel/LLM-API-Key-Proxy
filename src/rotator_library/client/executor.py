@@ -2236,7 +2236,7 @@ class RequestExecutor:
                 context.session_id,
                 provider=context.provider,
                 model=context.model,
-                scope_key=context.usage_manager_key,
+                scope_key=context.session_isolation_key,
                 tracking_namespace=context.session_tracking_namespace,
                 response=response,
             )

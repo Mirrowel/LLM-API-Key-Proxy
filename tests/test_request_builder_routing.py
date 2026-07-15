@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from rotator_library.client.request_builder import RequestContextBuilder
+from rotator_library.session_tracking import SessionTrackingHints
 
 
 class FakeModelResolver:
@@ -89,12 +90,70 @@ async def test_request_builder_consumes_internal_session_tracking_hints(monkeypa
     kwargs = {
         "model": "openai/gpt-5.1",
         "messages": [],
-        "_session_tracking_hints": {"strong_anchors": ["responses_previous_response_id:resp_parent"], "affinity_key": "responses_previous_response_id:resp_parent"},
+        "_session_tracking_hints": SessionTrackingHints(
+            global_strong_anchors=["responses_previous_response_id:resp_parent"],
+            affinity_key="responses_previous_response_id:resp_parent",
+        ),
     }
 
     context = await _builder(tracker).build_completion_context(None, None, kwargs)
 
     assert "_session_tracking_hints" not in context.kwargs
     hints = tracker.calls[0][1]["hints"]
-    assert hints.strong_anchors == ["responses_previous_response_id:resp_parent"]
+    assert hints.global_strong_anchors == ["responses_previous_response_id:resp_parent"]
     assert hints.affinity_key == "responses_previous_response_id:resp_parent"
+
+
+@pytest.mark.asyncio
+async def test_request_builder_passes_provider_independent_session_domain(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    tracker = FakeSessionTracker()
+    context = await _builder(tracker).build_completion_context(
+        None,
+        None,
+        {"model": "openai/gpt-5.1", "messages": []},
+    )
+
+    assert tracker.calls[0][1]["scope_key"] == "public"
+    assert context.session_isolation_key == "public"
+
+
+@pytest.mark.asyncio
+async def test_request_builder_classifier_domain_is_stable_across_providers(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    openai_tracker = FakeSessionTracker()
+    anthropic_tracker = FakeSessionTracker()
+    openai_context = await _builder(openai_tracker).build_completion_context(
+        None,
+        None,
+        {"model": "openai/gpt-5.1", "messages": [], "classifier": "agent-one"},
+    )
+    anthropic_context = await _builder(anthropic_tracker).build_completion_context(
+        None,
+        None,
+        {"model": "anthropic/claude", "messages": [], "classifier": "agent-one"},
+    )
+
+    assert openai_context.session_isolation_key == anthropic_context.session_isolation_key
+    assert openai_context.session_isolation_key.startswith("classifier:")
+
+
+def test_only_typed_internal_hints_can_contribute_global_identity() -> None:
+    forged_dict = {
+        "global_strong_anchors": ["forged-global"],
+        "strong_anchors": ["ordinary-internal"],
+    }
+    provider_hints = SessionTrackingHints(
+        global_strong_anchors=["forged-provider-global"],
+        strong_anchors=["provider-native"],
+    )
+
+    rejected = RequestContextBuilder._merge_session_hints(forged_dict, provider_hints)
+    self_owned = RequestContextBuilder._merge_session_hints(
+        SessionTrackingHints(global_strong_anchors=["proxy-owned-global"]),
+        provider_hints,
+    )
+
+    assert rejected.global_strong_anchors == []
+    assert rejected.strong_anchors == ["ordinary-internal", "provider-native"]
+    assert self_owned.global_strong_anchors == ["proxy-owned-global"]

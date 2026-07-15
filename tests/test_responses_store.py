@@ -45,6 +45,25 @@ async def test_in_memory_store_save_get_delete_and_input_items() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_storage_is_composite_by_domain_and_response_id() -> None:
+    store = InMemoryResponsesStore()
+    public = _stored("resp_shared")
+    public.scope_key = "public"
+    private = _stored("resp_shared")
+    private.scope_key = "bundle:private"
+    private.response["domain"] = "private"
+
+    await store.save(public)
+    await store.save(private)
+
+    assert (await store.get("resp_shared", "public")).response.get("domain") is None
+    assert (await store.get("resp_shared", "bundle:private")).response["domain"] == "private"
+    assert await store.delete("resp_shared", "public") is True
+    assert await store.get("resp_shared", "public") is None
+    assert await store.get("resp_shared", "bundle:private") is not None
+
+
+@pytest.mark.asyncio
 async def test_in_memory_store_returns_copies_and_expires() -> None:
     store = InMemoryResponsesStore()
     stored = _stored("resp_expiring")
@@ -105,6 +124,31 @@ async def test_provider_cache_store_serializes_json_and_does_not_clear_without_k
     assert await store.list_input_items(stored.id) == stored.input_items
     assert await store.delete(stored.id) is False
     assert cache.values
+
+
+@pytest.mark.asyncio
+async def test_provider_cache_response_ids_cannot_collide_after_encoding() -> None:
+    class FakeProviderCache:
+        def __init__(self) -> None:
+            self.values = {}
+
+        async def store_async(self, key: str, value: str) -> None:
+            self.values[key] = value
+
+        async def retrieve_async(self, key: str):
+            return self.values.get(key)
+
+    cache = FakeProviderCache()
+    store = ProviderCacheResponsesStore(cache)
+    slash = _stored("resp/a")
+    underscore = _stored("resp_a")
+
+    await store.save(slash)
+    await store.save(underscore)
+
+    assert len(cache.values) == 2
+    assert (await store.get("resp/a")).id == "resp/a"
+    assert (await store.get("resp_a")).id == "resp_a"
 
 
 @pytest.mark.asyncio

@@ -82,6 +82,7 @@ class RequestContext:
     session_possible_compaction: bool = False
     session_lineage_parent_id: Optional[str] = None
     session_tracking_namespace: Optional[str] = None
+    session_isolation_key: Optional[str] = None
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
     transaction_logger: Optional[Any] = None

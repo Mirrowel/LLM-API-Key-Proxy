@@ -26,7 +26,40 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 8. Replacing a minority section in the middle is ordinary continuity even if that section contains summary-like text.
 9. Exact replay of a validated compacted request reuses its existing child session; changed tails retaining the validated summary continue that child.
 10. A failed API attempt or partial stream never contributes response identity.
-11. Session, provider, model, and credential-scope isolation remains mandatory.
+11. Caller/credential isolation remains mandatory; provider and model changes do not change the logical session ID.
+12. Raw tool IDs remain weak, but a structurally closed assistant-call/tool-result
+    pair contributes one medium evidence group keyed by the call ID, function,
+    and canonicalized arguments. Pairing is ordered and one-to-one, closure must
+    exist in the current request, and repeated copies of one event count once.
+
+## Global Session Domain Extension
+
+The logical session ID is global across providers and models, but only inside one
+strict caller/credential isolation domain. Public traffic, each classifier, and
+each request-private credential bundle are separate domains and must never share
+anchors, compaction lineage, replay bindings, or trusted IDs.
+
+Generic conversation evidence is domain-global. Provider-supplied native anchors
+and affinity hints remain provider-qualified so equal opaque IDs from different
+upstreams cannot collide. Credential stickiness remains a separate binding keyed
+by provider, model/family affinity domain, and global session ID.
+
+Provider bindings use an idle timeout aligned with upstream cache lifetime. The
+default is 300 seconds, providers may declare a different default, and
+`SESSION_STICKY_ENTRY_TTL_SECONDS_<PROVIDER>` remains the user override. Activity
+on one provider must not refresh another provider's binding.
+
+Session persistence remains disabled by default. Enabling it persists logical
+lineage only, not credential bindings. Schema 3 records the new isolation-domain
+semantics; schema-2 state is rejected instead of being merged across old
+provider/model namespaces.
+
+Provider-native IDs and affinities are hashed and provider/session-scope
+qualified. Proxy-owned global IDs use a typed internal channel. Ad hoc private
+credential bundles use the same hash-derived boundary for session tracking,
+usage managers, cooldowns, and sticky maps. Responses storage is additionally
+owned by `(domain, response_id)` and validates that domain through every stored
+ancestor.
 
 ## Scope
 
@@ -49,7 +82,8 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - Do not inspect or persist raw prompt/response content in tracker state.
 - Do not make one quoted response sufficient for unmarked compaction.
 - Do not bind repeated standalone prompts that lack trustworthy session evidence.
-- Do not change balanced/sequential selection policy beyond corrected session evidence.
+- Do not persist credential bindings with logical lineage.
+- Do not broaden provider-native response IDs, cache keys, or affinity hints across providers.
 - Do not migrate unsupported historical persistence schemas.
 
 ## Implementation Plan
@@ -88,7 +122,13 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
    - Keep pruning and both trim paths bidirectionally consistent.
    - Preserve stronger/provenance-rich metadata when refreshing the same anchor in one session.
    - Verify every stored anchor has one live owner and every session anchor points back to that owner.
-   - Keep raw tool-call IDs non-authoritative because clients may reuse deterministic IDs.
+    - Keep raw tool-call IDs non-authoritative because clients may reuse deterministic IDs.
+    - Promote only closed tool events to medium evidence; an assistant call must
+      have a matching tool-result reference in the same request.
+    - Canonicalize JSON arguments so key order and insignificant formatting do
+      not fragment one event, while different functions/arguments remain distinct.
+    - Reconstruct streamed calls by provider choice plus tool index, accepting
+      incremental fragments and cumulative argument snapshots.
    - Normalize fallback response callbacks to the session's original namespace instead of migrating state across scopes.
 
 6. Persistence hardening.
@@ -173,15 +213,22 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - Clean EOF without an explicit provider completion signal does not record response provenance.
 - Failed, partial, and disconnected streams do not record response provenance.
 - Corrected session and affinity values reach sequential selection.
+- Sparse tool-only loops continue after two distinct closed events, or after one
+  closed event plus an independent medium message group.
+- Unpaired, duplicated, and cross-domain tool IDs remain insufficient.
 
 ### Stateful Conversation Simulations
 
 - Run a six-round agentic tool loop by inferring each growing request, recording each assistant tool-call response, appending tool results, and verifying one session at every turn.
-- Restart from schema-2 persistence multiple times inside the tool loop and verify the first post-restart request continues the persisted session.
+   - Restart from schema-3 persistence multiple times inside the tool loop and verify the first post-restart request continues the persisted session.
 - Compact the completed tool loop while dropping all tool IDs, verify a new child and parent lineage, restart, replay the exact compacted request, then append a child response and verify later summary-prefixed requests continue the child.
 - Run an eight-turn long-form ordinary conversation with long user/assistant content, duplicate response content, multiple persistence restarts, monotonically growing high-water history, and no compaction decisions.
 - Run a long roleplay conversation with exact generation redo, edited regeneration, rollback to an older request snapshot, resumed branching, and an assistant response edited in the middle while later turns remain.
 - Assert every roleplay operation stays on one session, keeps the high-water baseline, and does not become compaction.
+- Switch providers and models during agentic, ordinary, and roleplay histories while preserving one global session ID.
+- Exercise retries, response rerolls, latest and middle response edits, rollback, and compaction across provider boundaries.
+- Verify provider-native anchors never cross providers and every classifier/private credential domain remains isolated.
+- Advance provider binding clocks independently and prove one provider expires without refreshing or changing another.
 
 ## Acceptance Criteria
 
