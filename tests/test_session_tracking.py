@@ -19,6 +19,7 @@ from rotator_library.session_tracking import (
     _AnchorRecord,
 )
 from rotator_library.client.streaming import StreamingHandler
+from rotator_library.client.rotating_client import _resolve_session_persistence_settings
 
 
 class SessionTrackerTests(unittest.TestCase):
@@ -32,6 +33,1066 @@ class SessionTrackerTests(unittest.TestCase):
         if response_id:
             response["id"] = response_id
         return response
+
+    @staticmethod
+    def _persistent_tracker(path):
+        """Create a tracker whose every mutation is immediately restart-safe."""
+
+        return SessionTracker(
+            ttl_seconds=3600,
+            persist_to_disk=True,
+            persistence_path=path,
+            persistence_flush_interval_seconds=0,
+        )
+
+    def test_proxy_session_persistence_environment_settings(self):
+        """Proxy defaults expose persistence without overriding explicit callers."""
+
+        with patch.dict(
+            os.environ,
+            {
+                "SESSION_PERSISTENCE_ENABLED": "true",
+                "SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS": "0",
+            },
+        ):
+            self.assertEqual(
+                _resolve_session_persistence_settings(None, None),
+                (True, 0.0),
+            )
+            self.assertEqual(
+                _resolve_session_persistence_settings(False, 2.5),
+                (False, 2.5),
+            )
+
+        with patch.dict(
+            os.environ,
+            {"SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS": "invalid"},
+        ):
+            with self.assertLogs("rotator_library", level="WARNING") as captured:
+                enabled, interval = _resolve_session_persistence_settings(False, None)
+        self.assertFalse(enabled)
+        self.assertEqual(interval, 5.0)
+        self.assertIn("Invalid SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS", captured.output[0])
+
+    def test_warning_lineage_logs_new_and_continued_session_ids(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        request = {
+            "messages": [
+                {"role": "user", "content": self._long_text("lineage-user")},
+                {"role": "assistant", "content": self._long_text("lineage-assistant")},
+            ]
+        }
+
+        with self.assertLogs("rotator_library", level="WARNING") as captured:
+            first = tracker.infer_session(request, provider="gemini", model="pro")
+            second = tracker.infer_session(request, provider="gemini", model="pro")
+
+        self.assertEqual(first.session_id, second.session_id)
+        self.assertIn(f"action=new session_id={first.session_id}", captured.output[0])
+        self.assertIn("matched_session_id=-", captured.output[0])
+        self.assertIn("candidate_session_id=-", captured.output[0])
+        self.assertIn(f"action=continue session_id={first.session_id}", captured.output[1])
+        self.assertIn(f"matched_session_id={first.session_id}", captured.output[1])
+        self.assertIn("origin=memory", captured.output[1])
+
+    def test_warning_lineage_separates_rejected_candidate_from_accepted_match(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        opening = "Tell me a story now"
+        established = {
+            "messages": [
+                {"role": "user", "content": opening},
+                {"role": "assistant", "content": self._long_text("candidate-assistant")},
+                {"role": "user", "content": "Add another paragraph to the story."},
+            ]
+        }
+        first = tracker.infer_session(established, provider="deepseek", model="chat")
+
+        with self.assertLogs("rotator_library", level="WARNING") as captured:
+            independent = tracker.infer_session(
+                {"messages": [{"role": "user", "content": opening}]},
+                provider="deepseek",
+                model="chat",
+            )
+
+        self.assertNotEqual(first.session_id, independent.session_id)
+        self.assertIn(f"action=new session_id={independent.session_id}", captured.output[0])
+        self.assertIn("matched_session_id=-", captured.output[0])
+        self.assertIn(f"candidate_session_id={first.session_id}", captured.output[0])
+        self.assertIn("confidence=weak score=5", captured.output[0])
+
+    def test_warning_lineage_logs_compaction_child_and_exact_replay(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        original = {
+            "messages": [
+                {"role": "user", "content": self._long_text("log-parent-user")},
+                {"role": "assistant", "content": self._long_text("log-parent-assistant")},
+                {"role": "user", "content": self._long_text("log-parent-follow-up")},
+                {"role": "assistant", "content": self._long_text("log-parent-later")},
+            ]
+        }
+        parent = tracker.infer_session(original, provider="gemini", model="pro")
+        compacted = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Summary of previous conversation: "
+                    + original["messages"][1]["content"],
+                },
+                {"role": "user", "content": "Continue from compacted context."},
+            ]
+        }
+
+        with self.assertLogs("rotator_library", level="WARNING") as captured:
+            child = tracker.infer_session(compacted, provider="gemini", model="pro")
+            replay = tracker.infer_session(compacted, provider="gemini", model="pro")
+
+        self.assertEqual(child.session_id, replay.session_id)
+        self.assertIn(f"action=compaction_child session_id={child.session_id}", captured.output[0])
+        self.assertIn(f"parent_session_id={parent.session_id}", captured.output[0])
+        self.assertIn("marker=True", captured.output[0])
+        self.assertIn(f"action=compaction_replay session_id={child.session_id}", captured.output[1])
+        self.assertIn(f"matched_session_id={child.session_id}", captured.output[1])
+        self.assertIn(f"parent_session_id={parent.session_id}", captured.output[1])
+
+    def test_warning_lineage_logs_persisted_session_origin(self):
+        request = {
+            "messages": [
+                {"role": "user", "content": self._long_text("persisted-log-user")},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("persisted-log-assistant"),
+                },
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            tracker = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+            )
+            original = tracker.infer_session(request, provider="gemini", model="pro")
+            tracker.flush()
+            restored = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+            )
+
+            with self.assertLogs("rotator_library", level="WARNING") as captured:
+                continued = restored.infer_session(request, provider="gemini", model="pro")
+
+        self.assertEqual(original.session_id, continued.session_id)
+        self.assertIn(f"action=continue session_id={original.session_id}", captured.output[0])
+        self.assertIn(f"matched_session_id={original.session_id}", captured.output[0])
+        self.assertIn("origin=persisted", captured.output[0])
+
+    def test_warning_lineage_logs_untracked_request(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+
+        with self.assertLogs("rotator_library", level="WARNING") as captured:
+            inferred = tracker.infer_session({}, provider="gemini", model="pro")
+
+        self.assertIsNone(inferred.session_id)
+        self.assertIn("action=untracked session_id=-", captured.output[0])
+        self.assertIn("origin=none", captured.output[0])
+
+    def test_agentic_tool_loop_persists_compacts_replays_and_continues_child(self):
+        """Exercise a complete persisted agent loop and compacted-child lifecycle."""
+
+        provider = "gemini"
+        model = "pro"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "agentic_session_stickiness.json"
+            tracker = self._persistent_tracker(path)
+            history = [
+                {
+                    "role": "user",
+                    "content": self._long_text("agentic-root-task", repeats=16),
+                }
+            ]
+            root_session_id = None
+            assistant_responses = []
+
+            for round_index in range(6):
+                if round_index in {2, 4}:
+                    tracker.flush()
+                    tracker = self._persistent_tracker(path)
+                    self.assertTrue(tracker._sessions[root_session_id].loaded_from_persistence)
+
+                inferred = tracker.infer_session(
+                    {"messages": list(history)},
+                    provider=provider,
+                    model=model,
+                )
+                if root_session_id is None:
+                    root_session_id = inferred.session_id
+                self.assertEqual(inferred.session_id, root_session_id)
+                self.assertFalse(inferred.possible_compaction)
+
+                tool_id = f"call_agentic_{round_index}"
+                assistant_text = self._long_text(
+                    f"agentic-assistant-analysis-{round_index}",
+                    repeats=14,
+                )
+                assistant_responses.append(assistant_text)
+                assistant_message = {
+                    "role": "assistant",
+                    "content": assistant_text,
+                    "tool_calls": [
+                        {
+                            "id": tool_id,
+                            "type": "function",
+                            "function": {
+                                "name": f"agent_tool_{round_index}",
+                                "arguments": "{}",
+                            },
+                        }
+                    ],
+                }
+                tracker.record_response(
+                    inferred.session_id,
+                    provider=provider,
+                    model=model,
+                    tracking_namespace=inferred.tracking_namespace,
+                    response={"choices": [{"message": assistant_message}]},
+                )
+                history.extend(
+                    [
+                        assistant_message,
+                        {
+                            "role": "tool",
+                            "tool_call_id": tool_id,
+                            "content": self._long_text(
+                                f"agentic-tool-result-{round_index}",
+                                repeats=12,
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": self._long_text(
+                                f"agentic-next-instruction-{round_index}",
+                                repeats=10,
+                            ),
+                        },
+                    ]
+                )
+
+            # Six responses were appended, but the sixth response/tool/user tail
+            # has not yet appeared in a subsequent request. The high-water request
+            # therefore contains 16 rather than all 19 locally accumulated messages.
+            parent_high_water = tracker._sessions[root_session_id].history_signatures
+            self.assertEqual(len(parent_high_water), 16)
+            tracker.flush()
+            tracker = self._persistent_tracker(path)
+
+            # A real compacted payload drops every strong tool ID and replaces
+            # almost all prior messages with one durable summary.
+            compacted = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Compacted context: "
+                        + assistant_responses[1]
+                        + " "
+                        + assistant_responses[4],
+                    },
+                    {
+                        "role": "user",
+                        "content": self._long_text("agentic-resume-after-compaction"),
+                    },
+                ]
+            }
+            child = tracker.infer_session(compacted, provider=provider, model=model)
+            self.assertTrue(child.possible_compaction)
+            self.assertEqual(child.lineage_parent_session_id, root_session_id)
+            self.assertNotEqual(child.session_id, root_session_id)
+
+            child_response = self._long_text("agentic-child-response", repeats=14)
+            tracker.record_response(
+                child.session_id,
+                provider=provider,
+                model=model,
+                tracking_namespace=child.tracking_namespace,
+                response=self._response(child_response),
+            )
+            tracker.flush()
+            tracker = self._persistent_tracker(path)
+
+            replay = tracker.infer_session(compacted, provider=provider, model=model)
+            self.assertEqual(replay.session_id, child.session_id)
+            self.assertEqual(replay.lineage_parent_session_id, root_session_id)
+            self.assertTrue(replay.possible_compaction)
+            self.assertEqual(replay.confidence, "strong")
+
+            child_follow_up = {
+                "messages": [
+                    *compacted["messages"],
+                    {"role": "assistant", "content": child_response},
+                    {
+                        "role": "user",
+                        "content": self._long_text("agentic-child-next-step"),
+                    },
+                ]
+            }
+            continued_child = tracker.infer_session(
+                child_follow_up,
+                provider=provider,
+                model=model,
+            )
+            self.assertEqual(continued_child.session_id, child.session_id)
+            self.assertNotEqual(continued_child.session_id, root_session_id)
+            self.assertFalse(continued_child.possible_compaction)
+            self.assertEqual(continued_child.lineage_parent_session_id, root_session_id)
+
+    def test_long_normal_conversation_tracks_every_turn_across_restarts(self):
+        """Grow a long ordinary chat turn-by-turn without false compaction."""
+
+        provider = "deepseek"
+        model = "chat"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "normal_session_stickiness.json"
+            tracker = self._persistent_tracker(path)
+            history = []
+            session_id = None
+            first_response = None
+            request_lengths = []
+
+            for turn_index in range(8):
+                if turn_index in {3, 6}:
+                    tracker.flush()
+                    tracker = self._persistent_tracker(path)
+                    self.assertTrue(tracker._sessions[session_id].loaded_from_persistence)
+
+                history.append(
+                    {
+                        "role": "user",
+                        "content": self._long_text(
+                            f"normal-conversation-question-{turn_index}",
+                            repeats=14,
+                        ),
+                    }
+                )
+                inferred = tracker.infer_session(
+                    {"messages": list(history)},
+                    provider=provider,
+                    model=model,
+                )
+                if session_id is None:
+                    session_id = inferred.session_id
+                self.assertEqual(inferred.session_id, session_id)
+                self.assertFalse(inferred.possible_compaction)
+                request_lengths.append(len(history))
+                self.assertEqual(
+                    len(tracker._sessions[session_id].history_signatures),
+                    len(history),
+                )
+
+                response_text = (
+                    first_response
+                    if turn_index == 4
+                    else self._long_text(
+                        f"normal-conversation-answer-{turn_index}",
+                        repeats=16,
+                    )
+                )
+                if first_response is None:
+                    first_response = response_text
+                tracker.record_response(
+                    inferred.session_id,
+                    provider=provider,
+                    model=model,
+                    tracking_namespace=inferred.tracking_namespace,
+                    response=self._response(response_text),
+                )
+                history.append({"role": "assistant", "content": response_text})
+
+            self.assertEqual(request_lengths, [1, 3, 5, 7, 9, 11, 13, 15])
+            self.assertEqual(
+                len(tracker._sessions[session_id].history_signatures),
+                request_lengths[-1],
+            )
+            response_groups = {
+                record.group
+                for record in tracker._anchors.values()
+                if record.session_id == session_id
+                and record.source == "response"
+                and record.group
+                and record.group.startswith("response_event:")
+            }
+            self.assertEqual(len(response_groups), 7)
+
+    def test_roleplay_redo_edits_rollback_and_middle_rewrite_stay_on_session(self):
+        """Model realistic roleplay regeneration and branch editing behavior."""
+
+        provider = "mistral"
+        model = "large"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "roleplay_session_stickiness.json"
+            tracker = self._persistent_tracker(path)
+            history = [
+                {
+                    "role": "system",
+                    "content": self._long_text("roleplay-world-rules", repeats=14),
+                },
+                {
+                    "role": "user",
+                    "content": self._long_text("roleplay-opening-scene", repeats=12),
+                },
+            ]
+            session_id = None
+            request_snapshots = []
+
+            for turn_index in range(6):
+                request_snapshot = [dict(message) for message in history]
+                request_snapshots.append(request_snapshot)
+                inferred = tracker.infer_session(
+                    {"messages": request_snapshot},
+                    provider=provider,
+                    model=model,
+                )
+                if session_id is None:
+                    session_id = inferred.session_id
+                self.assertEqual(inferred.session_id, session_id)
+                self.assertFalse(inferred.possible_compaction)
+                self.assertIsNone(inferred.lineage_parent_session_id)
+
+                original_response = self._long_text(
+                    f"roleplay-assistant-scene-{turn_index}",
+                    repeats=15,
+                )
+                tracker.record_response(
+                    session_id,
+                    provider=provider,
+                    model=model,
+                    tracking_namespace=inferred.tracking_namespace,
+                    response=self._response(original_response),
+                )
+
+                if turn_index == 2:
+                    # Retrying generation sends the byte-identical request without
+                    # appending the response that is being regenerated.
+                    exact_redo = tracker.infer_session(
+                        {"messages": [dict(message) for message in request_snapshot]},
+                        provider=provider,
+                        model=model,
+                    )
+                    self.assertEqual(exact_redo.session_id, session_id)
+                    self.assertFalse(exact_redo.possible_compaction)
+                    chosen_response = self._long_text(
+                        "roleplay-assistant-scene-2-edited-redo",
+                        repeats=15,
+                    )
+                    tracker.record_response(
+                        session_id,
+                        provider=provider,
+                        model=model,
+                        tracking_namespace=exact_redo.tracking_namespace,
+                        response=self._response(chosen_response),
+                    )
+                else:
+                    chosen_response = original_response
+
+                history.append({"role": "assistant", "content": chosen_response})
+                if turn_index < 5:
+                    history.append(
+                        {
+                            "role": "user",
+                            "content": self._long_text(
+                                f"roleplay-user-action-{turn_index + 1}",
+                                repeats=11,
+                            ),
+                        }
+                    )
+
+                if turn_index == 3:
+                    tracker.flush()
+                    tracker = self._persistent_tracker(path)
+                    self.assertTrue(tracker._sessions[session_id].loaded_from_persistence)
+
+            high_water_before_edits = tracker._sessions[session_id].history_signatures
+            self.assertEqual(len(high_water_before_edits), len(request_snapshots[-1]))
+
+            # Rewrite an assistant response in the middle while preserving every
+            # later turn. Seven-plus surviving messages must dominate the edit.
+            middle_edited_history = [dict(message) for message in history]
+            middle_assistant_index = 6
+            self.assertEqual(middle_edited_history[middle_assistant_index]["role"], "assistant")
+            middle_edited_history[middle_assistant_index] = {
+                "role": "assistant",
+                "content": self._long_text("roleplay-middle-response-rewritten", repeats=15),
+            }
+            middle_edit = tracker.infer_session(
+                {"messages": middle_edited_history},
+                provider=provider,
+                model=model,
+            )
+            self.assertEqual(middle_edit.session_id, session_id)
+            self.assertFalse(middle_edit.possible_compaction)
+            self.assertIsNone(middle_edit.lineage_parent_session_id)
+
+            # Roll back to an older request snapshot, then resume a different
+            # branch. The shorter request must not reduce the high-water profile.
+            # This rollback retains less than half the high-water history. It is
+            # still ordinary branching because it has neither a summary marker nor
+            # response-derived probe evidence.
+            rollback_request = [dict(message) for message in request_snapshots[2]]
+            high_water_before_rollback = tracker._sessions[session_id].history_signatures
+            rolled_back = tracker.infer_session(
+                {"messages": rollback_request},
+                provider=provider,
+                model=model,
+            )
+            self.assertEqual(rolled_back.session_id, session_id)
+            self.assertFalse(rolled_back.possible_compaction)
+            self.assertIsNone(rolled_back.lineage_parent_session_id)
+            self.assertEqual(
+                tracker._sessions[session_id].history_signatures,
+                high_water_before_rollback,
+            )
+
+            branch_response = self._long_text("roleplay-rollback-new-response", repeats=15)
+            tracker.record_response(
+                session_id,
+                provider=provider,
+                model=model,
+                tracking_namespace=rolled_back.tracking_namespace,
+                response=self._response(branch_response),
+            )
+            resumed_branch = [
+                *rollback_request,
+                {"role": "assistant", "content": branch_response},
+                {
+                    "role": "user",
+                    "content": self._long_text("roleplay-rollback-new-user-action"),
+                },
+            ]
+            resumed = tracker.infer_session(
+                {"messages": resumed_branch},
+                provider=provider,
+                model=model,
+            )
+            self.assertEqual(resumed.session_id, session_id)
+            self.assertFalse(resumed.possible_compaction)
+            self.assertIsNone(resumed.lineage_parent_session_id)
+            self.assertEqual(
+                tracker._sessions[session_id].history_signatures,
+                high_water_before_rollback,
+            )
+
+    def test_long_changed_tail_continues_persisted_compaction_context(self):
+        """A long changing user tail must not become part of the summary key."""
+
+        provider = "gemini"
+        model = "pro"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "long_tail_session_stickiness.json"
+            tracker = self._persistent_tracker(path)
+            parent_request = {
+                "messages": [
+                    {"role": "user", "content": self._long_text("long-tail-parent-user-1")},
+                    {
+                        "role": "assistant",
+                        "content": self._long_text("long-tail-parent-assistant-1"),
+                    },
+                    {"role": "user", "content": self._long_text("long-tail-parent-user-2")},
+                    {
+                        "role": "assistant",
+                        "content": self._long_text("long-tail-parent-assistant-2"),
+                    },
+                ]
+            }
+            parent = tracker.infer_session(parent_request, provider=provider, model=model)
+            summary = {
+                "role": "system",
+                "content": "Summary of previous conversation: "
+                + parent_request["messages"][1]["content"],
+            }
+            first_compacted = {
+                "messages": [
+                    summary,
+                    {
+                        "role": "user",
+                        "content": self._long_text("long-tail-first-instruction", repeats=20),
+                    },
+                ]
+            }
+            child = tracker.infer_session(first_compacted, provider=provider, model=model)
+            self.assertTrue(child.possible_compaction)
+            self.assertEqual(child.lineage_parent_session_id, parent.session_id)
+            tracker.flush()
+            tracker = self._persistent_tracker(path)
+
+            changed_tail = {
+                "messages": [
+                    summary,
+                    {
+                        "role": "user",
+                        "content": self._long_text("long-tail-second-instruction", repeats=20),
+                    },
+                ]
+            }
+            continued = tracker.infer_session(changed_tail, provider=provider, model=model)
+
+            self.assertEqual(continued.session_id, child.session_id)
+            self.assertEqual(continued.lineage_parent_session_id, parent.session_id)
+            self.assertFalse(continued.possible_compaction)
+            self.assertEqual(continued.confidence, "strong")
+
+    def test_compaction_context_expires_without_reviving_child(self):
+        """Expired replay/context anchors cannot resurrect an old child."""
+
+        with patch("rotator_library.session_tracking.time.time", return_value=1000.0):
+            tracker = SessionTracker(ttl_seconds=10)
+            parent_request = {
+                "messages": [
+                    {"role": "user", "content": self._long_text("ttl-parent-user")},
+                    {
+                        "role": "assistant",
+                        "content": self._long_text("ttl-parent-assistant"),
+                    },
+                    {"role": "user", "content": self._long_text("ttl-parent-follow-up")},
+                ]
+            }
+            parent = tracker.infer_session(parent_request, provider="gemini", model="pro")
+            tracker.record_response(
+                parent.session_id,
+                provider="gemini",
+                model="pro",
+                tracking_namespace=parent.tracking_namespace,
+                response=self._response(parent_request["messages"][1]["content"]),
+            )
+            compacted = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Compacted context: "
+                        + parent_request["messages"][1]["content"],
+                    },
+                    {"role": "user", "content": "Continue after compaction."},
+                ]
+            }
+            child = tracker.infer_session(compacted, provider="gemini", model="pro")
+
+        with patch("rotator_library.session_tracking.time.time", return_value=1010.0):
+            after_expiry = tracker.infer_session(compacted, provider="gemini", model="pro")
+
+        self.assertNotEqual(after_expiry.session_id, child.session_id)
+        self.assertFalse(after_expiry.possible_compaction)
+        self.assertIsNone(after_expiry.lineage_parent_session_id)
+
+    def test_compaction_context_survives_anchor_caps_and_restart(self):
+        """Anchor caps retain both durable child bindings deterministically."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "capped_context_stickiness.json"
+            tracker = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+                max_anchors_per_session=16,
+            )
+            parent_request = {
+                "messages": [
+                    {"role": "user", "content": self._long_text("cap-parent-user")},
+                    {
+                        "role": "assistant",
+                        "content": self._long_text("cap-parent-assistant"),
+                    },
+                    {"role": "user", "content": self._long_text("cap-parent-follow-up")},
+                ]
+            }
+            tracker.infer_session(parent_request, provider="gemini", model="pro")
+            compacted = {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Summary of previous conversation: "
+                        + parent_request["messages"][1]["content"],
+                    },
+                    {"role": "user", "content": "Continue capped context."},
+                ]
+            }
+            child = tracker.infer_session(compacted, provider="gemini", model="pro")
+            child_response = self._long_text("cap-child-response")
+            tracker.record_response(
+                child.session_id,
+                provider="gemini",
+                model="pro",
+                tracking_namespace=child.tracking_namespace,
+                response=self._response(child_response),
+            )
+            pressure_messages = [
+                *compacted["messages"],
+                {"role": "assistant", "content": child_response},
+            ]
+            for index in range(8):
+                pressure_messages.append(
+                    {
+                        "role": "user" if index % 2 == 0 else "assistant",
+                        "content": self._long_text(f"cap-pressure-{index}"),
+                    }
+                )
+            pressured = tracker.infer_session(
+                {"messages": pressure_messages},
+                provider="gemini",
+                model="pro",
+            )
+            self.assertEqual(pressured.session_id, child.session_id)
+            child_sources = {
+                tracker._anchors[value].source
+                for value in tracker._sessions[child.session_id].anchors
+            }
+            self.assertIn("compaction_context", child_sources)
+            self.assertIn("compaction_replay", child_sources)
+            self.assertLessEqual(len(tracker._sessions[child.session_id].anchors), 16)
+            tracker.flush()
+
+            restored = SessionTracker(
+                ttl_seconds=3600,
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+                max_anchors_per_session=16,
+            )
+            replay = restored.infer_session(compacted, provider="gemini", model="pro")
+            self.assertEqual(replay.session_id, child.session_id)
+            self.assertTrue(replay.possible_compaction)
+            changed_tail = {
+                "messages": [
+                    compacted["messages"][0],
+                    {"role": "user", "content": "Continue capped context differently."},
+                ]
+            }
+            continued = restored.infer_session(
+                changed_tail,
+                provider="gemini",
+                model="pro",
+            )
+
+            self.assertEqual(continued.session_id, child.session_id)
+            self.assertFalse(continued.possible_compaction)
+
+    def test_compaction_context_cannot_cross_usage_scope(self):
+        """A validated child binding remains isolated to its usage namespace."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        parent_request = {
+            "messages": [
+                {"role": "user", "content": self._long_text("context-scope-user")},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("context-scope-assistant"),
+                },
+                {"role": "user", "content": self._long_text("context-scope-follow-up")},
+            ]
+        }
+        parent = tracker.infer_session(
+            parent_request,
+            provider="gemini",
+            model="pro",
+            scope_key="A",
+        )
+        compacted = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Compacted context: "
+                    + parent_request["messages"][1]["content"],
+                },
+                {"role": "user", "content": "Continue scoped context."},
+            ]
+        }
+        child_a = tracker.infer_session(
+            compacted,
+            provider="gemini",
+            model="pro",
+            scope_key="A",
+        )
+        same_payload_b = tracker.infer_session(
+            compacted,
+            provider="gemini",
+            model="pro",
+            scope_key="B",
+        )
+
+        self.assertEqual(child_a.lineage_parent_session_id, parent.session_id)
+        self.assertNotEqual(same_payload_b.session_id, child_a.session_id)
+        self.assertFalse(same_payload_b.possible_compaction)
+        self.assertIsNone(same_payload_b.lineage_parent_session_id)
+
+    def test_trusted_and_provider_identity_override_compaction_bindings(self):
+        """Authoritative identity must win over an older replay/context anchor."""
+
+        tracker = SessionTracker(
+            ttl_seconds=3600,
+            trusted_explicit_fields=["conversation_id"],
+        )
+        parent_request = {
+            "messages": [
+                {"role": "user", "content": self._long_text("identity-parent-user")},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("identity-parent-assistant"),
+                },
+                {"role": "user", "content": self._long_text("identity-parent-follow-up")},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("identity-parent-later"),
+                },
+            ]
+        }
+        tracker.infer_session(parent_request, provider="gemini", model="pro")
+        compacted = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Summary of previous conversation: "
+                    + parent_request["messages"][1]["content"],
+                },
+                {"role": "user", "content": "Continue from the compacted state."},
+            ]
+        }
+        compacted_child = tracker.infer_session(compacted, provider="gemini", model="pro")
+
+        explicit_session = tracker.infer_session(
+            {
+                "conversation_id": "trusted-conversation-B",
+                "messages": [
+                    {"role": "user", "content": self._long_text("identity-explicit-session")}
+                ],
+            },
+            provider="gemini",
+            model="pro",
+        )
+        explicit_replay = tracker.infer_session(
+            {**compacted, "conversation_id": "trusted-conversation-B"},
+            provider="gemini",
+            model="pro",
+        )
+        self.assertEqual(explicit_replay.session_id, explicit_session.session_id)
+        self.assertNotEqual(explicit_replay.session_id, compacted_child.session_id)
+        self.assertFalse(explicit_replay.possible_compaction)
+        self.assertIsNone(explicit_replay.lineage_parent_session_id)
+
+        unseen_explicit = tracker.infer_session(
+            {**compacted, "conversation_id": "trusted-conversation-C"},
+            provider="gemini",
+            model="pro",
+        )
+        self.assertNotEqual(unseen_explicit.session_id, compacted_child.session_id)
+        self.assertNotEqual(unseen_explicit.session_id, explicit_session.session_id)
+
+        provider_hints = SessionTrackingHints(strong_anchors=["provider-native-session-B"])
+        provider_session = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": self._long_text("identity-provider-session")}
+                ]
+            },
+            provider="gemini",
+            model="pro",
+            hints=provider_hints,
+        )
+        provider_replay = tracker.infer_session(
+            compacted,
+            provider="gemini",
+            model="pro",
+            hints=provider_hints,
+        )
+        self.assertEqual(provider_replay.session_id, provider_session.session_id)
+        self.assertNotEqual(provider_replay.session_id, compacted_child.session_id)
+        self.assertFalse(provider_replay.possible_compaction)
+        self.assertIsNone(provider_replay.lineage_parent_session_id)
+
+        opaque_tool_id = "call_92d1e7b45ac843f6"
+        tool_session = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": opaque_tool_id, "type": "function"}],
+                    }
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        tool_bound_context = tracker.infer_session(
+            {
+                "messages": [
+                    *compacted["messages"],
+                    {
+                        "role": "tool",
+                        "tool_call_id": opaque_tool_id,
+                        "content": "Opaque tool continuation evidence.",
+                    },
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        self.assertNotEqual(tool_bound_context.session_id, tool_session.session_id)
+        self.assertEqual(tool_bound_context.session_id, compacted_child.session_id)
+
+    def test_record_response_normalizes_cross_namespace_fallback_across_restart(self):
+        """A fallback response stays with its original logical session scope."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "namespace_session_stickiness.json"
+            tracker = self._persistent_tracker(path)
+            session_a = tracker.infer_session(
+                {
+                    "messages": [
+                        {"role": "user", "content": self._long_text("namespace-a-request")}
+                    ]
+                },
+                provider="gemini",
+                model="pro",
+                scope_key="A",
+            )
+            namespace_b = tracker._namespace("gemini", "pro", scope_key="B")
+            response_text = self._long_text("namespace-mismatched-response")
+
+            with self.assertLogs("rotator_library", level="WARNING") as captured:
+                tracker.record_response(
+                    session_a.session_id,
+                    provider="gemini",
+                    model="pro",
+                    tracking_namespace=namespace_b,
+                    response=self._response(response_text),
+                )
+
+            self.assertIn("normalized response namespace mismatch", captured.output[0])
+            self.assertEqual(
+                tracker._sessions[session_a.session_id].namespace,
+                session_a.tracking_namespace,
+            )
+            tracker.flush()
+            tracker = self._persistent_tracker(path)
+            self.assertEqual(
+                tracker._sessions[session_a.session_id].namespace,
+                session_a.tracking_namespace,
+            )
+
+            scope_a_continuation = tracker.infer_session(
+                {
+                    "messages": [
+                        {"role": "assistant", "content": response_text},
+                        {"role": "user", "content": "Continue in logical scope A."},
+                    ]
+                },
+                provider="gemini",
+                model="pro",
+                scope_key="A",
+            )
+            self.assertEqual(scope_a_continuation.session_id, session_a.session_id)
+
+            scope_b_request = tracker.infer_session(
+                {
+                    "messages": [
+                        {"role": "assistant", "content": response_text},
+                        {"role": "user", "content": "Continue in scope B."},
+                    ]
+                },
+                provider="gemini",
+                model="pro",
+                scope_key="B",
+            )
+            self.assertNotEqual(scope_b_request.session_id, session_a.session_id)
+
+    def test_raw_tool_ids_do_not_bind_independent_sessions(self):
+        """Neither short nor entropy-looking request tool IDs are authoritative."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        generic_owner = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": "call_1", "type": "function"}],
+                    }
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        unrelated_generic = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_1",
+                        "content": "An unrelated tool result from another conversation.",
+                    }
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        self.assertNotEqual(unrelated_generic.session_id, generic_owner.session_id)
+        self.assertEqual(unrelated_generic.confidence, "weak")
+
+        opaque_id = "call_7f4e2a91c8b64d37"
+        opaque_owner = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [{"id": opaque_id, "type": "function"}],
+                    }
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        opaque_result = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "tool",
+                        "tool_call_id": opaque_id,
+                        "content": "The matching opaque tool result.",
+                    }
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        self.assertNotEqual(opaque_result.session_id, opaque_owner.session_id)
+        self.assertEqual(opaque_result.confidence, "weak")
+
+        compound_tracker = SessionTracker(ttl_seconds=3600)
+        compound_owner = compound_tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {"id": "call_1", "type": "function"},
+                            {"id": "call_2", "type": "function"},
+                        ],
+                    }
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        compound_unrelated = compound_tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "tool", "tool_call_id": "call_1", "content": "first"},
+                    {"role": "tool", "tool_call_id": "call_2", "content": "second"},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        self.assertNotEqual(compound_unrelated.session_id, compound_owner.session_id)
+        self.assertEqual(compound_unrelated.confidence, "weak")
 
     def test_weak_first_user_only_does_not_reuse_session(self):
         tracker = SessionTracker(ttl_seconds=3600)
@@ -245,10 +1306,13 @@ class SessionTrackerTests(unittest.TestCase):
 
     def test_unmarked_summary_requires_two_distinct_response_events(self):
         tracker = SessionTracker(ttl_seconds=3600)
+        request_evidence = " ".join(
+            f"initialrequest{i:02d}durableevidenceword" for i in range(8)
+        )
         original = {
             "messages": [
                 {"role": "system", "content": "Stable harness instructions."},
-                {"role": "user", "content": self._long_text("initial-user")},
+                {"role": "user", "content": request_evidence},
                 {"role": "assistant", "content": self._long_text("initial-assistant")},
                 {"role": "user", "content": self._long_text("follow-up-user")},
             ]
@@ -281,9 +1345,7 @@ class SessionTrackerTests(unittest.TestCase):
             response=self._response(response_b),
         )
 
-        filler_a = " ".join(f"middle{i:02d}longword" for i in range(8))
-        filler_b = " ".join(f"ending{i:02d}longword" for i in range(8))
-        summary = f"{response_a} {filler_a} {response_b} {filler_b}"
+        summary = f"{request_evidence} {response_a} {response_b}"
         child_request = {"messages": [{"role": "user", "content": summary}]}
         child = tracker.infer_session(child_request, provider="gemini", model="pro")
         replay = tracker.infer_session(child_request, provider="gemini", model="pro")
@@ -293,6 +1355,275 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertNotEqual(parent.session_id, child.session_id)
         self.assertEqual(child.session_id, replay.session_id)
         self.assertEqual(parent.session_id, replay.lineage_parent_session_id)
+
+    def test_unmarked_aggregator_quoting_two_responses_is_not_compaction(self):
+        """Two quoted outputs without request-side history remain independent."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        parent = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": self._long_text("aggregator-parent-user")},
+                    {
+                        "role": "assistant",
+                        "content": self._long_text("aggregator-parent-assistant"),
+                    },
+                    {"role": "user", "content": self._long_text("aggregator-parent-follow-up")},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        response_a = " ".join(f"aggregatealpha{i:02d}longword" for i in range(8))
+        response_b = " ".join(f"aggregatebravo{i:02d}longword" for i in range(8))
+        tracker.record_response(
+            parent.session_id,
+            provider="gemini",
+            model="pro",
+            response=self._response(response_a),
+        )
+        tracker.record_response(
+            parent.session_id,
+            provider="gemini",
+            model="pro",
+            response=self._response(response_b),
+        )
+        filler_a = " ".join(f"aggregatefillera{i:02d}longword" for i in range(8))
+        filler_b = " ".join(f"aggregatefillerb{i:02d}longword" for i in range(8))
+        request = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": f"{response_a} {filler_a} {response_b} {filler_b}",
+                }
+            ]
+        }
+        namespace = parent.tracking_namespace
+        probe_indexes = tracker._compaction_probe_indexes(request)
+        probe_anchors = tracker._build_compaction_probe_anchors(
+            request,
+            namespace,
+            probe_indexes=probe_indexes,
+        )
+        candidate = tracker._best_match(probe_anchors, namespace, time.time())
+        self.assertEqual(len(candidate.response_groups), 2)
+        self.assertFalse(candidate.request_groups)
+
+        independent = tracker.infer_session(request, provider="gemini", model="pro")
+
+        self.assertFalse(independent.possible_compaction)
+        self.assertNotEqual(independent.session_id, parent.session_id)
+        self.assertIsNone(independent.lineage_parent_session_id)
+
+    def test_unmarked_compaction_does_not_bind_shared_system_harness(self):
+        """Only the probe carrying parent evidence may become a context key."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        request_evidence = " ".join(
+            f"sharedrequest{i:02d}durableevidenceword" for i in range(8)
+        )
+        parent = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": request_evidence},
+                    {"role": "assistant", "content": self._long_text("shared-parent-a")},
+                    {"role": "user", "content": self._long_text("shared-parent-u")},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        response_a = " ".join(f"sharedalpha{i:02d}longword" for i in range(8))
+        response_b = " ".join(f"sharedbravo{i:02d}longword" for i in range(8))
+        for response_text in (response_a, response_b):
+            tracker.record_response(
+                parent.session_id,
+                provider="gemini",
+                model="pro",
+                response=self._response(response_text),
+            )
+        shared_harness = self._long_text("shared-static-system-harness", repeats=18)
+        summary = f"{request_evidence} {response_a} {response_b}"
+        compacted = {
+            "messages": [
+                {"role": "system", "content": shared_harness},
+                {"role": "user", "content": summary},
+            ]
+        }
+        child = tracker.infer_session(compacted, provider="gemini", model="pro")
+        self.assertTrue(child.possible_compaction)
+
+        independent = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "system", "content": shared_harness},
+                    {"role": "user", "content": "Start a distinct unrelated task."},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+
+        self.assertNotEqual(independent.session_id, child.session_id)
+        self.assertFalse(independent.possible_compaction)
+        self.assertIsNone(independent.lineage_parent_session_id)
+
+    def test_unmarked_compaction_does_not_bind_shared_user_harness(self):
+        """Request overlap qualifies lineage but response overlap keys its child."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        shared_harness = self._long_text("shared-user-harness", repeats=18)
+        request_evidence = " ".join(
+            f"shareduserrequest{i:02d}durableword" for i in range(8)
+        )
+        parent = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": shared_harness},
+                    {"role": "assistant", "content": self._long_text("shared-user-parent-a")},
+                    {"role": "user", "content": request_evidence},
+                    {"role": "assistant", "content": self._long_text("shared-user-parent-b")},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        response_a = " ".join(f"useralpha{i:02d}durableword" for i in range(8))
+        response_b = " ".join(f"userbravo{i:02d}durableword" for i in range(8))
+        for response_text in (response_a, response_b):
+            tracker.record_response(
+                parent.session_id,
+                provider="gemini",
+                model="pro",
+                response=self._response(response_text),
+            )
+        summary = f"{request_evidence} {response_a} {response_b}"
+        child = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": shared_harness},
+                    {"role": "user", "content": summary},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        self.assertTrue(child.possible_compaction)
+
+        independent = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": shared_harness},
+                    {"role": "user", "content": "Start another unrelated task."},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+
+        self.assertNotEqual(independent.session_id, child.session_id)
+        self.assertFalse(independent.possible_compaction)
+
+    def test_marked_compaction_does_not_bind_retained_ordinary_user_probe(self):
+        """A marked summary may bind itself, never another retained probe."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        shared_user = self._long_text("marked-retained-user", repeats=18)
+        parent_request = {
+            "messages": [
+                {"role": "user", "content": shared_user},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("marked-retained-assistant"),
+                },
+                {"role": "user", "content": self._long_text("marked-retained-follow-up")},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("marked-retained-later"),
+                },
+            ]
+        }
+        parent = tracker.infer_session(parent_request, provider="gemini", model="pro")
+        child = tracker.infer_session(
+            {
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Summary of previous conversation: "
+                        + parent_request["messages"][1]["content"],
+                    },
+                    {"role": "user", "content": shared_user},
+                ]
+            },
+            provider="gemini",
+            model="pro",
+        )
+        self.assertTrue(child.possible_compaction)
+        self.assertEqual(child.lineage_parent_session_id, parent.session_id)
+
+        standalone = tracker.infer_session(
+            {"messages": [{"role": "user", "content": shared_user}]},
+            provider="gemini",
+            model="pro",
+        )
+
+        self.assertNotEqual(standalone.session_id, child.session_id)
+        self.assertFalse(standalone.possible_compaction)
+
+    def test_unmarked_compaction_context_continues_changed_tail_after_restart(self):
+        """The evidence-bearing unmarked summary remains a stable child base."""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "unmarked_context_stickiness.json"
+            tracker = self._persistent_tracker(path)
+            request_evidence = " ".join(
+                f"unmarkedcontext{i:02d}requestevidence" for i in range(8)
+            )
+            parent = tracker.infer_session(
+                {
+                    "messages": [
+                        {"role": "user", "content": request_evidence},
+                        {
+                            "role": "assistant",
+                            "content": self._long_text("unmarked-context-parent"),
+                        },
+                        {"role": "user", "content": self._long_text("unmarked-context-next")},
+                    ]
+                },
+                provider="gemini",
+                model="pro",
+            )
+            response_a = " ".join(f"contextalpha{i:02d}longword" for i in range(8))
+            response_b = " ".join(f"contextbravo{i:02d}longword" for i in range(8))
+            for response_text in (response_a, response_b):
+                tracker.record_response(
+                    parent.session_id,
+                    provider="gemini",
+                    model="pro",
+                    response=self._response(response_text),
+                )
+            summary = f"{request_evidence} {response_a} {response_b}"
+            first = {"messages": [{"role": "user", "content": summary}]}
+            child = tracker.infer_session(first, provider="gemini", model="pro")
+            self.assertTrue(child.possible_compaction)
+            tracker.flush()
+            tracker = self._persistent_tracker(path)
+
+            changed_tail = {
+                "messages": [
+                    {"role": "user", "content": summary},
+                    {"role": "user", "content": "Take a different next action."},
+                ]
+            }
+            continued = tracker.infer_session(
+                changed_tail,
+                provider="gemini",
+                model="pro",
+            )
+
+            self.assertEqual(continued.session_id, child.session_id)
+            self.assertEqual(continued.lineage_parent_session_id, parent.session_id)
+            self.assertFalse(continued.possible_compaction)
 
     def test_duplicate_response_content_counts_as_one_response_event(self):
         tracker = SessionTracker(ttl_seconds=3600)
@@ -708,10 +2039,17 @@ class SessionTrackerTests(unittest.TestCase):
 
     def test_unmarked_two_response_summary_replacing_most_history_creates_child(self):
         tracker = SessionTracker(ttl_seconds=3600)
+        request_evidence = " ".join(
+            f"mostrequest{i:02d}durableevidenceword" for i in range(8)
+        )
         original_messages = [
             {
                 "role": "user" if index % 2 == 0 else "assistant",
-                "content": self._long_text(f"unmarked-most-{index}"),
+                "content": (
+                    request_evidence
+                    if index == 0
+                    else self._long_text(f"unmarked-most-{index}")
+                ),
             }
             for index in range(8)
         ]
@@ -734,13 +2072,11 @@ class SessionTrackerTests(unittest.TestCase):
             model="pro",
             response=self._response(response_b),
         )
-        filler_a = " ".join(f"mostmiddle{i:02d}longword" for i in range(8))
-        filler_b = " ".join(f"mostending{i:02d}longword" for i in range(8))
         mostly_replaced = {
             "messages": [
                 {
                     "role": "user",
-                    "content": f"{response_a} {filler_a} {response_b} {filler_b}",
+                    "content": f"{request_evidence} {response_a} {response_b}",
                 },
                 original_messages[-1],
             ]
@@ -833,18 +2169,20 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertEqual(parent.session_id, compacted.session_id)
         self.assertIsNone(compacted.lineage_parent_session_id)
 
-    def test_strong_tool_identity_keeps_live_session_through_compaction(self):
+    def test_raw_tool_identity_does_not_override_validated_compaction(self):
         tracker = SessionTracker(ttl_seconds=3600)
         original_messages = [
             {"role": "user", "content": self._long_text("tool-parent-user")},
             {
                 "role": "assistant",
                 "content": self._long_text("tool-parent-assistant"),
-                "tool_calls": [{"id": "call_persistent", "type": "function"}],
+                "tool_calls": [
+                    {"id": "call_7f4e2a91c8b64d37", "type": "function"}
+                ],
             },
             {
                 "role": "tool",
-                "tool_call_id": "call_persistent",
+                "tool_call_id": "call_7f4e2a91c8b64d37",
                 "content": self._long_text("tool-parent-result"),
             },
             {"role": "user", "content": self._long_text("tool-parent-follow-up")},
@@ -865,7 +2203,7 @@ class SessionTrackerTests(unittest.TestCase):
                     },
                     {
                         "role": "tool",
-                        "tool_call_id": "call_persistent",
+                        "tool_call_id": "call_7f4e2a91c8b64d37",
                         "content": "The retained tool result remains authoritative.",
                     },
                 ]
@@ -875,9 +2213,10 @@ class SessionTrackerTests(unittest.TestCase):
         )
 
         self.assertTrue(compacted.possible_compaction)
-        self.assertEqual(parent.session_id, compacted.session_id)
+        self.assertNotEqual(parent.session_id, compacted.session_id)
+        self.assertEqual(compacted.lineage_parent_session_id, parent.session_id)
 
-    def test_changed_non_probe_history_does_not_hit_exact_compaction_replay(self):
+    def test_changed_post_summary_history_continues_validated_compaction_child(self):
         tracker = SessionTracker(ttl_seconds=3600)
         original = {
             "messages": [
@@ -905,15 +2244,19 @@ class SessionTrackerTests(unittest.TestCase):
             provider="gemini",
             model="pro",
         )
-        changed_child = tracker.infer_session(
-            changed_request,
-            provider="gemini",
-            model="pro",
-        )
+        with self.assertLogs("rotator_library", level="WARNING") as captured:
+            changed_child = tracker.infer_session(
+                changed_request,
+                provider="gemini",
+                model="pro",
+            )
 
         self.assertEqual(parent.session_id, first_child.lineage_parent_session_id)
         self.assertEqual(parent.session_id, changed_child.lineage_parent_session_id)
-        self.assertNotEqual(first_child.session_id, changed_child.session_id)
+        self.assertEqual(first_child.session_id, changed_child.session_id)
+        self.assertFalse(changed_child.possible_compaction)
+        self.assertEqual(changed_child.confidence, "strong")
+        self.assertIn("action=compaction_continue", captured.output[0])
 
     def test_marker_without_parent_evidence_does_not_create_compaction(self):
         tracker = SessionTracker(ttl_seconds=3600)
@@ -1587,22 +2930,23 @@ class SessionTrackerTests(unittest.TestCase):
             )
 
     def test_persistence_restart_preserves_compaction_and_replay_binding(self):
+        request_evidence = " ".join(
+            f"persistrequest{i:02d}durableevidenceword" for i in range(8)
+        )
         original = {
             "messages": [
-                {"role": "user", "content": self._long_text("persist-parent-user")},
+                {"role": "user", "content": request_evidence},
                 {"role": "assistant", "content": self._long_text("persist-parent-assistant")},
                 {"role": "user", "content": self._long_text("persist-parent-follow-up")},
             ]
         }
         response_a = " ".join(f"persistalpha{i:02d}word" for i in range(8))
         response_b = " ".join(f"persistbravo{i:02d}word" for i in range(8))
-        filler_a = " ".join(f"persistmiddle{i:02d}word" for i in range(8))
-        filler_b = " ".join(f"persistending{i:02d}word" for i in range(8))
         child_request = {
             "messages": [
                 {
                     "role": "user",
-                    "content": f"{response_a} {filler_a} {response_b} {filler_b}",
+                    "content": f"{request_evidence} {response_a} {response_b}",
                 }
             ]
         }

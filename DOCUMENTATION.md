@@ -994,6 +994,17 @@ Provider plugins may implement `get_session_tracking_hints()` to contribute
 provider-specific anchors or a provider session scope. The hook supplies evidence
 only; credential selection remains centralized in the rotator.
 
+Session inference persistence is opt-in for the proxy process:
+
+```env
+SESSION_PERSISTENCE_ENABLED=true
+SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=5.0
+```
+
+Set the flush interval to `0` for immediate writes during manual restart testing.
+After restart, a continued lineage warning reports `origin=persisted`; state is
+written to `session_stickiness.json` under the proxy data directory.
+
 Compaction lineage detection is intentionally conservative. A candidate must be
 an early user/system/developer message and must replace more than half of the
 matched parent's high-water request history. Replacing a minority of history,
@@ -1002,19 +1013,40 @@ history is never treated as a size-only compaction probe.
 
 Explicit summary markers still require matching parent evidence and structural
 replacement. Unmarked summaries additionally require overlap with at least two
-distinct completed response events, so an auxiliary prompt quoting one response
-cannot be mistaken for compaction. Probe-only summary anchors are not stored on
-the child; an opaque replay anchor makes an exact resend reuse the validated
-child. Strong trusted/provider/tool identity can keep the compacted request on
-the existing live session.
+distinct completed response events and request-side parent evidence, so output
+aggregation prompts cannot become compaction merely by quoting responses.
+Probe-only summary anchors are not stored as ordinary continuity. An opaque
+replay anchor identifies an exact resend, while context anchors derived only from
+probe messages that actually matched response evidence keep changed or extended
+tails on the validated child. Shared system/user harness probes therefore cannot
+become child bindings by position alone. Strong trusted explicit or provider
+identity takes precedence over replay/context bindings. Raw tool-call IDs remain
+supporting evidence rather than authoritative identity because clients may reuse
+counter-like or deterministic IDs across independent conversations.
+
+If fallback routing reports a target namespace while retaining the logical
+session ID, response recording normalizes the callback to the session's original
+namespace. This preserves response continuity without moving anchors across
+provider/model/usage scopes.
 
 Only completed responses contribute response-derived identity. Streaming text is
 recorded after an explicit provider completion signal, not from clean iterator
 EOF alone, because some transports surface truncation as normal EOF.
 
+During the current session-tracking validation period, every inference emits a
+warning-level `Session tracker decision` line. `action` is one of `new`,
+`continue`, `compaction_child`, `compaction_continue`, `compaction_replay`, or
+`untracked`. The line includes the selected `session_id`, any
+accepted `matched_session_id`, rejected best `candidate_session_id`, and
+`parent_session_id`, plus tracking namespace, confidence, score, persistence
+origin, and compaction evidence. `origin=persisted` confirms
+that the selected session was restored from `session_stickiness.json`. These
+diagnostics are intentionally warnings for terminal testing and are expected to
+move to debug level after validation.
+
 When optional session persistence is enabled, `session_stickiness.json` is
 schema-versioned. Schema 2 persists hashed high-water history profiles, scoped
-anchor provenance, response-event groups, and compaction replay bindings; raw
+anchor provenance, response-event groups, and compaction replay/context bindings; raw
 message content is never stored. Loading rebuilds ownership from validated anchor
 records and ignores malformed, expired, orphaned, cross-namespace, or unsupported
 state. Upgrades intentionally ignore older schemas instead of attempting an

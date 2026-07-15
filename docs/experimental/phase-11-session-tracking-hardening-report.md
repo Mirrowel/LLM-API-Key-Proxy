@@ -6,6 +6,9 @@ Phase 11 is complete. The captured false-positive families are now rejected, rea
 
 Implementation and report changes remain uncommitted.
 
+Every request now emits a temporary warning-level lineage decision. The log identifies new roots, continuations, compacted children, exact compaction replays, untracked requests, and sessions restored from persistence.
+Accepted continuations use `matched_session_id`; weak evidence rejected while creating a new root is reported separately as `candidate_session_id`.
+
 ## Incident Findings
 
 - The July Mistral report was caused by a downstream location-classifier prompt quoting one freshly generated response, not by the identical client regeneration immediately before it.
@@ -23,12 +26,14 @@ Implementation and report changes remain uncommitted.
 - Each session tracks a content-free high-water request-history profile.
 - Retaining at least half of the parent high-water history is ordinary continuity.
 - Replacing more than half is structural compaction only when parent evidence is sufficient.
-- Unmarked compaction requires overlap with at least two distinct completed response events.
+- Unmarked compaction requires overlap with at least two distinct completed response events and request-side parent evidence.
 - Duplicate content from one response remains one response event.
 - One quoted response cannot create compaction lineage or ordinary sticky response bridging from a user/system/developer role.
 - Exact replay of a validated compacted payload reuses the existing child.
-- Changing non-probe history changes the replay key and does not reuse the old child.
-- Strong trusted, provider, or tool identity can keep a compacted request on the existing live session.
+- Changed or extended tails retaining the validated summary continue the same child through an evidence-bearing context anchor.
+- Context anchors are minted only from probe groups that actually matched parent response evidence; shared long system/user harnesses cannot become bindings by position alone.
+- Strong trusted or provider identity takes precedence over replay/context bindings and suppresses unrelated compaction lineage.
+- Raw tool-call IDs are supporting evidence, not authoritative identity, because deterministic IDs can be reused across sessions.
 - All evidence remains isolated by usage scope, provider, and model/session scope.
 
 ## Tracking And Persistence Hardening
@@ -38,7 +43,8 @@ Implementation and report changes remain uncommitted.
 - Shared content anchors retain their first live owner instead of being stolen by an auxiliary session.
 - Per-session/global trimming and TTL pruning maintain bidirectional session-anchor ownership.
 - Late responses cannot resurrect an expired session.
-- Weak/ordinary evidence is evicted before strong replay/tool identity.
+- Weak/ordinary evidence is evicted before strong replay/context identity with deterministic tie-breaking.
+- Fallback response callbacks are normalized to the session's original namespace, preserving continuity without cross-scope migration.
 - Persistence schema 2 stores hashed high-water history, scoped anchor metadata, response-event groups, and replay bindings without raw content.
 - Loading rejects malformed containers, invalid/non-finite timestamps, unsupported schemas, expired sessions, orphan anchors, namespace mismatches, invalid strengths, and malformed history signatures.
 - Session anchor sets are rebuilt from validated anchor records instead of trusting duplicated serialized ownership.
@@ -71,9 +77,13 @@ Compaction regressions cover:
 - Middle-only replacement.
 - Context contraction without summary replacement.
 - Two distinct response events versus duplicate response content.
-- Trusted explicit and tool identity.
+- Trusted explicit/provider identity and raw tool-ID non-authority.
+- Trusted/provider precedence over existing replay/context bindings.
+- Raw short and entropy-looking tool-ID collision resistance.
 - Cross-scope isolation.
-- Exact replay and changed-history non-replay.
+- Exact replay plus marked/unmarked changed-tail child continuation.
+- Shared system/user harness rejection for context binding.
+- Two-response aggregation rejection without request-side evidence.
 - Competing parents with equal scores but different response-event diversity.
 
 Persistence/state tests cover:
@@ -88,6 +98,13 @@ Persistence/state tests cover:
 - Blocked disk I/O without holding the state lock.
 - Concurrent inference, response recording, and flushing.
 - Deterministic affinity across tracker instances and restart.
+- Context/replay TTL, supported cap pressure, restart, and scope isolation.
+
+Stateful simulations cover:
+
+- Six ordered agentic tool rounds with response recording, tool results, two mid-loop persistence restarts, full compaction, exact replay after restart, and child continuation.
+- Eight long ordinary turns with repeated response content, two persistence restarts, per-turn high-water growth, and no false compaction.
+- Long roleplay with exact redo, edited regeneration, a middle response rewrite while later turns remain, rollback below half the high-water history, resumed branching, and no false lineage.
 
 Streaming tests cover:
 
@@ -100,25 +117,28 @@ Streaming tests cover:
 
 ## Verification
 
-- `python -m pytest tests/test_session_tracking.py -q`: 66 passed, 15 subtests passed.
-- Session/request/selection integration slice: 81 passed, 15 subtests passed.
+- `python -m pytest tests/test_session_tracking.py -q`: 87 passed, 15 subtests passed.
+- Session/request/selection integration slice: 102 passed, 15 subtests passed.
 - Streaming regression slice: 70 passed.
 - Python compilation passed for both changed runtime modules.
 - `git diff --check` passed for all Phase 11 files.
 - Explore review: no blocker, high, or medium findings after re-review.
-- Explore-heavy review: no blocker, high, or medium findings after final completion-gate re-review.
+- Explore-heavy review: no blocker, high, or medium findings after final compaction-context and tool-evidence re-review.
 
 The unrestricted test run is not currently a clean repository-wide signal. Initial collection was blocked by 13 unrelated retired/Gemini import errors. After excluding those known collections, the run reached 724 passing tests but retained 71 unrelated failures and 7 tool-test errors from existing refactor drift, missing async-test plugins, environment-sensitive tests, and provider changes. Phase 11 focused and integration slices are clean.
 
 ## Files
 
 - `src/rotator_library/session_tracking.py`
+- `src/rotator_library/client/rotating_client.py`
 - `src/rotator_library/client/streaming.py`
 - `tests/test_session_tracking.py`
+- `.env.example`
+- `README.md`
 - `DOCUMENTATION.md`
 - `docs/experimental/phase-11-session-tracking-hardening.md`
 - `docs/experimental/phase-11-session-tracking-hardening-report.md`
 
 ## Review Disposition
 
-The first reviews found valid stream-evidence parsing/completion gaps and several missing boundary tests. Those were fixed and re-reviewed. Two reported anchor-ownership defects were independently rejected after direct inspection: shared anchors are skipped before entering a second session set, and global trimming already removes the owning session-set entry. Dedicated load-cap and ownership tests now guard both invariants.
+The first reviews found valid stream-evidence parsing/completion gaps and several missing boundary tests. The stateful-scenario reviews then found changed-tail child forking, context precedence, shared-harness binding, namespace migration, and raw tool-ID collision risks. These were reproduced, fixed, and covered by dedicated restart/isolation tests. Two reported anchor-ownership defects were independently rejected after direct inspection: shared anchors are skipped before entering a second session set, and global trimming already removes the owning session-set entry.
