@@ -500,6 +500,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `SESSION_STICKY_ENTRY_TTL_SECONDS[_<PROVIDER>]` | TTL for in-memory session-to-credential sticky entries |
 | `SESSION_STICKY_MAX_ENTRIES[_<PROVIDER>]` | Max in-memory sequential sticky entries before LRU pruning |
 | `TRUSTED_SESSION_ID_FIELDS` | Comma-separated explicit request ID fields to trust as strong evidence; unset by default |
+| `SESSION_PERSISTENCE_ENABLED` | Persist content-free session lineage across proxy restarts (`false` by default) |
+| `SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS` | Session-state write throttle; use `0` for immediate manual testing (default: `5`) |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
 | `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
@@ -590,6 +592,10 @@ SESSION_STICKY_MAX_ENTRIES=10000
 
 # Optional and conservative: only set this if your clients send stable IDs.
 TRUSTED_SESSION_ID_FIELDS="conversation_id,thread_id"
+
+# Optional restart persistence. State is stored in session_stickiness.json.
+SESSION_PERSISTENCE_ENABLED=true
+SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=5
 ```
 
 ### Priority Multipliers

@@ -20,11 +20,11 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 2. Size alone never proves compaction.
 3. Ordinary assistant, tool, and function-result history is not compaction-probe material.
 4. An explicit marker is evidence, not a decision; a known parent and structural history replacement are still required.
-5. Unmarked compaction requires evidence from at least two distinct prior response events.
+5. Unmarked compaction requires evidence from at least two distinct prior response events plus request-side parent evidence.
 6. The candidate must replace most of the parent session's high-water request history.
 7. Retaining at least half of the high-water history is ordinary continuity.
 8. Replacing a minority section in the middle is ordinary continuity even if that section contains summary-like text.
-9. Exact replay of a validated compacted request reuses its existing child session.
+9. Exact replay of a validated compacted request reuses its existing child session; changed tails retaining the validated summary continue that child.
 10. A failed API attempt or partial stream never contributes response identity.
 11. Session, provider, model, and credential-scope isolation remains mandatory.
 
@@ -35,6 +35,7 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - Distinct response-event provenance for response anchors.
 - Preservation of response provenance when responses return in request history.
 - Replay binding for validated compacted children.
+- Evidence-bearing context binding for post-compaction child continuation.
 - Session/anchor ownership and pruning invariants.
 - Strict, schema-versioned persistence loading and restart behavior.
 - Save throttling, failure recovery, stale generations, and lock handoff.
@@ -78,12 +79,17 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
    - Store it only on a confirmed compacted child.
    - Keep parent identity in anchor metadata.
    - Resolve an exact replay before creating another child.
+   - Mint context bindings only from probe groups that actually matched parent response evidence.
+   - Continue changed/extended tails that retain the validated summary without binding shared harness probes.
+   - Give trusted explicit/provider identity precedence over replay and context bindings.
 
 5. State integrity.
    - Preserve the first live owner of shared content anchors instead of letting an auxiliary request steal them.
    - Keep pruning and both trim paths bidirectionally consistent.
    - Preserve stronger/provenance-rich metadata when refreshing the same anchor in one session.
    - Verify every stored anchor has one live owner and every session anchor points back to that owner.
+   - Keep raw tool-call IDs non-authoritative because clients may reuse deterministic IDs.
+   - Normalize fallback response callbacks to the session's original namespace instead of migrating state across scopes.
 
 6. Persistence hardening.
    - Bump the persistence schema for high-water history metadata.
@@ -92,10 +98,12 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
    - Clamp anchor expiry to its owning session and enforce configured limits after load.
    - Preserve dirty state after failed writes and reject stale delayed snapshots.
    - Keep disk I/O outside the main state lock and serialize it under the save-I/O lock.
+   - Expose opt-in proxy environment settings for persistence and write throttling so restart behavior can be tested through the live API.
 
 7. Diagnostics and documentation.
-   - Log confirmed lineage with marker/size decision kind, retained-history ratio, and response-event count.
-   - Keep rejected candidate detail at debug level.
+   - Log every inference decision temporarily at warning level with the action, selected/accepted-match/rejected-candidate/parent IDs, namespace, confidence, persistence origin, retained-history ratio, and response-event count.
+   - Use stable actions for new, continued, compacted, replayed, and untracked requests so terminal runs expose the complete lineage.
+   - Keep rejected candidate detail at debug level and move the per-request decision line to debug after validation.
    - Never log prompt text or raw anchor values.
    - Update session-stickiness documentation with the structural decision contract.
 
@@ -132,10 +140,13 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - Marked system and developer summaries identify a parent.
 - One-response unmarked summary is rejected conservatively.
 - Two-response unmarked summary identifies a parent.
+- Two-response aggregation without request-side evidence remains independent.
 - Duplicate copies of one response count as one response event.
 - Exact compacted-request replay reuses one child.
-- Child follow-up continues after a completed response.
+- Marked and unmarked child follow-ups with changed short or long tails continue the child across restart.
+- Shared long system/user harnesses cannot become compaction context bindings without matching response evidence.
 - Strong trusted/provider identity survives a compaction candidate.
+- Raw short or entropy-looking tool IDs cannot bind independent sessions.
 - Namespace, provider, model, and credential scope stay isolated.
 
 ### Persistence And State
@@ -146,6 +157,8 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - TTL equality expires state.
 - Late response recording after expiry does not resurrect a session.
 - Per-session/global trimming preserves ownership invariants.
+- Replay/context bindings survive supported anchor caps and restart, then expire at the TTL boundary.
+- Fallback response namespace mismatches preserve original-scope continuity without cross-scope migration.
 - Shared anchors keep one live owner and never create stale secondary ownership.
 - Affinity is deterministic across fresh trackers and restart.
 - Flush throttling, forced flush, writer failure/recovery, stale generation ordering, and mutation during a blocked write are deterministic.
@@ -160,6 +173,15 @@ Make session inference conservative, deterministic, restart-safe, and resistant 
 - Clean EOF without an explicit provider completion signal does not record response provenance.
 - Failed, partial, and disconnected streams do not record response provenance.
 - Corrected session and affinity values reach sequential selection.
+
+### Stateful Conversation Simulations
+
+- Run a six-round agentic tool loop by inferring each growing request, recording each assistant tool-call response, appending tool results, and verifying one session at every turn.
+- Restart from schema-2 persistence multiple times inside the tool loop and verify the first post-restart request continues the persisted session.
+- Compact the completed tool loop while dropping all tool IDs, verify a new child and parent lineage, restart, replay the exact compacted request, then append a child response and verify later summary-prefixed requests continue the child.
+- Run an eight-turn long-form ordinary conversation with long user/assistant content, duplicate response content, multiple persistence restarts, monotonically growing high-water history, and no compaction decisions.
+- Run a long roleplay conversation with exact generation redo, edited regeneration, rollback to an older request snapshot, resumed branching, and an assistant response edited in the middle while later turns remain.
+- Assert every roleplay operation stays on one session, keeps the high-water baseline, and does not become compaction.
 
 ## Acceptance Criteria
 

@@ -99,6 +99,7 @@ class _SessionState:
     anchors: set[str] = field(default_factory=set)
     last_seen: float = 0.0
     history_signatures: tuple[str, ...] = field(default_factory=tuple)
+    loaded_from_persistence: bool = False
 
 
 @dataclass
@@ -123,6 +124,9 @@ class _MatchCandidate:
     provider_matches: int = 0
     response_matches: int = 0
     response_groups: set[str] = field(default_factory=set)
+    request_groups: set[str] = field(default_factory=set)
+    matched_probe_groups: set[str] = field(default_factory=set)
+    response_probe_groups: set[str] = field(default_factory=set)
     last_seen: float = 0.0
 
     @property
@@ -157,6 +161,7 @@ class _CompactionDecision:
     marker_compaction: bool = False
     retained_history_ratio: Optional[float] = None
     response_group_count: int = 0
+    context_probe_groups: frozenset[str] = frozenset()
 
     @property
     def possible_compaction(self) -> bool:
@@ -271,12 +276,90 @@ class SessionTracker:
             namespace,
             probe_indexes=probe_indexes,
         )
-
-        replay_record = self._find_compaction_replay(
-            compaction_probe_anchors,
-            history_signatures,
+        unsuppressed_normal_anchors = self._build_anchors(
+            request_data,
             namespace,
-            now,
+            hints,
+        )
+        compaction_match = (
+            self._best_match(compaction_probe_anchors, namespace, now)
+            if compaction_probe_anchors
+            else None
+        )
+        marker_probe_groups = self._compaction_marker_probe_groups(request_data)
+        marker_compaction = bool(marker_probe_groups)
+        compaction = self._evaluate_compaction(
+            compaction_match,
+            marker_compaction=marker_compaction,
+            marker_probe_groups=marker_probe_groups,
+            history_signatures=history_signatures,
+        )
+        authoritative_anchors = [
+            anchor
+            for anchor in unsuppressed_normal_anchors
+            if self._is_authoritative_identity_anchor(anchor)
+        ]
+        authoritative_match = (
+            self._best_match(authoritative_anchors, namespace, now)
+            if authoritative_anchors
+            else None
+        )
+        if authoritative_match and authoritative_match.is_sticky_match:
+            possible_compaction = (
+                compaction.possible_compaction
+                and compaction.parent_session_id == authoritative_match.session_id
+            )
+            normal_anchors = (
+                self._build_anchors(
+                    request_data,
+                    namespace,
+                    hints,
+                    suppressed_continuity_indexes=probe_indexes,
+                )
+                if possible_compaction
+                else unsuppressed_normal_anchors
+            )
+            state = self._refresh_and_bridge(
+                authoritative_match.session_id,
+                namespace,
+                normal_anchors,
+                now,
+                affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
+                history_signatures=history_signatures,
+            )
+            return self._log_inference_decision(
+                SessionInference(
+                    session_id=state.session_id,
+                    affinity_key=state.affinity_key,
+                    confidence=authoritative_match.confidence,
+                    match_score=authoritative_match.score,
+                    possible_compaction=possible_compaction,
+                    tracking_namespace=namespace,
+                ),
+                action="compaction_continue" if possible_compaction else "continue",
+                matched_session_id=state.session_id,
+                compaction=compaction if possible_compaction else None,
+            )
+
+        has_authoritative_identity = bool(authoritative_anchors)
+        context_binding = (
+            None
+            if has_authoritative_identity
+            else self._find_compaction_context(
+                compaction_probe_anchors,
+                namespace,
+                now,
+            )
+        )
+        replay_record = (
+            None
+            if has_authoritative_identity
+            else self._find_compaction_replay(
+                compaction_probe_anchors,
+                history_signatures,
+                namespace,
+                now,
+            )
         )
         if replay_record:
             replay_anchor = self._compaction_replay_anchor(
@@ -291,7 +374,14 @@ class SessionTracker:
                 hints,
                 suppressed_continuity_indexes=probe_indexes,
             )
-            normal_anchors = self._dedupe_anchors([*normal_anchors, replay_anchor])
+            context_anchors = (
+                [context_binding[1]]
+                if context_binding and context_binding[0].session_id == replay_record.session_id
+                else []
+            )
+            normal_anchors = self._dedupe_anchors(
+                [*normal_anchors, *context_anchors, replay_anchor]
+            )
             state = self._refresh_and_bridge(
                 replay_record.session_id,
                 namespace,
@@ -300,39 +390,68 @@ class SessionTracker:
                 affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
                 history_signatures=history_signatures,
             )
-            return SessionInference(
-                session_id=state.session_id,
-                affinity_key=state.affinity_key,
-                confidence="strong",
-                match_score=self._STRONG_SCORE,
-                possible_compaction=True,
-                lineage_parent_session_id=replay_record.group,
-                tracking_namespace=namespace,
+            return self._log_inference_decision(
+                SessionInference(
+                    session_id=state.session_id,
+                    affinity_key=state.affinity_key,
+                    confidence="strong",
+                    match_score=self._STRONG_SCORE,
+                    possible_compaction=True,
+                    lineage_parent_session_id=replay_record.group,
+                    tracking_namespace=namespace,
+                ),
+                action="compaction_replay",
+                matched_session_id=state.session_id,
             )
 
-        compaction_match = (
-            self._best_match(compaction_probe_anchors, namespace, now)
-            if compaction_probe_anchors
-            else None
-        )
-        marker_compaction = self._looks_like_compaction(request_data)
-        compaction = self._evaluate_compaction(
-            compaction_match,
-            marker_compaction=marker_compaction,
-            history_signatures=history_signatures,
-        )
+        if context_binding:
+            context_record, context_anchor = context_binding
+            normal_anchors = self._build_anchors(
+                request_data,
+                namespace,
+                hints,
+                suppressed_continuity_indexes=probe_indexes,
+            )
+            normal_anchors = self._dedupe_anchors([*normal_anchors, context_anchor])
+            state = self._refresh_and_bridge(
+                context_record.session_id,
+                namespace,
+                normal_anchors,
+                now,
+                affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
+                history_signatures=history_signatures,
+            )
+            return self._log_inference_decision(
+                SessionInference(
+                    session_id=state.session_id,
+                    affinity_key=state.affinity_key,
+                    confidence="strong",
+                    match_score=self._STRONG_SCORE,
+                    possible_compaction=False,
+                    lineage_parent_session_id=context_record.group,
+                    tracking_namespace=namespace,
+                ),
+                action="compaction_continue",
+                matched_session_id=state.session_id,
+            )
+
         possible_compaction = compaction.possible_compaction
-        normal_anchors = self._build_anchors(
-            request_data,
-            namespace,
-            hints,
-            suppressed_continuity_indexes=(
-                probe_indexes if possible_compaction else None
-            ),
+        normal_anchors = (
+            self._build_anchors(
+                request_data,
+                namespace,
+                hints,
+                suppressed_continuity_indexes=probe_indexes,
+            )
+            if possible_compaction
+            else unsuppressed_normal_anchors
         )
 
         if not normal_anchors and not compaction_probe_anchors:
-            return SessionInference(session_id=None, tracking_namespace=namespace)
+            return self._log_inference_decision(
+                SessionInference(session_id=None, tracking_namespace=namespace),
+                action="untracked",
+            )
 
         match = self._best_match(normal_anchors, namespace, now) if normal_anchors else None
 
@@ -349,20 +468,38 @@ class SessionTracker:
                 affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
                 history_signatures=history_signatures,
             )
-            return SessionInference(
-                session_id=state.session_id,
-                affinity_key=state.affinity_key,
-                confidence=match.confidence,
-                match_score=match.score,
-                possible_compaction=possible_compaction,
-                tracking_namespace=namespace,
+            return self._log_inference_decision(
+                SessionInference(
+                    session_id=state.session_id,
+                    affinity_key=state.affinity_key,
+                    confidence=match.confidence,
+                    match_score=match.score,
+                    possible_compaction=possible_compaction,
+                    lineage_parent_session_id=(
+                        compaction.parent_session_id
+                        if possible_compaction
+                        and compaction.parent_session_id != state.session_id
+                        else None
+                    ),
+                    tracking_namespace=namespace,
+                ),
+                action="compaction_continue" if possible_compaction else "continue",
+                matched_session_id=match.session_id,
+                compaction=compaction,
             )
 
         parent_id = compaction.parent_session_id
         if possible_compaction:
+            context_anchors = self._compaction_context_anchors(
+                compaction_probe_anchors,
+                compaction.context_probe_groups,
+                namespace,
+                parent_session_id=parent_id,
+            )
             normal_anchors = self._dedupe_anchors(
                 [
                     *normal_anchors,
+                    *context_anchors,
                     self._compaction_replay_anchor(
                         compaction_probe_anchors,
                         history_signatures,
@@ -380,26 +517,65 @@ class SessionTracker:
             affinity_key=self._affinity_from_anchors(normal_anchors, namespace),
             history_signatures=history_signatures,
         )
-        if parent_id:
-            lib_logger.info(
-                "Session tracker: possible compacted descendant %s -> %s for %s "
-                "(kind=%s, retained_history=%.3f, response_events=%d)",
-                parent_id,
-                session_id,
-                namespace,
-                "marker" if compaction.marker_compaction else "size",
-                compaction.retained_history_ratio or 0.0,
-                compaction.response_group_count,
-            )
-        return SessionInference(
-            session_id=state.session_id,
-            affinity_key=state.affinity_key,
-            confidence="weak" if match else "none",
-            match_score=match.score if match else 0,
-            possible_compaction=possible_compaction,
-            lineage_parent_session_id=parent_id,
-            tracking_namespace=namespace,
+        return self._log_inference_decision(
+            SessionInference(
+                session_id=state.session_id,
+                affinity_key=state.affinity_key,
+                confidence="weak" if match else "none",
+                match_score=match.score if match else 0,
+                possible_compaction=possible_compaction,
+                lineage_parent_session_id=parent_id,
+                tracking_namespace=namespace,
+            ),
+            action="compaction_child" if parent_id else "new",
+            candidate_session_id=match.session_id if match else None,
+            compaction=compaction,
         )
+
+    def _log_inference_decision(
+        self,
+        inference: SessionInference,
+        *,
+        action: str,
+        matched_session_id: Optional[str] = None,
+        candidate_session_id: Optional[str] = None,
+        compaction: Optional[_CompactionDecision] = None,
+    ) -> SessionInference:
+        """Emit temporary warning-level lineage diagnostics for every request."""
+
+        state = self._sessions.get(inference.session_id) if inference.session_id else None
+        origin = (
+            "persisted"
+            if state and state.loaded_from_persistence
+            else ("memory" if state else "none")
+        )
+        retained_ratio = (
+            f"{compaction.retained_history_ratio:.3f}"
+            if compaction and compaction.retained_history_ratio is not None
+            else "-"
+        )
+        response_events = compaction.response_group_count if compaction else 0
+        marker = compaction.marker_compaction if compaction else False
+        lib_logger.warning(
+            "Session tracker decision: action=%s session_id=%s matched_session_id=%s "
+            "candidate_session_id=%s parent_session_id=%s namespace=%s "
+            "confidence=%s score=%d origin=%s "
+            "possible_compaction=%s marker=%s retained_history=%s response_events=%d",
+            action,
+            inference.session_id or "-",
+            matched_session_id or "-",
+            candidate_session_id or "-",
+            inference.lineage_parent_session_id or "-",
+            inference.tracking_namespace or "-",
+            inference.confidence,
+            inference.match_score,
+            origin,
+            inference.possible_compaction,
+            marker,
+            retained_ratio,
+            response_events,
+        )
+        return inference
 
     def record_response(
         self,
@@ -426,6 +602,15 @@ class SessionTracker:
                 namespace = tracking_namespace or state.namespace or self._namespace(
                     provider, model, scope_key=scope_key
                 )
+                if namespace != state.namespace:
+                    lib_logger.warning(
+                        "Session tracker normalized response namespace mismatch: "
+                        "session_id=%s expected_namespace=%s received_namespace=%s",
+                        session_id,
+                        state.namespace,
+                        namespace,
+                    )
+                    namespace = state.namespace
                 anchors = self._anchors_from_response(response, namespace)
                 if anchors:
                     self._refresh_and_bridge(session_id, namespace, anchors, now)
@@ -481,7 +666,10 @@ class SessionTracker:
             session_id,
             _SessionState(session_id=session_id, namespace=namespace, expires_at=expires_at),
         )
-        state.namespace = namespace
+        if state.namespace != namespace:
+            raise ValueError(
+                f"Session {session_id} belongs to {state.namespace}, not {namespace}"
+            )
         state.expires_at = expires_at
         state.last_seen = now
         if affinity_key and not state.affinity_key:
@@ -538,6 +726,8 @@ class SessionTracker:
                 continue
             candidate = candidates.setdefault(record.session_id, _MatchCandidate(record.session_id))
             candidate.last_seen = max(candidate.last_seen, record.last_seen)
+            if anchor.source == "compaction_probe" and anchor.group:
+                candidate.matched_probe_groups.add(anchor.group)
             strength = self._strongest(anchor.strength, record.strength)
             if strength == "strong":
                 candidate.score += self._STRONG_SCORE
@@ -558,6 +748,10 @@ class SessionTracker:
                     )
                     if response_group:
                         candidate.response_groups.add(response_group)
+                    if anchor.source == "compaction_probe" and anchor.group:
+                        candidate.response_probe_groups.add(anchor.group)
+                if record.source == "message" and record.group:
+                    candidate.request_groups.add(record.group)
             else:
                 candidate.score += self._WEAK_SCORE
                 candidate.weak_matches += 1
@@ -689,6 +883,7 @@ class SessionTracker:
         match: Optional[_MatchCandidate],
         *,
         marker_compaction: bool,
+        marker_probe_groups: set[str],
         history_signatures: tuple[str, ...],
     ) -> _CompactionDecision:
         """Require parent evidence and replacement of most known history.
@@ -721,23 +916,49 @@ class SessionTracker:
         qualifies = (
             match.score > 0
             if marker_compaction
-            else response_group_count >= self._MIN_UNMARKED_RESPONSE_GROUPS
+            else (
+                response_group_count >= self._MIN_UNMARKED_RESPONSE_GROUPS
+                and bool(match.request_groups)
+            )
         )
         if not qualifies:
             lib_logger.debug(
                 "Session tracker rejected compaction candidate for %s: "
-                "marker=%s, response_events=%d",
+                "marker=%s, response_events=%d, request_groups=%d",
                 match.session_id,
                 marker_compaction,
                 response_group_count,
+                len(match.request_groups),
             )
             return _CompactionDecision()
+        marker_context_groups = match.matched_probe_groups.intersection(marker_probe_groups)
         return _CompactionDecision(
             parent_session_id=match.session_id,
             marker_compaction=marker_compaction,
             retained_history_ratio=retained_ratio,
             response_group_count=response_group_count,
+            context_probe_groups=frozenset(
+                (marker_context_groups or match.response_probe_groups)
+                if marker_compaction
+                else match.response_probe_groups
+            ),
         )
+
+    def _compaction_marker_probe_groups(self, request_data: Dict[str, Any]) -> set[str]:
+        """Return early system/developer probe groups carrying explicit markers."""
+
+        messages = request_data.get("messages") or []
+        groups: set[str] = set()
+        if not isinstance(messages, list):
+            return groups
+        for index, message in enumerate(messages[:2]):
+            if not isinstance(message, dict):
+                continue
+            role = str(message.get("role", "")).lower()
+            text = self._extract_text(message.get("content"))
+            if role in {"system", "developer"} and self._has_compaction_marker(text):
+                groups.add(f"compaction_probe:{index}")
+        return groups
 
     def _compaction_replay_anchor(
         self,
@@ -761,6 +982,55 @@ class SessionTracker:
             source="compaction_replay",
             group=parent_session_id,
         )
+
+    def _compaction_context_anchor(
+        self,
+        probe_anchors: List[SessionAnchor],
+        namespace: str,
+        *,
+        parent_session_id: Optional[str],
+    ) -> SessionAnchor:
+        """Bind later requests that retain one validated compacted base context."""
+
+        digest = self._hash_json(sorted(anchor.value for anchor in probe_anchors))
+        return SessionAnchor(
+            self._scoped(namespace, f"compaction_context:{digest}"),
+            "strong",
+            source="compaction_context",
+            group=parent_session_id,
+        )
+
+    def _compaction_context_anchors(
+        self,
+        probe_anchors: List[SessionAnchor],
+        probe_groups: Iterable[str],
+        namespace: str,
+        *,
+        parent_session_id: Optional[str],
+    ) -> List[SessionAnchor]:
+        """Build context keys only for probes that actually matched the parent."""
+
+        anchors: List[SessionAnchor] = []
+        for group in sorted(set(probe_groups)):
+            grouped = [anchor for anchor in probe_anchors if anchor.group == group]
+            if grouped:
+                anchors.append(
+                    self._compaction_context_anchor(
+                        grouped,
+                        namespace,
+                        parent_session_id=parent_session_id,
+                    )
+                )
+        return anchors
+
+    @staticmethod
+    def _is_authoritative_identity_anchor(anchor: SessionAnchor) -> bool:
+        """Return whether an anchor must take precedence over replay bindings."""
+
+        return anchor.strength == "strong" and anchor.source in {
+            "explicit",
+            "provider",
+        }
 
     def _find_compaction_replay(
         self,
@@ -788,6 +1058,40 @@ class SessionTracker:
         ):
             return None
         return record
+
+    def _find_compaction_context(
+        self,
+        probe_anchors: List[SessionAnchor],
+        namespace: str,
+        now: float,
+    ) -> Optional[tuple[_AnchorRecord, SessionAnchor]]:
+        probe_groups = sorted({anchor.group for anchor in probe_anchors if anchor.group})
+        for probe_group in probe_groups:
+            grouped = [anchor for anchor in probe_anchors if anchor.group == probe_group]
+            anchor = self._compaction_context_anchor(
+                grouped,
+                namespace,
+                parent_session_id=None,
+            )
+            record = self._anchors.get(anchor.value)
+            if (
+                record
+                and record.source == "compaction_context"
+                and record.namespace == namespace
+                and record.expires_at > now
+                and record.session_id in self._sessions
+                and record.group
+            ):
+                return (
+                    record,
+                    SessionAnchor(
+                        anchor.value,
+                        "strong",
+                        source="compaction_context",
+                        group=record.group,
+                    ),
+                )
+        return None
 
     def _anchors_from_provider_hints(
         self,
@@ -884,7 +1188,7 @@ class SessionTracker:
                 anchors.append(
                     SessionAnchor(
                         self._scoped(namespace, f"tool:{tool_id}"),
-                        "strong",
+                        "weak",
                         source="tool",
                         group=f"tool:{tool_id}",
                     )
@@ -904,7 +1208,7 @@ class SessionTracker:
                         anchors.append(
                             SessionAnchor(
                                 self._scoped(namespace, f"tool:{call_id}"),
-                                "strong",
+                                "weak",
                                 source="tool",
                                 group=f"tool:{call_id}",
                             )
@@ -954,7 +1258,7 @@ class SessionTracker:
             anchors.append(
                 SessionAnchor(
                     self._scoped(namespace, "tool_group:" + self._hash_json(sorted(tool_ids))),
-                    "strong",
+                    "weak",
                     source="tool",
                     group="tool_group",
                 )
@@ -1046,21 +1350,6 @@ class SessionTracker:
             return self._scoped(namespace, "affinity:" + self._hash_json(medium[:8]))
         return None
 
-    def _looks_like_compaction(self, request_data: Dict[str, Any]) -> bool:
-        messages = request_data.get("messages") or []
-        if not isinstance(messages, list) or not messages:
-            return False
-        summary_texts: List[str] = []
-        for message in messages[:2]:
-            if not isinstance(message, dict):
-                continue
-            role = str(message.get("role", "")).lower()
-            if role not in {"system", "developer"}:
-                continue
-            summary_texts.append(self._extract_text(message.get("content")))
-        joined = "\n".join(summary_texts)
-        return self._has_compaction_marker(joined)
-
     def _is_compaction_probe_text(self, text: str) -> bool:
         if not text:
             return False
@@ -1088,7 +1377,10 @@ class SessionTracker:
             return
         sorted_anchors = sorted(
             state.anchors,
-            key=lambda value: self._anchor_eviction_key(self._anchors.get(value)),
+            key=lambda value: (
+                self._anchor_eviction_key(self._anchors.get(value)),
+                value,
+            ),
         )
         for value in sorted_anchors[: len(state.anchors) - self.max_anchors_per_session]:
             state.anchors.discard(value)
@@ -1102,7 +1394,7 @@ class SessionTracker:
         overage = len(self._anchors) - self.max_anchor_records
         for value, record in sorted(
             self._anchors.items(),
-            key=lambda item: self._anchor_eviction_key(item[1]),
+            key=lambda item: (self._anchor_eviction_key(item[1]), item[0]),
         )[:overage]:
             state = self._sessions.get(record.session_id)
             if state:
@@ -1182,6 +1474,7 @@ class SessionTracker:
                 anchors=set(),
                 last_seen=last_seen if last_seen is not None else now,
                 history_signatures=history_signatures,
+                loaded_from_persistence=True,
             )
         for value, payload in anchors.items():
             if not isinstance(payload, dict):
@@ -1327,7 +1620,7 @@ class SessionTracker:
         if record is None:
             return (-1, 0, 0.0)
         strength_rank = {"weak": 0, "medium": 1, "strong": 2}.get(record.strength, 0)
-        replay_rank = 1 if record.source == "compaction_replay" else 0
+        replay_rank = 1 if record.source in {"compaction_context", "compaction_replay"} else 0
         return (strength_rank, replay_rank, record.last_seen)
 
     def _allows_response_bridge(

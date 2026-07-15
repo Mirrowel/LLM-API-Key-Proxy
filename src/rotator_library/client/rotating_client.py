@@ -63,6 +63,33 @@ if TYPE_CHECKING:
 lib_logger = logging.getLogger("rotator_library")
 
 
+def _resolve_session_persistence_settings(
+    enabled: Optional[bool],
+    flush_interval_seconds: Optional[float],
+) -> tuple[bool, float]:
+    """Resolve explicit session-persistence settings before environment defaults."""
+
+    if enabled is None:
+        enabled = os.getenv(
+            "SESSION_PERSISTENCE_ENABLED",
+            "false",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    if flush_interval_seconds is None:
+        raw_flush_interval = os.getenv(
+            "SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS",
+            "5.0",
+        )
+        try:
+            flush_interval_seconds = max(0.0, float(raw_flush_interval))
+        except (TypeError, ValueError):
+            flush_interval_seconds = 5.0
+            lib_logger.warning(
+                "Invalid SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=%r; using 5.0",
+                raw_flush_interval,
+            )
+    return enabled, float(flush_interval_seconds)
+
+
 class RotatingClient:
     """
     A client that intelligently rotates and retries API keys using LiteLLM,
@@ -99,8 +126,8 @@ class RotatingClient:
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
         session_stickiness_ttl_seconds: int = 3600,
-        session_persistence_enabled: bool = False,
-        session_persistence_flush_interval_seconds: float = 5.0,
+        session_persistence_enabled: Optional[bool] = None,
+        session_persistence_flush_interval_seconds: Optional[float] = None,
     ):
         """
         Initialize the RotatingClient.
@@ -109,6 +136,13 @@ class RotatingClient:
         """
         # Resolve data directory
         self.data_dir = Path(data_dir).resolve() if data_dir else get_default_root()
+        (
+            session_persistence_enabled,
+            session_persistence_flush_interval_seconds,
+        ) = _resolve_session_persistence_settings(
+            session_persistence_enabled,
+            session_persistence_flush_interval_seconds,
+        )
 
         # Configure logging
         configure_failure_logger(get_logs_dir(self.data_dir))
