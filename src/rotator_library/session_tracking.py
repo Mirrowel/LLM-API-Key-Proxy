@@ -289,9 +289,7 @@ class SessionTracker:
         hints = self._coerce_hints(hints)
         namespace = self._namespace(
             provider,
-            model,
             scope_key=scope_key,
-            session_scope=hints.session_scope if hints else None,
             trusted_isolation_key=trusted_isolation_key,
         )
         history_signatures = self._request_history_signatures(request_data)
@@ -646,7 +644,7 @@ class SessionTracker:
             if session_id and response is not None and session_id in self._sessions:
                 state = self._sessions[session_id]
                 namespace = tracking_namespace or state.namespace or self._namespace(
-                    provider, model, scope_key=scope_key
+                    provider, scope_key=scope_key
                 )
                 if namespace != state.namespace:
                     lib_logger.warning(
@@ -1822,10 +1820,8 @@ class SessionTracker:
     def _namespace(
         self,
         provider: Optional[str],
-        model: Optional[str],
         *,
         scope_key: Optional[str] = None,
-        session_scope: Optional[str] = None,
         trusted_isolation_key: bool = False,
     ) -> str:
         # Logical sessions cross providers and models, but never caller/credential

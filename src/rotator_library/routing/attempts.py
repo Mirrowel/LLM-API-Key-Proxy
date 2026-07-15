@@ -42,7 +42,6 @@ def clone_context_for_target(
         provider_config=provider_config if provider_config is not None else context.provider_config,
         credential_secrets=dict(credential_secrets) if credential_secrets is not None else dict(context.credential_secrets),
         routing_target_index=target_index,
-        session_tracking_namespace=context.session_tracking_namespace,
         session_affinity_key=(
             context.session_affinity_key
             if target.provider == context.provider and target.prefixed_model == context.model

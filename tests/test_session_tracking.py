@@ -1038,7 +1038,7 @@ class SessionTrackerTests(unittest.TestCase):
                 model="pro",
                 scope_key="A",
             )
-            namespace_b = tracker._namespace("gemini", "pro", scope_key="B")
+            namespace_b = tracker._namespace("gemini", scope_key="B")
             response_text = self._long_text("namespace-mismatched-response")
 
             with self.assertLogs("rotator_library", level="WARNING") as captured:

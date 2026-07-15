@@ -395,6 +395,37 @@ async def test_stream_events_can_store_in_progress_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scoped_in_progress_state_is_immediately_capability_accessible() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(
+        store=store,
+        store_settings=ResponsesStoreSettings(store_in_progress=True),
+    )
+    request = {
+        "model": "gpt-test",
+        "input": "private stream",
+        "stream": True,
+        "api_keys": {"openai": ["private-key"]},
+        "private": True,
+    }
+    request_scope = service.prepare_request_scope(request)
+    stream = service.stream_events(
+        request,
+        FakeStreamingClient(),
+        request_scope=request_scope,
+    )
+
+    created = await anext(stream)
+    stored = await service.get_response_with_access_token(
+        created.payload["id"],
+        request_scope.access_token,
+    )
+    await stream.aclose()
+
+    assert stored["status"] == "in_progress"
+
+
+@pytest.mark.asyncio
 async def test_stream_response_store_failures_emit_store_specific_trace(tmp_path) -> None:
     logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
     service = ResponsesService(store=FailingStore())

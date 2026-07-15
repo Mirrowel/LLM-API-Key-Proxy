@@ -611,10 +611,12 @@ SESSION_PERSISTENCE_ENABLED=true
 SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=5
 ```
 
-Scoped Responses API creation returns `X-Proxy-Session-Domain`. Present that
-header when retrieving, deleting, or listing input items for a non-public stored
-response. Responses storage and `previous_response_id` lineage are keyed by both
-that domain and the response ID.
+Scoped Responses API creation returns a response-specific
+`X-Proxy-Session-Domain` access capability. Present that header when retrieving,
+deleting, listing input items, or creating a `previous_response_id` continuation
+for that non-public response. Only the capability hash is stored; knowing a
+classifier label or deterministic domain hash is insufficient. Responses storage
+and lineage remain keyed internally by both the domain and response ID.
 
 ### Priority Multipliers
 

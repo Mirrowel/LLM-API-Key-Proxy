@@ -6,10 +6,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import re
+import secrets
 import time
 from copy import deepcopy
-from typing import Any, AsyncGenerator, Optional
+from dataclasses import dataclass
+from typing import Any, AsyncGenerator, NoReturn, Optional
 
 from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
@@ -18,7 +23,7 @@ from ..client.scopes import derive_session_isolation_key
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from ..protocols.responses import ResponsesProtocol
-from .bridge import ResponsesBridge, responses_session_hints
+from .bridge import PROXY_ROUTING_KEYS, ResponsesBridge
 from .store import InMemoryResponsesStore, ResponsesStore
 from .streaming import (
     ResponsesSSEFormatter,
@@ -36,7 +41,6 @@ from .types import ResponsesStoreSettings, StoredResponse
 from .types import generate_response_id
 
 
-_ROUTING_FIELDS = {"classifier", "api_keys", "providers", "private", "model_filters"}
 _STORED_REQUEST_FIELDS = {
     "include",
     "input",
@@ -57,6 +61,21 @@ _STORED_REQUEST_FIELDS = {
     "truncation",
     "user",
 }
+_SCOPE_ACCESS_TOKEN_RE = re.compile(
+    r"^(classifier:[0-9a-f]{24}|bundle:[0-9a-f]{64})\.([A-Za-z0-9_-]{32,64})$"
+)
+
+
+@dataclass(frozen=True)
+class ResponsesRequestScope:
+    """Internal scope plus the unforgeable capability returned to HTTP clients."""
+
+    key: str
+    access_token: str
+
+    @property
+    def access_token_hash(self) -> str:
+        return hashlib.sha256(self.access_token.encode("utf-8")).hexdigest()
 
 
 class ResponsesServiceError(ValueError):
@@ -89,6 +108,54 @@ class ResponsesService:
         self.bridge = bridge or ResponsesBridge(self.protocol)
         self.store = store or InMemoryResponsesStore(max_items=self.store_settings.max_items)
 
+    @staticmethod
+    def request_scope_key(raw_request: dict[str, Any]) -> str:
+        """Return the opaque caller/credential domain for a Responses request."""
+
+        return _request_isolation_key(raw_request)
+
+    @staticmethod
+    def redact_request_for_logging(raw_request: dict[str, Any]) -> dict[str, Any]:
+        """Return a recursive credential-free copy for transport-level logs."""
+
+        redacted = _redact_sensitive_fields(raw_request)
+        return redacted if isinstance(redacted, dict) else {}
+
+    def prepare_request_scope(
+        self,
+        raw_request: dict[str, Any],
+    ) -> ResponsesRequestScope:
+        """Create the scope capability used by transport-facing retrieval APIs."""
+
+        scope_key = self.request_scope_key(raw_request)
+        access_token = (
+            "public"
+            if scope_key == "public"
+            else f"{scope_key}.{secrets.token_urlsafe(32)}"
+        )
+        return ResponsesRequestScope(scope_key, access_token)
+
+    def _resolve_request_scope(
+        self,
+        raw_request: dict[str, Any],
+        request_scope: Optional[ResponsesRequestScope],
+    ) -> ResponsesRequestScope:
+        expected_key = self.request_scope_key(raw_request)
+        resolved = request_scope or self.prepare_request_scope(raw_request)
+        if resolved.key != expected_key:
+            raise ResponsesServiceError(
+                "Responses request scope does not match routing credentials",
+                status_code=400,
+            )
+        return resolved
+
+    async def close(self) -> None:
+        """Close the configured response store and its owned background tasks."""
+
+        close = getattr(self.store, "close", None)
+        if close:
+            await close()
+
     async def create_response(
         self,
         raw_request: dict[str, Any],
@@ -96,6 +163,8 @@ class ResponsesService:
         *,
         request: Optional[Any] = None,
         transaction_logger: Optional[Any] = None,
+        request_scope: Optional[ResponsesRequestScope] = None,
+        previous_response_access_token: Optional[str] = None,
     ) -> dict[str, Any]:
         """Create a non-streaming Responses object through the chat bridge."""
 
@@ -104,7 +173,8 @@ class ResponsesService:
         if raw_request.get("stream"):
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
 
-        isolation_key = _request_isolation_key(raw_request)
+        resolved_scope = self._resolve_request_scope(raw_request, request_scope)
+        isolation_key = resolved_scope.key
         safe_request = _safe_stored_request(raw_request)
         self._trace(transaction_logger, "responses_raw_request", safe_request, direction="request", stage="client")
         try:
@@ -119,6 +189,7 @@ class ResponsesService:
             unified.previous_response_id,
             transaction_logger,
             expected_scope_key=isolation_key,
+            access_token=previous_response_access_token,
         )
         try:
             parent_lineage = await self._load_response_lineage(
@@ -136,8 +207,9 @@ class ResponsesService:
             raise
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
         session_hints = chat_kwargs.pop("_session_tracking_hints", None)
-        session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
-        session_info: dict[str, Any] = {}
+        session_info: dict[str, Any] = {
+            "scope_access_hash": resolved_scope.access_token_hash,
+        }
         chat_kwargs.update(_routing_kwargs(raw_request))
         chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
         trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
@@ -183,11 +255,21 @@ class ResponsesService:
         request: Optional[Any] = None,
         transaction_logger: Optional[Any] = None,
         transport: str = "sse",
+        request_scope: Optional[ResponsesRequestScope] = None,
+        previous_response_access_token: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """Stream a Responses API request as HTTP SSE events."""
 
         formatter = ResponsesSSEFormatter()
-        async for event in self.stream_events(raw_request, client, request=request, transaction_logger=transaction_logger, transport=transport):
+        async for event in self.stream_events(
+            raw_request,
+            client,
+            request=request,
+            transaction_logger=transaction_logger,
+            transport=transport,
+            request_scope=request_scope,
+            previous_response_access_token=previous_response_access_token,
+        ):
             formatted = formatter.format_stream_event(event)
             self._trace(
                 transaction_logger,
@@ -210,17 +292,25 @@ class ResponsesService:
                 )
             yield formatted
 
-    async def validate_stream_request(self, raw_request: dict[str, Any]) -> None:
+    async def validate_stream_request(
+        self,
+        raw_request: dict[str, Any],
+        *,
+        request_scope: Optional[ResponsesRequestScope] = None,
+        previous_response_access_token: Optional[str] = None,
+    ) -> None:
         """Validate stream-only preconditions before an HTTP response starts."""
 
         if not raw_request.get("model"):
             raise ResponsesServiceError("'model' is required", status_code=400)
         previous_response_id = raw_request.get("previous_response_id")
         if previous_response_id:
+            resolved_scope = self._resolve_request_scope(raw_request, request_scope)
             await self._load_previous_response(
                 str(previous_response_id),
                 None,
-                expected_scope_key=_request_isolation_key(raw_request),
+                expected_scope_key=resolved_scope.key,
+                access_token=previous_response_access_token,
             )
 
     async def stream_events(
@@ -231,6 +321,8 @@ class ResponsesService:
         request: Optional[Any] = None,
         transaction_logger: Optional[Any] = None,
         transport: str = "sse",
+        request_scope: Optional[ResponsesRequestScope] = None,
+        previous_response_access_token: Optional[str] = None,
     ) -> AsyncGenerator[ResponsesStreamEvent, None]:
         """Yield transport-neutral Responses events for streaming transports."""
 
@@ -238,7 +330,8 @@ class ResponsesService:
             raise ResponsesServiceError("'model' is required", status_code=400)
         stream_request = dict(raw_request)
         stream_request["stream"] = True
-        isolation_key = _request_isolation_key(stream_request)
+        resolved_scope = self._resolve_request_scope(stream_request, request_scope)
+        isolation_key = resolved_scope.key
         safe_stream_request = _safe_stored_request(stream_request)
         self._trace(transaction_logger, "responses_raw_request", safe_stream_request, direction="request", stage="client")
         try:
@@ -252,6 +345,7 @@ class ResponsesService:
             unified.previous_response_id,
             transaction_logger,
             expected_scope_key=isolation_key,
+            access_token=previous_response_access_token,
         )
         try:
             parent_lineage = await self._load_response_lineage(
@@ -269,8 +363,9 @@ class ResponsesService:
             raise
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
         session_hints = chat_kwargs.pop("_session_tracking_hints", None)
-        session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
-        session_info: dict[str, Any] = {}
+        session_info: dict[str, Any] = {
+            "scope_access_hash": resolved_scope.access_token_hash,
+        }
         chat_kwargs.update(_routing_kwargs(stream_request))
         chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
         chat_kwargs["stream"] = True
@@ -486,7 +581,13 @@ class ResponsesService:
             )
         created = response_created_payload(response_id, unified.model)
         self._trace(transaction_logger, "responses_stream_event_created", created, direction="stream", stage="final", metadata={"transport": transport})
-        await self._store_stream_current_state(stream_request, created, parent, transaction_logger=transaction_logger)
+        await self._store_stream_current_state(
+            stream_request,
+            created,
+            parent,
+            transaction_logger=transaction_logger,
+            session_info=session_info,
+        )
         yield ResponsesStreamEvent("response.created", created)
         try:
             while chat_stream is None:
@@ -654,9 +755,17 @@ class ResponsesService:
     ) -> dict[str, Any]:
         """Return a stored response payload or raise a 404-compatible error."""
 
-        stored = await self.store.get(response_id, scope_key)
-        if stored is None or stored.scope_key != scope_key:
-            raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
+        stored = await self._stored_or_not_found(response_id, scope_key)
+        return deepcopy(stored.response)
+
+    async def get_response_with_access_token(
+        self,
+        response_id: str,
+        access_token: str = "public",
+    ) -> dict[str, Any]:
+        """Return a response only when the transport capability is valid."""
+
+        stored = await self._stored_for_access(response_id, access_token)
         return deepcopy(stored.response)
 
     async def delete_response(
@@ -667,12 +776,23 @@ class ResponsesService:
     ) -> dict[str, Any]:
         """Delete a stored response and return a compatible deletion object."""
 
-        stored = await self.store.get(response_id, scope_key)
-        if stored is None or stored.scope_key != scope_key:
-            raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
+        await self._stored_or_not_found(response_id, scope_key)
         deleted = await self.store.delete(response_id, scope_key)
         if not deleted:
             raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
+        return {"id": response_id, "object": "response.deleted", "deleted": True}
+
+    async def delete_response_with_access_token(
+        self,
+        response_id: str,
+        access_token: str = "public",
+    ) -> dict[str, Any]:
+        """Delete a response only when the transport capability is valid."""
+
+        stored = await self._stored_for_access(response_id, access_token)
+        deleted = await self.store.delete(response_id, stored.scope_key or "public")
+        if not deleted:
+            self._raise_response_not_found(response_id)
         return {"id": response_id, "object": "response.deleted", "deleted": True}
 
     async def list_input_items(
@@ -683,10 +803,54 @@ class ResponsesService:
     ) -> dict[str, Any]:
         """Return stored input items for a response continuation."""
 
+        stored = await self._stored_or_not_found(response_id, scope_key)
+        return {"object": "list", "data": deepcopy(stored.input_items)}
+
+    async def list_input_items_with_access_token(
+        self,
+        response_id: str,
+        access_token: str = "public",
+    ) -> dict[str, Any]:
+        """Return input items only when the transport capability is valid."""
+
+        stored = await self._stored_for_access(response_id, access_token)
+        return {"object": "list", "data": deepcopy(stored.input_items)}
+
+    async def _stored_for_access(
+        self,
+        response_id: str,
+        access_token: str,
+    ) -> StoredResponse:
+        if access_token == "public":
+            return await self._stored_or_not_found(response_id, "public")
+        match = _SCOPE_ACCESS_TOKEN_RE.fullmatch(str(access_token))
+        if not match:
+            self._raise_response_not_found(response_id)
+        scope_key = match.group(1)
+        stored = await self._stored_or_not_found(response_id, scope_key)
+        expected_hash = str(stored.metadata.get("scope_access_hash") or "")
+        actual_hash = hashlib.sha256(str(access_token).encode("utf-8")).hexdigest()
+        if not expected_hash or not hmac.compare_digest(expected_hash, actual_hash):
+            self._raise_response_not_found(response_id)
+        return stored
+
+    async def _stored_or_not_found(
+        self,
+        response_id: str,
+        scope_key: str,
+    ) -> StoredResponse:
         stored = await self.store.get(response_id, scope_key)
         if stored is None or stored.scope_key != scope_key:
-            raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
-        return {"object": "list", "data": deepcopy(stored.input_items)}
+            self._raise_response_not_found(response_id)
+        return stored
+
+    @staticmethod
+    def _raise_response_not_found(response_id: str) -> NoReturn:
+        raise ResponsesServiceError(
+            f"Response not found: {response_id}",
+            status_code=404,
+            error_type="not_found_error",
+        )
 
     async def _load_response_lineage(
         self,
@@ -723,12 +887,16 @@ class ResponsesService:
         transaction_logger: Optional[Any],
         *,
         expected_scope_key: str,
+        access_token: Optional[str] = None,
     ) -> Optional[StoredResponse]:
         if not response_id:
             return None
-        parent = await self.store.get(response_id, expected_scope_key)
-        if parent is None or parent.scope_key != expected_scope_key:
-            raise ResponsesServiceError(f"Previous response not found: {response_id}", status_code=404, error_type="not_found_error")
+        if expected_scope_key == "public":
+            parent = await self._stored_or_not_found(response_id, "public")
+        else:
+            parent = await self._stored_for_access(response_id, access_token or "")
+            if parent.scope_key != expected_scope_key:
+                self._raise_response_not_found(response_id)
         if transaction_logger:
             self._trace(
                 transaction_logger,
@@ -767,12 +935,13 @@ class ResponsesService:
             metadata={
                 "previous_response_id": parent.id if parent else raw_request.get("previous_response_id"),
                 "response_id": response_payload.get("id"),
+                "scope_access_hash": session_info.get("scope_access_hash"),
             },
             session_id=session_info.get("session_id") or (parent.session_id if parent else None),
             scope_key=(
                 session_info.get("scope_key")
                 or (parent.scope_key if parent else None)
-                or _request_isolation_key(raw_request)
+                or self.request_scope_key(raw_request)
             ),
             classifier=session_info.get("classifier") or (parent.classifier if parent else None),
             expires_at=_expires_at(self.store_settings),
@@ -905,7 +1074,7 @@ def _routing_kwargs(raw_request: dict[str, Any]) -> dict[str, Any]:
 
     return {
         key: deepcopy(raw_request[key])
-        for key in _ROUTING_FIELDS
+        for key in PROXY_ROUTING_KEYS
         if key in raw_request
     }
 
@@ -993,7 +1162,6 @@ def _capture_request_context(session_info: dict[str, Any]):
 
     def capture(context: Any) -> None:
         session_info["session_id"] = getattr(context, "session_id", None)
-        session_info["session_affinity_key"] = getattr(context, "session_affinity_key", None)
         session_info["scope_key"] = getattr(context, "session_isolation_key", None)
         session_info["classifier"] = getattr(context, "classifier", None)
         session_info["session_tracker"] = getattr(context, "session_tracker", None)
@@ -1011,17 +1179,9 @@ def _without_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
         {
             key: deepcopy(value)
             for key, value in kwargs.items()
-            if not key.startswith("_") and key not in _ROUTING_FIELDS
+            if not key.startswith("_") and key not in PROXY_ROUTING_KEYS
         }
     )
-
-
-def _responses_session_hints(previous_response_id: Optional[str], parent: Optional[StoredResponse], fallback: Any) -> Any:
-    """Build proxy-global continuation evidence without provider affinity."""
-
-    if not previous_response_id:
-        return None
-    return responses_session_hints(previous_response_id) or fallback
 
 
 def _record_responses_session_anchor(session_info: dict[str, Any], response_payload: dict[str, Any]) -> None:

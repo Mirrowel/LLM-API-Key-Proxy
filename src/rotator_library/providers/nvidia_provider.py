@@ -4,7 +4,6 @@
 import httpx
 import logging
 from typing import List, Dict, Any
-import litellm
 from .provider_interface import ProviderInterface
 
 lib_logger = logging.getLogger("rotator_library")
@@ -162,6 +161,7 @@ class NvidiaProvider(ProviderInterface):
         kwargs = payload["extra_body"]["chat_template_kwargs"]
 
         if is_disabled:
+            payload.pop("reasoning_effort", None)
             kwargs["thinking"] = False
             lib_logger.info(
                 f"NVIDIA: DeepSeek '{model_name}' — thinking DISABLED "

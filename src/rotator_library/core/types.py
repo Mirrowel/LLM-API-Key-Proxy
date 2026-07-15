@@ -14,9 +14,7 @@ from typing import (
     Callable,
     Dict,
     List,
-    Literal,
     Optional,
-    Set,
     Tuple,
     Union,
 )
@@ -79,8 +77,6 @@ class RequestContext:
     session_id: Optional[str] = None
     session_affinity_key: Optional[str] = None
     session_tracker: Optional[Any] = None
-    session_possible_compaction: bool = False
-    session_lineage_parent_id: Optional[str] = None
     session_tracking_namespace: Optional[str] = None
     session_isolation_key: Optional[str] = None
     request: Optional[Any] = None  # FastAPI Request object

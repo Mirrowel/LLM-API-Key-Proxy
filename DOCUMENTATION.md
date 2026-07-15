@@ -1054,10 +1054,18 @@ affinity before selecting a different provider/model. Response recording remains
 in the original caller domain.
 
 Scoped Responses storage uses `(session_domain, response_id)` ownership. Creation
-returns `X-Proxy-Session-Domain`; non-public GET, DELETE, and input-items requests
-must return that opaque header. Continuation validates every stored ancestor in
-the same domain, and credential/provider routing containers are omitted from
-stored requests and transform traces.
+returns a response-specific `X-Proxy-Session-Domain` capability; non-public GET,
+DELETE, input-items, and `previous_response_id` continuation requests must return
+that opaque header. The token contains the lookup domain plus a random nonce, and
+only its hash is stored, so a deterministic classifier/domain hash cannot be used
+to forge access. Continuation validates the parent capability and every stored
+ancestor's domain. Credential/provider routing containers are omitted from stored
+requests and transform traces.
+
+Legacy public ProviderCache entries are migrated on first exact ID/scope match.
+Pre-capability private entries intentionally reject their old deterministic domain
+header because accepting it would restore forgeable access; those records expire
+under the configured Responses store TTL.
 
 Only completed responses contribute response-derived identity. Streaming text is
 recorded after an explicit provider completion signal, not from clean iterator

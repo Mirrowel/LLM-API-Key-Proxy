@@ -5,7 +5,7 @@ import json
 import pytest
 
 import rotator_library.responses.service as responses_service_module
-from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, ResponsesStoreSettings, StoredResponse
+from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, ResponsesStoreSettings, StoredResponse, create_configured_responses_store
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -62,6 +62,109 @@ class FakeInternalClient(FakeClient):
 
 def _trace_entries(log_dir):
     return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+def test_responses_service_owns_request_scope_derivation() -> None:
+    service = ResponsesService()
+
+    assert service.request_scope_key({"model": "gpt-test"}) == "public"
+    assert service.request_scope_key(
+        {
+            "model": "gpt-test",
+            "api_keys": {"openai": ["private-key"]},
+            "private": True,
+        }
+    ).startswith("bundle:")
+
+
+def test_responses_service_recursively_redacts_transport_logging_payload() -> None:
+    service = ResponsesService()
+    request = {
+        "model": "gpt-test",
+        "api_keys": {"openai": ["top-level-secret"]},
+        "metadata": {
+            "providers": {"private": {"api_key": "nested-secret"}},
+            "keep": "visible",
+        },
+        "input": [{"authorization": "Bearer secret", "value": "visible"}],
+    }
+
+    redacted = service.redact_request_for_logging(request)
+
+    assert redacted == {
+        "model": "gpt-test",
+        "metadata": {"keep": "visible"},
+        "input": [{"value": "visible"}],
+    }
+    assert request["api_keys"]["openai"] == ["top-level-secret"]
+    assert request["metadata"]["providers"]["private"]["api_key"] == "nested-secret"
+
+
+@pytest.mark.asyncio
+async def test_scoped_response_requires_unforgeable_access_capability() -> None:
+    service = ResponsesService(store=InMemoryResponsesStore())
+    request = {
+        "model": "gpt-test",
+        "input": "private",
+        "api_keys": {"openai": ["private-key"]},
+        "private": True,
+    }
+    request_scope = service.prepare_request_scope(request)
+    response = await service.create_response(
+        request,
+        FakeClient(),
+        request_scope=request_scope,
+    )
+    raw_domain = request_scope.access_token.rsplit(".", 1)[0]
+
+    loaded = await service.get_response_with_access_token(
+        response["id"],
+        request_scope.access_token,
+    )
+
+    assert loaded["id"] == response["id"]
+    with pytest.raises(ResponsesServiceError) as raw_error:
+        await service.get_response_with_access_token(response["id"], raw_domain)
+    assert raw_error.value.status_code == 404
+    with pytest.raises(ResponsesServiceError) as forged_error:
+        await service.get_response_with_access_token(
+            response["id"],
+            request_scope.access_token[:-1] + "x",
+        )
+    assert forged_error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_scoped_access_capability_survives_durable_store_restart(tmp_path) -> None:
+    env = {
+        "RESPONSES_STORE_BACKEND": "provider_cache",
+        "RESPONSES_STORE_CACHE_NAME": "responses_capability_test",
+        "RESPONSES_STORE_CACHE_PREFIX": "responses",
+        "RESPONSES_STORE_CACHE_DIR": str(tmp_path),
+        "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "60",
+        "RESPONSES_STORE_CACHE_DISK_TTL_SECONDS": "60",
+    }
+    request = {
+        "model": "gpt-test",
+        "input": "private",
+        "api_keys": {"openai": ["private-key"]},
+        "private": True,
+    }
+    first = ResponsesService(store=create_configured_responses_store(env=env))
+    request_scope = first.prepare_request_scope(request)
+    response = await first.create_response(
+        request,
+        FakeClient(),
+        request_scope=request_scope,
+    )
+    restarted = ResponsesService(store=create_configured_responses_store(env=env))
+
+    loaded = await restarted.get_response_with_access_token(
+        response["id"],
+        request_scope.access_token,
+    )
+
+    assert loaded["id"] == response["id"]
 
 
 @pytest.mark.asyncio
@@ -263,10 +366,12 @@ async def test_scoped_responses_preserve_routing_but_never_store_or_trace_secret
         "private": True,
     }
 
+    request_scope = service.prepare_request_scope(raw_request)
     response = await service.create_response(
         raw_request,
         client,
         transaction_logger=logger,
+        request_scope=request_scope,
     )
     scope_key = responses_service_module._request_isolation_key(raw_request)
     stored = await store.get(response["id"], scope_key)
@@ -296,7 +401,12 @@ async def test_scoped_responses_preserve_routing_but_never_store_or_trace_secret
 
     continued = dict(raw_request)
     continued["previous_response_id"] = response["id"]
-    await service.create_response(continued, FakeClient())
+    await service.create_response(
+        continued,
+        FakeClient(),
+        request_scope=service.prepare_request_scope(continued),
+        previous_response_access_token=request_scope.access_token,
+    )
 
 
 @pytest.mark.asyncio
