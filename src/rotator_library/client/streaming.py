@@ -78,6 +78,7 @@ class StreamingHandler:
             SSE-formatted strings: "data: {...}\\n\\n"
         """
         stream_completed = False
+        response_identity_complete = False
         error_buffer = StreamBuffer()  # Use StreamBuffer for JSON reassembly
         accumulated_finish_reason: Optional[str] = None
         has_tool_calls = False
@@ -224,12 +225,17 @@ class StreamingHandler:
                         usage_record = _merge_usage_cost(usage_record, cost_event_record)
                     if not processed.sse_string:
                         stream_completed = True
+                        response_identity_complete = True
                         break
                     self._collect_session_response_anchors(
                         processed.sse_string,
                         assistant_parts,
                         tool_call_ids,
                     )
+                    if processed.finish_reason or self._sse_has_completion_signal(
+                        processed.sse_string
+                    ):
+                        response_identity_complete = True
                     event = stream_event_from_sse_chunk(processed.sse_string)
                     first_visible = (
                         event.visible_output
@@ -366,11 +372,14 @@ class StreamingHandler:
                 if success_callback:
                     success_callback()
 
-                if response_callback and (assistant_parts or tool_call_ids):
-                    # Intentionally only record response anchors after a complete
-                    # stream. Partial/aborted streams can contain text the client
-                    # never accepted, so using them for identity would over-bind
-                    # failed or disconnected sessions.
+                if (
+                    response_callback
+                    and response_identity_complete
+                    and (assistant_parts or tool_call_ids)
+                ):
+                    # A clean iterator EOF is not enough identity evidence: some
+                    # transports surface upstream truncation as normal EOF. Require
+                    # a provider completion signal before recording response anchors.
                     response_callback(
                         {
                             "choices": [
@@ -454,24 +463,75 @@ class StreamingHandler:
         chunks. We keep a synthetic assistant message so the core tracker can use
         the same response-anchor path as non-streaming responses.
         """
-        if not sse_string.startswith("data: "):
-            return
-        payload = sse_string[6:].strip()
-        if not payload or payload == "[DONE]":
-            return
-        try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            return
-        for choice in data.get("choices") or []:
-            delta = choice.get("delta") or {}
-            content = delta.get("content")
-            if content:
-                assistant_parts.append(str(content))
-            for tool_call in delta.get("tool_calls") or []:
-                call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
-                if call_id:
-                    tool_call_ids.append(str(call_id))
+        for payload in self._sse_data_payloads(sse_string):
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            choices = data.get("choices") or []
+            if not isinstance(choices, list):
+                continue
+            for choice in choices:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    assistant_parts.append(content)
+                tool_calls = delta.get("tool_calls") or []
+                if not isinstance(tool_calls, list):
+                    continue
+                for tool_call in tool_calls:
+                    call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+                    if call_id and str(call_id) not in tool_call_ids:
+                        tool_call_ids.append(str(call_id))
+
+    def _sse_has_completion_signal(self, sse_string: str) -> bool:
+        """Return whether an SSE frame explicitly marks response completion."""
+
+        for payload in self._sse_data_payloads(sse_string):
+            if payload == "[DONE]":
+                return True
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            choices = data.get("choices") or []
+            if not isinstance(choices, list):
+                continue
+            has_finish_reason = any(
+                isinstance(choice, dict) and choice.get("finish_reason") is not None
+                for choice in choices
+            )
+            usage = data.get("usage")
+            has_meaningful_usage = isinstance(usage, dict) and any(
+                isinstance(value, (int, float)) and value > 0
+                for value in usage.values()
+            )
+            if isinstance(usage, dict) and (has_finish_reason or has_meaningful_usage):
+                return True
+        return False
+
+    def _sse_data_payloads(self, sse_string: str) -> List[str]:
+        """Extract SSE data payloads from plain or event-prefixed frames."""
+
+        payloads: List[str] = []
+        for frame in re.split(r"\r?\n\r?\n", sse_string):
+            data_lines = []
+            for line in frame.splitlines():
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+            if data_lines:
+                payloads.append("\n".join(data_lines).strip())
+        return payloads
 
     def _process_chunk(
         self,
@@ -529,7 +589,7 @@ class StreamingHandler:
 
             # Detect final chunk using multiple signals:
             # 1. Primary: has usage with any meaningful token count > 0
-            # 2. Secondary: has usage (even empty) + source has finish_reason (Fallback case)
+            # 2. Secondary: has usage (even empty) + source has finish_reason
             has_meaningful_usage = (
                 usage
                 and isinstance(usage, dict)

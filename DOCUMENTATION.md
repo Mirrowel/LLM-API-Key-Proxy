@@ -994,14 +994,30 @@ Provider plugins may implement `get_session_tracking_hints()` to contribute
 provider-specific anchors or a provider session scope. The hook supplies evidence
 only; credential selection remains centralized in the rotator.
 
-Compaction lineage detection is intentionally conservative telemetry. It can use
-summary-like or unusually large early messages in any role as temporary parent
-lookup evidence, but those probe-only anchors are not stored on the child session
-and do not force sticky continuation.
+Compaction lineage detection is intentionally conservative. A candidate must be
+an early user/system/developer message and must replace more than half of the
+matched parent's high-water request history. Replacing a minority of history,
+including turns in the middle, remains ordinary continuity. Assistant/tool
+history is never treated as a size-only compaction probe.
+
+Explicit summary markers still require matching parent evidence and structural
+replacement. Unmarked summaries additionally require overlap with at least two
+distinct completed response events, so an auxiliary prompt quoting one response
+cannot be mistaken for compaction. Probe-only summary anchors are not stored on
+the child; an opaque replay anchor makes an exact resend reuse the validated
+child. Strong trusted/provider/tool identity can keep the compacted request on
+the existing live session.
+
+Only completed responses contribute response-derived identity. Streaming text is
+recorded after an explicit provider completion signal, not from clean iterator
+EOF alone, because some transports surface truncation as normal EOF.
 
 When optional session persistence is enabled, `session_stickiness.json` is
-schema-versioned. Upgrades that change the schema intentionally ignore older
-session-stickiness files and rebuild in-memory state instead of attempting an
+schema-versioned. Schema 2 persists hashed high-water history profiles, scoped
+anchor provenance, response-event groups, and compaction replay bindings; raw
+message content is never stored. Loading rebuilds ownership from validated anchor
+records and ignores malformed, expired, orphaned, cross-namespace, or unsupported
+state. Upgrades intentionally ignore older schemas instead of attempting an
 unsafe migration.
 
 #### Per-Model Quota Tracking
