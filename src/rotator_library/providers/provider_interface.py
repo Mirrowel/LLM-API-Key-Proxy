@@ -309,10 +309,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """Return provider-specific evidence for core session tracking.
 
         Providers can expose stable native markers, custom request structure, or
-        a preferred affinity key before credential selection. The return value is
-        intentionally evidence-only: providers must not select credentials or
-        mutate sticky state. Core routing merges these hints with generic anchors
-        and applies the same confidence policy for every provider.
+        a preferred affinity key before credential selection. Native evidence is
+        provider-qualified and may use ``SessionTrackingHints.session_scope`` for
+        model/family partitioning without fragmenting the global logical session.
+        The return value is intentionally evidence-only: providers must not select
+        credentials or mutate sticky state. Core routing merges these hints with
+        generic anchors and applies the same confidence policy for every provider.
 
         Expansion path: providers that know their upstream cache/session scope can
         return a richer ``SessionTrackingHints`` object from

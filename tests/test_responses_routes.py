@@ -41,6 +41,7 @@ def test_post_responses_non_stream_success() -> None:
     assert body["id"] == "chat_route_1"
     assert body["object"] == "response"
     assert body["output"][0]["content"][0]["text"] == "route ok"
+    assert response.headers["x-proxy-session-domain"] == "public"
 
 
 def test_post_responses_missing_model_returns_400() -> None:
@@ -89,11 +90,44 @@ def test_get_delete_and_input_items_routes() -> None:
     assert missing.json()["error"]["type"] == "not_found_error"
 
 
+def test_scoped_response_retrieval_requires_creation_domain_header() -> None:
+    client = _client()
+    created_response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-test",
+            "input": "private",
+            "api_keys": {"openai": ["private-key"]},
+            "private": True,
+        },
+    )
+    response_id = created_response.json()["id"]
+    domain = created_response.headers["x-proxy-session-domain"]
+
+    assert domain.startswith("bundle:")
+    assert client.get(f"/v1/responses/{response_id}").status_code == 404
+    assert (
+        client.get(
+            f"/v1/responses/{response_id}",
+            headers={"X-Proxy-Session-Domain": domain},
+        ).status_code
+        == 200
+    )
+    assert (
+        client.get(
+            f"/v1/responses/{response_id}",
+            headers={"X-Proxy-Session-Domain": "bundle:wrong"},
+        ).status_code
+        == 404
+    )
+
+
 def test_post_responses_stream_returns_sse_events() -> None:
     client = _client()
 
     response = client.post("/v1/responses", json={"model": "gpt-test", "input": "hello", "stream": True})
 
     assert response.status_code == 200
+    assert response.headers["x-proxy-session-domain"] == "public"
     assert "event: response.created" in response.text
     assert "event: response.completed" in response.text

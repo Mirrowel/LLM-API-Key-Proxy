@@ -50,7 +50,7 @@ def test_clone_context_for_target_preserves_request_metadata() -> None:
     assert cloned.routing_group_name == "chain"
 
 
-def test_clone_context_for_target_rewrites_standard_session_namespace() -> None:
+def test_clone_context_for_target_preserves_global_session_domain() -> None:
     original = RequestContext(
         model="openai/gpt-5",
         provider="openai",
@@ -58,12 +58,14 @@ def test_clone_context_for_target_rewrites_standard_session_namespace() -> None:
         streaming=False,
         credentials=["cred-a"],
         deadline=123.0,
-        session_tracking_namespace="scope:openai:provider:openai:model:openai/gpt-5",
+        session_tracking_namespace="session-domain:public",
+        session_affinity_key="provider-native-affinity",
     )
 
     cloned = clone_context_for_target(original, parse_route_target("anthropic/claude"))
 
-    assert cloned.session_tracking_namespace == "scope:anthropic:provider:anthropic:model:anthropic/claude"
+    assert cloned.session_tracking_namespace == "session-domain:public"
+    assert cloned.session_affinity_key is None
 
 
 def test_clone_context_for_target_preserves_custom_session_namespace() -> None:

@@ -608,6 +608,37 @@ def test_scoped_usage_manager_inherits_rotation_tolerance_and_reset_config(tmp_p
     run_async(run_test())
 
 
+def test_ad_hoc_private_bundles_never_share_usage_manager_state(tmp_path):
+    client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
+
+    async def run_test():
+        try:
+            first = await client._resolve_scope_for_provider(
+                "openai",
+                None,
+                {"openai": ["private-secret-a"]},
+                None,
+                True,
+            )
+            second = await client._resolve_scope_for_provider(
+                "openai",
+                None,
+                {"openai": ["private-secret-b"]},
+                None,
+                True,
+            )
+
+            assert first["usage_manager_key"] != second["usage_manager_key"]
+            assert first["classifier"].startswith("bundle:")
+            assert second["classifier"].startswith("bundle:")
+            assert first["usage_manager_key"] in client.usage_managers
+            assert second["usage_manager_key"] in client.usage_managers
+        finally:
+            await _close(client)
+
+    run_async(run_test())
+
+
 def test_model_discovery_cache_key_changes_with_scoped_credentials(tmp_path):
     seen = []
 

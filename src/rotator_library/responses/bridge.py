@@ -10,6 +10,7 @@ from typing import Any, Optional
 
 from ..protocols import ContentBlock, ToolDefinition, UnifiedMessage, UnifiedRequest, serialize_value
 from ..protocols.responses import ResponsesProtocol
+from ..session_tracking import SessionTrackingHints
 from .types import generate_response_id
 
 _CHAT_GENERATION_KEYS = {
@@ -35,6 +36,7 @@ _CHAT_GENERATION_KEYS = {
     "top_p",
     "user",
 }
+_PROXY_ROUTING_KEYS = {"classifier", "api_keys", "providers", "private", "model_filters"}
 
 
 class ResponsesBridge:
@@ -82,7 +84,11 @@ class ResponsesBridge:
             kwargs.setdefault("metadata", deepcopy(unified.metadata))
         unsupported = {
             "previous_response_id": unified.previous_response_id,
-            "extra": deepcopy(unified.extra),
+            "extra": {
+                key: deepcopy(value)
+                for key, value in unified.extra.items()
+                if key not in _PROXY_ROUTING_KEYS
+            },
         }
         kwargs["_responses_bridge"] = {k: v for k, v in unsupported.items() if v}
         hints = responses_session_hints(unified.previous_response_id)
@@ -126,16 +132,20 @@ def _chat_generation_key(key: str) -> str:
     return key
 
 
-def responses_session_hints(previous_response_id: Optional[str], *, affinity_key: Optional[str] = None) -> dict[str, Any] | None:
+def responses_session_hints(
+    previous_response_id: Optional[str],
+    *,
+    affinity_key: Optional[str] = None,
+) -> SessionTrackingHints | None:
     """Return proxy-internal sticky routing evidence for Responses continuations."""
 
     if not previous_response_id:
         return None
     anchor = f"responses_previous_response_id:{previous_response_id}"
-    return {
-        "strong_anchors": [anchor],
-        "affinity_key": affinity_key or anchor,
-    }
+    return SessionTrackingHints(
+        global_strong_anchors=[anchor],
+        affinity_key=affinity_key or anchor,
+    )
 
 
 def _message_to_chat(message: UnifiedMessage) -> dict[str, Any]:

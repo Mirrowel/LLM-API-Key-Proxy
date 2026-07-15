@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import time
+from copy import deepcopy
 from dataclasses import replace
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
 
@@ -35,6 +36,13 @@ if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
 
 lib_logger = logging.getLogger("rotator_library")
+
+_MIXED_REASONING_CONTENT_MODELS = frozenset(
+    {
+        "google/diffusiongemma-26b-a4b-it",
+        "nvidia_nim/google/diffusiongemma-26b-a4b-it",
+    }
+)
 
 
 class StreamingHandler:
@@ -91,11 +99,15 @@ class StreamingHandler:
         usage_record = UsageRecord(source="stream")
         assistant_parts: List[str] = []
         tool_call_ids: List[str] = []
+        tool_call_events: Dict[tuple[int, int], Dict[str, str]] = {}
         monitor = StreamMonitor(clock=time.monotonic)
         from ..config.experimental import get_stream_runtime_settings
 
         stream_settings = get_stream_runtime_settings()
         formatter = SSEStreamFormatter()
+        split_mixed_reasoning_content = (
+            model.lower() in _MIXED_REASONING_CONTENT_MODELS
+        )
         upstream_closed = False
         stream_cancelled = False
         last_heartbeat_at = monitor.metrics.started_at
@@ -227,28 +239,18 @@ class StreamingHandler:
                         stream_completed = True
                         response_identity_complete = True
                         break
-                    self._collect_session_response_anchors(
-                        processed.sse_string,
-                        assistant_parts,
-                        tool_call_ids,
+                    output_frames = (
+                        self._split_mixed_reasoning_content_frames(
+                            processed.sse_string
+                        )
+                        if split_mixed_reasoning_content
+                        else [processed.sse_string]
                     )
-                    if processed.finish_reason or self._sse_has_completion_signal(
-                        processed.sse_string
+                    if processed.finish_reason or any(
+                        self._sse_has_completion_signal(frame)
+                        for frame in output_frames
                     ):
                         response_identity_complete = True
-                    event = stream_event_from_sse_chunk(processed.sse_string)
-                    first_visible = (
-                        event.visible_output
-                        and monitor.metrics.first_visible_output_at is None
-                    )
-                    monitor.record_event(event)
-                    if first_visible:
-                        self._log_stream_lifecycle(
-                            lifecycle_logger,
-                            "stream_first_visible_output",
-                            monitor,
-                            event,
-                        )
 
                     # Update tracking state
                     if processed.has_tool_calls:
@@ -273,7 +275,27 @@ class StreamingHandler:
                         prompt_tokens_cache_write = usage_record.cache_write_tokens
                         prompt_tokens_uncached = usage_record.prompt_tokens_for_mark_success
 
-                    yield processed.sse_string
+                    for frame in output_frames:
+                        self._collect_session_response_anchors(
+                            frame,
+                            assistant_parts,
+                            tool_call_ids,
+                            tool_call_events,
+                        )
+                        event = stream_event_from_sse_chunk(frame)
+                        first_visible = (
+                            event.visible_output
+                            and monitor.metrics.first_visible_output_at is None
+                        )
+                        monitor.record_event(event)
+                        if first_visible:
+                            self._log_stream_lifecycle(
+                                lifecycle_logger,
+                                "stream_first_visible_output",
+                                monitor,
+                                event,
+                            )
+                        yield frame
 
                 except StopAsyncIteration:
                     # Stream ended normally
@@ -387,9 +409,10 @@ class StreamingHandler:
                                     "message": {
                                         "role": "assistant",
                                         "content": "".join(assistant_parts),
-                                        "tool_calls": [
-                                            {"id": call_id} for call_id in tool_call_ids
-                                        ],
+                                        "tool_calls": self._assembled_tool_calls(
+                                            tool_call_ids,
+                                            tool_call_events,
+                                        ),
                                     }
                                 }
                             ]
@@ -456,6 +479,7 @@ class StreamingHandler:
         sse_string: str,
         assistant_parts: List[str],
         tool_call_ids: List[str],
+        tool_call_events: Optional[Dict[tuple[int, int], Dict[str, str]]] = None,
     ) -> None:
         """Collect lightweight response evidence for session tracking.
 
@@ -475,9 +499,14 @@ class StreamingHandler:
             choices = data.get("choices") or []
             if not isinstance(choices, list):
                 continue
-            for choice in choices:
+            for choice_position, choice in enumerate(choices):
                 if not isinstance(choice, dict):
                     continue
+                choice_index = choice.get("index", choice_position)
+                try:
+                    stable_choice_index = int(choice_index)
+                except (TypeError, ValueError):
+                    stable_choice_index = choice_position
                 delta = choice.get("delta") or {}
                 if not isinstance(delta, dict):
                     continue
@@ -487,10 +516,75 @@ class StreamingHandler:
                 tool_calls = delta.get("tool_calls") or []
                 if not isinstance(tool_calls, list):
                     continue
-                for tool_call in tool_calls:
+                for position, tool_call in enumerate(tool_calls):
                     call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
                     if call_id and str(call_id) not in tool_call_ids:
                         tool_call_ids.append(str(call_id))
+                    if tool_call_events is None or not isinstance(tool_call, dict):
+                        continue
+                    index = tool_call.get("index", position)
+                    try:
+                        event_index = int(index)
+                    except (TypeError, ValueError):
+                        event_index = position
+                    event = tool_call_events.setdefault(
+                        (stable_choice_index, event_index),
+                        {},
+                    )
+                    if call_id:
+                        event["id"] = str(call_id)
+                    function = tool_call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    if function.get("name"):
+                        event["name"] = str(function["name"])
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str) and arguments:
+                        event["arguments"] = self._merge_streamed_tool_arguments(
+                            event.get("arguments", ""),
+                            arguments,
+                        )
+
+    @staticmethod
+    def _assembled_tool_calls(
+        tool_call_ids: List[str],
+        tool_call_events: Dict[tuple[int, int], Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """Return reconstructed tool calls for response-derived session evidence."""
+
+        calls: List[Dict[str, Any]] = []
+        emitted_ids: set[str] = set()
+        for index in sorted(tool_call_events):
+            event = tool_call_events[index]
+            call_id = event.get("id")
+            if not call_id:
+                continue
+            call: Dict[str, Any] = {"id": call_id}
+            if event.get("name"):
+                call["function"] = {
+                    "name": event["name"],
+                    "arguments": event.get("arguments", ""),
+                }
+            calls.append(call)
+            emitted_ids.add(call_id)
+        calls.extend(
+            {"id": call_id}
+            for call_id in tool_call_ids
+            if call_id not in emitted_ids
+        )
+        return calls
+
+    @staticmethod
+    def _merge_streamed_tool_arguments(current: str, incoming: str) -> str:
+        """Accept both incremental fragments and cumulative argument snapshots."""
+
+        if not current:
+            return incoming
+        if incoming.startswith(current):
+            return incoming
+        if current.startswith(incoming):
+            return current
+        return current + incoming
 
     def _sse_has_completion_signal(self, sse_string: str) -> bool:
         """Return whether an SSE frame explicitly marks response completion."""
@@ -532,6 +626,73 @@ class StreamingHandler:
             if data_lines:
                 payloads.append("\n".join(data_lines).strip())
         return payloads
+
+    def _split_mixed_reasoning_content_frames(
+        self,
+        sse_string: str,
+    ) -> List[str]:
+        """Separate reasoning and final text that share one OpenAI delta.
+
+        DiffusionGemma can end reasoning and begin answer text in the same
+        chunk. Several OpenAI-compatible clients treat a delta as one state or
+        the other and discard its content when reasoning is also present.
+        Fast checks keep normal stream chunks out of the JSON parsing path.
+        """
+        if (
+            '"reasoning_content"' not in sse_string
+            or '"content"' not in sse_string
+        ):
+            return [sse_string]
+        if '"content": null' in sse_string or '"content":null' in sse_string:
+            return [sse_string]
+
+        payloads = self._sse_data_payloads(sse_string)
+        if len(payloads) != 1:
+            return [sse_string]
+
+        try:
+            payload = json.loads(payloads[0])
+        except json.JSONDecodeError:
+            return [sse_string]
+        if not isinstance(payload, dict):
+            return [sse_string]
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            return [sse_string]
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return [sse_string]
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return [sse_string]
+
+        content = delta.get("content")
+        reasoning_fields = [
+            field
+            for field in ("reasoning_content", "reasoning")
+            if isinstance(delta.get(field), str) and delta[field]
+        ]
+        if not isinstance(content, str) or not content or not reasoning_fields:
+            return [sse_string]
+
+        reasoning_payload = deepcopy(payload)
+        reasoning_choice = reasoning_payload["choices"][0]
+        reasoning_delta = reasoning_choice["delta"]
+        for field in ("content", "tool_calls", "function_call", "audio", "refusal"):
+            reasoning_delta.pop(field, None)
+        reasoning_choice["finish_reason"] = None
+        reasoning_payload.pop("usage", None)
+
+        content_payload = deepcopy(payload)
+        content_delta = content_payload["choices"][0]["delta"]
+        for field in reasoning_fields:
+            content_delta.pop(field, None)
+
+        return [
+            f"data: {json.dumps(reasoning_payload)}\n\n",
+            f"data: {json.dumps(content_payload)}\n\n",
+        ]
 
     def _process_chunk(
         self,

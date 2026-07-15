@@ -20,6 +20,7 @@ from rotator_library.session_tracking import (
 )
 from rotator_library.client.streaming import StreamingHandler
 from rotator_library.client.rotating_client import _resolve_session_persistence_settings
+from rotator_library.client.request_builder import RequestContextBuilder
 
 
 class SessionTrackerTests(unittest.TestCase):
@@ -35,6 +36,24 @@ class SessionTrackerTests(unittest.TestCase):
         return response
 
     @staticmethod
+    def _tool_call_message(call_id, name, arguments="{}"):
+        return {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+            ],
+        }
+
+    @staticmethod
+    def _tool_result(call_id, content="ok"):
+        return {"role": "tool", "tool_call_id": call_id, "content": content}
+
+    @staticmethod
     def _persistent_tracker(path):
         """Create a tracker whose every mutation is immediately restart-safe."""
 
@@ -47,6 +66,12 @@ class SessionTrackerTests(unittest.TestCase):
 
     def test_proxy_session_persistence_environment_settings(self):
         """Proxy defaults expose persistence without overriding explicit callers."""
+
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                _resolve_session_persistence_settings(None, None),
+                (False, 5.0),
+            )
 
         with patch.dict(
             os.environ,
@@ -202,8 +227,14 @@ class SessionTrackerTests(unittest.TestCase):
     def test_agentic_tool_loop_persists_compacts_replays_and_continues_child(self):
         """Exercise a complete persisted agent loop and compacted-child lifecycle."""
 
-        provider = "gemini"
-        model = "pro"
+        routes = [
+            ("deepseek", "deepseek/v4"),
+            ("deepseek", "deepseek/v4-flash"),
+            ("anthropic", "anthropic/claude-sonnet"),
+            ("anthropic", "anthropic/claude-opus"),
+            ("openai", "openai/gpt-5"),
+            ("deepseek", "deepseek/v4"),
+        ]
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "agentic_session_stickiness.json"
             tracker = self._persistent_tracker(path)
@@ -217,6 +248,7 @@ class SessionTrackerTests(unittest.TestCase):
             assistant_responses = []
 
             for round_index in range(6):
+                provider, model = routes[round_index]
                 if round_index in {2, 4}:
                     tracker.flush()
                     tracker = self._persistent_tracker(path)
@@ -231,6 +263,9 @@ class SessionTrackerTests(unittest.TestCase):
                     root_session_id = inferred.session_id
                 self.assertEqual(inferred.session_id, root_session_id)
                 self.assertFalse(inferred.possible_compaction)
+                self.assertEqual(inferred.tracking_namespace, "session-domain:public")
+                if round_index:
+                    self.assertIn(inferred.confidence, {"probable", "strong"})
 
                 tool_id = f"call_agentic_{round_index}"
                 assistant_text = self._long_text(
@@ -305,7 +340,11 @@ class SessionTrackerTests(unittest.TestCase):
                     },
                 ]
             }
-            child = tracker.infer_session(compacted, provider=provider, model=model)
+            child = tracker.infer_session(
+                compacted,
+                provider="anthropic",
+                model="anthropic/claude-opus",
+            )
             self.assertTrue(child.possible_compaction)
             self.assertEqual(child.lineage_parent_session_id, root_session_id)
             self.assertNotEqual(child.session_id, root_session_id)
@@ -313,15 +352,19 @@ class SessionTrackerTests(unittest.TestCase):
             child_response = self._long_text("agentic-child-response", repeats=14)
             tracker.record_response(
                 child.session_id,
-                provider=provider,
-                model=model,
+                provider="anthropic",
+                model="anthropic/claude-opus",
                 tracking_namespace=child.tracking_namespace,
                 response=self._response(child_response),
             )
             tracker.flush()
             tracker = self._persistent_tracker(path)
 
-            replay = tracker.infer_session(compacted, provider=provider, model=model)
+            replay = tracker.infer_session(
+                compacted,
+                provider="openai",
+                model="openai/gpt-5",
+            )
             self.assertEqual(replay.session_id, child.session_id)
             self.assertEqual(replay.lineage_parent_session_id, root_session_id)
             self.assertTrue(replay.possible_compaction)
@@ -339,19 +382,35 @@ class SessionTrackerTests(unittest.TestCase):
             }
             continued_child = tracker.infer_session(
                 child_follow_up,
-                provider=provider,
-                model=model,
+                provider="deepseek",
+                model="deepseek/v4-flash",
             )
             self.assertEqual(continued_child.session_id, child.session_id)
             self.assertNotEqual(continued_child.session_id, root_session_id)
             self.assertFalse(continued_child.possible_compaction)
             self.assertEqual(continued_child.lineage_parent_session_id, root_session_id)
 
+            parent_continuation = tracker.infer_session(
+                {"messages": list(history)},
+                provider="openai",
+                model="openai/gpt-5",
+            )
+            self.assertEqual(parent_continuation.session_id, root_session_id)
+            self.assertNotEqual(parent_continuation.session_id, child.session_id)
+
     def test_long_normal_conversation_tracks_every_turn_across_restarts(self):
         """Grow a long ordinary chat turn-by-turn without false compaction."""
 
-        provider = "deepseek"
-        model = "chat"
+        routes = [
+            ("deepseek", "deepseek/chat"),
+            ("openai", "openai/gpt-5"),
+            ("anthropic", "anthropic/claude-sonnet"),
+            ("deepseek", "deepseek/reasoner"),
+            ("openai", "openai/gpt-5-mini"),
+            ("anthropic", "anthropic/claude-opus"),
+            ("deepseek", "deepseek/chat"),
+            ("openai", "openai/gpt-5"),
+        ]
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "normal_session_stickiness.json"
             tracker = self._persistent_tracker(path)
@@ -361,6 +420,7 @@ class SessionTrackerTests(unittest.TestCase):
             request_lengths = []
 
             for turn_index in range(8):
+                provider, model = routes[turn_index]
                 if turn_index in {3, 6}:
                     tracker.flush()
                     tracker = self._persistent_tracker(path)
@@ -384,6 +444,7 @@ class SessionTrackerTests(unittest.TestCase):
                     session_id = inferred.session_id
                 self.assertEqual(inferred.session_id, session_id)
                 self.assertFalse(inferred.possible_compaction)
+                self.assertEqual(inferred.tracking_namespace, "session-domain:public")
                 request_lengths.append(len(history))
                 self.assertEqual(
                     len(tracker._sessions[session_id].history_signatures),
@@ -427,8 +488,14 @@ class SessionTrackerTests(unittest.TestCase):
     def test_roleplay_redo_edits_rollback_and_middle_rewrite_stay_on_session(self):
         """Model realistic roleplay regeneration and branch editing behavior."""
 
-        provider = "mistral"
-        model = "large"
+        routes = [
+            ("mistral", "mistral/large"),
+            ("anthropic", "anthropic/claude-sonnet"),
+            ("mistral", "mistral/large"),
+            ("openai", "openai/gpt-5"),
+            ("anthropic", "anthropic/claude-opus"),
+            ("mistral", "mistral/large"),
+        ]
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "roleplay_session_stickiness.json"
             tracker = self._persistent_tracker(path)
@@ -446,6 +513,7 @@ class SessionTrackerTests(unittest.TestCase):
             request_snapshots = []
 
             for turn_index in range(6):
+                provider, model = routes[turn_index]
                 request_snapshot = [dict(message) for message in history]
                 request_snapshots.append(request_snapshot)
                 inferred = tracker.infer_session(
@@ -474,10 +542,18 @@ class SessionTrackerTests(unittest.TestCase):
                 if turn_index == 2:
                     # Retrying generation sends the byte-identical request without
                     # appending the response that is being regenerated.
-                    exact_redo = tracker.infer_session(
+                    same_provider_redo = tracker.infer_session(
                         {"messages": [dict(message) for message in request_snapshot]},
                         provider=provider,
                         model=model,
+                    )
+                    self.assertEqual(same_provider_redo.session_id, session_id)
+                    self.assertFalse(same_provider_redo.possible_compaction)
+
+                    exact_redo = tracker.infer_session(
+                        {"messages": [dict(message) for message in request_snapshot]},
+                        provider="openai",
+                        model="openai/gpt-5-mini",
                     )
                     self.assertEqual(exact_redo.session_id, session_id)
                     self.assertFalse(exact_redo.possible_compaction)
@@ -487,8 +563,8 @@ class SessionTrackerTests(unittest.TestCase):
                     )
                     tracker.record_response(
                         session_id,
-                        provider=provider,
-                        model=model,
+                        provider="openai",
+                        model="openai/gpt-5-mini",
                         tracking_namespace=exact_redo.tracking_namespace,
                         response=self._response(chosen_response),
                     )
@@ -526,8 +602,8 @@ class SessionTrackerTests(unittest.TestCase):
             }
             middle_edit = tracker.infer_session(
                 {"messages": middle_edited_history},
-                provider=provider,
-                model=model,
+                provider="anthropic",
+                model="anthropic/claude-opus",
             )
             self.assertEqual(middle_edit.session_id, session_id)
             self.assertFalse(middle_edit.possible_compaction)
@@ -542,8 +618,8 @@ class SessionTrackerTests(unittest.TestCase):
             high_water_before_rollback = tracker._sessions[session_id].history_signatures
             rolled_back = tracker.infer_session(
                 {"messages": rollback_request},
-                provider=provider,
-                model=model,
+                provider="deepseek",
+                model="deepseek/v4-flash",
             )
             self.assertEqual(rolled_back.session_id, session_id)
             self.assertFalse(rolled_back.possible_compaction)
@@ -556,8 +632,8 @@ class SessionTrackerTests(unittest.TestCase):
             branch_response = self._long_text("roleplay-rollback-new-response", repeats=15)
             tracker.record_response(
                 session_id,
-                provider=provider,
-                model=model,
+                provider="deepseek",
+                model="deepseek/v4-flash",
                 tracking_namespace=rolled_back.tracking_namespace,
                 response=self._response(branch_response),
             )
@@ -571,8 +647,8 @@ class SessionTrackerTests(unittest.TestCase):
             ]
             resumed = tracker.infer_session(
                 {"messages": resumed_branch},
-                provider=provider,
-                model=model,
+                provider="openai",
+                model="openai/gpt-5",
             )
             self.assertEqual(resumed.session_id, session_id)
             self.assertFalse(resumed.possible_compaction)
@@ -641,8 +717,8 @@ class SessionTrackerTests(unittest.TestCase):
             self.assertFalse(continued.possible_compaction)
             self.assertEqual(continued.confidence, "strong")
 
-    def test_compaction_context_expires_without_reviving_child(self):
-        """Expired replay/context anchors cannot resurrect an old child."""
+    def test_expired_compaction_child_is_recreated_from_live_parent(self):
+        """Expired child bindings cannot revive, while a live parent can fork anew."""
 
         with patch("rotator_library.session_tracking.time.time", return_value=1000.0):
             tracker = SessionTracker(ttl_seconds=10)
@@ -676,12 +752,20 @@ class SessionTrackerTests(unittest.TestCase):
             }
             child = tracker.infer_session(compacted, provider="gemini", model="pro")
 
-        with patch("rotator_library.session_tracking.time.time", return_value=1010.0):
+        with patch("rotator_library.session_tracking.time.time", return_value=1005.0):
+            refreshed_parent = tracker.infer_session(
+                parent_request,
+                provider="openai",
+                model="gpt",
+            )
+            self.assertEqual(refreshed_parent.session_id, parent.session_id)
+
+        with patch("rotator_library.session_tracking.time.time", return_value=1011.0):
             after_expiry = tracker.infer_session(compacted, provider="gemini", model="pro")
 
         self.assertNotEqual(after_expiry.session_id, child.session_id)
-        self.assertFalse(after_expiry.possible_compaction)
-        self.assertIsNone(after_expiry.lineage_parent_session_id)
+        self.assertTrue(after_expiry.possible_compaction)
+        self.assertEqual(after_expiry.lineage_parent_session_id, parent.session_id)
 
     def test_compaction_context_survives_anchor_caps_and_restart(self):
         """Anchor caps retain both durable child bindings deterministically."""
@@ -1094,6 +1178,540 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertNotEqual(compound_unrelated.session_id, compound_owner.session_id)
         self.assertEqual(compound_unrelated.confidence, "weak")
 
+    def test_closed_tool_event_plus_message_group_continues_across_provider(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("closed-tool-event-user"),
+        }
+        call = self._tool_call_message(
+            "call_read_1",
+            "read_file",
+            '{"path":"src/session.py","line":10}',
+        )
+        root = tracker.infer_session(
+            {"messages": [user_message]},
+            provider="deepseek",
+            model="chat",
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": call}]},
+        )
+        pending_events = [
+            record
+            for record in tracker._anchors.values()
+            if record.session_id == root.session_id
+            and record.source == "tool_event"
+        ]
+        self.assertEqual(len(pending_events), 1)
+        self.assertEqual(pending_events[0].strength, "weak")
+
+        continued = tracker.infer_session(
+            {"messages": [user_message, call, self._tool_result("call_read_1")]},
+            provider="anthropic",
+            model="claude",
+        )
+
+        self.assertEqual(continued.session_id, root.session_id)
+        self.assertEqual(continued.confidence, "probable")
+
+    def test_two_distinct_closed_tool_events_continue_sparse_agentic_turn(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        first_call = self._tool_call_message("call_1", "read_file", '{"path":"a.py"}')
+        second_call = self._tool_call_message("call_2", "grep", '{"pattern":"needle"}')
+        response_message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [*first_call["tool_calls"], *second_call["tool_calls"]],
+        }
+        root = tracker.infer_session(
+            {"messages": [{"role": "user", "content": "continue"}]},
+            provider="openai",
+            model="gpt",
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": response_message}]},
+        )
+
+        continued = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": "continue"},
+                    response_message,
+                    self._tool_result("call_1", "a"),
+                    self._tool_result("call_2", "b"),
+                ]
+            },
+            provider="deepseek",
+            model="chat",
+        )
+
+        self.assertEqual(continued.session_id, root.session_id)
+        self.assertEqual(continued.confidence, "probable")
+
+    def test_one_closed_tool_event_without_other_medium_group_remains_weak(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        call = self._tool_call_message("call_1", "read_file", '{"path":"a.py"}')
+        root = tracker.infer_session(
+            {"messages": [{"role": "user", "content": "continue"}]},
+            provider="openai",
+            model="gpt",
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": call}]},
+        )
+
+        ambiguous = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": "continue"},
+                    call,
+                    self._tool_result("call_1"),
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+
+        self.assertNotEqual(ambiguous.session_id, root.session_id)
+        self.assertEqual(ambiguous.confidence, "weak")
+
+    def test_tool_event_arguments_are_canonical_and_result_edits_do_not_fragment(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("canonical-tool-event-user"),
+        }
+        emitted = self._tool_call_message(
+            "call_1",
+            "read_file",
+            '{"path":"a.py","line":10}',
+        )
+        reordered = self._tool_call_message(
+            "call_1",
+            "read_file",
+            '{ "line": 10, "path": "a.py" }',
+        )
+        root = tracker.infer_session(
+            {"messages": [user_message]}, provider="openai", model="gpt"
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": emitted}]},
+        )
+        first = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    reordered,
+                    self._tool_result("call_1", "original result"),
+                ]
+            },
+            provider="anthropic",
+            model="claude",
+        )
+        edited = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    reordered,
+                    self._tool_result("call_1", "edited result"),
+                ]
+            },
+            provider="deepseek",
+            model="chat",
+        )
+
+        self.assertEqual(first.session_id, root.session_id)
+        self.assertEqual(edited.session_id, root.session_id)
+
+    def test_same_raw_id_with_different_call_structure_does_not_bind(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("tool-event-collision-user"),
+        }
+        owner_call = self._tool_call_message(
+            "call_1", "read_file", '{"path":"owner.py"}'
+        )
+        owner = tracker.infer_session(
+            {"messages": [user_message]}, provider="openai", model="gpt"
+        )
+        tracker.record_response(
+            owner.session_id,
+            tracking_namespace=owner.tracking_namespace,
+            response={"choices": [{"message": owner_call}]},
+        )
+
+        unrelated = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    self._tool_call_message(
+                        "call_1", "read_file", '{"path":"other.py"}'
+                    ),
+                    self._tool_result("call_1"),
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+
+        self.assertNotEqual(unrelated.session_id, owner.session_id)
+        self.assertEqual(unrelated.confidence, "weak")
+
+    def test_duplicate_tool_results_count_as_one_closed_event(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        call = self._tool_call_message("call_1", "read_file", '{"path":"a.py"}')
+        root = tracker.infer_session(
+            {"messages": [{"role": "user", "content": "continue"}]},
+            provider="openai",
+            model="gpt",
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": call}]},
+        )
+
+        duplicated = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": "continue"},
+                    call,
+                    self._tool_result("call_1", "first"),
+                    self._tool_result("call_1", "duplicate"),
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+
+        self.assertNotEqual(duplicated.session_id, root.session_id)
+        self.assertEqual(duplicated.confidence, "weak")
+
+    def test_multiple_unpaired_structural_tool_calls_remain_weak(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        calls = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                self._tool_call_message(
+                    "call_1", "read_file", '{"path":"a.py"}'
+                )["tool_calls"][0],
+                self._tool_call_message(
+                    "call_2", "grep", '{"pattern":"needle"}'
+                )["tool_calls"][0],
+            ],
+        }
+
+        first = tracker.infer_session(
+            {"messages": [calls]}, provider="openai", model="gpt"
+        )
+        second = tracker.infer_session(
+            {"messages": [calls]}, provider="openai", model="gpt"
+        )
+
+        self.assertNotEqual(second.session_id, first.session_id)
+        self.assertEqual(second.confidence, "weak")
+
+    def test_previously_closed_event_does_not_upgrade_later_unpaired_call(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("request-local-tool-closure"),
+        }
+        call = self._tool_call_message("call_1", "read_file", '{"path":"a.py"}')
+        root = tracker.infer_session(
+            {"messages": [user_message]}, provider="openai", model="gpt"
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": call}]},
+        )
+        closed = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    call,
+                    self._tool_result("call_1"),
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+        self.assertEqual(closed.session_id, root.session_id)
+
+        unpaired = tracker.infer_session(
+            {"messages": [user_message, call]},
+            provider="anthropic",
+            model="claude",
+        )
+
+        self.assertNotEqual(unpaired.session_id, root.session_id)
+        self.assertEqual(unpaired.confidence, "weak")
+
+    def test_one_result_closes_only_one_of_multiple_same_id_calls(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        calls = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                self._tool_call_message(
+                    "call_1", "read_file", '{"path":"a.py"}'
+                )["tool_calls"][0],
+                self._tool_call_message(
+                    "call_1", "read_file", '{"path":"b.py"}'
+                )["tool_calls"][0],
+            ],
+        }
+        root = tracker.infer_session(
+            {"messages": [{"role": "user", "content": "continue"}]},
+            provider="openai",
+            model="gpt",
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": calls}]},
+        )
+
+        ambiguous = tracker.infer_session(
+            {
+                "messages": [
+                    {"role": "user", "content": "continue"},
+                    calls,
+                    self._tool_result("call_1"),
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+
+        self.assertNotEqual(ambiguous.session_id, root.session_id)
+        self.assertEqual(ambiguous.confidence, "weak")
+
+    def test_non_json_and_mapping_tool_arguments_are_canonical(self):
+        cases = (
+            ("path   =   a.py", "path = a.py"),
+            ({"path": "a.py", "line": 10}, {"line": 10, "path": "a.py"}),
+        )
+        for emitted_arguments, returned_arguments in cases:
+            with self.subTest(arguments=emitted_arguments):
+                tracker = SessionTracker(ttl_seconds=3600)
+                user_message = {
+                    "role": "user",
+                    "content": self._long_text("non-json-tool-arguments"),
+                }
+                emitted = self._tool_call_message(
+                    "call_1", "read_file", emitted_arguments
+                )
+                returned = self._tool_call_message(
+                    "call_1", "read_file", returned_arguments
+                )
+                root = tracker.infer_session(
+                    {"messages": [user_message]},
+                    provider="openai",
+                    model="gpt",
+                )
+                tracker.record_response(
+                    root.session_id,
+                    tracking_namespace=root.tracking_namespace,
+                    response={"choices": [{"message": emitted}]},
+                )
+
+                continued = tracker.infer_session(
+                    {
+                        "messages": [
+                            user_message,
+                            returned,
+                            self._tool_result("call_1"),
+                        ]
+                    },
+                    provider="openai",
+                    model="gpt",
+                )
+
+                self.assertEqual(continued.session_id, root.session_id)
+
+    def test_function_name_is_part_of_tool_event_identity(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("tool-function-name-collision"),
+        }
+        emitted = self._tool_call_message("call_1", "read_file", '{"path":"a.py"}')
+        root = tracker.infer_session(
+            {"messages": [user_message]}, provider="openai", model="gpt"
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": emitted}]},
+        )
+
+        unrelated = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    self._tool_call_message(
+                        "call_1", "write_file", '{"path":"a.py"}'
+                    ),
+                    self._tool_result("call_1"),
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+
+        self.assertNotEqual(unrelated.session_id, root.session_id)
+        self.assertEqual(unrelated.confidence, "weak")
+
+    def test_legacy_function_result_closes_matching_tool_event(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("legacy-function-tool-event"),
+        }
+        call = self._tool_call_message("call_1", "lookup", '{"query":"state"}')
+        root = tracker.infer_session(
+            {"messages": [user_message]}, provider="openai", model="gpt"
+        )
+        tracker.record_response(
+            root.session_id,
+            tracking_namespace=root.tracking_namespace,
+            response={"choices": [{"message": call}]},
+        )
+
+        continued = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    call,
+                    {
+                        "role": "function",
+                        "tool_call_id": "call_1",
+                        "content": "ok",
+                    },
+                ]
+            },
+            provider="openai",
+            model="gpt",
+        )
+
+        self.assertEqual(continued.session_id, root.session_id)
+
+    def test_nameless_tool_call_never_creates_structural_event(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        anchors = tracker._build_anchors(
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "function": {"arguments": '{"path":"a.py"}'},
+                            }
+                        ],
+                    },
+                    self._tool_result("call_1"),
+                ]
+            },
+            "session-domain:public",
+            None,
+        )
+
+        self.assertFalse(any(anchor.source == "tool_event" for anchor in anchors))
+
+    def test_closed_tool_events_support_continuity_but_not_compaction_probes(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        calls = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                self._tool_call_message(
+                    "call_1", "read_file", '{"path":"a.py"}'
+                )["tool_calls"][0],
+                self._tool_call_message(
+                    "call_2", "grep", '{"pattern":"needle"}'
+                )["tool_calls"][0],
+            ],
+        }
+        history = [
+            calls,
+            self._tool_result("call_1", "a"),
+            self._tool_result("call_2", "b"),
+        ]
+        root = tracker.infer_session(
+            {"messages": history}, provider="openai", model="gpt"
+        )
+
+        replay = tracker.infer_session(
+            {"messages": history}, provider="anthropic", model="claude"
+        )
+
+        self.assertEqual(replay.session_id, root.session_id)
+        self.assertEqual(replay.confidence, "probable")
+        self.assertFalse(replay.possible_compaction)
+
+    def test_closed_tool_event_survives_persistence_and_never_crosses_domain(self):
+        user_message = {
+            "role": "user",
+            "content": self._long_text("persisted-tool-event-user"),
+        }
+        call = self._tool_call_message(
+            "call_persisted", "lookup", '{"query":"status"}'
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "tool_event_session.json"
+            tracker = self._persistent_tracker(path)
+            root = tracker.infer_session(
+                {"messages": [user_message]},
+                provider="openai",
+                model="gpt",
+                scope_key="domain-a",
+            )
+            tracker.record_response(
+                root.session_id,
+                tracking_namespace=root.tracking_namespace,
+                response={"choices": [{"message": call}]},
+            )
+            tracker.flush()
+            tracker = self._persistent_tracker(path)
+            request = {
+                "messages": [
+                    user_message,
+                    call,
+                    self._tool_result("call_persisted", "changed safely"),
+                ]
+            }
+
+            continued = tracker.infer_session(
+                request,
+                provider="anthropic",
+                model="claude",
+                scope_key="domain-a",
+            )
+            isolated = tracker.infer_session(
+                request,
+                provider="anthropic",
+                model="claude",
+                scope_key="domain-b",
+            )
+
+        self.assertEqual(continued.session_id, root.session_id)
+        self.assertNotEqual(isolated.session_id, root.session_id)
+        self.assertFalse(continued.possible_compaction)
+
     def test_weak_first_user_only_does_not_reuse_session(self):
         tracker = SessionTracker(ttl_seconds=3600)
         request = {"messages": [{"role": "user", "content": "hello world"}]}
@@ -1258,9 +1876,9 @@ class SessionTrackerTests(unittest.TestCase):
 
         continued = tracker.infer_session(
             {"messages": [{"role": "user", "content": "Continue."}]},
-            provider="openai",
-            model="gpt-test",
-            hints={"strong_anchors": ["responses_previous_response_id:resp_parent"]},
+            provider="anthropic",
+            model="claude-test",
+            hints={"global_strong_anchors": ["responses_previous_response_id:resp_parent"]},
         )
 
         self.assertEqual(inferred.session_id, continued.session_id)
@@ -2550,7 +3168,7 @@ class SessionTrackerTests(unittest.TestCase):
     def test_best_match_tie_breaks_deterministically(self):
         tracker = SessionTracker(ttl_seconds=3600)
         now = 1000.0
-        namespace = "scope:test:provider:gemini:model:pro"
+        namespace = "session-domain:test"
         tracker._anchors["anchor-a"] = _AnchorRecord(
             session_id="session-a",
             namespace=namespace,
@@ -2583,7 +3201,7 @@ class SessionTrackerTests(unittest.TestCase):
 
     def test_best_match_prefers_distinct_response_events_on_equal_score(self):
         tracker = SessionTracker(ttl_seconds=3600)
-        namespace = "scope:test:provider:gemini:model:pro"
+        namespace = "session-domain:test"
         now = 1000.0
         records = {
             "single-a": ("session-z-single", "response_event:one"),
@@ -2778,12 +3396,12 @@ class SessionTrackerTests(unittest.TestCase):
 
         self.assertEqual(inferred.session_id, continued.session_id)
 
-    def test_provider_model_scope_is_isolated(self):
+    def test_provider_and_model_changes_keep_global_logical_session(self):
         tracker = SessionTracker(ttl_seconds=3600)
         request = {
             "messages": [
                 {"role": "user", "content": "Compare the provider model cache behavior using the same long prompt."},
-                {"role": "assistant", "content": "The same text should not cross provider or model scopes."},
+                {"role": "assistant", "content": "The same logical session should cross providers and models."},
             ]
         }
 
@@ -2791,8 +3409,82 @@ class SessionTrackerTests(unittest.TestCase):
         openai = tracker.infer_session(request, provider="openai", model="pro")
         gemini_flash = tracker.infer_session(request, provider="gemini", model="flash")
 
-        self.assertNotEqual(gemini.session_id, openai.session_id)
-        self.assertNotEqual(gemini.session_id, gemini_flash.session_id)
+        self.assertEqual(gemini.session_id, openai.session_id)
+        self.assertEqual(gemini.session_id, gemini_flash.session_id)
+        self.assertEqual(gemini.tracking_namespace, "session-domain:public")
+
+    def test_cross_provider_first_turn_reroll_remains_ambiguous(self):
+        """Removing the sole response leaves only one conversational group."""
+
+        tracker = SessionTracker(ttl_seconds=3600)
+        request = {
+            "messages": [
+                {"role": "system", "content": self._long_text("shared-agent-harness")},
+                {"role": "developer", "content": self._long_text("shared-tool-rules")},
+                {"role": "user", "content": "Write one opening scene for this story."},
+            ]
+        }
+        deepseek = tracker.infer_session(request, provider="deepseek", model="chat")
+        response = self._long_text("first-turn-response")
+        tracker.record_response(
+            deepseek.session_id,
+            provider="deepseek",
+            model="chat",
+            tracking_namespace=deepseek.tracking_namespace,
+            response=self._response(response),
+        )
+
+        reroll = tracker.infer_session(request, provider="openai", model="gpt")
+
+        self.assertNotEqual(reroll.session_id, deepseek.session_id)
+        self.assertEqual(reroll.confidence, "weak")
+
+    def test_cross_provider_complete_first_turn_and_follow_up_continue(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        initial = {
+            "messages": [
+                {"role": "system", "content": self._long_text("shared-agent-harness")},
+                {"role": "user", "content": self._long_text("global-first-user")},
+            ]
+        }
+        deepseek = tracker.infer_session(initial, provider="deepseek", model="chat")
+        response = self._long_text("global-first-response")
+        tracker.record_response(
+            deepseek.session_id,
+            provider="deepseek",
+            model="chat",
+            tracking_namespace=deepseek.tracking_namespace,
+            response=self._response(response),
+        )
+        continued_request = {
+            "messages": [
+                *initial["messages"],
+                {"role": "assistant", "content": response},
+                {"role": "user", "content": self._long_text("global-follow-up")},
+            ]
+        }
+
+        anthropic = tracker.infer_session(
+            continued_request,
+            provider="anthropic",
+            model="claude",
+        )
+
+        self.assertEqual(anthropic.session_id, deepseek.session_id)
+        self.assertEqual(anthropic.confidence, "probable")
+
+    def test_trusted_client_identity_crosses_provider_inside_domain(self):
+        tracker = SessionTracker(
+            ttl_seconds=3600,
+            trusted_explicit_fields=["conversation_id"],
+        )
+        request = {"conversation_id": "client-global-session"}
+
+        deepseek = tracker.infer_session(request, provider="deepseek", model="chat")
+        openai = tracker.infer_session(request, provider="openai", model="gpt")
+
+        self.assertEqual(openai.session_id, deepseek.session_id)
+        self.assertEqual(openai.confidence, "strong")
 
     def test_allowed_usage_scope_is_isolated(self):
         tracker = SessionTracker(ttl_seconds=3600)
@@ -2812,6 +3504,114 @@ class SessionTrackerTests(unittest.TestCase):
 
         self.assertNotEqual(public.session_id, scoped.session_id)
 
+    def test_request_isolation_keys_are_stable_secret_free_and_strict(self):
+        self.assertEqual(
+            RequestContextBuilder._session_isolation_key(None, None, None, False),
+            "public",
+        )
+        classifier_a = RequestContextBuilder._session_isolation_key(
+            "agent-a", None, None, False
+        )
+        classifier_a_again = RequestContextBuilder._session_isolation_key(
+            "agent-a", None, None, False
+        )
+        classifier_b = RequestContextBuilder._session_isolation_key(
+            "agent-b", None, None, False
+        )
+        classifier_a_with_rotated_credentials = RequestContextBuilder._session_isolation_key(
+            "agent-a",
+            {"openai": ["rotated-secret"]},
+            {"openai": {"api_base": "https://rotated.example"}},
+            True,
+        )
+        self.assertEqual(classifier_a, classifier_a_again)
+        self.assertEqual(classifier_a, classifier_a_with_rotated_credentials)
+        self.assertNotEqual(classifier_a, classifier_b)
+
+        bundle_a = RequestContextBuilder._session_isolation_key(
+            None,
+            {"deepseek": ["secret-b", "secret-a"], "openai": "secret-c"},
+            {"openai": {"api_base": "https://one.example"}},
+            True,
+        )
+        bundle_a_reordered = RequestContextBuilder._session_isolation_key(
+            None,
+            {"openai": "secret-c", "deepseek": ["secret-a", "secret-b"]},
+            {"openai": {"api_base": "https://one.example"}},
+            True,
+        )
+        bundle_a_mixed_case = RequestContextBuilder._session_isolation_key(
+            None,
+            {"OpenAI": "secret-c", "DeepSeek": ["secret-a", "secret-b"]},
+            {"OpenAI": {"api_base": "https://one.example"}},
+            True,
+        )
+        bundle_b = RequestContextBuilder._session_isolation_key(
+            None,
+            {"deepseek": ["different-secret"], "openai": "secret-c"},
+            {"openai": {"api_base": "https://one.example"}},
+            True,
+        )
+        self.assertEqual(bundle_a, bundle_a_reordered)
+        self.assertEqual(bundle_a, bundle_a_mixed_case)
+        self.assertNotEqual(bundle_a, bundle_b)
+        self.assertNotIn("secret", bundle_a)
+
+    def test_global_evidence_never_crosses_isolation_domains(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        request = {
+            "messages": [
+                {"role": "user", "content": self._long_text("strict-domain-user")},
+                {"role": "assistant", "content": self._long_text("strict-domain-assistant")},
+            ]
+        }
+
+        domain_a = tracker.infer_session(
+            request,
+            provider="deepseek",
+            model="chat",
+            scope_key="classifier:a",
+        )
+        domain_b = tracker.infer_session(
+            request,
+            provider="openai",
+            model="gpt",
+            scope_key="classifier:b",
+        )
+
+        self.assertNotEqual(domain_a.session_id, domain_b.session_id)
+        self.assertNotEqual(domain_a.tracking_namespace, domain_b.tracking_namespace)
+
+    def test_raw_scope_text_cannot_impersonate_derived_bundle_domain(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        derived_domain = "bundle:" + ("a" * 64)
+        request = {
+            "messages": [
+                {"role": "user", "content": self._long_text("scope-marker-collision-user")},
+                {
+                    "role": "assistant",
+                    "content": self._long_text("scope-marker-collision-assistant"),
+                },
+            ]
+        }
+
+        trusted = tracker.infer_session(
+            request,
+            provider="openai",
+            model="gpt",
+            scope_key=derived_domain,
+            _trusted_isolation_key=True,
+        )
+        raw = tracker.infer_session(
+            request,
+            provider="openai",
+            model="gpt",
+            scope_key=derived_domain,
+        )
+
+        self.assertNotEqual(raw.session_id, trusted.session_id)
+        self.assertNotEqual(raw.tracking_namespace, trusted.tracking_namespace)
+
     def test_provider_strong_hint_reuses_session(self):
         tracker = SessionTracker(ttl_seconds=3600)
         hints = SessionTrackingHints(strong_anchors=["native-session-abc"])
@@ -2822,7 +3622,17 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertEqual(first.session_id, second.session_id)
         self.assertIsNotNone(first.affinity_key)
 
-    def test_provider_session_scope_can_override_model_inside_allowed_scope(self):
+    def test_provider_native_hint_does_not_cross_provider(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        hints = SessionTrackingHints(strong_anchors=["native-session-abc"])
+
+        gemini = tracker.infer_session({}, provider="gemini", model="pro", hints=hints)
+        openai = tracker.infer_session({}, provider="openai", model="gpt", hints=hints)
+
+        self.assertNotEqual(gemini.session_id, openai.session_id)
+        self.assertNotEqual(gemini.affinity_key, openai.affinity_key)
+
+    def test_provider_session_scope_cannot_cross_caller_isolation_domain(self):
         tracker = SessionTracker(ttl_seconds=3600)
         hints = SessionTrackingHints(
             strong_anchors=["native-session-abc"],
@@ -2845,6 +3655,56 @@ class SessionTrackerTests(unittest.TestCase):
 
         self.assertEqual(pro.session_id, flash.session_id)
         self.assertNotEqual(pro.session_id, other_scope.session_id)
+
+    def test_provider_session_scope_partitions_only_native_evidence(self):
+        tracker = SessionTracker(ttl_seconds=3600)
+        model_a_hints = SessionTrackingHints(
+            strong_anchors=["native-session-abc"],
+            session_scope="model-a",
+        )
+        model_b_hints = SessionTrackingHints(
+            strong_anchors=["native-session-abc"],
+            session_scope="model-b",
+        )
+
+        model_a = tracker.infer_session(
+            {}, provider="custom", model="a", hints=model_a_hints
+        )
+        model_b = tracker.infer_session(
+            {}, provider="custom", model="b", hints=model_b_hints
+        )
+
+        self.assertNotEqual(model_a.session_id, model_b.session_id)
+        self.assertEqual(model_a.tracking_namespace, model_b.tracking_namespace)
+        self.assertNotEqual(model_a.affinity_key, model_b.affinity_key)
+
+    def test_provider_native_scope_partition_survives_persistence_restart(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "provider_native_scope.json"
+            tracker = self._persistent_tracker(path)
+            hints_a = SessionTrackingHints(
+                strong_anchors=["provider-native-secret-a"],
+                session_scope="family-a",
+            )
+            hints_b = SessionTrackingHints(
+                strong_anchors=["provider-native-secret-a"],
+                session_scope="family-b",
+            )
+            session_a = tracker.infer_session(
+                {}, provider="custom", model="a", hints=hints_a
+            )
+            tracker.flush()
+            restored = self._persistent_tracker(path)
+
+            continued_a = restored.infer_session(
+                {}, provider="custom", model="a2", hints=hints_a
+            )
+            independent_b = restored.infer_session(
+                {}, provider="custom", model="b", hints=hints_b
+            )
+
+        self.assertEqual(continued_a.session_id, session_a.session_id)
+        self.assertNotEqual(independent_b.session_id, session_a.session_id)
 
     def test_compaction_lineage_creates_new_session_without_strong_anchor(self):
         tracker = SessionTracker(ttl_seconds=3600)
@@ -2917,7 +3777,7 @@ class SessionTrackerTests(unittest.TestCase):
             second = restored.infer_session(request, provider="gemini", model="pro")
             restored_state = restored._sessions[first.session_id]
 
-        self.assertEqual(persisted["schema_version"], 2)
+        self.assertEqual(persisted["schema_version"], 3)
         self.assertNotIn("anchors", persisted["sessions"][first.session_id])
         self.assertEqual(first.session_id, second.session_id)
         self.assertEqual(first.affinity_key, second.affinity_key)
@@ -2928,6 +3788,107 @@ class SessionTrackerTests(unittest.TestCase):
                 (restored_record.strength, restored_record.source, restored_record.group),
                 metadata,
             )
+
+    def test_schema_three_persistence_hashes_all_external_identifiers(self):
+        secrets = {
+            "explicit": "client-conversation-secret",
+            "provider": "provider-native-secret",
+            "affinity": "provider-affinity-secret",
+            "tool": "tool-call-secret",
+            "response": "response-id-secret",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            tracker = SessionTracker(
+                ttl_seconds=3600,
+                trusted_explicit_fields=["conversation_id"],
+                persist_to_disk=True,
+                persistence_path=path,
+                persistence_flush_interval_seconds=0,
+            )
+            inferred = tracker.infer_session(
+                {
+                    "conversation_id": secrets["explicit"],
+                    "messages": [
+                        {
+                            "role": "assistant",
+                            "tool_calls": [{"id": secrets["tool"], "type": "function"}],
+                        }
+                    ],
+                },
+                provider="custom",
+                model="model-a",
+                hints=SessionTrackingHints(
+                    strong_anchors=[secrets["provider"]],
+                    affinity_key=secrets["affinity"],
+                ),
+            )
+            tracker.record_response(
+                inferred.session_id,
+                tracking_namespace=inferred.tracking_namespace,
+                response={"id": secrets["response"], "object": "response"},
+            )
+            tracker.flush()
+            persisted_text = path.read_text(encoding="utf-8")
+
+        for secret in secrets.values():
+            self.assertNotIn(secret, persisted_text)
+
+    def test_schema_three_loader_bounds_sessions_and_rejects_unknown_sources(self):
+        now = time.time()
+        namespace = "session-domain:test"
+        sessions = {
+            f"session-{index}": {
+                "namespace": namespace,
+                "expires_at": now + 3600,
+                "last_seen": now + index,
+                "history_signatures": [],
+            }
+            for index in range(3)
+        }
+        evil_anchor = f"{namespace}:evil:{'a' * 64}"
+        payload = {
+            "schema_version": 3,
+            "sessions": sessions,
+            "anchors": {
+                evil_anchor: {
+                    "session_id": "session-2",
+                    "namespace": namespace,
+                    "strength": "strong",
+                    "source": "compaction_probe",
+                    "group": "forged",
+                    "expires_at": now + 3600,
+                    "last_seen": now,
+                }
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with patch.object(SessionTracker, "_MAX_PERSISTED_SESSIONS", 2):
+                tracker = SessionTracker(
+                    ttl_seconds=3600,
+                    persist_to_disk=True,
+                    persistence_path=path,
+                )
+
+        self.assertEqual(set(tracker._sessions), {"session-1", "session-2"})
+        self.assertNotIn(evil_anchor, tracker._anchors)
+
+    def test_schema_three_loader_rejects_oversized_state_before_json_parsing(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            path.write_text("{" + ("x" * 128), encoding="utf-8")
+            with patch.object(SessionTracker, "_MAX_PERSISTED_FILE_BYTES", 64):
+                tracker = SessionTracker(
+                    ttl_seconds=3600,
+                    persist_to_disk=True,
+                    persistence_path=path,
+                )
+
+        self.assertFalse(tracker._sessions)
+        self.assertFalse(tracker._anchors)
 
     def test_persistence_restart_preserves_compaction_and_replay_binding(self):
         request_evidence = " ".join(
@@ -3009,13 +3970,14 @@ class SessionTrackerTests(unittest.TestCase):
             "{not-json",
             json.dumps([]),
             json.dumps({"schema_version": 1, "sessions": {}, "anchors": {}}),
-            json.dumps({"schema_version": 2, "sessions": [], "anchors": {}}),
+            json.dumps({"schema_version": 2, "sessions": {}, "anchors": {}}),
+            json.dumps({"schema_version": 3, "sessions": [], "anchors": {}}),
             json.dumps(
                 {
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "sessions": {
                         "bad": {
-                            "namespace": "scope:x:provider:y:model:z",
+                            "namespace": "session-domain:x",
                             "expires_at": "not-a-number",
                         }
                     },
@@ -3037,11 +3999,11 @@ class SessionTrackerTests(unittest.TestCase):
                 self.assertEqual(tracker._anchors, {})
 
     def test_persistence_loader_rebuilds_only_valid_anchor_ownership(self):
-        namespace = "scope:gemini:provider:gemini:model:pro"
+        namespace = "session-domain:test"
         expires_at = time.time() + 3600
         good_value = f"{namespace}:message:user:{'a' * 64}"
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "sessions": {
                 "good-session": {
                     "namespace": namespace,
@@ -3078,7 +4040,7 @@ class SessionTrackerTests(unittest.TestCase):
                 },
                 f"{namespace}:wrong-namespace": {
                     "session_id": "good-session",
-                    "namespace": "scope:other:provider:gemini:model:pro",
+                    "namespace": "session-domain:other",
                     "strength": "medium",
                     "source": "message",
                     "group": "message:0:user",
@@ -3114,7 +4076,7 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertEqual(tracker._anchors[good_value].expires_at, state.expires_at)
 
     def test_persistence_loader_enforces_caps_without_orphaning_session_sets(self):
-        namespace = "scope:gemini:provider:gemini:model:pro"
+        namespace = "session-domain:test"
         expires_at = time.time() + 3600
         sessions = {}
         anchors = {}
@@ -3138,7 +4100,7 @@ class SessionTrackerTests(unittest.TestCase):
                     "last_seen": expires_at - anchor_index,
                 }
         payload = {
-            "schema_version": 2,
+            "schema_version": 3,
             "sessions": sessions,
             "anchors": anchors,
         }
@@ -3203,6 +4165,281 @@ class SessionTrackerTests(unittest.TestCase):
 
         self.assertEqual(assistant_parts, ["hello "])
         self.assertEqual(tool_call_ids, ["call_1"])
+
+    def test_streaming_collector_reassembles_structural_tool_event(self):
+        handler = StreamingHandler()
+        assistant_parts = []
+        tool_call_ids = []
+        tool_call_events = {}
+        handler._collect_session_response_anchors(
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
+            '"function":{"name":"read_file","arguments":"{\\"path\\":"}}]}}]}'
+            "\n\n",
+            assistant_parts,
+            tool_call_ids,
+            tool_call_events,
+        )
+        handler._collect_session_response_anchors(
+            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
+            '"function":{"arguments":"\\"a.py\\"}"}}]}}]}\n\n',
+            assistant_parts,
+            tool_call_ids,
+            tool_call_events,
+        )
+
+        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+
+        self.assertEqual(
+            assembled,
+            [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"a.py"}',
+                    },
+                }
+            ],
+        )
+
+    def test_streaming_tool_events_separate_choices_with_shared_indexes(self):
+        handler = StreamingHandler()
+        tool_call_ids = []
+        tool_call_events = {}
+        handler._collect_session_response_anchors(
+            "data: "
+            + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_a",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path":"a.py"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        },
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_b",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path":"b.py"}',
+                                        },
+                                    }
+                                ]
+                            }
+                        },
+                    ]
+                }
+            )
+            + "\n\n",
+            [],
+            tool_call_ids,
+            tool_call_events,
+        )
+
+        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+
+        self.assertEqual([call["id"] for call in assembled], ["call_a", "call_b"])
+        self.assertEqual(
+            [call["function"]["arguments"] for call in assembled],
+            ['{"path":"a.py"}', '{"path":"b.py"}'],
+        )
+
+    def test_streaming_tool_events_use_choice_index_across_separate_frames(self):
+        handler = StreamingHandler()
+        tool_call_ids = []
+        tool_call_events = {}
+        for choice_index, call_id, path in (
+            (0, "call_a", "a.py"),
+            (1, "call_b", "b.py"),
+        ):
+            handler._collect_session_response_anchors(
+                "data: "
+                + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "index": choice_index,
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": call_id,
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": json.dumps({"path": path}),
+                                            },
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    }
+                )
+                + "\n\n",
+                [],
+                tool_call_ids,
+                tool_call_events,
+            )
+
+        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+
+        self.assertEqual([call["id"] for call in assembled], ["call_a", "call_b"])
+        self.assertEqual(
+            [call["function"]["arguments"] for call in assembled],
+            ['{"path": "a.py"}', '{"path": "b.py"}'],
+        )
+
+    def test_streaming_cumulative_argument_snapshots_replace_instead_of_append(self):
+        handler = StreamingHandler()
+        tool_call_ids = []
+        tool_call_events = {}
+        for arguments in ('{"path":', '{"path":"a.py"}'):
+            handler._collect_session_response_anchors(
+                "data: "
+                + json.dumps(
+                    {
+                        "choices": [
+                            {
+                                "delta": {
+                                    "tool_calls": [
+                                        {
+                                            "index": 0,
+                                            "id": "call_1",
+                                            "function": {
+                                                "name": "read_file",
+                                                "arguments": arguments,
+                                            },
+                                        }
+                                    ]
+                                }
+                            }
+                        ]
+                    }
+                )
+                + "\n\n",
+                [],
+                tool_call_ids,
+                tool_call_events,
+            )
+
+        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+
+        self.assertEqual(
+            assembled[0]["function"]["arguments"],
+            '{"path":"a.py"}',
+        )
+
+    def test_completed_streamed_tool_call_bridges_closed_event_across_provider(self):
+        handler = StreamingHandler()
+        tracker = SessionTracker(ttl_seconds=3600)
+        user_message = {
+            "role": "user",
+            "content": self._long_text("streamed-tool-event-user"),
+        }
+        root = tracker.infer_session(
+            {"messages": [user_message]}, provider="openai", model="gpt"
+        )
+        responses = []
+
+        def record(response):
+            responses.append(response)
+            tracker.record_response(
+                root.session_id,
+                tracking_namespace=root.tracking_namespace,
+                response=response,
+            )
+
+        async def stream():
+            yield "data: " + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_streamed",
+                                        "function": {
+                                            "name": "read_file",
+                                            "arguments": '{"path":',
+                                        },
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ) + "\n\n"
+            yield "data: " + json.dumps(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "function": {"arguments": '"a.py"}'},
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            ) + "\n\n"
+            yield "data: " + json.dumps(
+                {
+                    "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                }
+            ) + "\n\n"
+
+        async def consume():
+            return [
+                chunk
+                async for chunk in handler.wrap_stream(
+                    stream(),
+                    "credential",
+                    "model",
+                    response_callback=record,
+                )
+            ]
+
+        asyncio.run(consume())
+        assistant = responses[0]["choices"][0]["message"]
+        continued = tracker.infer_session(
+            {
+                "messages": [
+                    user_message,
+                    assistant,
+                    self._tool_result("call_streamed"),
+                ]
+            },
+            provider="anthropic",
+            model="claude",
+        )
+
+        self.assertEqual(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            '{"path":"a.py"}',
+        )
+        self.assertEqual(continued.session_id, root.session_id)
+        self.assertEqual(continued.confidence, "probable")
 
     def test_streaming_chunk_collector_ignores_non_evidence_payloads(self):
         handler = StreamingHandler()

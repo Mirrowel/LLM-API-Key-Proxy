@@ -133,6 +133,7 @@ async def test_previous_response_id_loads_parent_context() -> None:
             id="resp_parent",
             model="gpt-test",
             status="completed",
+            scope_key="public",
             request={"input": "Earlier"},
             response={
                 "id": "resp_parent",
@@ -165,6 +166,7 @@ async def test_previous_response_id_loads_full_lineage_oldest_first() -> None:
             id="resp_grandparent",
             model="gpt-test",
             status="completed",
+            scope_key="public",
             request={"model": "gpt-test", "input": "First"},
             response={"id": "resp_grandparent", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "First answer"}]}]},
         )
@@ -174,6 +176,7 @@ async def test_previous_response_id_loads_full_lineage_oldest_first() -> None:
             id="resp_parent",
             model="gpt-test",
             status="completed",
+            scope_key="public",
             request={"model": "gpt-test", "input": "Second", "previous_response_id": "resp_grandparent"},
             response={"id": "resp_parent", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Second answer"}]}]},
         )
@@ -201,6 +204,7 @@ async def test_internal_session_hints_do_not_leak_to_direct_clients_or_traces(tm
             id="resp_parent",
             model="gpt-test",
             status="completed",
+            scope_key="public",
             response={"id": "resp_parent", "object": "response", "output": []},
             metadata={"session_affinity_key": "affinity-parent"},
         )
@@ -224,6 +228,7 @@ async def test_internal_client_context_metadata_is_stored_with_response() -> Non
             id="resp_parent",
             model="gpt-test",
             status="completed",
+            scope_key="public",
             response={"id": "resp_parent", "object": "response", "output": []},
             metadata={"session_affinity_key": "affinity-parent"},
         )
@@ -233,10 +238,65 @@ async def test_internal_client_context_metadata_is_stored_with_response() -> Non
     response = await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client)
     stored = await store.get(response["id"])
 
-    assert client.internal_hints["affinity_key"] == "affinity-parent"
+    assert client.internal_hints.affinity_key == "responses_previous_response_id:resp_parent"
     assert stored is not None
     assert stored.session_id == "session-parent"
-    assert stored.metadata["session_affinity_key"] == "affinity-parent"
+    assert "session_affinity_key" not in stored.metadata
+
+
+@pytest.mark.asyncio
+async def test_scoped_responses_preserve_routing_but_never_store_or_trace_secrets(tmp_path) -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+    client = FakeClient()
+    logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
+    raw_request = {
+        "model": "gpt-test",
+        "input": "Scoped request",
+        "api_keys": {"openai": ["super-secret-routing-key"]},
+        "providers": {
+            "openai": {
+                "api_base": "https://private.example",
+                "authorization": "provider-secret-header",
+            }
+        },
+        "private": True,
+    }
+
+    response = await service.create_response(
+        raw_request,
+        client,
+        transaction_logger=logger,
+    )
+    scope_key = responses_service_module._request_isolation_key(raw_request)
+    stored = await store.get(response["id"], scope_key)
+
+    assert stored is not None
+    assert stored.scope_key is not None and stored.scope_key.startswith("bundle:")
+    assert client.calls[0]["api_keys"] == raw_request["api_keys"]
+    assert client.calls[0]["providers"] == raw_request["providers"]
+    persisted_text = json.dumps(stored.to_dict())
+    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "super-secret-routing-key" not in persisted_text
+    assert "provider-secret-header" not in persisted_text
+    assert "super-secret-routing-key" not in trace_text
+    assert "provider-secret-header" not in trace_text
+
+    with pytest.raises(ResponsesServiceError) as public_access:
+        await service.get_response(response["id"])
+    assert public_access.value.status_code == 404
+    assert (await service.get_response(response["id"], scope_key=stored.scope_key))["id"] == response["id"]
+
+    mismatched = dict(raw_request)
+    mismatched["api_keys"] = {"openai": ["different-private-key"]}
+    mismatched["previous_response_id"] = response["id"]
+    with pytest.raises(ResponsesServiceError) as cross_scope:
+        await service.create_response(mismatched, FakeClient())
+    assert cross_scope.value.status_code == 404
+
+    continued = dict(raw_request)
+    continued["previous_response_id"] = response["id"]
+    await service.create_response(continued, FakeClient())
 
 
 @pytest.mark.asyncio
@@ -353,6 +413,7 @@ def test_trace_responses_usage_returns_before_conversion_without_logger(monkeypa
 async def test_previous_response_trace_payload_skipped_without_logger() -> None:
     class Parent:
         id = "resp_parent"
+        scope_key = "public"
         response = {"output": []}
         output_items = []
         input_items = []
@@ -361,11 +422,15 @@ async def test_previous_response_trace_payload_skipped_without_logger() -> None:
             raise AssertionError("previous response trace payload should not be built without a logger")
 
     class Store(InMemoryResponsesStore):
-        async def get(self, response_id):
+        async def get(self, response_id, scope_key="public"):
             return Parent()
 
     service = ResponsesService(store=Store())
 
-    parent = await service._load_previous_response("resp_parent", None)
+    parent = await service._load_previous_response(
+        "resp_parent",
+        None,
+        expected_scope_key="public",
+    )
 
     assert parent.id == "resp_parent"

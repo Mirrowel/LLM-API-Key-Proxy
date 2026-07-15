@@ -14,6 +14,7 @@ from typing import Any, AsyncGenerator, Optional
 from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
 from ..config.experimental import get_stream_runtime_settings
+from ..client.scopes import derive_session_isolation_key
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from ..protocols.responses import ResponsesProtocol
@@ -33,6 +34,29 @@ from .streaming import (
 )
 from .types import ResponsesStoreSettings, StoredResponse
 from .types import generate_response_id
+
+
+_ROUTING_FIELDS = {"classifier", "api_keys", "providers", "private", "model_filters"}
+_STORED_REQUEST_FIELDS = {
+    "include",
+    "input",
+    "instructions",
+    "max_output_tokens",
+    "metadata",
+    "model",
+    "parallel_tool_calls",
+    "previous_response_id",
+    "reasoning",
+    "store",
+    "stream",
+    "temperature",
+    "text",
+    "tool_choice",
+    "tools",
+    "top_p",
+    "truncation",
+    "user",
+}
 
 
 class ResponsesServiceError(ValueError):
@@ -80,26 +104,41 @@ class ResponsesService:
         if raw_request.get("stream"):
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
 
-        self._trace(transaction_logger, "responses_raw_request", raw_request, direction="request", stage="client")
+        isolation_key = _request_isolation_key(raw_request)
+        safe_request = _safe_stored_request(raw_request)
+        self._trace(transaction_logger, "responses_raw_request", safe_request, direction="request", stage="client")
         try:
             unified = self.protocol.parse_request(raw_request, ProtocolContext(source_protocol="responses"))
         except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_parse_request", exc, raw_request)
+            self._log_transform_error(transaction_logger, "responses_parse_request", exc, safe_request)
             raise
         if transaction_logger:
-            self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
+            self._trace(transaction_logger, "responses_parsed_request", _redact_sensitive_fields(unified.to_dict()), direction="request", stage="protocol")
 
-        parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
+        parent = await self._load_previous_response(
+            unified.previous_response_id,
+            transaction_logger,
+            expected_scope_key=isolation_key,
+        )
         try:
-            parent_lineage = await self._load_response_lineage(parent)
+            parent_lineage = await self._load_response_lineage(
+                parent,
+                expected_scope_key=isolation_key,
+            )
             chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
         except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_bridge_chat_request", exc, unified.to_dict())
+            self._log_transform_error(
+                transaction_logger,
+                "responses_bridge_chat_request",
+                exc,
+                _redact_sensitive_fields(unified.to_dict()),
+            )
             raise
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
         session_hints = chat_kwargs.pop("_session_tracking_hints", None)
         session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
         session_info: dict[str, Any] = {}
+        chat_kwargs.update(_routing_kwargs(raw_request))
         chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
         trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
         self._trace(
@@ -108,7 +147,7 @@ class ResponsesService:
             trace_chat_kwargs,
             direction="request",
             stage="adapter",
-            metadata={"bridge_metadata": {**bridge_metadata, "has_session_hints": bool(session_hints)}},
+            metadata={"bridge_metadata": {"extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()), "has_session_hints": bool(session_hints)}},
         )
 
         chat_response = await client.acompletion(request=request, **chat_kwargs)
@@ -178,7 +217,11 @@ class ResponsesService:
             raise ResponsesServiceError("'model' is required", status_code=400)
         previous_response_id = raw_request.get("previous_response_id")
         if previous_response_id:
-            await self._load_previous_response(str(previous_response_id), None)
+            await self._load_previous_response(
+                str(previous_response_id),
+                None,
+                expected_scope_key=_request_isolation_key(raw_request),
+            )
 
     async def stream_events(
         self,
@@ -195,25 +238,40 @@ class ResponsesService:
             raise ResponsesServiceError("'model' is required", status_code=400)
         stream_request = dict(raw_request)
         stream_request["stream"] = True
-        self._trace(transaction_logger, "responses_raw_request", stream_request, direction="request", stage="client")
+        isolation_key = _request_isolation_key(stream_request)
+        safe_stream_request = _safe_stored_request(stream_request)
+        self._trace(transaction_logger, "responses_raw_request", safe_stream_request, direction="request", stage="client")
         try:
             unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport=transport))
         except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_parse_request", exc, stream_request)
+            self._log_transform_error(transaction_logger, "responses_parse_request", exc, safe_stream_request)
             raise
         if transaction_logger:
-            self._trace(transaction_logger, "responses_parsed_request", unified.to_dict(), direction="request", stage="protocol")
-        parent = await self._load_previous_response(unified.previous_response_id, transaction_logger)
+            self._trace(transaction_logger, "responses_parsed_request", _redact_sensitive_fields(unified.to_dict()), direction="request", stage="protocol")
+        parent = await self._load_previous_response(
+            unified.previous_response_id,
+            transaction_logger,
+            expected_scope_key=isolation_key,
+        )
         try:
-            parent_lineage = await self._load_response_lineage(parent)
+            parent_lineage = await self._load_response_lineage(
+                parent,
+                expected_scope_key=isolation_key,
+            )
             chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
         except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_bridge_chat_request", exc, unified.to_dict())
+            self._log_transform_error(
+                transaction_logger,
+                "responses_bridge_chat_request",
+                exc,
+                _redact_sensitive_fields(unified.to_dict()),
+            )
             raise
         bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
         session_hints = chat_kwargs.pop("_session_tracking_hints", None)
         session_hints = _responses_session_hints(unified.previous_response_id, parent, session_hints)
         session_info: dict[str, Any] = {}
+        chat_kwargs.update(_routing_kwargs(stream_request))
         chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
         chat_kwargs["stream"] = True
         trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
@@ -223,7 +281,13 @@ class ResponsesService:
             trace_chat_kwargs,
             direction="request",
             stage="adapter",
-            metadata={"bridge_metadata": {**bridge_metadata, "has_session_hints": bool(session_hints)}, "transport": transport},
+            metadata={
+                "bridge_metadata": {
+                    "extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()),
+                    "has_session_hints": bool(session_hints),
+                },
+                "transport": transport,
+            },
         )
 
         response_id = generate_response_id()
@@ -582,31 +646,55 @@ class ResponsesService:
             if chat_stream is not None and not upstream_closed:
                 await close_upstream("wrapper_exit")
 
-    async def get_response(self, response_id: str) -> dict[str, Any]:
+    async def get_response(
+        self,
+        response_id: str,
+        *,
+        scope_key: str = "public",
+    ) -> dict[str, Any]:
         """Return a stored response payload or raise a 404-compatible error."""
 
-        stored = await self.store.get(response_id)
-        if stored is None:
+        stored = await self.store.get(response_id, scope_key)
+        if stored is None or stored.scope_key != scope_key:
             raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
         return deepcopy(stored.response)
 
-    async def delete_response(self, response_id: str) -> dict[str, Any]:
+    async def delete_response(
+        self,
+        response_id: str,
+        *,
+        scope_key: str = "public",
+    ) -> dict[str, Any]:
         """Delete a stored response and return a compatible deletion object."""
 
-        deleted = await self.store.delete(response_id)
+        stored = await self.store.get(response_id, scope_key)
+        if stored is None or stored.scope_key != scope_key:
+            raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
+        deleted = await self.store.delete(response_id, scope_key)
         if not deleted:
             raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
         return {"id": response_id, "object": "response.deleted", "deleted": True}
 
-    async def list_input_items(self, response_id: str) -> dict[str, Any]:
+    async def list_input_items(
+        self,
+        response_id: str,
+        *,
+        scope_key: str = "public",
+    ) -> dict[str, Any]:
         """Return stored input items for a response continuation."""
 
-        items = await self.store.list_input_items(response_id)
-        if items is None:
+        stored = await self.store.get(response_id, scope_key)
+        if stored is None or stored.scope_key != scope_key:
             raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
-        return {"object": "list", "data": items}
+        return {"object": "list", "data": deepcopy(stored.input_items)}
 
-    async def _load_response_lineage(self, parent: Optional[StoredResponse], *, max_depth: int = 20) -> list[StoredResponse]:
+    async def _load_response_lineage(
+        self,
+        parent: Optional[StoredResponse],
+        *,
+        expected_scope_key: str,
+        max_depth: int = 20,
+    ) -> list[StoredResponse]:
         """Return parent continuation lineage from oldest to newest."""
 
         if parent is None:
@@ -615,19 +703,31 @@ class ResponsesService:
         seen: set[str] = set()
         current: Optional[StoredResponse] = parent
         while current is not None and current.id not in seen and len(lineage) < max_depth:
+            if current.scope_key != expected_scope_key:
+                raise ResponsesServiceError(
+                    f"Previous response not found: {current.id}",
+                    status_code=404,
+                    error_type="not_found_error",
+                )
             seen.add(current.id)
             lineage.append(current)
             previous_id = current.request.get("previous_response_id") if isinstance(current.request, dict) else None
             if not previous_id:
                 break
-            current = await self.store.get(str(previous_id))
+            current = await self.store.get(str(previous_id), expected_scope_key)
         return list(reversed(lineage))
 
-    async def _load_previous_response(self, response_id: Optional[str], transaction_logger: Optional[Any]) -> Optional[StoredResponse]:
+    async def _load_previous_response(
+        self,
+        response_id: Optional[str],
+        transaction_logger: Optional[Any],
+        *,
+        expected_scope_key: str,
+    ) -> Optional[StoredResponse]:
         if not response_id:
             return None
-        parent = await self.store.get(response_id)
-        if parent is None:
+        parent = await self.store.get(response_id, expected_scope_key)
+        if parent is None or parent.scope_key != expected_scope_key:
             raise ResponsesServiceError(f"Previous response not found: {response_id}", status_code=404, error_type="not_found_error")
         if transaction_logger:
             self._trace(
@@ -654,13 +754,12 @@ class ResponsesService:
         session_info: Optional[dict[str, Any]] = None,
     ) -> StoredResponse:
         session_info = session_info or {}
-        session_affinity_key = session_info.get("session_affinity_key") or (parent.metadata.get("session_affinity_key") if parent else None)
         return StoredResponse(
             id=str(response_payload["id"]),
             created_at=float(response_payload.get("created_at") or time.time()),
             model=str(response_payload.get("model") or raw_request.get("model") or ""),
             status=str(response_payload.get("status") or "completed"),
-            request=deepcopy(raw_request),
+            request=_safe_stored_request(raw_request),
             response=deepcopy(response_payload),
             input_items=_input_items(raw_request),
             output_items=deepcopy(response_payload.get("output") or []),
@@ -668,10 +767,13 @@ class ResponsesService:
             metadata={
                 "previous_response_id": parent.id if parent else raw_request.get("previous_response_id"),
                 "response_id": response_payload.get("id"),
-                "session_affinity_key": session_affinity_key,
             },
             session_id=session_info.get("session_id") or (parent.session_id if parent else None),
-            scope_key=session_info.get("scope_key") or (parent.scope_key if parent else None),
+            scope_key=(
+                session_info.get("scope_key")
+                or (parent.scope_key if parent else None)
+                or _request_isolation_key(raw_request)
+            ),
             classifier=session_info.get("classifier") or (parent.classifier if parent else None),
             expires_at=_expires_at(self.store_settings),
         )
@@ -798,6 +900,60 @@ def _input_items(raw_request: dict[str, Any]) -> list[Any]:
     return deepcopy(value if isinstance(value, list) else [value])
 
 
+def _routing_kwargs(raw_request: dict[str, Any]) -> dict[str, Any]:
+    """Carry proxy routing controls to RequestContextBuilder without tracing them."""
+
+    return {
+        key: deepcopy(raw_request[key])
+        for key in _ROUTING_FIELDS
+        if key in raw_request
+    }
+
+
+def _request_isolation_key(raw_request: dict[str, Any]) -> str:
+    return derive_session_isolation_key(
+        raw_request.get("classifier"),
+        raw_request.get("api_keys"),
+        raw_request.get("providers"),
+        bool(raw_request.get("private", False)),
+    )
+
+
+def _safe_stored_request(raw_request: dict[str, Any]) -> dict[str, Any]:
+    """Persist only standard continuation fields, never routing credentials."""
+
+    return {
+        key: deepcopy(raw_request[key])
+        for key in _STORED_REQUEST_FIELDS
+        if key in raw_request
+    }
+
+
+def _redact_sensitive_fields(value: Any) -> Any:
+    """Remove routing/auth containers recursively from diagnostic payloads."""
+
+    if isinstance(value, dict):
+        return {
+            key: _redact_sensitive_fields(item)
+            for key, item in value.items()
+            if str(key).lower()
+            not in {
+                "api_key",
+                "api_keys",
+                "authorization",
+                "credential_secrets",
+                "provider_config",
+                "providers",
+                "x-api-key",
+            }
+        }
+    if isinstance(value, list):
+        return [_redact_sensitive_fields(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_sensitive_fields(item) for item in value)
+    return deepcopy(value)
+
+
 def _current_stream_payload(state: ResponsesStreamState) -> dict[str, Any]:
     """Return a retrievable in-progress Responses object for stream state."""
 
@@ -838,7 +994,7 @@ def _capture_request_context(session_info: dict[str, Any]):
     def capture(context: Any) -> None:
         session_info["session_id"] = getattr(context, "session_id", None)
         session_info["session_affinity_key"] = getattr(context, "session_affinity_key", None)
-        session_info["scope_key"] = getattr(context, "usage_manager_key", None)
+        session_info["scope_key"] = getattr(context, "session_isolation_key", None)
         session_info["classifier"] = getattr(context, "classifier", None)
         session_info["session_tracker"] = getattr(context, "session_tracker", None)
         session_info["provider"] = getattr(context, "provider", None)
@@ -851,16 +1007,21 @@ def _capture_request_context(session_info: dict[str, Any]):
 def _without_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """Return trace/provider-visible kwargs without proxy-internal controls."""
 
-    return {key: deepcopy(value) for key, value in kwargs.items() if not key.startswith("_")}
+    return _redact_sensitive_fields(
+        {
+            key: deepcopy(value)
+            for key, value in kwargs.items()
+            if not key.startswith("_") and key not in _ROUTING_FIELDS
+        }
+    )
 
 
 def _responses_session_hints(previous_response_id: Optional[str], parent: Optional[StoredResponse], fallback: Any) -> Any:
-    """Prefer parent stored affinity when building Responses continuation hints."""
+    """Build proxy-global continuation evidence without provider affinity."""
 
     if not previous_response_id:
         return None
-    parent_affinity = parent.metadata.get("session_affinity_key") if parent else None
-    return responses_session_hints(previous_response_id, affinity_key=parent_affinity) or fallback
+    return responses_session_hints(previous_response_id) or fallback
 
 
 def _record_responses_session_anchor(session_info: dict[str, Any], response_payload: dict[str, Any]) -> None:

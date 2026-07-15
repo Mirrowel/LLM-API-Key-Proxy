@@ -4,7 +4,8 @@
 
 Phase 11 is complete. The captured false-positive families are now rejected, real compaction requires structural replacement of most known history, minority/middle-only replacement remains ordinary continuity, and optional persistence has a strict restart-safe schema and substantially broader failure/concurrency coverage.
 
-Implementation and report changes remain uncommitted.
+The core hardening is committed; later global-domain, binding, Responses, and
+closed-tool-event refinements remain in the staged/working-tree change set.
 
 Every request now emits a temporary warning-level lineage decision. The log identifies new roots, continuations, compacted children, exact compaction replays, untracked requests, and sessions restored from persistence.
 Accepted continuations use `matched_session_id`; weak evidence rejected while creating a new root is reported separately as `candidate_session_id`.
@@ -34,7 +35,13 @@ Accepted continuations use `matched_session_id`; weak evidence rejected while cr
 - Context anchors are minted only from probe groups that actually matched parent response evidence; shared long system/user harnesses cannot become bindings by position alone.
 - Strong trusted or provider identity takes precedence over replay/context bindings and suppresses unrelated compaction lineage.
 - Raw tool-call IDs are supporting evidence, not authoritative identity, because deterministic IDs can be reused across sessions.
-- All evidence remains isolated by usage scope, provider, and model/session scope.
+- Each one-to-one closed assistant-call/tool-result event contributes one medium
+  evidence group keyed by hashed ID, function name, and canonical arguments.
+- Closure is request-local: persisted medium evidence cannot upgrade a later
+  unpaired call, duplicate results count once, and one result closes one call.
+- Generic evidence and logical IDs cross providers/models only inside one strict
+  public, classifier, or ad hoc credential-bundle domain. Provider-native
+  evidence remains provider/session-scope qualified.
 
 ## Tracking And Persistence Hardening
 
@@ -44,9 +51,9 @@ Accepted continuations use `matched_session_id`; weak evidence rejected while cr
 - Per-session/global trimming and TTL pruning maintain bidirectional session-anchor ownership.
 - Late responses cannot resurrect an expired session.
 - Weak/ordinary evidence is evicted before strong replay/context identity with deterministic tie-breaking.
-- Fallback response callbacks are normalized to the session's original namespace, preserving continuity without cross-scope migration.
-- Persistence schema 2 stores hashed high-water history, scoped anchor metadata, response-event groups, and replay bindings without raw content.
-- Loading rejects malformed containers, invalid/non-finite timestamps, unsupported schemas, expired sessions, orphan anchors, namespace mismatches, invalid strengths, and malformed history signatures.
+- Fallback response callbacks stay in the logical domain while source-provider affinity is cleared before cross-provider selection.
+- Persistence schema 3 stores hashed high-water history, scoped anchor metadata, response-event groups, and replay bindings without raw content or external IDs.
+- Loading rejects malformed containers, invalid/non-finite timestamps, unsupported schemas, expired sessions, orphan anchors, namespace mismatches, invalid strengths/sources, malformed history signatures, oversized files, and excess sessions/strings.
 - Session anchor sets are rebuilt from validated anchor records instead of trusting duplicated serialized ownership.
 - Loaded state enforces both per-session and global caps without orphaning either side.
 - Failed and exceptional writes retain dirty state for retry.
@@ -62,6 +69,8 @@ Accepted continuations use `matched_session_id`; weak evidence rejected while cr
 - Event-prefixed SSE and `data:` frames with or without a space are parsed.
 - Non-object JSON, malformed choices/deltas, and non-list tool-call payloads are ignored safely.
 - Duplicate streamed tool-call IDs are deduplicated.
+- Streamed function/argument fragments are reconstructed by provider choice and
+  tool index; cumulative snapshots replace prefixes instead of being appended.
 
 ## Test Coverage
 
@@ -78,6 +87,10 @@ Compaction regressions cover:
 - Context contraction without summary replacement.
 - Two distinct response events versus duplicate response content.
 - Trusted explicit/provider identity and raw tool-ID non-authority.
+- Sparse tool loops with one closed event plus independent message evidence or
+  two distinct closed events, including provider switches and restart.
+- Unpaired calls, duplicate results, duplicate IDs, changed function/arguments,
+  nameless calls, malformed arguments, and cross-domain events.
 - Trusted/provider precedence over existing replay/context bindings.
 - Raw short and entropy-looking tool-ID collision resistance.
 - Cross-scope isolation.
@@ -88,7 +101,7 @@ Compaction regressions cover:
 
 Persistence/state tests cover:
 
-- Schema-2 metadata round trip.
+- Schema-3 metadata round trip and explicit schema-2 rejection.
 - Compaction and replay across two restarts.
 - Malformed, unsupported, expired, orphaned, and cross-namespace state.
 - Per-session/global caps during runtime and load.
@@ -102,9 +115,19 @@ Persistence/state tests cover:
 
 Stateful simulations cover:
 
-- Six ordered agentic tool rounds with response recording, tool results, two mid-loop persistence restarts, full compaction, exact replay after restart, and child continuation.
-- Eight long ordinary turns with repeated response content, two persistence restarts, per-turn high-water growth, and no false compaction.
-- Long roleplay with exact redo, edited regeneration, a middle response rewrite while later turns remain, rollback below half the high-water history, resumed branching, and no false lineage.
+- Six ordered agentic tool rounds switching DeepSeek/Anthropic/OpenAI, with response recording, tool results, two mid-loop persistence restarts, cross-provider compaction, exact replay after restart, child continuation, and parent continuation.
+- Eight long ordinary turns rotating providers/models, with repeated response content, two persistence restarts, per-turn high-water growth, and no false compaction.
+- Long roleplay with same/cross-provider exact redo, edited regeneration, a cross-provider middle response rewrite while later turns remain, rollback, resumed branching, and no false lineage.
+- First-turn reroll ambiguity, shared harness exclusion, trusted global identity, provider-native collision resistance, independent provider binding clocks, and strict public/classifier/private-bundle isolation.
+
+Responses/isolation tests cover:
+
+- Scoped routing reaches RequestContextBuilder without storing or tracing credential containers.
+- Every `previous_response_id` ancestor must belong to the requesting domain.
+- Storage ownership is composite by `(domain, response_id)`, including IDs that would collide under path sanitization.
+- Non-public retrieval/deletion/input-items require the opaque domain header returned at creation.
+- Ad hoc credential bundles use distinct usage managers; named classifier identity remains stable across credential rotation.
+- External anchor IDs are hashed and raw scope strings cannot impersonate internally derived domain markers.
 
 Streaming tests cover:
 
@@ -114,25 +137,50 @@ Streaming tests cover:
 - `[DONE]` and usage-backed completion.
 - Event-framed/no-space SSE.
 - Non-object/malformed SSE and tool-call payloads.
+- Incremental/cumulative arguments, interleaved calls, shared tool indexes across
+  choices, and choices arriving in separate frames.
 
 ## Verification
 
-- `python -m pytest tests/test_session_tracking.py -q`: 87 passed, 15 subtests passed.
-- Session/request/selection integration slice: 102 passed, 15 subtests passed.
-- Streaming regression slice: 70 passed.
-- Python compilation passed for both changed runtime modules.
+- `python -m pytest tests/test_session_tracking.py -q`: 119 passed, 18 subtests passed.
+- Final session/request/selection/routing/classifier/executor slice: 173 passed, 18 subtests passed.
+- Final Responses bridge/service/store/routes/streaming/accounting slice: 76 passed.
+- Python compilation passed for all changed runtime modules.
 - `git diff --check` passed for all Phase 11 files.
-- Explore review: no blocker, high, or medium findings after re-review.
-- Explore-heavy review: no blocker, high, or medium findings after final compaction-context and tool-evidence re-review.
+- Explore scenario review: no blocker, high, or medium findings after final re-review.
+- Explore-heavy isolation/persistence review: no blocker, high, or medium findings after the final domain-marker, composite-storage, and zero-TTL fixes.
+- Explore-heavy closed-tool-event review: no blocker, high, or medium findings
+  after request-local closure, one-to-one pairing, and stable streamed choice
+  indexing were verified.
 
-The unrestricted test run is not currently a clean repository-wide signal. Initial collection was blocked by 13 unrelated retired/Gemini import errors. After excluding those known collections, the run reached 724 passing tests but retained 71 unrelated failures and 7 tool-test errors from existing refactor drift, missing async-test plugins, environment-sensitive tests, and provider changes. Phase 11 focused and integration slices are clean.
+The unrestricted test run is not currently a clean repository-wide signal. Initial collection is blocked by 13 unrelated retired/Gemini import errors. After excluding only those known collections, the active run reached 791 passing tests plus 16 subtests, with 68 unrelated failures from existing refactor drift, missing async-test plugins, legacy constructor assumptions, and order-dependent provider-global test state. Phase 11 focused and integration slices are clean.
 
 ## Files
 
 - `src/rotator_library/session_tracking.py`
 - `src/rotator_library/client/rotating_client.py`
+- `src/rotator_library/client/request_builder.py`
+- `src/rotator_library/client/scopes.py`
 - `src/rotator_library/client/streaming.py`
+- `src/rotator_library/client/executor.py`
+- `src/rotator_library/core/types.py`
+- `src/rotator_library/providers/provider_interface.py`
+- `src/rotator_library/routing/attempts.py`
+- `src/rotator_library/usage/config.py`
+- `src/rotator_library/usage/selection/strategies/sequential.py`
+- `src/rotator_library/responses/bridge.py`
+- `src/rotator_library/responses/service.py`
+- `src/rotator_library/responses/store.py`
+- `src/proxy_app/main.py`
 - `tests/test_session_tracking.py`
+- `tests/test_request_builder_routing.py`
+- `tests/test_selection_engine.py`
+- `tests/test_routing_attempts.py`
+- `tests/test_classifier_scoped_routing.py`
+- `tests/test_responses_bridge.py`
+- `tests/test_responses_service.py`
+- `tests/test_responses_store.py`
+- `tests/test_responses_routes.py`
 - `.env.example`
 - `README.md`
 - `DOCUMENTATION.md`
@@ -141,4 +189,4 @@ The unrestricted test run is not currently a clean repository-wide signal. Initi
 
 ## Review Disposition
 
-The first reviews found valid stream-evidence parsing/completion gaps and several missing boundary tests. The stateful-scenario reviews then found changed-tail child forking, context precedence, shared-harness binding, namespace migration, and raw tool-ID collision risks. These were reproduced, fixed, and covered by dedicated restart/isolation tests. Two reported anchor-ownership defects were independently rejected after direct inspection: shared anchors are skipped before entering a second session set, and global trimming already removes the owning session-set entry.
+The first reviews found valid stream-evidence parsing/completion gaps and several missing boundary tests. The stateful-scenario reviews then found changed-tail child forking, context precedence, shared-harness binding, namespace migration, and raw tool-ID collision risks. The closed-tool-event review found persisted-strength promotion, many-to-one result pairing, and streamed choice-index collisions. These were reproduced, fixed, and covered by dedicated restart/isolation tests. Two reported anchor-ownership defects were independently rejected after direct inspection: shared anchors are skipped before entering a second session set, and global trimming already removes the owning session-set entry.

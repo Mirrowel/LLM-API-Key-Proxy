@@ -3,8 +3,8 @@
 
 """RequestContext construction for RotatingClient public request methods."""
 
-import time
 import inspect
+import time
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..core.types import RequestContext
@@ -12,6 +12,7 @@ from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_
 from ..routing.types import RouteTarget, RoutingDecision
 from ..session_tracking import SessionTrackingHints
 from ..transaction_logger import TransactionLogger
+from .scopes import derive_session_isolation_key
 
 
 class RequestContextBuilder:
@@ -46,6 +47,27 @@ class RequestContextBuilder:
         session_tracking_hints = kwargs.pop("_session_tracking_hints", None)
         kwargs.pop("model_filters", None)
         return classifier, request_api_keys, request_providers, private, session_tracking_hints
+
+    @staticmethod
+    def _session_isolation_key(
+        classifier: Optional[str],
+        request_api_keys: Any,
+        request_providers: Any,
+        private: bool,
+    ) -> str:
+        """Return a provider-independent caller/credential isolation key.
+
+        Ad hoc credentials and provider overrides are hashed as one bundle so
+        secrets never enter logs or persistence. Named classifiers intentionally
+        share a domain across their providers unless a request supplies overrides.
+        """
+
+        return derive_session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
+        )
 
     @staticmethod
     def _provider_from_model(model: str) -> str:
@@ -142,9 +164,10 @@ class RequestContextBuilder:
 
         merged = SessionTrackingHints()
         seen = False
-        for hint in hints:
+        for index, hint in enumerate(hints):
             if not hint:
                 continue
+            allow_global = index == 0 and isinstance(hint, SessionTrackingHints)
             if isinstance(hint, dict):
                 hint = SessionTrackingHints(
                     strong_anchors=list(hint.get("strong_anchors") or []),
@@ -159,6 +182,10 @@ class RequestContextBuilder:
             merged.strong_anchors.extend(hint.strong_anchors)
             merged.medium_anchors.extend(hint.medium_anchors)
             merged.weak_anchors.extend(hint.weak_anchors)
+            if allow_global:
+                merged.global_strong_anchors.extend(hint.global_strong_anchors)
+                merged.global_medium_anchors.extend(hint.global_medium_anchors)
+                merged.global_weak_anchors.extend(hint.global_weak_anchors)
             if not merged.affinity_key and hint.affinity_key:
                 merged.affinity_key = hint.affinity_key
             if not merged.session_scope and hint.session_scope:
@@ -173,6 +200,12 @@ class RequestContextBuilder:
     ) -> RequestContext:
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
+        )
+        session_isolation_key = self._session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
         )
         model = kwargs.get("model", "")
         routing_decision = self._resolve_routing_decision(model)
@@ -224,11 +257,12 @@ class RequestContextBuilder:
             kwargs,
             provider=provider,
             model=resolved_model,
-            scope_key=scope["usage_manager_key"],
+            scope_key=session_isolation_key,
             hints=self._merge_session_hints(
                 internal_session_hints,
                 await self._get_session_hints(provider, resolved_model, kwargs),
             ),
+            _trusted_isolation_key=True,
         )
         if transaction_logger:
             transaction_logger.set_trace_context(
@@ -250,6 +284,7 @@ class RequestContextBuilder:
             session_possible_compaction=session.possible_compaction,
             session_lineage_parent_id=session.lineage_parent_session_id,
             session_tracking_namespace=session.tracking_namespace,
+            session_isolation_key=session_isolation_key,
             request=request,
             pre_request_callback=pre_request_callback,
             transaction_logger=transaction_logger,
@@ -271,6 +306,12 @@ class RequestContextBuilder:
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
+        session_isolation_key = self._session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
+        )
         model = kwargs.get("model", "")
         provider = self._provider_from_model(model)
         if not provider:
@@ -290,11 +331,12 @@ class RequestContextBuilder:
             kwargs,
             provider=provider,
             model=model,
-            scope_key=scope["usage_manager_key"],
+            scope_key=session_isolation_key,
             hints=self._merge_session_hints(
                 internal_session_hints,
                 await self._get_session_hints(provider, model, kwargs),
             ),
+            _trusted_isolation_key=True,
         )
 
         return RequestContext(
@@ -310,6 +352,7 @@ class RequestContextBuilder:
             session_possible_compaction=session.possible_compaction,
             session_lineage_parent_id=session.lineage_parent_session_id,
             session_tracking_namespace=session.tracking_namespace,
+            session_isolation_key=session_isolation_key,
             request=request,
             pre_request_callback=pre_request_callback,
             usage_manager_key=scope["usage_manager_key"],
