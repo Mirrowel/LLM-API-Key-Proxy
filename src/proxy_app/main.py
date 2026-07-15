@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Mirrowel
 
 import time
-import uuid
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
@@ -61,7 +60,6 @@ _start_time = time.time()
 
 # Load all .env files from root folder (main .env first, then any additional *.env files)
 from dotenv import load_dotenv
-from glob import glob
 from proxy_app.startup_display import mask_secret_for_display as _mask_secret_for_display
 
 # Get the application root directory (EXE dir if frozen, else CWD)
@@ -117,7 +115,6 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
 
 print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
-    from dotenv import load_dotenv
     import colorlog
     import json
     from typing import AsyncGenerator, Any, List, Optional, Union
@@ -137,7 +134,6 @@ print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
     from rotator_library.credential_manager import CredentialManager
-    from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
@@ -637,6 +633,9 @@ async def lifespan(app: FastAPI):
     await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
+    responses_service = getattr(app.state, "responses_service", None)
+    if responses_service:
+        await responses_service.close()
     await client.close()
 
     # Stop model info service
@@ -1040,29 +1039,6 @@ def _responses_error_response(error: ResponsesServiceError) -> dict[str, Any]:
     return {"error": {"message": str(error), "type": error.error_type, "code": error.status_code}}
 
 
-def _responses_session_domain(request_data: dict[str, Any]) -> str:
-    """Derive the opaque caller/credential domain used by Responses storage."""
-
-    from rotator_library.client.scopes import derive_session_isolation_key
-
-    return derive_session_isolation_key(
-        request_data.get("classifier"),
-        request_data.get("api_keys"),
-        request_data.get("providers"),
-        bool(request_data.get("private", False)),
-    )
-
-
-def _responses_request_for_logging(request_data: dict[str, Any]) -> dict[str, Any]:
-    """Remove scoped credential containers from optional raw request logs."""
-
-    return {
-        key: value
-        for key, value in request_data.items()
-        if key not in {"api_keys", "providers"}
-    }
-
-
 @app.post("/v1/responses")
 async def responses_create(
     request: Request,
@@ -1084,28 +1060,50 @@ async def responses_create(
     if logger:
         logger.log_request(
             headers=dict(request.headers),
-            body=_responses_request_for_logging(request_data),
+            body=service.redact_request_for_logging(request_data),
         )
     transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
     try:
+        request_scope = service.prepare_request_scope(request_data)
+        previous_response_access_token = request.headers.get(
+            "X-Proxy-Session-Domain"
+        )
         if request_data.get("stream"):
-            await service.validate_stream_request(request_data)
+            await service.validate_stream_request(
+                request_data,
+                request_scope=request_scope,
+                previous_response_access_token=previous_response_access_token,
+            )
             return StreamingResponse(
-                service.stream_response(request_data, client, request=request, transaction_logger=transaction_logger),
+                service.stream_response(
+                    request_data,
+                    client,
+                    request=request,
+                    transaction_logger=transaction_logger,
+                    request_scope=request_scope,
+                    previous_response_access_token=previous_response_access_token,
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
-                    "X-Proxy-Session-Domain": _responses_session_domain(request_data),
+                    "X-Proxy-Session-Domain": request_scope.access_token,
                 },
             )
-        result = await service.create_response(request_data, client, request=request, transaction_logger=transaction_logger)
+        result = await service.create_response(
+            request_data,
+            client,
+            request=request,
+            transaction_logger=transaction_logger,
+            request_scope=request_scope,
+            previous_response_access_token=previous_response_access_token,
+        )
         if logger:
             logger.log_final_response(status_code=200, headers=None, body=result)
         return JSONResponse(
             content=result,
-            headers={"X-Proxy-Session-Domain": _responses_session_domain(request_data)},
+            headers={"X-Proxy-Session-Domain": request_scope.access_token},
         )
     except ResponsesServiceError as e:
         payload = _responses_error_response(e)
@@ -1130,9 +1128,9 @@ async def responses_get(
 
     try:
         return JSONResponse(
-            content=await service.get_response(
+            content=await service.get_response_with_access_token(
                 response_id,
-                scope_key=request.headers.get("X-Proxy-Session-Domain", "public"),
+                request.headers.get("X-Proxy-Session-Domain", "public"),
             )
         )
     except ResponsesServiceError as e:
@@ -1150,9 +1148,9 @@ async def responses_delete(
 
     try:
         return JSONResponse(
-            content=await service.delete_response(
+            content=await service.delete_response_with_access_token(
                 response_id,
-                scope_key=request.headers.get("X-Proxy-Session-Domain", "public"),
+                request.headers.get("X-Proxy-Session-Domain", "public"),
             )
         )
     except ResponsesServiceError as e:
@@ -1170,9 +1168,9 @@ async def responses_input_items(
 
     try:
         return JSONResponse(
-            content=await service.list_input_items(
+            content=await service.list_input_items_with_access_token(
                 response_id,
-                scope_key=request.headers.get("X-Proxy-Session-Domain", "public"),
+                request.headers.get("X-Proxy-Session-Domain", "public"),
             )
         )
     except ResponsesServiceError as e:

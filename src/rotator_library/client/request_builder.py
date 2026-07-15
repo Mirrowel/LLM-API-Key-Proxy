@@ -59,7 +59,7 @@ class RequestContextBuilder:
 
         Ad hoc credentials and provider overrides are hashed as one bundle so
         secrets never enter logs or persistence. Named classifiers intentionally
-        share a domain across their providers unless a request supplies overrides.
+        own one authoritative domain across their providers and credential changes.
         """
 
         return derive_session_isolation_key(
@@ -281,8 +281,6 @@ class RequestContextBuilder:
             session_id=session.session_id,
             session_affinity_key=session.affinity_key,
             session_tracker=self._session_tracker,
-            session_possible_compaction=session.possible_compaction,
-            session_lineage_parent_id=session.lineage_parent_session_id,
             session_tracking_namespace=session.tracking_namespace,
             session_isolation_key=session_isolation_key,
             request=request,
@@ -349,8 +347,6 @@ class RequestContextBuilder:
             session_id=session.session_id,
             session_affinity_key=session.affinity_key,
             session_tracker=self._session_tracker,
-            session_possible_compaction=session.possible_compaction,
-            session_lineage_parent_id=session.lineage_parent_session_id,
             session_tracking_namespace=session.tracking_namespace,
             session_isolation_key=session_isolation_key,
             request=request,

@@ -706,7 +706,8 @@ def test_usage_registry_scope_paths_do_not_depend_on_scope_manager_construction_
     run_async(run_test())
 
 
-def test_provider_config_override_routes_without_global_mutation(tmp_path):
+def test_provider_config_override_routes_without_global_mutation(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOGFARE_API_BASE", raising=False)
     client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
 
     try:

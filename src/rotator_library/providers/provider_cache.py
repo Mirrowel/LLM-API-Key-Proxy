@@ -107,6 +107,8 @@ class ProviderCache:
             else _env_bool(f"{env_prefix}_ENABLE", True)
         )
         self._dirty = False
+        self._deleted_keys: set[str] = set()
+        self._clear_disk_on_save = False
         self._write_interval = write_interval or _env_int(
             f"{env_prefix}_WRITE_INTERVAL", 60
         )
@@ -232,11 +234,18 @@ class ProviderCache:
 
             # Step 2: Filter existing disk entries by disk_ttl (not memory_ttl)
             # This preserves entries that expired from memory but are still valid on disk
-            valid_disk_entries = {
-                k: v
-                for k, v in existing_entries.items()
-                if now - v.get("timestamp", 0) <= self._disk_ttl
-            }
+            deleted_keys = set(self._deleted_keys)
+            clear_disk = self._clear_disk_on_save
+            valid_disk_entries = (
+                {}
+                if clear_disk
+                else {
+                    k: v
+                    for k, v in existing_entries.items()
+                    if k not in deleted_keys
+                    and now - v.get("timestamp", 0) <= self._disk_ttl
+                }
+            )
 
             # Step 3: Merge - memory entries take precedence (fresher timestamps)
             merged_entries = valid_disk_entries.copy()
@@ -269,6 +278,9 @@ class ProviderCache:
             ):
                 self._stats["writes"] += 1
                 self._disk_available = True
+                self._deleted_keys.difference_update(deleted_keys)
+                if clear_disk:
+                    self._clear_disk_on_save = False
                 # Log merge info only when we preserved disk-only entries (infrequent)
                 if preserved_from_disk > 0:
                     lib_logger.debug(
@@ -360,6 +372,7 @@ class ProviderCache:
         """Async implementation of store."""
         async with self._lock:
             self._cache[key] = (value, time.time())
+            self._deleted_keys.discard(key)
             self._dirty = True
 
     async def store_async(self, key: str, value: str) -> None:
@@ -421,6 +434,20 @@ class ProviderCache:
 
         self._stats["misses"] += 1
         return None
+
+    async def delete_async(self, key: str) -> bool:
+        """Delete one key from memory and durable storage."""
+
+        existed = key in self._cache
+        if not existed and self._enable_disk:
+            existed = await self.retrieve_async(key) is not None
+        async with self._lock:
+            self._cache.pop(key, None)
+            self._deleted_keys.add(key)
+            self._dirty = True
+        if self._enable_disk:
+            await self._save_to_disk()
+        return existed
 
     async def _check_disk_fallback(self, key: str) -> None:
         """Check disk for key and load into memory if found (background)."""
@@ -507,6 +534,8 @@ class ProviderCache:
         """Clear all cached data."""
         async with self._lock:
             self._cache.clear()
+            self._deleted_keys.clear()
+            self._clear_disk_on_save = True
             self._dirty = True
         if self._enable_disk:
             await self._save_to_disk()

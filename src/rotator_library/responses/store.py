@@ -33,6 +33,8 @@ class ResponsesStore(Protocol):
         scope_key: str = "public",
     ) -> Optional[list[Any]]: ...
 
+    async def close(self) -> None: ...
+
 
 class InMemoryResponsesStore:
     """Process-local Responses store.
@@ -79,6 +81,9 @@ class InMemoryResponsesStore:
             return None
         return deepcopy(response.input_items)
 
+    async def close(self) -> None:
+        """Memory storage owns no external resources."""
+
     def _prune_expired(self) -> None:
         for key, response in list(self._responses.items()):
             if response.is_expired():
@@ -98,8 +103,8 @@ class InMemoryResponsesStore:
 class ProviderCacheResponsesStore:
     """Responses store backed by an injected `ProviderCache` instance.
 
-    The wrapper does not instantiate `ProviderCache`, because that class starts
-    background tasks. The caller owns cache lifecycle and shutdown.
+    The wrapper does not instantiate `ProviderCache`; the factory injects it and
+    `close()` delegates lifecycle shutdown for its background tasks.
     """
 
     def __init__(self, provider_cache: Any, *, prefix: str = "responses") -> None:
@@ -121,9 +126,22 @@ class ProviderCacheResponsesStore:
         scope_key: str = "public",
     ) -> Optional[StoredResponse]:
         raw = await self._cache.retrieve_async(self._key(response_id, scope_key))
+        legacy_key = None
+        if raw is None:
+            legacy_key = self._legacy_key(response_id)
+            raw = await self._cache.retrieve_async(legacy_key)
         if raw is None:
             return None
         response = StoredResponse.from_dict(json.loads(raw))
+        response_scope = response.scope_key or "public"
+        if response.id != response_id or response_scope != scope_key:
+            return None
+        if legacy_key is not None:
+            response.scope_key = response_scope
+            await self.save(response)
+            delete = getattr(self._cache, "delete_async", None)
+            if delete:
+                await delete(legacy_key)
         if response.is_expired():
             await self.delete(response_id, scope_key)
             return None
@@ -133,8 +151,8 @@ class ProviderCacheResponsesStore:
         delete = getattr(self._cache, "delete_async", None)
         if delete:
             return bool(await delete(self._key(response_id, scope_key)))
-        # ProviderCache currently exposes clear(), not key-level deletion. When
-        # key deletion is unavailable, avoid clearing unrelated provider state.
+        # Third-party cache adapters may not support key-level deletion. Avoid
+        # clearing unrelated provider state when that capability is absent.
         return False
 
     async def list_input_items(
@@ -147,11 +165,22 @@ class ProviderCacheResponsesStore:
             return None
         return deepcopy(response.input_items)
 
+    async def close(self) -> None:
+        """Stop the injected cache's writer and cleanup tasks."""
+
+        shutdown = getattr(self._cache, "shutdown", None)
+        if shutdown:
+            await shutdown()
+
     def _key(self, response_id: str, scope_key: str) -> str:
         digest = hashlib.sha256(
             f"{scope_key}\x00{response_id}".encode("utf-8")
         ).hexdigest()
         return f"{self._prefix}:{digest}"
+
+    def _legacy_key(self, response_id: str) -> str:
+        safe_id = response_id.replace("/", "_").replace("\\", "_").replace(":", "_")
+        return f"{self._prefix}:{safe_id}"
 
 
 def create_configured_responses_store(*, config: Any = None, env: Any = None) -> ResponsesStore:

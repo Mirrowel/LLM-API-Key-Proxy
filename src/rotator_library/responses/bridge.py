@@ -36,7 +36,7 @@ _CHAT_GENERATION_KEYS = {
     "top_p",
     "user",
 }
-_PROXY_ROUTING_KEYS = {"classifier", "api_keys", "providers", "private", "model_filters"}
+PROXY_ROUTING_KEYS = {"classifier", "api_keys", "providers", "private", "model_filters"}
 
 
 class ResponsesBridge:
@@ -87,7 +87,7 @@ class ResponsesBridge:
             "extra": {
                 key: deepcopy(value)
                 for key, value in unified.extra.items()
-                if key not in _PROXY_ROUTING_KEYS
+                if key not in PROXY_ROUTING_KEYS
             },
         }
         kwargs["_responses_bridge"] = {k: v for k, v in unsupported.items() if v}
@@ -134,8 +134,6 @@ def _chat_generation_key(key: str) -> str:
 
 def responses_session_hints(
     previous_response_id: Optional[str],
-    *,
-    affinity_key: Optional[str] = None,
 ) -> SessionTrackingHints | None:
     """Return proxy-internal sticky routing evidence for Responses continuations."""
 
@@ -144,7 +142,7 @@ def responses_session_hints(
     anchor = f"responses_previous_response_id:{previous_response_id}"
     return SessionTrackingHints(
         global_strong_anchors=[anchor],
-        affinity_key=affinity_key or anchor,
+        affinity_key=anchor,
     )
 
 

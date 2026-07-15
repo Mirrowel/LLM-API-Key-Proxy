@@ -59,7 +59,9 @@ qualified. Proxy-owned global IDs use a typed internal channel. Ad hoc private
 credential bundles use the same hash-derived boundary for session tracking,
 usage managers, cooldowns, and sticky maps. Responses storage is additionally
 owned by `(domain, response_id)` and validates that domain through every stored
-ancestor.
+ancestor. Transport retrieval and continuation require a response-specific
+random capability whose hash is stored with the response; deterministic domain
+hashes are not access credentials.
 
 ## Scope
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
 from fastapi.testclient import TestClient
 
 from proxy_app import main as proxy_main
+from proxy_app.detailed_logger import RawIOLogger
 from rotator_library.responses import InMemoryResponsesStore, ResponsesService
 
 
@@ -29,6 +32,33 @@ def _client() -> TestClient:
     proxy_main.app.state.rotating_client = FakeClient()
     proxy_main.app.state.responses_service = ResponsesService(store=InMemoryResponsesStore())
     return TestClient(proxy_main.app)
+
+
+def test_raw_logger_never_persists_authentication_headers() -> None:
+    logger = RawIOLogger.__new__(RawIOLogger)
+    logger.request_id = "request"
+    logger.streaming = False
+    written = {}
+    logger._write_json = lambda filename, data: written.update(
+        {"filename": filename, "data": data}
+    )
+
+    logger.log_request(
+        {
+            "Authorization": "Bearer proxy-secret",
+            "X-Api-Key": "provider-secret",
+            "X-Proxy-Session-Domain": "bundle:private.capability",
+            "Content-Type": "application/json",
+        },
+        {"model": "gpt-test"},
+    )
+
+    assert written["data"]["headers"] == {
+        "Authorization": "<redacted>",
+        "X-Api-Key": "<redacted>",
+        "X-Proxy-Session-Domain": "<redacted>",
+        "Content-Type": "application/json",
+    }
 
 
 def test_post_responses_non_stream_success() -> None:
@@ -103,9 +133,18 @@ def test_scoped_response_retrieval_requires_creation_domain_header() -> None:
     )
     response_id = created_response.json()["id"]
     domain = created_response.headers["x-proxy-session-domain"]
+    raw_domain = domain.rsplit(".", 1)[0]
 
     assert domain.startswith("bundle:")
+    assert raw_domain.startswith("bundle:")
     assert client.get(f"/v1/responses/{response_id}").status_code == 404
+    assert (
+        client.get(
+            f"/v1/responses/{response_id}",
+            headers={"X-Proxy-Session-Domain": raw_domain},
+        ).status_code
+        == 404
+    )
     assert (
         client.get(
             f"/v1/responses/{response_id}",
@@ -122,6 +161,45 @@ def test_scoped_response_retrieval_requires_creation_domain_header() -> None:
     )
 
 
+def test_scoped_response_access_capabilities_are_unique_per_response() -> None:
+    client = _client()
+    payload = {
+        "model": "gpt-test",
+        "input": "private",
+        "api_keys": {"openai": ["private-key"]},
+        "private": True,
+    }
+
+    first = client.post("/v1/responses", json=payload)
+    second = client.post("/v1/responses", json=payload)
+
+    assert first.headers["x-proxy-session-domain"] != second.headers["x-proxy-session-domain"]
+
+
+def test_scoped_continuation_requires_parent_access_capability() -> None:
+    client = _client()
+    payload = {
+        "model": "gpt-test",
+        "input": "private",
+        "api_keys": {"openai": ["private-key"]},
+        "private": True,
+    }
+    parent = client.post("/v1/responses", json=payload)
+    continuation = {**payload, "previous_response_id": parent.json()["id"]}
+
+    denied = client.post("/v1/responses", json=continuation)
+    allowed = client.post(
+        "/v1/responses",
+        json=continuation,
+        headers={
+            "X-Proxy-Session-Domain": parent.headers["x-proxy-session-domain"]
+        },
+    )
+
+    assert denied.status_code == 404
+    assert allowed.status_code == 200
+
+
 def test_post_responses_stream_returns_sse_events() -> None:
     client = _client()
 
@@ -131,3 +209,35 @@ def test_post_responses_stream_returns_sse_events() -> None:
     assert response.headers["x-proxy-session-domain"] == "public"
     assert "event: response.created" in response.text
     assert "event: response.completed" in response.text
+
+
+def test_scoped_stream_uses_same_access_capability_for_stored_response() -> None:
+    client = _client()
+
+    response = client.post(
+        "/v1/responses",
+        json={
+            "model": "gpt-test",
+            "input": "private stream",
+            "stream": True,
+            "api_keys": {"openai": ["private-key"]},
+            "private": True,
+        },
+    )
+    capability = response.headers["x-proxy-session-domain"]
+    created_payload = next(
+        json.loads(line.removeprefix("data: "))
+        for line in response.text.splitlines()
+        if line.startswith("data: {")
+    )
+    response_id = created_payload["id"]
+
+    assert response.status_code == 200
+    assert capability.startswith("bundle:")
+    assert (
+        client.get(
+            f"/v1/responses/{response_id}",
+            headers={"X-Proxy-Session-Domain": capability},
+        ).status_code
+        == 200
+    )

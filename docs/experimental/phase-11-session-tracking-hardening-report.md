@@ -123,9 +123,14 @@ Stateful simulations cover:
 Responses/isolation tests cover:
 
 - Scoped routing reaches RequestContextBuilder without storing or tracing credential containers.
-- Every `previous_response_id` ancestor must belong to the requesting domain.
+- Every `previous_response_id` parent requires its response-specific access
+  capability, and every ancestor must belong to the requesting domain.
 - Storage ownership is composite by `(domain, response_id)`, including IDs that would collide under path sanitization.
-- Non-public retrieval/deletion/input-items require the opaque domain header returned at creation.
+- Non-public retrieval/deletion/input-items require the unforgeable access header
+  returned at creation; deterministic classifier/domain hashes are rejected.
+- Legacy durable public entries migrate only on exact ID/scope match. Old private
+  deterministic headers are intentionally rejected rather than weakening the new
+  capability boundary.
 - Ad hoc credential bundles use distinct usage managers; named classifier identity remains stable across credential rotation.
 - External anchor IDs are hashed and raw scope strings cannot impersonate internally derived domain markers.
 
@@ -144,7 +149,8 @@ Streaming tests cover:
 
 - `python -m pytest tests/test_session_tracking.py -q`: 119 passed, 18 subtests passed.
 - Final session/request/selection/routing/classifier/executor slice: 173 passed, 18 subtests passed.
-- Final Responses bridge/service/store/routes/streaming/accounting slice: 76 passed.
+- Final Responses bridge/service/store/routes/streaming/accounting slice: 90 passed.
+- Consolidated changed-surface slice: 279 passed, 18 subtests passed.
 - Python compilation passed for all changed runtime modules.
 - `git diff --check` passed for all Phase 11 files.
 - Explore scenario review: no blocker, high, or medium findings after final re-review.
@@ -153,7 +159,14 @@ Streaming tests cover:
   after request-local closure, one-to-one pairing, and stable streamed choice
   indexing were verified.
 
-The unrestricted test run is not currently a clean repository-wide signal. Initial collection is blocked by 13 unrelated retired/Gemini import errors. After excluding only those known collections, the active run reached 791 passing tests plus 16 subtests, with 68 unrelated failures from existing refactor drift, missing async-test plugins, legacy constructor assumptions, and order-dependent provider-global test state. Phase 11 focused and integration slices are clean.
+A previous unrestricted test run was not a clean repository-wide signal. Initial
+collection was blocked by 13 unrelated retired/Gemini import errors. After
+excluding only those known collections, that run reached 791 passing tests plus
+16 subtests, with 68 failures from existing refactor drift, missing async-test
+plugins, legacy constructor assumptions, and provider-global test state. The
+known classifier test pollution on the changed surface is now isolated; the
+279-test consolidated changed-surface run is clean. The unrestricted suite was
+not rerun after this final cleanup.
 
 ## Files
 
@@ -165,6 +178,7 @@ The unrestricted test run is not currently a clean repository-wide signal. Initi
 - `src/rotator_library/client/executor.py`
 - `src/rotator_library/core/types.py`
 - `src/rotator_library/providers/provider_interface.py`
+- `src/rotator_library/providers/provider_cache.py`
 - `src/rotator_library/routing/attempts.py`
 - `src/rotator_library/usage/config.py`
 - `src/rotator_library/usage/selection/strategies/sequential.py`
@@ -172,6 +186,7 @@ The unrestricted test run is not currently a clean repository-wide signal. Initi
 - `src/rotator_library/responses/service.py`
 - `src/rotator_library/responses/store.py`
 - `src/proxy_app/main.py`
+- `src/proxy_app/detailed_logger.py`
 - `tests/test_session_tracking.py`
 - `tests/test_request_builder_routing.py`
 - `tests/test_selection_engine.py`
@@ -181,6 +196,7 @@ The unrestricted test run is not currently a clean repository-wide signal. Initi
 - `tests/test_responses_service.py`
 - `tests/test_responses_store.py`
 - `tests/test_responses_routes.py`
+- `tests/test_responses_streaming.py`
 - `.env.example`
 - `README.md`
 - `DOCUMENTATION.md`
@@ -189,4 +205,4 @@ The unrestricted test run is not currently a clean repository-wide signal. Initi
 
 ## Review Disposition
 
-The first reviews found valid stream-evidence parsing/completion gaps and several missing boundary tests. The stateful-scenario reviews then found changed-tail child forking, context precedence, shared-harness binding, namespace migration, and raw tool-ID collision risks. The closed-tool-event review found persisted-strength promotion, many-to-one result pairing, and streamed choice-index collisions. These were reproduced, fixed, and covered by dedicated restart/isolation tests. Two reported anchor-ownership defects were independently rejected after direct inspection: shared anchors are skipped before entering a second session set, and global trimming already removes the owning session-set entry.
+The first reviews found valid stream-evidence parsing/completion gaps and several missing boundary tests. The stateful-scenario reviews then found changed-tail child forking, context precedence, shared-harness binding, namespace migration, and raw tool-ID collision risks. The closed-tool-event review found persisted-strength promotion, many-to-one result pairing, and streamed choice-index collisions. The final staged-diff review removed duplicate continuation/scope policy and dead context fields, then found deterministic scoped-response access, missing durable key deletion, capability log exposure, and an inaccessible initial scoped stream state. These were reproduced, fixed, and covered by dedicated restart/isolation tests. Two reported anchor-ownership defects were independently rejected after direct inspection: shared anchors are skipped before entering a second session set, and global trimming already removes the owning session-set entry.
