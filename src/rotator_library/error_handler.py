@@ -680,6 +680,25 @@ def get_retry_after(error: Exception) -> Optional[int]:
             except (ValueError, TypeError):
                 pass
 
+    # Structured native errors retain decoded bodies and headers without needing
+    # to expose transport objects to protocol formatters.
+    structured_response = getattr(error, "response", None)
+    if isinstance(structured_response, dict):
+        try:
+            result = _extract_retry_from_json_body(json.dumps(structured_response))
+            if result is not None:
+                return result
+        except (TypeError, ValueError):
+            pass
+    structured_headers = getattr(error, "headers", None)
+    if isinstance(structured_headers, dict):
+        retry_header = structured_headers.get("retry-after") or structured_headers.get("Retry-After")
+        if retry_header is not None:
+            try:
+                return max(0, int(retry_header))
+            except (TypeError, ValueError):
+                pass
+
     # 1. Try to parse JSON from the error string representation
     # Some exceptions embed JSON in their string representation
     error_str = str(error)
@@ -795,6 +814,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             error_type=str(explicit_error_type).strip().lower().replace("-", "_").replace(" ", "_"),
             original_exception=e,
             status_code=getattr(e, "status_code", None),
+            retry_after=get_retry_after(e),
         )
 
     error_text = str(e)

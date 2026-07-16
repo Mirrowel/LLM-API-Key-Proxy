@@ -389,9 +389,11 @@ State: **completed**
 
 ### Phase E: Public Gemini and configurable providers
 
-State: **pending**
+State: **completed for non-streaming; streamGenerateContent moves with Phase F**
 
-- Add Gemini generateContent, streamGenerateContent, and countTokens-compatible routes.
+- Add Gemini generateContent and countTokens-compatible routes.
+- Reserve streamGenerateContent for the canonical streaming checkpoint so the
+  public route never exposes an unconverted or falsely advertised stream.
 - Add explicit output protocol selection.
 - Extend custom provider configuration to supported native protocols and output defaults.
 - Validate configurations before execution.
@@ -520,6 +522,55 @@ This correction is complete only when:
 - Verification: 269 focused protocol/runtime/provider tests passed; all 68 currently tracked test files passed with 763 tests and 18 subtests; compile checks and `git diff --check` passed apart from repository line-ending notices.
 - Canonical streaming, public Gemini endpoints, and configuration-defined provider protocols remain explicitly deferred to Phases E and F.
 
+### 2026-07-16: Public protocol and configurable-provider checkpoint
+
+- Added first-class Gemini `generateContent` and `countTokens` client routes for
+  both `/v1beta/models/...` and `/v1/models/...`. Bare Gemini model IDs route to
+  the Gemini provider unless an explicit model-route alias exists.
+- Added independent non-streaming output selection. Precedence is explicit
+  library argument, `X-Proxy-Output-Protocol`, configured provider default, then
+  the input protocol. Aliases are normalized case-insensitively and unknown
+  values fail as client errors.
+- Chat, Anthropic, Responses, and Gemini ingress now share that selector.
+  Responses always executes and stores a native Responses object before an
+  optional return-format conversion, preserving retrieval and continuation.
+- Added config-defined custom providers with startup-snapshotted API base,
+  provider protocol, endpoint templates, auth-header mode, model list, adapters,
+  field-cache rules, native-stream capability, and default output protocol.
+- Limited configurable provider and output protocols to the four supported
+  generative protocols. Broader registered operation adapters such as embeddings,
+  audio, and images are not falsely advertised as interchangeable generation
+  protocols.
+- Kept credentials outside structured config. API bases reject userinfo, query,
+  and fragments; operation paths remain on the configured origin, reject secret-
+  bearing query keys and fragments, and permit protocol selectors such as
+  Gemini's `?alt=sse`.
+- Native HTTP transport now treats only 2xx as success and preserves non-success
+  status plus structured provider bodies for retry, cooldown, and selected-
+  protocol error formatting.
+- Aggregate credential exhaustion now raises a protocol-formatable error without
+  regressing ordered fallback: structured failure details determine retryability,
+  and final errors retain all target and attempt summaries.
+- Cross-protocol streams are rejected centrally from both `agenerate()` and
+  direct `acompletion()` entry paths. Gemini `generateContent` also rejects
+  `stream=true`; the real `streamGenerateContent` route is intentionally coupled
+  to Phase F's canonical event conversion.
+- Iterative `explore` and fresh `explore-heavy` audits found and drove fixes for
+  header normalization, stream bypasses, endpoint credential safety, native HTTP
+  errors, Responses error formatting, fallback exhaustion, config snapshots,
+  non-generative declarations, redirects, and public test tracking.
+- Final verification: the complete git-tracked local suite passes 889 tests and
+  18 subtests; the widened protocol/public/provider subset passes 390 tests;
+  `compileall` and staged `git diff --check` pass apart from repository line-
+  ending notices.
+- Final `explore` and `explore-heavy` indexed-state reviews both issued explicit
+  safe-to-commit verdicts with no unresolved blocker, high, or medium findings.
+- Intentional boundaries: custom-provider transport config is snapshotted at
+  process startup; Gemini `countTokens` is locally estimated; cross-protocol
+  streaming and the public `streamGenerateContent` route remain Phase F work.
+
 ### Current next action
 
-Implement Phase E: expose first-class Gemini client endpoints, add explicit output protocol selection, and let configuration-defined providers declare any supported native protocol and output default.
+Finish Phase E sign-off and commit, then implement Phase F: canonical streaming
+across Chat, Anthropic, Responses, and Gemini, including the public
+`streamGenerateContent` surface.

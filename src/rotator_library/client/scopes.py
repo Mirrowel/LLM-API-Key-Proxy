@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 
+NO_AUTH_CREDENTIAL = "__proxy_no_auth__"
+
+
 def derive_session_isolation_key(
     classifier: Optional[str],
     request_api_keys: Any,
@@ -191,6 +194,11 @@ class ScopeManager:
             credential_entry = registered["credentials"][provider]
             raw_credentials = list(credential_entry.get("keys", []))
             credential_private = bool(credential_entry.get("private", True))
+        elif self._all_credentials.get(provider) == [NO_AUTH_CREDENTIAL]:
+            # A no-auth provider still needs one selector/accounting slot in each
+            # isolated usage pool, but there is no secret to fingerprint or leak.
+            raw_credentials = [NO_AUTH_CREDENTIAL]
+            credential_private = False
 
         session_domain = derive_session_isolation_key(
             classifier,

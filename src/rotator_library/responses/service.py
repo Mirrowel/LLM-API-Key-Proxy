@@ -16,7 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, NoReturn, Optional
 
-from ..protocols import ProtocolContext
+from ..protocols import ProtocolContext, get_protocol
 from ..streaming import StreamEvent, StreamMonitor
 from ..config.experimental import get_stream_runtime_settings
 from ..client.scopes import derive_session_isolation_key
@@ -86,6 +86,30 @@ class ResponsesServiceError(ValueError):
         self.status_code = status_code
         self.error_type = error_type
         super().__init__(message)
+
+    def to_protocol_payload(self, protocol: str) -> dict[str, Any]:
+        """Format this service failure in an independently selected protocol."""
+
+        if protocol == "responses":
+            return {
+                "error": {
+                    "message": str(self),
+                    "type": self.error_type,
+                    "code": self.status_code,
+                }
+            }
+        normalized = {
+            "authentication_error": "authentication",
+            "permission_error": "forbidden",
+            "rate_limit_error": "rate_limit",
+            "invalid_request_error": "invalid_request",
+            "not_found_error": "not_found",
+        }.get(self.error_type, self.error_type)
+        return StructuredAPIResponseError(
+            str(self),
+            error_type=normalized,
+            status_code=self.status_code,
+        ).to_protocol_payload(protocol)
 
 
 class ResponsesService:
@@ -175,6 +199,15 @@ class ResponsesService:
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
 
         resolved_scope = self._resolve_request_scope(raw_request, request_scope)
+        selected_output = (
+            client.resolve_output_protocol(
+                raw_request,
+                input_protocol="responses",
+                request=request,
+            )
+            if hasattr(client, "resolve_output_protocol")
+            else "responses"
+        )
         isolation_key = resolved_scope.key
         safe_request = _safe_stored_request(raw_request)
         self._trace(transaction_logger, "responses_raw_request", safe_request, direction="request", stage="client")
@@ -255,6 +288,7 @@ class ResponsesService:
                 stage="adapter",
                 metadata={"bridge_metadata": {"extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()), "has_session_hints": bool(session_hints)}},
             )
+            chat_kwargs["_output_protocol"] = "openai_chat"
             chat_response = await client.acompletion(request=request, **chat_kwargs)
             if transaction_logger:
                 self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
@@ -277,7 +311,22 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
         self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")
-        return response_payload
+        if selected_output == "responses":
+            return response_payload
+        unified_response = self.protocol.parse_response(
+            response_payload,
+            ProtocolContext(source_protocol="responses", target_protocol=selected_output),
+        )
+        return get_protocol(selected_output).format_response(
+            unified_response,
+            ProtocolContext(
+                source_protocol="responses",
+                target_protocol=selected_output,
+                input_protocol="responses",
+                output_protocol=selected_output,
+                provider_state_compatible=False,
+            ),
+        )
 
     async def stream_response(
         self,

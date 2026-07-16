@@ -36,11 +36,14 @@ from .models import ModelResolver
 from .transforms import ProviderTransforms
 from .executor import RequestExecutor
 from .anthropic import AnthropicHandler
-from .scopes import ScopeManager
+from .gemini import GeminiHandler
+from .scopes import NO_AUTH_CREDENTIAL, ScopeManager
 from .model_discovery import ModelDiscoveryService
 from .usage_managers import UsageManagerRegistry
 from .request_builder import RequestContextBuilder
 from .quota import QuotaService
+from .protocol_selection import canonical_protocol_name, request_output_protocol, require_same_protocol_stream
+from ..routing import FallbackResolver, load_routing_config_from_env
 from ..session_tracking import SessionTracker
 
 # Import providers and other dependencies
@@ -88,6 +91,23 @@ def _resolve_session_persistence_settings(
                 raw_flush_interval,
             )
     return enabled, float(flush_interval_seconds)
+
+
+def _add_configured_no_auth_credentials(
+    credentials: Dict[str, List[str]],
+    provider_names: set[str],
+    *,
+    config: Any = None,
+) -> None:
+    """Give configured no-auth providers one internal rotation/accounting slot."""
+
+    from ..config.experimental import get_provider_runtime_config, load_experimental_config
+
+    active = config or load_experimental_config()
+    for provider in provider_names:
+        runtime = get_provider_runtime_config(provider, config=active)
+        if runtime.api_base and runtime.auth_mode == "none" and not credentials.get(provider):
+            credentials[provider] = [NO_AUTH_CREDENTIAL]
 
 
 class RotatingClient:
@@ -165,11 +185,6 @@ class RotatingClient:
         api_keys = {p: k for p, k in api_keys.items() if k}
         oauth_credentials = {p: c for p, c in oauth_credentials.items() if c}
 
-        if not api_keys and not oauth_credentials:
-            lib_logger.warning(
-                "No provider credentials configured. Client will be unable to make requests."
-            )
-
         # Discover OAuth credentials if not provided
         if oauth_credentials:
             self.oauth_credentials = oauth_credentials
@@ -185,6 +200,14 @@ class RotatingClient:
             self.all_credentials.setdefault(provider, []).extend(keys)
         for provider, paths in self.oauth_credentials.items():
             self.all_credentials.setdefault(provider, []).extend(paths)
+        _add_configured_no_auth_credentials(
+            self.all_credentials,
+            set(PROVIDER_PLUGINS),
+        )
+        if not self.all_credentials:
+            lib_logger.warning(
+                "No provider credentials configured. Client will be unable to make requests."
+            )
 
         self.api_keys = api_keys
         self.oauth_providers = set(self.oauth_credentials.keys())
@@ -355,6 +378,7 @@ class RotatingClient:
 
         # Initialize Anthropic compatibility handler
         self._anthropic_handler = AnthropicHandler(self)
+        self._gemini_handler = GeminiHandler(self)
 
     @staticmethod
     def _normalize_mode_concurrency(values: Dict[str, Dict[str, int]]) -> None:
@@ -580,15 +604,52 @@ class RotatingClient:
         the selected output defaults to the client's input format.
         """
 
+        selected_output = self.resolve_output_protocol(
+            payload,
+            input_protocol=input_protocol,
+            request=request,
+            explicit=output_protocol,
+        )
+        if payload.get("stream"):
+            require_same_protocol_stream(input_protocol, selected_output)
         kwargs = dict(payload)
         kwargs.update(routing_kwargs)
         kwargs["_input_protocol"] = input_protocol
-        kwargs["_output_protocol"] = output_protocol or input_protocol
+        kwargs["_output_protocol"] = selected_output
         return await self.acompletion(
             request=request,
             pre_request_callback=pre_request_callback,
             **kwargs,
         )
+
+    def resolve_output_protocol(
+        self,
+        payload: Dict[str, Any],
+        *,
+        input_protocol: str,
+        request: Optional[Any] = None,
+        explicit: Optional[str] = None,
+    ) -> str:
+        """Resolve explicit, HTTP, provider-default, then input output format."""
+
+        selected = explicit or request_output_protocol(request)
+        if selected:
+            return canonical_protocol_name(selected)
+        model = str(payload.get("model") or "")
+        provider = model.split("/", 1)[0] if "/" in model else ""
+        if not provider and model:
+            routing = load_routing_config_from_env()
+            if model.lower() in routing.model_routes:
+                decision = FallbackResolver(routing).resolve(model)
+                if decision.targets:
+                    provider = decision.targets[0].provider
+        plugin = self._get_provider_instance(provider) if provider else None
+        configured = (
+            plugin.get_default_output_protocol(model)
+            if plugin and hasattr(plugin, "get_default_output_protocol")
+            else None
+        )
+        return canonical_protocol_name(configured or input_protocol)
 
     async def acompletion(
         self,
@@ -633,6 +694,22 @@ class RotatingClient:
             raise ValueError("Either 'text' or 'messages' must be provided")
 
         return base_count
+
+    async def gemini_generate(
+        self,
+        payload: Dict[str, Any],
+        *,
+        model: str,
+        raw_request: Optional[Any] = None,
+    ) -> Any:
+        """Execute a native Gemini client request through shared routing."""
+
+        return await self._gemini_handler.generate(payload, model=model, raw_request=raw_request)
+
+    def gemini_count_tokens(self, payload: Dict[str, Any], *, model: str) -> Dict[str, int]:
+        """Return Gemini-compatible local token usage for a request."""
+
+        return self._gemini_handler.count_tokens(payload, model=model)
 
     def _model_cache_key(
         self,

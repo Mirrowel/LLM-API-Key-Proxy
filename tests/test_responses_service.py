@@ -126,6 +126,11 @@ class FakeNativeProtocolErrorClient(FakeNativeProtocolClient):
         )
 
 
+class FakeSelectedOutputClient(FakeNativeProtocolClient):
+    def resolve_output_protocol(self, payload, *, input_protocol, request=None, explicit=None):
+        return "anthropic_messages"
+
+
 @pytest.mark.asyncio
 async def test_native_structured_errors_keep_responses_status_and_type() -> None:
     service = ResponsesService(store=InMemoryResponsesStore())
@@ -138,6 +143,15 @@ async def test_native_structured_errors_keep_responses_status_and_type() -> None
 
     assert raised.value.status_code == 429
     assert raised.value.error_type == "rate_limit"
+
+
+def test_responses_service_errors_follow_selected_output_protocol() -> None:
+    error = ResponsesServiceError("provider busy", status_code=429, error_type="rate_limit")
+
+    assert error.to_protocol_payload("gemini") == {
+        "error": {"code": 429, "message": "provider busy", "status": "RESOURCE_EXHAUSTED"}
+    }
+    assert error.to_protocol_payload("anthropic_messages")["error"]["type"] == "rate_limit_error"
 
 
 def _trace_entries(log_dir):
@@ -205,6 +219,25 @@ async def test_internal_responses_path_uses_native_protocol_and_expands_local_co
     ]
     assert "previous_response_id" not in client.calls[1]["payload"]
     assert client.calls[1]["kwargs"]["_disable_provider_continuation"] is True
+
+
+@pytest.mark.asyncio
+async def test_responses_storage_stays_native_before_selected_output_conversion() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+    client = FakeSelectedOutputClient()
+
+    result = await service.create_response(
+        {"model": "openai/gpt-test", "input": "hello"},
+        client,
+    )
+
+    assert result["type"] == "message"
+    assert result["content"][0]["text"] == "answer 1"
+    stored = await store.get("resp_native_1", "public")
+    assert stored is not None
+    assert stored.response["object"] == "response"
+    assert stored.response["output"][0]["type"] == "message"
 
 
 @pytest.mark.asyncio

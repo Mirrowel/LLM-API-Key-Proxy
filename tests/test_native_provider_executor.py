@@ -8,6 +8,7 @@ from rotator_library.adapters import PayloadAdapter, register_adapter
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from rotator_library.protocols import ProtocolError
+from rotator_library.core.errors import StructuredAPIResponseError, classify_error
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -22,6 +23,12 @@ class FakeHTTPResponse:
         return self.payload
 
 
+class FakeHTTPErrorResponse(FakeHTTPResponse):
+    status_code = 429
+    text = "quota exhausted"
+    headers = {"Retry-After": "17"}
+
+
 class FakeHTTPClient:
     def __init__(self, response):
         self.response = response
@@ -30,6 +37,79 @@ class FakeHTTPClient:
     async def post(self, endpoint, *, headers, json):
         self.calls.append({"endpoint": endpoint, "headers": headers, "json": json})
         return FakeHTTPResponse(self.response)
+
+
+@pytest.mark.asyncio
+async def test_native_transport_preserves_non_success_status_and_body() -> None:
+    class ErrorClient:
+        async def post(self, endpoint, *, headers, json):
+            return FakeHTTPErrorResponse(
+                {"error": {"status": "RESOURCE_EXHAUSTED", "message": "quota exhausted"}}
+            )
+
+    with pytest.raises(StructuredAPIResponseError) as raised:
+        await NativeHTTPTransport(ErrorClient()).post_json(
+            "https://example.test/generate",
+            headers={"Authorization": "Bearer secret"},
+            payload={"contents": []},
+        )
+
+    assert raised.value.http_status == 429
+    assert raised.value.error_type == "quota_exceeded"
+    assert raised.value.response["error"]["message"] == "quota exhausted"
+    assert classify_error(raised.value).retry_after == 17
+
+
+@pytest.mark.asyncio
+async def test_native_transport_preserves_body_retry_delay_without_header() -> None:
+    class DelayResponse(FakeHTTPErrorResponse):
+        headers = {}
+
+    class DelayClient:
+        async def post(self, endpoint, *, headers, json):
+            return DelayResponse(
+                {
+                    "error": {
+                        "status": "RESOURCE_EXHAUSTED",
+                        "message": "quota exhausted",
+                        "details": [
+                            {
+                                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                                "metadata": {"quotaResetDelay": "39s"},
+                            }
+                        ],
+                    }
+                }
+            )
+
+    with pytest.raises(StructuredAPIResponseError) as raised:
+        await NativeHTTPTransport(DelayClient()).post_json(
+            "https://example.test/generate",
+            headers={},
+            payload={},
+        )
+
+    assert classify_error(raised.value).retry_after == 39
+
+
+@pytest.mark.asyncio
+async def test_native_transport_rejects_redirects_as_non_success() -> None:
+    class RedirectResponse(FakeHTTPResponse):
+        status_code = 302
+
+    class RedirectClient:
+        async def post(self, endpoint, *, headers, json):
+            return RedirectResponse({"location": "https://other.example"})
+
+    with pytest.raises(StructuredAPIResponseError) as raised:
+        await NativeHTTPTransport(RedirectClient()).post_json(
+            "https://example.test/generate",
+            headers={},
+            payload={},
+        )
+
+    assert raised.value.status_code == 302
+    assert raised.value.error_type == "invalid_request"
 
 
 def _trace_entries(log_dir):
