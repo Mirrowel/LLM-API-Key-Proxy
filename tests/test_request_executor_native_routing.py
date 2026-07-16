@@ -308,7 +308,7 @@ async def test_codex_provider_runs_mock_live_native_request(monkeypatch) -> None
     assert response["choices"][0]["message"]["content"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://codex.test/v1/responses"
     assert http_client.calls[0]["json"]["model"] == "gpt-5.1-codex"
-    assert http_client.calls[0]["json"]["input"][0]["content"] == [{"type": "text", "text": "hi"}]
+    assert http_client.calls[0]["json"]["input"][0]["content"] == [{"type": "input_text", "text": "hi"}]
     assert "messages" not in http_client.calls[0]["json"]
 
 

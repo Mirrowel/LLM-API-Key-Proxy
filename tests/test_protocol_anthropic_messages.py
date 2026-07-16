@@ -2,7 +2,18 @@ from __future__ import annotations
 
 import json
 
-from rotator_library.protocols import get_protocol, list_protocols
+from rotator_library.protocols import ProtocolContext, get_protocol, list_protocols
+
+
+def _compatible_context() -> ProtocolContext:
+    """Return a provider-state domain that may restore hidden signatures."""
+
+    return ProtocolContext(
+        source_protocol="anthropic_messages",
+        target_protocol="anthropic_messages",
+        source_provider="anthropic",
+        target_provider="anthropic",
+    )
 
 
 def test_anthropic_build_uses_mutated_unified_thinking_signature() -> None:
@@ -14,7 +25,7 @@ def test_anthropic_build_uses_mutated_unified_thinking_signature() -> None:
 
     unified = adapter.parse_request(raw)
     unified.messages[0].content[0].reasoning.text = "after"
-    rebuilt = adapter.build_request(unified)
+    rebuilt = adapter.build_request(unified, _compatible_context())
 
     assert rebuilt["messages"][0]["content"][0]["thinking"] == "after"
     assert rebuilt["messages"][0]["content"][0]["signature"] == "sig_1"
@@ -50,7 +61,7 @@ def test_anthropic_request_round_trip_preserves_thinking_tools_and_cache_metadat
     }
 
     unified = adapter.parse_request(raw)
-    rebuilt = adapter.build_request(unified)
+    rebuilt = adapter.build_request(unified, _compatible_context())
 
     assert unified.model == "anthropic/claude-test"
     assert unified.system[0].text == "system"

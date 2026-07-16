@@ -153,6 +153,36 @@ class ReasoningBlock(ProtocolSerializable):
 
 
 @dataclass
+class MediaSource(ProtocolSerializable):
+    """Canonical media identity independent of a protocol's wire spelling.
+
+    A media value can be URL-backed, embedded, or provider-file-backed. Protocol
+    parsers populate the common fields and retain the source object only for
+    same-protocol fidelity. Cross-protocol writers consume the common fields.
+    """
+
+    kind: str = "url"
+    media_type: Optional[str] = None
+    url: Optional[str] = None
+    data: Optional[str] = None
+    file_id: Optional[str] = None
+    detail: Optional[str] = None
+    raw: Any = None
+    extra: JsonObject = field(default_factory=dict)
+
+    _fields: ClassVar[tuple[str, ...]] = (
+        "kind",
+        "media_type",
+        "url",
+        "data",
+        "file_id",
+        "detail",
+        "raw",
+        "extra",
+    )
+
+
+@dataclass
 class ToolCall(ProtocolSerializable):
     """Protocol-neutral tool/function call emitted by an assistant."""
 
@@ -172,12 +202,13 @@ class ToolResult(ProtocolSerializable):
     """Protocol-neutral result associated with a prior tool call."""
 
     tool_call_id: Optional[str] = None
+    name: Optional[str] = None
     content: Any = None
     is_error: Optional[bool] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
-    _fields: ClassVar[tuple[str, ...]] = ("tool_call_id", "content", "is_error", "raw", "extra")
+    _fields: ClassVar[tuple[str, ...]] = ("tool_call_id", "name", "content", "is_error", "raw", "extra")
 
 
 @dataclass
@@ -197,9 +228,10 @@ class ToolDefinition(ProtocolSerializable):
 class ContentBlock(ProtocolSerializable):
     """A single message content block.
 
-    ``type`` follows the source protocol when practical. The dedicated fields
-    cover common text, image, document, tool, and reasoning cases, while ``extra``
-    keeps provider-specific payloads for later field-cache extraction.
+    ``type`` is canonical (for example ``text``, ``image``, ``tool_call``, or
+    ``reasoning``). ``raw`` and ``extra`` retain source-protocol details for
+    same-protocol fidelity and field-cache extraction; foreign formatters must
+    not replay them without an explicit mapping.
     """
 
     type: str = "text"
@@ -220,6 +252,25 @@ class ContentBlock(ProtocolSerializable):
         "reasoning",
         "raw",
         "extra",
+    )
+
+
+@dataclass
+class ConversionWarning(ProtocolSerializable):
+    """A non-fatal, explicit loss of an optional conversion hint."""
+
+    code: str
+    message: str
+    field: Optional[str] = None
+    source_protocol: Optional[str] = None
+    target_protocol: Optional[str] = None
+
+    _fields: ClassVar[tuple[str, ...]] = (
+        "code",
+        "message",
+        "field",
+        "source_protocol",
+        "target_protocol",
     )
 
 
@@ -253,6 +304,7 @@ class UnifiedRequest(ProtocolSerializable):
     """A request after parsing from a client or provider protocol."""
 
     operation: str = OPERATION_UNKNOWN
+    logical_operation: str = OPERATION_UNKNOWN
     model: str = ""
     messages: list[UnifiedMessage] = field(default_factory=list)
     system: list[ContentBlock] = field(default_factory=list)
@@ -265,11 +317,15 @@ class UnifiedRequest(ProtocolSerializable):
     response_format: Any = None
     previous_response_id: Optional[str] = None
     metadata: JsonObject = field(default_factory=dict)
+    source_protocol: Optional[str] = None
+    extensions: dict[str, JsonObject] = field(default_factory=dict)
+    warnings: list[ConversionWarning] = field(default_factory=list)
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
     _fields: ClassVar[tuple[str, ...]] = (
         "operation",
+        "logical_operation",
         "model",
         "messages",
         "system",
@@ -282,6 +338,36 @@ class UnifiedRequest(ProtocolSerializable):
         "response_format",
         "previous_response_id",
         "metadata",
+        "source_protocol",
+        "extensions",
+        "warnings",
+        "raw",
+        "extra",
+    )
+
+
+@dataclass
+class OutputItem(ProtocolSerializable):
+    """One ordered semantic output item from a generative response."""
+
+    type: str
+    id: Optional[str] = None
+    role: Optional[str] = None
+    content: list[ContentBlock] = field(default_factory=list)
+    tool_call: Optional[ToolCall] = None
+    reasoning: Optional[ReasoningBlock] = None
+    status: Optional[str] = None
+    raw: Any = None
+    extra: JsonObject = field(default_factory=dict)
+
+    _fields: ClassVar[tuple[str, ...]] = (
+        "type",
+        "id",
+        "role",
+        "content",
+        "tool_call",
+        "reasoning",
+        "status",
         "raw",
         "extra",
     )
@@ -292,29 +378,39 @@ class UnifiedResponse(ProtocolSerializable):
     """A complete provider/client response in protocol-neutral form."""
 
     operation: str = OPERATION_UNKNOWN
+    logical_operation: str = OPERATION_UNKNOWN
     id: Optional[str] = None
     model: Optional[str] = None
     messages: list[UnifiedMessage] = field(default_factory=list)
+    items: list[OutputItem] = field(default_factory=list)
     output: list[Any] = field(default_factory=list)
     data: list[Any] = field(default_factory=list)
     content_type: Optional[str] = None
     stop_reason: Optional[str] = None
     usage: Optional[Usage] = None
     metadata: JsonObject = field(default_factory=dict)
+    source_protocol: Optional[str] = None
+    extensions: dict[str, JsonObject] = field(default_factory=dict)
+    warnings: list[ConversionWarning] = field(default_factory=list)
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
     _fields: ClassVar[tuple[str, ...]] = (
         "operation",
+        "logical_operation",
         "id",
         "model",
         "messages",
+        "items",
         "output",
         "data",
         "content_type",
         "stop_reason",
         "usage",
         "metadata",
+        "source_protocol",
+        "extensions",
+        "warnings",
         "raw",
         "extra",
     )
@@ -330,22 +426,36 @@ class UnifiedStreamEvent(ProtocolSerializable):
 
     type: str
     operation: str = OPERATION_UNKNOWN
+    logical_operation: str = OPERATION_UNKNOWN
+    source_protocol: Optional[str] = None
+    native_type: Optional[str] = None
     delta: Optional[UnifiedMessage] = None
     message: Optional[UnifiedMessage] = None
     tool_call: Optional[ToolCall] = None
     usage: Optional[Usage] = None
     error: Any = None
+    item_id: Optional[str] = None
+    output_index: Optional[int] = None
+    content_index: Optional[int] = None
+    stop_reason: Optional[str] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
     _fields: ClassVar[tuple[str, ...]] = (
         "type",
         "operation",
+        "logical_operation",
+        "source_protocol",
+        "native_type",
         "delta",
         "message",
         "tool_call",
         "usage",
         "error",
+        "item_id",
+        "output_index",
+        "content_index",
+        "stop_reason",
         "raw",
         "extra",
     )
@@ -364,6 +474,12 @@ class ProtocolContext(ProtocolSerializable):
     model: Optional[str] = None
     source_protocol: Optional[str] = None
     target_protocol: Optional[str] = None
+    input_protocol: Optional[str] = None
+    provider_protocol: Optional[str] = None
+    output_protocol: Optional[str] = None
+    source_provider: Optional[str] = None
+    target_provider: Optional[str] = None
+    provider_state_compatible: bool = False
     request_id: Optional[str] = None
     session_id: Optional[str] = None
     credential_stable_id: Optional[str] = None
@@ -376,6 +492,12 @@ class ProtocolContext(ProtocolSerializable):
         "model",
         "source_protocol",
         "target_protocol",
+        "input_protocol",
+        "provider_protocol",
+        "output_protocol",
+        "source_provider",
+        "target_provider",
+        "provider_state_compatible",
         "request_id",
         "session_id",
         "credential_stable_id",
