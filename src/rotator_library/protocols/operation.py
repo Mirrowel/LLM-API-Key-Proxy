@@ -14,6 +14,11 @@ from __future__ import annotations
 from typing import Final
 
 OPERATION_UNKNOWN: Final[str] = "unknown"
+# The four conversational wire operations map to this logical operation. Keeping
+# it separate from endpoint-specific names allows a Chat request to target a
+# Messages, Responses, or Gemini generate endpoint without failing capability
+# checks merely because the external operation names differ.
+OPERATION_GENERATE: Final[str] = "generate"
 OPERATION_CHAT: Final[str] = "chat"
 OPERATION_MESSAGES: Final[str] = "messages"
 OPERATION_RESPONSES: Final[str] = "responses"

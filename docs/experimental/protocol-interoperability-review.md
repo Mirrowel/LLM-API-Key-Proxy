@@ -352,7 +352,7 @@ Tests must assert destination payload validity, not merely the presence of a res
 
 ### Phase A: Durable review and contract
 
-State: **in progress**
+State: **completed**
 
 - Persist this review and implementation state.
 - Establish product and preservation policies.
@@ -360,7 +360,7 @@ State: **in progress**
 
 ### Phase B: Canonical model and protocol contract
 
-State: **pending**
+State: **completed**
 
 - Add canonical instruction, media, tool policy, generation, status, output-item, error, and stream lifecycle semantics.
 - Preserve non-generative operation compatibility.
@@ -369,7 +369,7 @@ State: **pending**
 
 ### Phase C: Protocol conversions
 
-State: **pending**
+State: **completed**
 
 - Rework Chat, Anthropic, Responses, and Gemini readers and writers around canonical meaning.
 - Implement stop/status and generation-control mappings.
@@ -378,7 +378,7 @@ State: **pending**
 
 ### Phase D: Runtime wiring
 
-State: **pending**
+State: **in progress**
 
 - Carry input/provider/output protocol identities through the common request context.
 - Parse with the input protocol and build with the provider protocol.
@@ -484,6 +484,23 @@ This correction is complete only when:
 - Product owner confirmed opaque provider state should remain cached even when clients do not receive or return it.
 - Selected strict preservation for meaning-changing semantics, warning-based best effort for optional tuning fields, same-protocol extension passthrough, and explicit-only cross-protocol extension mapping.
 
+### 2026-07-16: Canonical non-streaming conversion checkpoint
+
+- Added independent input/provider/output protocol identities and logical-operation identity to the protocol context and unified records.
+- Added canonical source ownership, conversion warnings, media identity, ordered output items, normalized tool arguments/results, and canonical completion reasons.
+- Reworked Chat, Anthropic, Responses, and Gemini request/response readers and writers around canonical instruction, content, reasoning, tool, media, generation, status, and usage semantics.
+- Added source-aware passthrough: same-protocol extensions remain available while foreign raw fields and reasoning extensions are not replayed into another protocol.
+- Added destination validation for required content, media identity, tool identity, tool choice, response modalities, provider-bound continuation/background controls, and failed-response envelopes.
+- Added explicit warning behavior for unsupported optional controls and strengthened schema behavior.
+- Added provider-state compatibility gating for hidden reasoning/thought signatures. Protocol equality alone is not sufficient to emit opaque state.
+- Added a four-by-four non-streaming request and response semantic matrix with destination-wire assertions and focused regressions for all review findings.
+- Corrected tool-result behavior so application JSON containing an `error` field is never reclassified as transport failure. Native Anthropic `is_error` is encoded explicitly for protocols without a native error flag without relying on ambiguous reverse inference.
+- Ran four iterative `explore` and `explore-heavy` review passes. Both reviewers signed off with no unresolved blocker, high, or medium findings for the isolated canonical non-streaming checkpoint.
+- Verification: 172 focused protocol/native-provider tests passed; `git diff --check` passed except repository line-ending notices.
+- A raw `pytest -q tests` collection remains blocked by pre-existing retired Antigravity tests and two stale quota tests importing removed modules. This is recorded for the later full-local-verification phase and was not caused by this checkpoint.
+- Runtime execution still uses provider-side parsing of Chat-shaped requests and hardcodes Chat output. This is intentionally not claimed as fixed until Phase D.
+- Canonical streaming remains intentionally deferred to Phase F.
+
 ### Current next action
 
-Implement Phase B: canonical model and base protocol contract, with focused tests and an independent review before moving to complete protocol writers.
+Implement Phase D: carry independent input, provider, and output protocol identities through live execution; parse with the client protocol, build with the provider protocol, and remove provider-owned client translation.

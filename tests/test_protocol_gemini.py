@@ -95,7 +95,8 @@ def test_gemini_response_extracts_usage_and_thought_signature() -> None:
     unified = adapter.parse_response(raw)
 
     assert unified.id == "resp_1"
-    assert unified.stop_reason == "STOP"
+    assert unified.stop_reason == "stop"
+    assert unified.metadata["native_stop_reason"] == "STOP"
     assert unified.messages[0].content[0].text == "answer"
     assert unified.messages[0].reasoning[0].signature == "sig_2"
     assert unified.usage is not None
