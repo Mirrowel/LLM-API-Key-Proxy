@@ -105,8 +105,8 @@ openai/gpt-4o                    ← OpenAI API
 anthropic/claude-3-5-sonnet      ← Anthropic API
 openrouter/anthropic/claude-3-opus  ← OpenRouter
 gemini_cli/gemini-2.5-pro        ← Gemini CLI (OAuth)
-minimax/MiniMax-M3               ← MiniMax OpenAI-compatible route
-minimax/MiniMax-M2.7             ← MiniMax OpenAI-compatible route
+minimax/MiniMax-M3               (MiniMax OpenAI-compatible route)
+minimax/MiniMax-M2.7             (MiniMax OpenAI-compatible route)
 ```
 
 ### Usage Examples
