@@ -12,6 +12,7 @@ from rotator_library.providers.antigravity_provider import AntigravityProvider
 from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.copilot_provider import CopilotProvider
+from rotator_library.protocols import get_protocol
 from rotator_library.routing import parse_route_target
 
 
@@ -139,14 +140,18 @@ class CustomPlugin:
 
 
 def _context(target=None) -> RequestContext:
+    kwargs = {"model": "provider/gpt-test", "messages": [{"role": "user", "content": "hi"}]}
     return RequestContext(
         model="provider/gpt-test",
         provider="provider",
-        kwargs={"model": "provider/gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+        kwargs=kwargs,
         streaming=False,
         credentials=["cred"],
         deadline=9999999999.0,
         routing_targets=(target,) if target else None,
+        protocol_request=dict(kwargs),
+        unified_request=get_protocol("openai_chat").parse_request(kwargs),
+        input_provider="provider",
     )
 
 
@@ -159,6 +164,9 @@ def _provider_context(provider: str, model: str, kwargs: dict, target=None) -> R
         credentials=["cred"],
         deadline=9999999999.0,
         routing_targets=(target,) if target else None,
+        protocol_request=dict(kwargs),
+        unified_request=get_protocol("openai_chat").parse_request(kwargs),
+        input_provider=provider,
     )
 
 
@@ -364,7 +372,7 @@ def test_claude_code_header_modes(monkeypatch) -> None:
 
 def test_antigravity_alias_normalization_preserves_thinking_level() -> None:
     provider = AntigravityProvider()
-    request = {"_proxy_model": "antigravity/gemini-3-pro-low", "model": "gemini-3-pro-preview", "messages": [{"role": "user", "content": "hi"}]}
+    request = {"_proxy_model": "antigravity/gemini-3-pro-low", "model": "gemini-3-pro-preview", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
 
     prepared = provider.prepare_native_request(request, model=provider.normalize_native_model("antigravity/gemini-3-pro-low"), operation="generate")
 
@@ -373,7 +381,6 @@ def test_antigravity_alias_normalization_preserves_thinking_level() -> None:
     assert prepared["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
     assert prepared["metadata"]["thinking_level"] == "low"
     assert "_proxy_model" not in prepared
-    assert "messages" not in prepared
     assert prepared["contents"][0]["parts"][0]["text"] == "hi"
 
 
@@ -398,19 +405,25 @@ def test_auto_native_streaming_selection_honors_provider_opt_out() -> None:
     ) is False
 
 
-def test_native_request_payload_drops_litellm_only_fields() -> None:
-    payload = executor_module._native_request_payload(
-        {
-            "model": "provider/gpt-test",
-            "messages": [{"role": "user", "content": "hi"}],
-            "custom_llm_provider": "openai",
-            "api_base": "https://litellm-only.test",
-            "transaction_context": {"id": "trace"},
-            "litellm_call_id": "call",
-        }
-    )
+def test_native_operation_selection_never_receives_client_or_litellm_payload() -> None:
+    class OperationProbe(NativePlugin):
+        request = object()
 
-    assert payload == {"model": "provider/gpt-test", "messages": [{"role": "user", "content": "hi"}]}
+        def get_native_operation(self, model="", request=None, stream=False):
+            self.request = request
+            return "chat"
+
+    plugin = OperationProbe()
+
+    assert executor_module._should_use_native_protocol(
+        plugin,
+        "provider/gpt-test",
+        parse_route_target("provider/gpt-test"),
+        {"messages": [], "custom_llm_provider": "openai", "api_base": "https://litellm-only.test"},
+        stream=False,
+        execution="auto",
+    ) is True
+    assert plugin.request is None
 
 
 def test_route_error_type_from_response_hard_stop_wins_over_retry_summary() -> None:

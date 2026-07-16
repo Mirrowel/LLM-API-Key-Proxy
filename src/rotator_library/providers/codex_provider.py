@@ -31,7 +31,10 @@ class CodexProvider(ProviderInterface):
             path="id",
             scope=("provider", "model", "credential", "session"),
             inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
-            metadata={"purpose": "preserve Responses continuation IDs for Codex sessions"},
+            metadata={
+                "purpose": "preserve Responses continuation IDs for Codex sessions",
+                "provider_continuation": True,
+            },
         ),
     )
     default_rotation_mode = "sequential"
@@ -78,19 +81,11 @@ class CodexProvider(ProviderInterface):
         return False
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:
-        """Convert chat-style proxy input into Responses API input.
-
-        Direct `/v1/responses` calls already provide `input`; routed chat calls
-        usually provide `messages`. Converting here keeps the reusable Responses
-        protocol focused on its native shape while still making Codex mock-live
-        through the generic native executor.
-        """
+        """Apply the normalized upstream model to a Responses-native payload."""
 
         prepared = dict(request)
         if model:
             prepared["model"] = model
-        if "input" not in prepared and isinstance(prepared.get("messages"), list):
-            prepared["input"] = [_message_to_responses_input(message) for message in prepared.pop("messages")]
         return prepared
 
     def get_native_endpoint(self, model: str = "", operation: str = "responses") -> str:
@@ -104,11 +99,3 @@ class CodexProvider(ProviderInterface):
         if model.startswith("codex/"):
             return model
         return f"codex/{model}"
-
-
-def _message_to_responses_input(message: Any) -> dict[str, Any]:
-    """Return a minimal Responses input item from an OpenAI-style message."""
-
-    if not isinstance(message, dict):
-        return {"role": "user", "content": str(message)}
-    return {"role": message.get("role", "user"), "content": message.get("content", "")}

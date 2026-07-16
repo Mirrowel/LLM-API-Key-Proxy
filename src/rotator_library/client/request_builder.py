@@ -5,9 +5,11 @@
 
 import inspect
 import time
+from copy import deepcopy
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..core.types import RequestContext
+from ..protocols import ProtocolContext, get_protocol
 from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
 from ..routing.types import RouteTarget, RoutingDecision
 from ..session_tracking import SessionTrackingHints
@@ -121,6 +123,9 @@ class RequestContextBuilder:
         provider: str,
         model: str,
         kwargs: Dict[str, Any],
+        *,
+        unified_request: Any = None,
+        input_protocol: str = "openai_chat",
     ) -> Any:
         """Ask the provider for optional session evidence before routing.
 
@@ -136,7 +141,31 @@ class RequestContextBuilder:
         if not hook:
             return None
         try:
-            result = hook(kwargs, model=model)
+            provider_request = kwargs
+            if unified_request is not None:
+                provider_protocol_name = plugin.get_protocol_name(model) if hasattr(plugin, "get_protocol_name") else "openai_chat"
+                provider_protocol = get_protocol(provider_protocol_name)
+                native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else model
+                provider_view = deepcopy(unified_request)
+                provider_view.model = native_model
+                provider_request = provider_protocol.build_request(
+                    provider_view,
+                    ProtocolContext(
+                        input_protocol=input_protocol,
+                        provider_protocol=provider_protocol.name,
+                        output_protocol=input_protocol,
+                        source_protocol=input_protocol,
+                        target_protocol=provider_protocol.name,
+                        source_provider=None,
+                        target_provider=provider,
+                        provider=provider,
+                        model=native_model,
+                    ),
+                )
+                operation = plugin.get_native_operation(native_model, None, stream=bool(provider_view.stream)) if hasattr(plugin, "get_native_operation") else "generate"
+                if hasattr(plugin, "prepare_native_request"):
+                    provider_request = plugin.prepare_native_request(provider_request, native_model, operation)
+            result = hook(provider_request, model=model)
             if inspect.isawaitable(result):
                 result = await result
             return result
@@ -201,6 +230,31 @@ class RequestContextBuilder:
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        disable_provider_continuation = bool(kwargs.pop("_disable_provider_continuation", False))
+        requested_input_protocol = str(kwargs.pop("_input_protocol", "openai_chat") or "openai_chat")
+        requested_output_protocol = str(kwargs.pop("_output_protocol", requested_input_protocol) or requested_input_protocol)
+        input_protocol = get_protocol(requested_input_protocol)
+        output_protocol = get_protocol(requested_output_protocol)
+        protocol_request = deepcopy(kwargs)
+        protocol_context = ProtocolContext(
+            source_protocol=input_protocol.name,
+            target_protocol=input_protocol.name,
+            input_protocol=input_protocol.name,
+            output_protocol=output_protocol.name,
+        )
+        unified_request = input_protocol.parse_request(protocol_request, protocol_context)
+        if input_protocol.name != "openai_chat":
+            kwargs = get_protocol("openai_chat").build_request(
+                unified_request,
+                ProtocolContext(
+                    source_protocol=input_protocol.name,
+                    target_protocol="openai_chat",
+                    input_protocol=input_protocol.name,
+                    provider_protocol="openai_chat",
+                    output_protocol=output_protocol.name,
+                ),
+            )
         session_isolation_key = self._session_isolation_key(
             classifier,
             request_api_keys,
@@ -239,7 +293,6 @@ class RequestContextBuilder:
                 scoped_targets.append(self._with_request_scope(target, target_scope))
             routing_targets = tuple(scoped_targets)
 
-        parent_log_dir = kwargs.pop("_parent_log_dir", None)
         resolved_model = self._model_resolver.resolve_model_id(routing_targets[0].prefixed_model if routing_targets else model, provider)
         kwargs["model"] = resolved_model
 
@@ -260,7 +313,13 @@ class RequestContextBuilder:
             scope_key=session_isolation_key,
             hints=self._merge_session_hints(
                 internal_session_hints,
-                await self._get_session_hints(provider, resolved_model, kwargs),
+                await self._get_session_hints(
+                    provider,
+                    resolved_model,
+                    kwargs,
+                    unified_request=unified_request,
+                    input_protocol=input_protocol.name,
+                ),
             ),
             _trusted_isolation_key=True,
         )
@@ -292,6 +351,12 @@ class RequestContextBuilder:
             classifier=scope["classifier"],
             routing_targets=routing_targets,
             routing_group_name=routing_decision.group_name if routing_decision else None,
+            input_protocol_name=input_protocol.name,
+            output_protocol_name=output_protocol.name,
+            protocol_request=protocol_request,
+            unified_request=unified_request,
+            input_provider=provider,
+            disable_provider_continuation=disable_provider_continuation,
             routing_group=routing_decision.group if routing_decision else None,
         )
 

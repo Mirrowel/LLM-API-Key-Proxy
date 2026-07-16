@@ -7,6 +7,7 @@ import pytest
 
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.core.types import RequestContext
+from rotator_library.core.errors import structured_api_response_error
 from rotator_library.routing import parse_route_target
 from rotator_library.routing.types import FallbackGroup
 from rotator_library.transaction_logger import TransactionLogger
@@ -60,6 +61,28 @@ async def test_non_streaming_fallback_group_tries_next_target_on_retryable_error
     assert context.routing_attempt_history[0]["error_type"] == "rate_limit"
     assert context.routing_attempt_history[0]["fallback_allowed"] is True
     assert context.routing_attempt_history[1]["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_structured_numeric_rate_limit_error_reaches_fallback_policy() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_execute(self, context):
+        attempts.append(context.provider)
+        if len(attempts) == 1:
+            raise structured_api_response_error({"error": {"status": 429, "message": "busy"}})
+        return {"id": "ok", "model": context.model}
+
+    executor._execute_non_streaming = MethodType(fake_execute, executor)
+    targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
+    context = _context(routing_targets=targets)
+
+    result = await executor._execute_non_streaming_with_fallback(context)
+
+    assert result["id"] == "ok"
+    assert attempts == ["codex", "openai"]
+    assert context.routing_attempt_history[0]["error_type"] == "rate_limit"
 
 
 @pytest.mark.asyncio

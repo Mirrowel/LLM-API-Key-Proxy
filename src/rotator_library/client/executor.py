@@ -48,6 +48,8 @@ from ..core.errors import (
     StreamedAPIError,
     ClassifiedError,
     RequestErrorAccumulator,
+    StructuredAPIResponseError,
+    structured_api_response_error,
     classify_error,
     should_rotate_on_error,
     should_retry_same_key,
@@ -68,6 +70,7 @@ from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.policy import normalize_route_error_type
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from ..protocols import ProtocolContext, get_protocol
 from ..native_provider.streaming import provider_supports_native_streaming as native_provider_supports_streaming
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..transform_trace import REDACTED
@@ -381,6 +384,7 @@ class RequestExecutor:
         context: "RequestContext",
         *,
         credential_id: Optional[str] = None,
+        native_execution: bool = False,
     ) -> Dict[str, Any]:
         """
         Prepare request kwargs with transforms, sanitization, and provider params.
@@ -394,6 +398,19 @@ class RequestExecutor:
         Returns:
             Prepared kwargs dict for the LiteLLM call
         """
+        if native_execution:
+            kwargs = deepcopy(context.kwargs)
+            self._log_executor_trace(
+                context,
+                "native_callback_compatibility_view",
+                kwargs,
+                direction="request",
+                stage="client",
+                credential_id=credential_id,
+                metadata={"provider": provider, "model": model},
+            )
+            return kwargs
+
         # Apply transforms
         kwargs = await self._transforms.apply(
             provider,
@@ -582,7 +599,9 @@ class RequestExecutor:
                 "routing_litellm_fallback",
                 _target_trace(target) if target else {"provider": provider, "model": model},
             )
-            return await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+            response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+            _raise_for_structured_response_error(response)
+            return self._format_execution_response(response, "openai_chat", context)
 
         if execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
             if not plugin or not plugin.has_custom_logic():
@@ -597,7 +616,9 @@ class RequestExecutor:
                 credential_id=credential_id,
                 metadata={"execution": "custom", "provider": provider, "model": model},
             )
-            return await plugin.acompletion(self._http_client, **kwargs)
+            response = await plugin.acompletion(self._http_client, **kwargs)
+            _raise_for_structured_response_error(response)
+            return self._format_execution_response(response, "openai_chat", context)
 
         if execution == "native" or (execution == "auto" and _should_use_native_protocol(plugin, model, target, kwargs, stream=False, execution=execution)):
             native_context, native_request = self._build_native_provider_context(
@@ -619,7 +640,9 @@ class RequestExecutor:
             )
             return await self._get_native_executor().execute(native_request, native_context, NativeHTTPTransport(self._http_client))
 
-        return await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+        response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+        _raise_for_structured_response_error(response)
+        return self._format_execution_response(response, "openai_chat", context)
 
     def _get_native_executor(self) -> NativeProviderExecutor:
         """Return the shared native executor for process-local field-cache state."""
@@ -655,6 +678,42 @@ class RequestExecutor:
             )
         return await litellm.acompletion(**kwargs)
 
+    @staticmethod
+    def _format_execution_response(
+        response: Any,
+        source_protocol_name: str,
+        context: RequestContext,
+    ) -> Any:
+        """Format a non-native execution result into the selected client protocol."""
+
+        output_protocol = get_protocol(context.output_protocol_name)
+        source_protocol = get_protocol(source_protocol_name)
+        if output_protocol.name == source_protocol.name:
+            return response
+        if isinstance(response, dict):
+            payload = deepcopy(response)
+        elif hasattr(response, "model_dump"):
+            payload = response.model_dump()
+        elif hasattr(response, "dict"):
+            payload = response.dict()
+        else:
+            payload = dict(response)
+        protocol_context = ProtocolContext(
+            provider=context.provider,
+            model=context.model,
+            source_protocol=source_protocol.name,
+            target_protocol=output_protocol.name,
+            input_protocol=context.input_protocol_name,
+            provider_protocol=source_protocol.name,
+            output_protocol=output_protocol.name,
+            source_provider=context.provider,
+            session_id=context.session_id,
+            transport="http",
+        )
+        unified_response = source_protocol.parse_response(payload, protocol_context)
+        unified_response.model = context.model
+        return output_protocol.format_response(unified_response, protocol_context)
+
     def _build_native_provider_context(
         self,
         provider: str,
@@ -678,28 +737,9 @@ class RequestExecutor:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
-        request_payload = _native_request_payload(raw_request or {})
-        request_payload["_proxy_model"] = public_model
-        if native_model:
-            request_payload["model"] = native_model
-        operation = plugin.get_native_operation(native_model, request_payload, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+        operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
         if hasattr(plugin, "supports_native_operation") and not plugin.supports_native_operation(native_model, operation):
             raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
-        if hasattr(plugin, "prepare_native_request"):
-            prepared = plugin.prepare_native_request(request_payload, model=native_model, operation=operation)
-            if prepared is not request_payload:
-                request_payload = dict(prepared)
-            request_payload.pop("_proxy_model", None)
-            self._log_executor_trace(
-                context,
-                "provider_native_request_prepared",
-                request_payload,
-                direction="request",
-                stage="provider",
-                credential_id=credential_id,
-                metadata={"provider": provider, "model": public_model, "native_model": native_model, "operation": operation},
-            )
-        request_payload.pop("_proxy_model", None)
         try:
             endpoint = plugin.get_native_endpoint(model=native_model, operation=operation)
             headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
@@ -711,7 +751,8 @@ class RequestExecutor:
             protocol_name=protocol_name,
             endpoint=endpoint,
             operation=operation,
-            client_protocol_name="openai_chat",
+            input_protocol_name=context.input_protocol_name,
+            output_protocol_name=context.output_protocol_name,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,
@@ -722,11 +763,102 @@ class RequestExecutor:
             adapter_config=dict(plugin.get_adapter_config(native_model) if hasattr(plugin, "get_adapter_config") else {}),
             field_cache_rules=_merged_field_cache_rules(provider, public_model, plugin),
             transaction_logger=context.transaction_logger,
-            metadata={"public_model": public_model},
+            metadata={
+                "public_model": public_model,
+                "input_provider": context.input_provider,
+                "disable_provider_continuation": context.disable_provider_continuation,
+            },
+            request_preparer=plugin.prepare_native_request if hasattr(plugin, "prepare_native_request") else None,
+            request_validator=plugin.validate_request if hasattr(plugin, "validate_request") else None,
         )
         if return_request:
-            return native_context, request_payload
+            if context.unified_request is None:
+                raise RoutingExecutionError("Native execution requires a canonical request")
+            return native_context, self._canonical_request_for_native(context, raw_request or {})
         return native_context
+
+    @staticmethod
+    def _canonical_request_for_native(
+        context: RequestContext,
+        request_payload: Dict[str, Any],
+    ) -> Any:
+        """Overlay protocol-safe attempt mutations onto the canonical request.
+
+        Existing transforms and callbacks operate on the Chat execution view.
+        Only canonical fields changed relative to that view are overlaid, so
+        source-native semantics that Chat cannot represent remain intact.
+        """
+
+        canonical_request = deepcopy(context.unified_request)
+        chat_protocol = get_protocol("openai_chat")
+        baseline = chat_protocol.parse_request(context.kwargs)
+        attempted = chat_protocol.parse_request(request_payload)
+        original_instructions = [message for message in canonical_request.messages if message.role in {"system", "developer"}]
+        original_conversation = [message for message in canonical_request.messages if message.role not in {"system", "developer"}]
+        baseline_instructions = [message for message in baseline.messages if message.role in {"system", "developer"}]
+        baseline_conversation = [message for message in baseline.messages if message.role not in {"system", "developer"}]
+        attempted_instructions = [message for message in attempted.messages if message.role in {"system", "developer"}]
+        attempted_conversation = [message for message in attempted.messages if message.role not in {"system", "developer"}]
+        if baseline_conversation != attempted_conversation:
+            original_conversation = _merge_canonical_sequence(
+                original_conversation,
+                baseline_conversation,
+                attempted_conversation,
+                _merge_canonical_message,
+                lambda message: (message.role, message.tool_call_id, message.name),
+            )
+        if baseline_instructions != attempted_instructions:
+            if canonical_request.system and not original_instructions:
+                baseline_blocks = [block for message in baseline_instructions for block in message.content]
+                attempted_blocks = [block for message in attempted_instructions for block in message.content]
+                canonical_request.system = _merge_canonical_sequence(
+                    canonical_request.system,
+                    baseline_blocks,
+                    attempted_blocks,
+                    _merge_canonical_content_block,
+                    lambda block: block.type,
+                )
+            else:
+                original_instructions = _merge_canonical_sequence(
+                    original_instructions,
+                    baseline_instructions,
+                    attempted_instructions,
+                    _merge_canonical_message,
+                    lambda message: (message.role, message.tool_call_id, message.name),
+                )
+        canonical_request.messages = original_instructions + original_conversation
+        if baseline.tools != attempted.tools:
+            canonical_request.tools = _merge_canonical_sequence(
+                canonical_request.tools,
+                baseline.tools,
+                attempted.tools,
+                _merge_canonical_tool,
+                lambda tool: (tool.type, tool.name),
+            )
+        for field_name in ("stream", "modalities"):
+            if getattr(baseline, field_name) != getattr(attempted, field_name):
+                setattr(canonical_request, field_name, deepcopy(getattr(attempted, field_name)))
+        metadata_keys = set(baseline.metadata) | set(attempted.metadata)
+        for key in metadata_keys:
+            if baseline.metadata.get(key) == attempted.metadata.get(key):
+                continue
+            if key in attempted.metadata:
+                canonical_request.metadata[key] = deepcopy(attempted.metadata[key])
+            else:
+                canonical_request.metadata.pop(key, None)
+        if baseline.response_format != attempted.response_format:
+            canonical_request.response_format = deepcopy(attempted.response_format)
+        generation_keys = set(baseline.generation_params) | set(attempted.generation_params)
+        for key in generation_keys:
+            baseline_value = baseline.generation_params.get(key)
+            attempted_value = attempted.generation_params.get(key)
+            if baseline_value == attempted_value:
+                continue
+            if key in attempted.generation_params:
+                canonical_request.generation_params[key] = deepcopy(attempted_value)
+            else:
+                canonical_request.generation_params.pop(key, None)
+        return canonical_request
 
     async def execute(
         self,
@@ -1049,8 +1181,9 @@ class RequestExecutor:
         quota_group = usage_manager.get_model_quota_group(model)
 
         await self._ensure_initialized(usage_manager, context, filter_result)
-        await self._validate_request(provider, model, context.kwargs)
-
+        plugin = self._get_plugin_instance(provider)
+        if not _attempt_uses_native_protocol(plugin, model, context):
+            await self._validate_request(provider, model, context.kwargs)
         if not credentials:
             raise NoAvailableKeysError(f"No compatible credentials for model {model}")
 
@@ -1131,6 +1264,8 @@ class RequestExecutor:
                     self._log_acquired_credential(
                         cred, model, state, quota_group, availability, usage_manager
                     )
+                    plugin = self._get_plugin_instance(provider)
+                    native_execution = _attempt_uses_native_protocol(plugin, model, context)
 
                     try:
                         # Prepare request kwargs
@@ -1140,6 +1275,7 @@ class RequestExecutor:
                             cred,
                             context,
                             credential_id=cred_context.stable_id,
+                            native_execution=native_execution,
                         )
 
                         # Log transformed request if it differs from original
@@ -1154,9 +1290,6 @@ class RequestExecutor:
                                     "classifier": context.classifier,
                                 },
                             )
-
-                        # Get provider plugin
-                        plugin = self._get_plugin_instance(provider)
 
                         # Execute request with retries
                         for attempt in range(self._max_retries):
@@ -1298,6 +1431,8 @@ class RequestExecutor:
 
         # All credentials exhausted
         error_accumulator.timeout_occurred = time.time() >= deadline
+        if isinstance(last_exception, StructuredAPIResponseError):
+            raise last_exception
         if last_exception and not error_accumulator.has_errors():
             raise last_exception
 
@@ -1395,6 +1530,8 @@ class RequestExecutor:
                         self._log_acquired_credential(
                             cred, model, state, quota_group, availability, usage_manager
                         )
+                        plugin = self._get_plugin_instance(provider)
+                        native_execution = _attempt_uses_native_protocol(plugin, model, context)
 
                         try:
                             # Prepare request kwargs
@@ -1404,6 +1541,7 @@ class RequestExecutor:
                                 cred,
                                 context,
                                 credential_id=cred_context.stable_id,
+                                native_execution=native_execution,
                             )
 
                             # Log transformed request if it differs from original
@@ -1420,13 +1558,11 @@ class RequestExecutor:
                                 )
 
                             # Add stream usage metadata for active providers.
-                            if "stream_options" not in kwargs:
+                            if not native_execution and "stream_options" not in kwargs:
                                 kwargs["stream_options"] = {}
-                            if "include_usage" not in kwargs["stream_options"]:
+                            if not native_execution and "include_usage" not in kwargs["stream_options"]:
                                 kwargs["stream_options"]["include_usage"] = True
 
-                            # Get provider plugin
-                            plugin = self._get_plugin_instance(provider)
                             skip_cost_calculation = bool(
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
@@ -1446,7 +1582,6 @@ class RequestExecutor:
                                     await self._run_pre_request_callback(
                                         context, kwargs
                                     )
-
                                     target = _current_route_target(context)
                                     execution = target.execution if target else "auto"
 
@@ -2265,8 +2400,10 @@ class RequestExecutor:
         provider: str,
         model: str,
         kwargs: Dict[str, Any],
+        *,
+        plugin: Any = None,
     ) -> None:
-        plugin = self._get_plugin_instance(provider)
+        plugin = plugin or self._get_plugin_instance(provider)
         if not plugin or not hasattr(plugin, "validate_request"):
             return
 
@@ -2442,6 +2579,124 @@ def _target_trace(target: RouteTarget) -> Dict[str, Any]:
     }
 
 
+def _merge_canonical_sequence(
+    original: list[Any],
+    baseline: list[Any],
+    attempted: list[Any],
+    merge_item: Any,
+    identity: Any,
+) -> list[Any]:
+    """Apply Chat-view edits while retaining source-native item metadata."""
+
+    if len(original) == len(baseline) == len(attempted):
+        return [
+            deepcopy(source) if before == after else merge_item(source, before, after)
+            for source, before, after in zip(original, baseline, attempted)
+        ]
+    merged: list[Any] = []
+    unused = set(range(min(len(original), len(baseline))))
+    for index, after in enumerate(attempted):
+        exact = next((position for position in unused if baseline[position] == after), None)
+        if exact is not None:
+            merged.append(deepcopy(original[exact]))
+            unused.remove(exact)
+            continue
+        if index in unused and identity(baseline[index]) == identity(after):
+            merged.append(merge_item(original[index], baseline[index], after))
+            unused.remove(index)
+            continue
+        merged.append(_without_source_artifacts(after))
+    return merged
+
+
+def _merge_canonical_message(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original.role != baseline.role or baseline.role != attempted.role:
+        return _without_source_artifacts(attempted)
+    merged = deepcopy(original)
+    for field_name in ("role", "name", "tool_call_id"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+    if baseline.content != attempted.content:
+        merged.content = _merge_canonical_sequence(
+            original.content,
+            baseline.content,
+            attempted.content,
+            _merge_canonical_content_block,
+            lambda block: block.type,
+        )
+    if baseline.tool_calls != attempted.tool_calls:
+        merged.tool_calls = _merge_canonical_sequence(
+            original.tool_calls,
+            baseline.tool_calls,
+            attempted.tool_calls,
+            _merge_canonical_tool_call,
+            lambda call: (call.type, call.id, call.name),
+        )
+    if baseline.reasoning != attempted.reasoning:
+        merged.reasoning = deepcopy(attempted.reasoning)
+    return merged
+
+
+def _merge_canonical_content_block(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original.type != baseline.type or baseline.type != attempted.type:
+        return _without_source_artifacts(attempted)
+    merged = deepcopy(original)
+    for field_name in ("type", "text", "source"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+    if baseline.tool_call != attempted.tool_call:
+        merged.tool_call = (
+            _merge_canonical_tool_call(original.tool_call, baseline.tool_call, attempted.tool_call)
+            if original.tool_call and baseline.tool_call and attempted.tool_call
+            else deepcopy(attempted.tool_call)
+        )
+    if baseline.tool_result != attempted.tool_result:
+        merged.tool_result = deepcopy(attempted.tool_result)
+    if baseline.reasoning != attempted.reasoning:
+        merged.reasoning = deepcopy(attempted.reasoning)
+    return merged
+
+
+def _merge_canonical_tool_call(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original is None or baseline is None or attempted is None:
+        return deepcopy(attempted)
+    merged = deepcopy(original)
+    changed = False
+    for field_name in ("type", "id", "name", "arguments", "index"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+            changed = True
+    if changed:
+        merged.raw = None
+        merged.extra = {}
+    return merged
+
+
+def _merge_canonical_tool(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original.type != baseline.type or baseline.type != attempted.type:
+        return _without_source_artifacts(attempted)
+    merged = deepcopy(original)
+    for field_name in ("type", "name", "description", "input_schema"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+    return merged
+
+
+def _without_source_artifacts(value: Any) -> Any:
+    """Copy a callback-created canonical value without Chat wire fragments."""
+
+    copied = deepcopy(value)
+    if hasattr(copied, "raw"):
+        copied.raw = None
+    if hasattr(copied, "extra"):
+        copied.extra = {}
+    if hasattr(copied, "content") and isinstance(copied.content, list):
+        copied.content = [_without_source_artifacts(item) for item in copied.content]
+    if hasattr(copied, "tool_calls") and isinstance(copied.tool_calls, list):
+        copied.tool_calls = [_without_source_artifacts(item) for item in copied.tool_calls]
+    return copied
+
+
 def _current_route_target(context: RequestContext) -> Optional[RouteTarget]:
     """Return the currently selected route target from context metadata."""
 
@@ -2470,11 +2725,7 @@ def _should_use_native_protocol(plugin: Any, model: str, target: Optional[RouteT
     if not plugin or not protocol_name:
         return False
     native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
-    request_payload = _native_request_payload(kwargs)
-    request_payload["_proxy_model"] = model
-    if native_model:
-        request_payload["model"] = native_model
-    operation = plugin.get_native_operation(native_model, request_payload, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+    operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
     hook = getattr(plugin, "should_use_native_protocol", None)
     if callable(hook):
         return bool(hook(model=native_model, operation=operation, stream=stream, execution=execution))
@@ -2488,34 +2739,6 @@ def _strip_provider_prefix(model: str) -> str:
     return model.split("/", 1)[1] if "/" in model else model
 
 
-_NATIVE_REQUEST_DROP_KEYS = {
-    "api_base",
-    "api_key",
-    "api_type",
-    "api_version",
-    "base_url",
-    "custom_llm_provider",
-    "drop_params",
-    "logger_fn",
-    "litellm_call_id",
-    "mock_response",
-    "organization",
-    "project",
-    "transaction_context",
-}
-
-
-def _native_request_payload(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """Return provider-visible kwargs for native protocol parsing.
-
-    Full executor calls prepare kwargs for LiteLLM before execution-mode routing.
-    Native providers must not receive LiteLLM-only routing, logging, or transport
-    controls because protocol adapters preserve unknown fields intentionally.
-    """
-
-    return {key: deepcopy(value) for key, value in kwargs.items() if key not in _NATIVE_REQUEST_DROP_KEYS and not key.startswith("litellm_")}
-
-
 def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
     """Return whether a provider declares native streaming support."""
 
@@ -2526,7 +2749,7 @@ def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
     resolver = getattr(plugin, "get_native_operation", None)
     if callable(resolver):
         try:
-            operation = resolver(model, {"model": model, "stream": True}, stream=True)
+            operation = resolver(model, None, stream=True)
         except TypeError:
             try:
                 operation = resolver(model)
@@ -2747,6 +2970,35 @@ def _route_error_type_from_response(response: Any) -> Optional[str]:
     if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
         return "rate_limit"
     return None
+
+
+def _attempt_uses_native_protocol(plugin: Any, model: str, context: RequestContext) -> bool:
+    """Predict execution mode before attempt-specific request preparation."""
+
+    target = _current_route_target(context)
+    execution = target.execution if target else "auto"
+    if execution in {"custom", "litellm_fallback"}:
+        return False
+    if execution == "auto" and plugin and getattr(plugin, "has_custom_logic", lambda: False)():
+        return False
+    if context.streaming:
+        return _should_use_native_streaming(plugin, model, target, execution, context.provider)
+    return execution == "native" or _should_use_native_protocol(
+        plugin,
+        model,
+        target,
+        context.kwargs,
+        stream=context.streaming,
+        execution=execution,
+    )
+
+
+def _raise_for_structured_response_error(response: Any) -> None:
+    """Prevent structured errors from being formatted as empty successes."""
+
+    error = structured_api_response_error(response)
+    if error:
+        raise error
 
 
 def _route_status_code_from_response(response: Any) -> Optional[int]:

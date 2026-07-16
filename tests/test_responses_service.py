@@ -6,6 +6,7 @@ import pytest
 
 import rotator_library.responses.service as responses_service_module
 from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, ResponsesStoreSettings, StoredResponse, create_configured_responses_store
+from rotator_library.core.errors import StructuredAPIResponseError
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -60,6 +61,85 @@ class FakeInternalClient(FakeClient):
         return await super().acompletion(**kwargs)
 
 
+class FakeNativeProtocolClient:
+    """Exercise the internal Responses protocol path without a chat bridge."""
+
+    def __init__(self) -> None:
+        self.calls = []
+        self._request_builder = object()
+        self._executor = object()
+
+    async def agenerate(self, payload, *, input_protocol, output_protocol, request=None, **kwargs):
+        callback = kwargs.pop("_request_context_callback", None)
+        if callback:
+            callback(
+                type(
+                    "Context",
+                    (),
+                    {
+                        "session_id": "session-native",
+                        "session_affinity_key": "affinity-native",
+                        "usage_manager_key": "scope-native",
+                        "session_isolation_key": "public",
+                        "classifier": "global",
+                        "session_tracker": None,
+                        "provider": "openai",
+                        "model": payload["model"],
+                        "session_tracking_namespace": "namespace",
+                    },
+                )()
+            )
+        self.calls.append(
+            {
+                "payload": payload,
+                "input_protocol": input_protocol,
+                "output_protocol": output_protocol,
+                "kwargs": kwargs,
+            }
+        )
+        index = len(self.calls)
+        return {
+            "id": f"resp_native_{index}",
+            "object": "response",
+            "model": payload["model"],
+            "status": "completed",
+            "output": [
+                {
+                    "id": f"msg_{index}",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": f"answer {index}"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+        }
+
+
+class FakeNativeProtocolErrorClient(FakeNativeProtocolClient):
+    async def agenerate(self, payload, *, input_protocol, output_protocol, request=None, **kwargs):
+        raise StructuredAPIResponseError(
+            "provider busy",
+            error_type="rate_limit",
+            status_code=429,
+            response={"error": {"status": 429, "message": "provider busy"}},
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_structured_errors_keep_responses_status_and_type() -> None:
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    with pytest.raises(ResponsesServiceError) as raised:
+        await service.create_response(
+            {"model": "openai/gpt-test", "input": "hello"},
+            FakeNativeProtocolErrorClient(),
+        )
+
+    assert raised.value.status_code == 429
+    assert raised.value.error_type == "rate_limit"
+
+
 def _trace_entries(log_dir):
     return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
 
@@ -98,6 +178,33 @@ def test_responses_service_recursively_redacts_transport_logging_payload() -> No
     }
     assert request["api_keys"]["openai"] == ["top-level-secret"]
     assert request["metadata"]["providers"]["private"]["api_key"] == "nested-secret"
+
+
+@pytest.mark.asyncio
+async def test_internal_responses_path_uses_native_protocol_and_expands_local_continuation() -> None:
+    service = ResponsesService(store=InMemoryResponsesStore())
+    client = FakeNativeProtocolClient()
+
+    first = await service.create_response(
+        {"model": "openai/gpt-test", "input": "first"},
+        client,
+    )
+    second = await service.create_response(
+        {"model": "openai/gpt-test", "input": "second", "previous_response_id": first["id"]},
+        client,
+    )
+
+    assert second["id"] == "resp_native_2"
+    assert client.calls[0]["input_protocol"] == "responses"
+    assert client.calls[0]["output_protocol"] == "responses"
+    assert client.calls[0]["payload"]["input"] == ["first"]
+    assert client.calls[1]["payload"]["input"] == [
+        "first",
+        first["output"][0],
+        "second",
+    ]
+    assert "previous_response_id" not in client.calls[1]["payload"]
+    assert client.calls[1]["kwargs"]["_disable_provider_continuation"] is True
 
 
 @pytest.mark.asyncio

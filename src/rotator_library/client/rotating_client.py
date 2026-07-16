@@ -563,6 +563,33 @@ class RotatingClient:
             classifier, provider=provider, include_secrets=include_secrets
         )
 
+    async def agenerate(
+        self,
+        payload: Dict[str, Any],
+        *,
+        input_protocol: str,
+        output_protocol: Optional[str] = None,
+        request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+        **routing_kwargs: Any,
+    ) -> Union[Any, AsyncGenerator[str, None]]:
+        """Execute a generative request with independent wire protocols.
+
+        Provider selection is still driven by the request model and existing
+        routing controls. Providers receive only their declared native format;
+        the selected output defaults to the client's input format.
+        """
+
+        kwargs = dict(payload)
+        kwargs.update(routing_kwargs)
+        kwargs["_input_protocol"] = input_protocol
+        kwargs["_output_protocol"] = output_protocol or input_protocol
+        return await self.acompletion(
+            request=request,
+            pre_request_callback=pre_request_callback,
+            **kwargs,
+        )
+
     async def acompletion(
         self,
         request: Optional[Any] = None,

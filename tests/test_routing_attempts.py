@@ -13,6 +13,7 @@ def test_clone_context_for_target_updates_model_provider_without_mutating_origin
         credentials=["cred-a"],
         deadline=123.0,
         usage_manager_key="original",
+        input_provider="original",
     )
     target = parse_route_target("codex/gpt-5.1-codex@native")
 
@@ -24,6 +25,7 @@ def test_clone_context_for_target_updates_model_provider_without_mutating_origin
     assert cloned.credentials == ["cred-b"]
     assert cloned.usage_manager_key == "codex"
     assert cloned.routing_target_index == 1
+    assert cloned.input_provider == "original"
     assert original.model == "requested"
     assert original.kwargs["model"] == "requested"
     assert original.credentials == ["cred-a"]

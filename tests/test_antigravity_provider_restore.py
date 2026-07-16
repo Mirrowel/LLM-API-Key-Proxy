@@ -90,20 +90,17 @@ def test_antigravity_native_operation_model_and_stream_support() -> None:
     assert prepared["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
 
 
-def test_antigravity_prepare_native_request_converts_messages_to_gemini_contents() -> None:
+def test_antigravity_prepare_native_request_only_adjusts_gemini_native_payload() -> None:
     provider = AntigravityProvider()
 
     prepared = provider.prepare_native_request(
-        {"messages": [{"role": "user", "content": "hello"}, {"role": "assistant", "content": "hi"}]},
+        {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
         model="gemini-3-flash",
         operation="generate",
     )
 
     assert prepared["model"] == "gemini-3-flash"
-    assert prepared["contents"] == [
-        {"role": "user", "parts": [{"text": "hello"}]},
-        {"role": "model", "parts": [{"text": "hi"}]},
-    ]
+    assert prepared["contents"] == [{"role": "user", "parts": [{"text": "hello"}]}]
     assert "messages" not in prepared
 
 
