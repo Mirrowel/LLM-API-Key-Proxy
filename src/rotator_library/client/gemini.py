@@ -39,6 +39,24 @@ class GeminiHandler:
             request=raw_request,
         )
 
+    async def stream_generate(
+        self,
+        payload: dict[str, Any],
+        *,
+        model: str,
+        raw_request: Optional[Any] = None,
+    ) -> Any:
+        """Execute one Gemini streamGenerateContent request canonically."""
+
+        request_payload = dict(payload)
+        request_payload["model"] = self._routable_model(model)
+        request_payload["stream"] = True
+        return await self._client.agenerate(
+            request_payload,
+            input_protocol="gemini",
+            request=raw_request,
+        )
+
     def count_tokens(self, payload: dict[str, Any], *, model: str) -> dict[str, int]:
         """Count a Gemini request locally using its canonical Chat projection."""
 

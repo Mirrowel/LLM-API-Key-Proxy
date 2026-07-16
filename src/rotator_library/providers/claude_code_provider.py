@@ -29,7 +29,7 @@ class ClaudeCodeProvider(ProviderInterface):
     provider_env_name = "claude_code"
     protocol_name = "anthropic_messages"
     adapter_names = ("suppress_developer_role",)
-    native_streaming_supported = False
+    native_streaming_supported = True
     field_cache_rules = (
         FieldCacheRule(
             name="claude_code_thinking_signature",
@@ -39,6 +39,15 @@ class ClaudeCodeProvider(ProviderInterface):
             scope=("provider", "model", "credential", "session"),
             inject=FieldCacheInjection(target="request", path="metadata.thinking_signatures", as_list=True),
             metadata={"purpose": "preserve Claude thinking signatures for follow-up requests"},
+        ),
+        FieldCacheRule(
+            name="claude_code_stream_thinking_signature",
+            source="stream_event",
+            path="raw.delta.signature",
+            mode="all",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="metadata.thinking_signatures", as_list=True),
+            metadata={"purpose": "preserve streamed Claude thinking signatures for follow-up requests"},
         ),
     )
     default_rotation_mode = "sequential"
@@ -92,11 +101,11 @@ class ClaudeCodeProvider(ProviderInterface):
         return model.split("/", 1)[1] if model.startswith("claude_code/") else model
 
     def supports_native_streaming(self, model: str = "", operation: str = "messages") -> bool:
-        """Return false until the generic native stream wrapper is compatible."""
+        """Return whether Anthropic Messages SSE is enabled for this model."""
 
         if self._get_runtime_config(model).native_streaming_supported is not None:
             return super().supports_native_streaming(model, operation)
-        return False
+        return operation == "messages"
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "messages") -> dict[str, Any]:
         """Ensure Anthropic Messages-required fields are present."""

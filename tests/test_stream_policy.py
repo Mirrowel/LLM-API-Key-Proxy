@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from rotator_library.client.stream_retry_policy import can_retry_stream_after_error as compat_retry_policy
+from rotator_library.client.streaming import StreamingHandler
+from rotator_library.core.errors import StreamedAPIError
 from rotator_library.streaming.policy import can_retry_stream_after_error, is_visible_stream_output
 
 
@@ -17,6 +19,9 @@ def test_reasoning_only_retry_policy_is_preserved() -> None:
 
 def test_heartbeat_comments_do_not_block_stream_retry() -> None:
     assert can_retry_stream_after_error(': heartbeat\n\n', False) is True
+    assert can_retry_stream_after_error('event: message_start\ndata: {"type":"message_start","message":{"role":"assistant","content":[]}}\n\n', False) is True
+    assert can_retry_stream_after_error('event: response.created\ndata: {"type":"response.created","response":{"status":"in_progress","output":[]}}\n\n', False) is True
+    assert can_retry_stream_after_error('data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n', False) is True
 
 
 def test_cost_events_do_not_count_as_visible_output() -> None:
@@ -47,3 +52,26 @@ def test_visible_output_detection_for_responses_events() -> None:
     assert is_visible_stream_output('data: {"event_type":"response.function_call_arguments.delta","delta":"{\\"x\\":"}\n\n') is True
     assert is_visible_stream_output('data: {"event_type":"response.failed","error":{"message":"x"}}\n\n', protocol="responses") is False
     assert is_visible_stream_output('event: response.failed\ndata: {"error":{"message":"x"}}\n\n', protocol="responses") is False
+    assert is_visible_stream_output('event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"fc_0","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}\n\n') is True
+
+
+def test_visible_output_detection_for_anthropic_and_gemini_events() -> None:
+    assert is_visible_stream_output('event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"visible thought"}}\n\n') is True
+    assert is_visible_stream_output('event: content_block_start\ndata: {"type":"content_block_start","content_block":{"type":"tool_use","id":"call_1","name":"lookup","input":{}}}\n\n') is True
+    assert is_visible_stream_output('data: {"candidates":[{"content":{"role":"model","parts":[{"functionCall":{"name":"lookup","args":{}}}]}}]}\n\n') is True
+
+
+def test_stream_handler_rejects_string_and_event_level_error_payloads() -> None:
+    handler = StreamingHandler()
+
+    for chunk in (
+        'data: {"error":"provider failed"}\n\n',
+        'event: error\ndata: {"type":"rate_limit","message":"slow down"}\n\n',
+        {"type": "response.failed", "response": {"error": {"type": "server_error", "message": "unavailable"}}},
+    ):
+        try:
+            handler._process_chunk(chunk, None, False)
+        except StreamedAPIError as error:
+            assert error.data["error"]["message"]
+        else:
+            raise AssertionError("in-band stream error must raise")

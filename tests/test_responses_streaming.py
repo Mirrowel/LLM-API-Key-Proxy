@@ -24,6 +24,25 @@ class FakeStreamingClient:
         return chunks()
 
 
+class NativeResponsesStreamingClient:
+    def __init__(self, output_protocol: str = "responses") -> None:
+        self.output_protocol = output_protocol
+        self.calls = []
+
+    def resolve_output_protocol(self, payload, *, input_protocol, request=None):
+        return self.output_protocol
+
+    async def agenerate(self, payload, **kwargs):
+        self.calls.append((payload, kwargs))
+
+        async def chunks():
+            yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_native","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+            yield 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"native"}\n\n'
+            yield 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_native","object":"response","status":"completed","model":"gpt-test","output":[{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"native"}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+
+        return chunks()
+
+
 class DelayedCloseableStream:
     def __init__(self, chunks: list[str], delays: list[float]) -> None:
         self.chunks = chunks
@@ -223,6 +242,37 @@ async def test_stream_response_emits_responses_sse_events_and_stores_final_respo
     assert stored is not None
     assert stored.output_items[0]["content"][0]["text"] == "Hello"
     assert stored.usage == {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3, "cost_details": {"total_cost": 0.044, "source": "stream_provider"}}
+
+
+@pytest.mark.asyncio
+async def test_native_responses_stream_uses_agenerate_and_stores_terminal_object() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+    client = NativeResponsesStreamingClient()
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, client)]
+
+    assert client.calls[0][1]["input_protocol"] == "responses"
+    assert client.calls[0][1]["output_protocol"] == "responses"
+    assert "event: response.output_text.delta" in "".join(events)
+    stored = await store.get("resp_native")
+    assert stored is not None
+    assert stored.output_items[0]["content"][0]["text"] == "native"
+
+
+@pytest.mark.asyncio
+async def test_native_responses_stream_reformats_after_storing_responses_object() -> None:
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+    client = NativeResponsesStreamingClient("anthropic_messages")
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, client)]
+
+    output = "".join(events)
+    assert "event: message_start" in output
+    assert "native" in output
+    assert "event: message_stop" in output
+    assert await store.get("resp_native") is not None
 
 
 @pytest.mark.asyncio

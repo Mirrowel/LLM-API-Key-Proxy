@@ -151,9 +151,11 @@ class ProtocolAdapter:
         return UnifiedStreamEvent(type=event_type, raw=deepcopy(raw_event))
 
     def format_stream_event(self, unified_event: UnifiedStreamEvent, context: ProtocolContext | None = None) -> Any:
-        """Format one unified stream event for the target transport."""
+        """Format one canonical stream event for this destination protocol."""
 
-        return deepcopy(unified_event.raw) if unified_event.raw is not None else unified_event.to_dict()
+        from .streaming import format_canonical_stream_event
+
+        return format_canonical_stream_event(unified_event, self.name, context)
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         """Extract normalized usage when the protocol can identify it."""

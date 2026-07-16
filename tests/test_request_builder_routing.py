@@ -203,7 +203,7 @@ async def test_provider_default_output_applies_only_without_explicit_override(mo
 
 
 @pytest.mark.asyncio
-async def test_request_builder_rejects_cross_protocol_stream_for_direct_acompletion(monkeypatch) -> None:
+async def test_request_builder_carries_independent_cross_protocol_stream_selection(monkeypatch) -> None:
     monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
     builder = RequestContextBuilder(
         resolve_scope_for_provider=_scope,
@@ -213,18 +213,21 @@ async def test_request_builder_rejects_cross_protocol_stream_for_direct_acomplet
         get_enable_request_logging=lambda: False,
     )
 
-    with pytest.raises(ValueError, match="Streaming conversion"):
-        await builder.build_completion_context(
-            None,
-            None,
-            {
-                "_input_protocol": "openai_chat",
-                "_output_protocol": "gemini",
-                "model": "openai/gpt-5.1",
-                "messages": [],
-                "stream": True,
-            },
-        )
+    context = await builder.build_completion_context(
+        None,
+        None,
+        {
+            "_input_protocol": "openai_chat",
+            "_output_protocol": "gemini",
+            "model": "openai/gpt-5.1",
+            "messages": [],
+            "stream": True,
+        },
+    )
+
+    assert context.streaming is True
+    assert context.input_protocol_name == "openai_chat"
+    assert context.output_protocol_name == "gemini"
 
 @pytest.mark.asyncio
 async def test_request_builder_classifier_domain_is_stable_across_providers(monkeypatch) -> None:

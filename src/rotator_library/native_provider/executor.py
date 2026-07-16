@@ -11,7 +11,7 @@ from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
-from ..core.errors import structured_api_response_error
+from ..core.errors import StreamedAPIError, structured_api_response_error
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..protocols import ProtocolError, get_protocol, serialize_value
 from ..protocols.types import UnifiedRequest
@@ -224,17 +224,23 @@ class NativeProviderExecutor:
             await self._validate_provider_request(provider_request, context)
             self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
             usage_record = extract_usage_record(None, provider=context.provider, model=context.model, source="native_provider_stream")
+            response_context = context.protocol_context(
+                source_protocol=protocol.name,
+                target_protocol=output_protocol.name,
+                source_provider=context.provider,
+                target_provider=None,
+                provider_state_compatible=False,
+            )
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
-                response_context = context.protocol_context(
-                    source_protocol=protocol.name,
-                    target_protocol=output_protocol.name,
-                    source_provider=context.provider,
-                    target_provider=context.provider if output_protocol.name == protocol.name else None,
-                    provider_state_compatible=output_protocol.name == protocol.name,
-                )
                 event = protocol.parse_stream_event(raw_chunk, response_context)
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
+                if event.type == "error" or event.error is not None:
+                    error = event.error if isinstance(event.error, dict) else {"message": str(event.error or "Provider stream failed")}
+                    raise StreamedAPIError(
+                        str(error.get("message") or error.get("type") or "Provider stream failed"),
+                        data={"error": deepcopy(error)},
+                    )
                 usage_record = _merge_stream_usage_records(
                     usage_record,
                     extract_usage_record(serialize_value(event), provider=context.provider, model=context.model, source="native_stream_event"),
@@ -243,6 +249,10 @@ class NativeProviderExecutor:
                 if event.type == "done":
                     event_payload = stream_event_payload(event)
                     self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
+                    formatted = output_protocol.format_stream_event(event, response_context)
+                    for frame in _formatted_stream_frames(formatted):
+                        self._trace(context, "formatted_client_stream_event", frame, direction="stream", stage="final", snapshot=False)
+                        yield frame
                     break
                 adapter_context = context.adapter_context()
                 # Native stream traces apply field-cache path redaction below.
@@ -265,8 +275,9 @@ class NativeProviderExecutor:
                     snapshot=False,
                 )
                 formatted = output_protocol.format_stream_event(event, response_context)
-                self._trace(context, "formatted_client_stream_event", formatted, direction="stream", stage="final", snapshot=False)
-                yield formatted
+                for frame in _formatted_stream_frames(formatted):
+                    self._trace(context, "formatted_client_stream_event", frame, direction="stream", stage="final", snapshot=False)
+                    yield frame
             cost_breakdown = CostCalculator().calculate(usage_record, model=context.model, provider=context.provider)
             self._trace(
                 context,
@@ -599,3 +610,13 @@ def _redact_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
     elif isinstance(value, list):
         for item in value:
             _redact_leaf_key(item, tokens)
+
+
+def _formatted_stream_frames(formatted: Any) -> list[Any]:
+    """Normalize one adapter result into destination frames."""
+
+    if formatted is None:
+        return []
+    if isinstance(formatted, list):
+        return formatted
+    return [formatted]

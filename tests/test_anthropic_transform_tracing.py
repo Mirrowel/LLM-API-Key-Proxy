@@ -39,6 +39,13 @@ class FakeNativeProtocolClient:
             "input_protocol": input_protocol,
             "output_protocol": output_protocol,
         }
+        if payload.get("stream"):
+            async def stream():
+                yield 'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_stream","type":"message","role":"assistant","content":[],"model":"claude-test","usage":{"input_tokens":1,"output_tokens":0}}}\n\n'
+                yield 'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n'
+                yield 'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"native stream"}}\n\n'
+                yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+            return stream()
         return {
             "id": "msg_provider",
             "type": "message",
@@ -90,6 +97,24 @@ async def test_anthropic_handler_uses_protocol_native_runtime_when_available() -
     assert client.call["payload"]["system"] == "rule"
     assert response["content"][0]["text"] == "native answer"
     assert response["id"].startswith("msg_")
+
+
+@pytest.mark.asyncio
+async def test_anthropic_handler_uses_protocol_native_runtime_for_streams() -> None:
+    client = FakeNativeProtocolClient()
+    request = AnthropicMessagesRequest(
+        model="claude_code/claude-test",
+        max_tokens=16,
+        messages=[{"role": "user", "content": "hi"}],
+        stream=True,
+    )
+
+    stream = await AnthropicHandler(client).messages(request)
+    output = "".join([chunk async for chunk in stream])
+
+    assert client.call["input_protocol"] == "anthropic_messages"
+    assert client.call["output_protocol"] == "anthropic_messages"
+    assert "native stream" in output
 
 
 class ClosingOpenAIStream:

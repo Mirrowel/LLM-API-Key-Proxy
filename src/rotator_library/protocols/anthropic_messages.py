@@ -190,20 +190,23 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", operation=OPERATION_MESSAGES, raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))
         data = _as_dict(event)
         event_type = str(data.get("type") or "chunk")
 
         if event_type == "error" or data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", operation=OPERATION_MESSAGES, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="error", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "message_start":
             response = self.parse_response(data.get("message") or {}, context)
-            return UnifiedStreamEvent(type="message_start", operation=OPERATION_MESSAGES, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="message_start", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "message_delta":
-            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_MESSAGES, usage=self.extract_usage(data.get("usage") or {}, context), raw=deepcopy(raw_event), extra={"payload": data, "stop_reason": (data.get("delta") or {}).get("stop_reason")})
+            stop_reason = canonical_stop_reason((data.get("delta") or {}).get("stop_reason"))
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, usage=self.extract_usage(data.get("usage") or {}, context), stop_reason=stop_reason, raw=deepcopy(raw_event), extra={"payload": data, "stop_reason": stop_reason})
         if event_type in {"content_block_start", "content_block_delta", "content_block_stop"}:
             return self._parse_content_stream_event(data, raw_event)
-        return UnifiedStreamEvent(type=event_type, operation=OPERATION_MESSAGES, raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type == "message_stop":
+            event_type = "done"
+        return UnifiedStreamEvent(type=event_type, operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=str(data.get("type") or "chunk"), raw=deepcopy(raw_event), extra={"payload": data})
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):
@@ -482,6 +485,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         content_block = None
         if block:
             content_block = self._parse_content_block(block)
+            if content_block.tool_call:
+                content_block.tool_call.index = data.get("index")
+                if content_block.tool_call.arguments == {}:
+                    content_block.tool_call.arguments = None
         elif delta:
             delta_type = delta.get("type")
             if delta_type == "text_delta":
@@ -489,9 +496,12 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             elif delta_type in {"thinking_delta", "signature_delta"}:
                 reasoning = ReasoningBlock(type=str(delta_type), text=delta.get("thinking"), signature=delta.get("signature"), extra=_without(delta, {"type", "thinking", "signature"}))
                 content_block = ContentBlock(type=str(delta_type), reasoning=reasoning, raw=deepcopy(delta))
+            elif delta_type == "input_json_delta":
+                call = ToolCall(index=data.get("index"), arguments=delta.get("partial_json") or "")
+                content_block = ContentBlock(type="tool_call", tool_call=call, raw=deepcopy(delta))
         message = UnifiedMessage(role="assistant", content=[content_block] if content_block else [])
         self._promote_message_blocks(message)
-        return UnifiedStreamEvent(type=str(data.get("type") or "content_block_delta"), operation=OPERATION_MESSAGES, delta=message, raw=deepcopy(raw_event), extra={"payload": data, "index": data.get("index")})
+        return UnifiedStreamEvent(type=str(data.get("type") or "content_block_delta"), operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=str(data.get("type") or "content_block_delta"), delta=message, raw=deepcopy(raw_event), extra={"payload": data, "index": data.get("index")})
 
 
 def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
@@ -527,17 +537,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _decode_sse_data(raw_event: Any) -> Any:
-    if not isinstance(raw_event, str):
-        return raw_event
-    text = raw_event.strip()
-    if text.startswith("data:"):
-        text = text[5:].strip()
-    if text == "[DONE]":
-        return text
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return raw_event
+    from .streaming import decode_sse_data
+
+    return decode_sse_data(raw_event)
 
 
 def _without(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:

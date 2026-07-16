@@ -27,6 +27,10 @@ class SurfaceClient:
                 "output_header": request.headers.get("X-Proxy-Output-Protocol"),
             }
         )
+        if payload.get("stream"):
+            async def stream():
+                yield 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"streamed"}]}}]}\n\n'
+            return stream()
         if request.headers.get("X-Proxy-Output-Protocol") == "anthropic_messages":
             return {
                 "id": "msg_surface",
@@ -58,6 +62,14 @@ class SurfaceClient:
             "modelVersion": model,
             "candidates": [{"content": {"role": "model", "parts": [{"text": "gemini"}]}, "finishReason": "STOP"}],
         }
+
+    async def gemini_stream_generate(self, payload, *, model, raw_request=None):
+        self.calls.append({"payload": payload, "model": model, "operation": "stream_generate"})
+
+        async def stream():
+            yield 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"gemini-stream"}]}}]}\n\n'
+
+        return stream()
 
     def gemini_count_tokens(self, payload, *, model):
         self.calls.append({"payload": payload, "model": model, "operation": "count_tokens"})
@@ -102,7 +114,20 @@ def test_gemini_generate_and_count_routes_preserve_native_client_shape() -> None
     assert rotating.calls[1]["operation"] == "count_tokens"
 
 
-def test_cross_protocol_stream_selection_fails_instead_of_being_ignored() -> None:
+def test_gemini_stream_generate_route_preserves_native_stream_shape() -> None:
+    client, rotating = _surface_client()
+
+    response = client.post(
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        json={"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+    )
+
+    assert response.status_code == 200
+    assert "gemini-stream" in response.text
+    assert rotating.calls[0]["operation"] == "stream_generate"
+
+
+def test_cross_protocol_stream_selection_reaches_selected_wire_format() -> None:
     client, _ = _surface_client()
 
     response = client.post(
@@ -115,8 +140,9 @@ def test_cross_protocol_stream_selection_fails_instead_of_being_ignored() -> Non
         },
     )
 
-    assert response.status_code == 400
-    assert "Streaming conversion" in response.json()["detail"]
+    assert response.status_code == 200
+    assert '"candidates"' in response.text
+    assert "streamed" in response.text
 
 
 def test_gemini_generate_rejects_stream_flag_until_stream_route_exists() -> None:
@@ -165,25 +191,12 @@ def test_output_header_is_case_insensitive_and_unknown_values_are_client_errors(
         raise AssertionError("unknown output protocol must fail")
 
 
-def test_library_rejects_cross_protocol_streams_before_execution() -> None:
-    client = RotatingClient.__new__(RotatingClient)
-    client._get_provider_instance = lambda provider: None
+def test_library_accepts_all_generative_cross_protocol_stream_pairs() -> None:
+    from rotator_library.client.protocol_selection import require_same_protocol_stream
 
-    import asyncio
-
-    async def run():
-        await client.agenerate(
-            {"model": "openai/gpt-test", "messages": [], "stream": True},
-            input_protocol="openai_chat",
-            output_protocol="gemini",
-        )
-
-    try:
-        asyncio.run(run())
-    except ValueError as error:
-        assert "Streaming conversion" in str(error)
-    else:
-        raise AssertionError("cross-protocol library stream must fail")
+    for source in ("openai_chat", "anthropic_messages", "responses", "gemini"):
+        for output in ("openai_chat", "anthropic_messages", "responses", "gemini"):
+            require_same_protocol_stream(source, output)
 
 
 class GeminiRuntimeClient:

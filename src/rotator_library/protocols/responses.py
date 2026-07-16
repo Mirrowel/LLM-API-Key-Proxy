@@ -216,21 +216,34 @@ class ResponsesProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", operation=OPERATION_RESPONSES, raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))
         data = _as_dict(event)
         event_type = str(data.get("type") or data.get("event") or "chunk")
         if event_type in {"error", "response.error"} or data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", operation=OPERATION_RESPONSES, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
+            return UnifiedStreamEvent(type="error", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
         if event_type in {"response.completed", "response.failed", "response.incomplete"}:
-            response = self.parse_response(data.get("response") or {}, context)
-            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
+            response_payload = data.get("response") if isinstance(data.get("response"), dict) else {}
+            response = self.parse_response(response_payload, context)
+            error = None
+            if event_type == "response.failed":
+                error = deepcopy(response_payload.get("error") or data.get("error") or {"type": "upstream_error", "message": "Provider response failed"})
+            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, message=response.messages[0] if response.messages else None, usage=response.usage, error=error, stop_reason=response.stop_reason, raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "response.output_text.delta":
             message = UnifiedMessage(role="assistant", content=text_blocks(data.get("delta") or ""))
-            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, delta=message, raw=deepcopy(raw_event), extra={"payload": data, "output_index": data.get("output_index"), "content_index": data.get("content_index")})
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, output_index=data.get("output_index"), content_index=data.get("content_index"), raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type == "response.function_call_arguments.delta":
+            call = ToolCall(id=data.get("call_id") or data.get("item_id"), arguments=data.get("delta") or "", index=data.get("output_index"))
+            message = UnifiedMessage(role="assistant", content=[ContentBlock(type="tool_call", tool_call=call)], tool_calls=[call])
+            return UnifiedStreamEvent(type="tool_call_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, tool_call=call, item_id=data.get("item_id"), output_index=data.get("output_index"), raw=deepcopy(raw_event), extra={"payload": data})
         if event_type in {"response.output_item.added", "response.output_item.done"} and isinstance(data.get("item"), dict):
             message = self._parse_output_item(data["item"])
-            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, message=message, raw=deepcopy(raw_event), extra={"payload": data})
-        return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, raw=deepcopy(raw_event), extra={"payload": data})
+            if message and message.tool_calls:
+                for call in message.tool_calls:
+                    call.index = data.get("output_index")
+                    if call.arguments in ({}, ""):
+                        call.arguments = None
+            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, message=message, raw=deepcopy(raw_event), extra={"payload": data})
+        return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, raw=deepcopy(raw_event), extra={"payload": data})
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):
@@ -610,17 +623,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _decode_sse_data(raw_event: Any) -> Any:
-    if not isinstance(raw_event, str):
-        return raw_event
-    text = raw_event.strip()
-    if text.startswith("data:"):
-        text = text[5:].strip()
-    if text == "[DONE]":
-        return text
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return raw_event
+    from .streaming import decode_sse_data
+
+    return decode_sse_data(raw_event)
 
 
 def _reasoning_text(item: dict[str, Any]) -> str | None:

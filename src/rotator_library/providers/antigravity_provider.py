@@ -68,8 +68,17 @@ class AntigravityProvider(ProviderInterface):
             inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
             metadata={"purpose": "preserve Gemini thought signatures across Antigravity turns"},
         ),
+        FieldCacheRule(
+            name="antigravity_stream_thought_signature",
+            source="stream_event",
+            path="raw.candidates.*.content.parts.*.thoughtSignature",
+            mode="all",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
+            metadata={"purpose": "preserve streamed Gemini thought signatures across Antigravity turns"},
+        ),
     )
-    native_streaming_supported = False
+    native_streaming_supported = True
     model_quota_groups = {
         "gemini_3_pro": ["gemini-3-pro-preview", "gemini-3-pro-low", "gemini-3-pro-high"],
         "gemini_3_flash": ["gemini-3-flash"],
@@ -149,11 +158,11 @@ class AntigravityProvider(ProviderInterface):
         return prepared
 
     def supports_native_streaming(self, model: str = "", operation: str = "generate") -> bool:
-        """Return false until native stream wrapping is provider-safe."""
+        """Return whether the Gemini SSE endpoint is enabled for this model."""
 
         if self._get_runtime_config(model).native_streaming_supported is not None:
             return super().supports_native_streaming(model, operation)
-        return False
+        return operation == "stream_generate"
 
     def get_native_endpoint(self, model: str = "", operation: str = "generate") -> str:
         """Return Antigravity internal operation endpoints."""
