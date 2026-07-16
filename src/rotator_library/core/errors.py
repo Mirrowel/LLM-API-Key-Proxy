@@ -72,11 +72,13 @@ class StructuredAPIResponseError(Exception):
         error_type: str,
         status_code: int | None = None,
         response: dict | None = None,
+        headers: dict | None = None,
     ) -> None:
         super().__init__(message)
         self.error_type = error_type
         self.status_code = status_code
         self.response = response or {}
+        self.headers = headers or {}
 
     @property
     def http_status(self) -> int:
@@ -89,6 +91,9 @@ class StructuredAPIResponseError(Exception):
             "quota_exceeded": 429,
             "invalid_request": 400,
             "server_error": 502,
+            "proxy_timeout": 504,
+            "proxy_all_credentials_exhausted": 503,
+            "not_found": 404,
         }.get(self.error_type, 502)
 
     def to_protocol_payload(self, protocol: str) -> dict:
@@ -102,6 +107,7 @@ class StructuredAPIResponseError(Exception):
                 "rate_limit": "rate_limit_error",
                 "quota_exceeded": "rate_limit_error",
                 "invalid_request": "invalid_request_error",
+                "not_found": "not_found_error",
             }.get(self.error_type, "api_error")
             return {"type": "error", "error": {"type": error_type, "message": message}}
         if protocol == "gemini":
@@ -111,6 +117,9 @@ class StructuredAPIResponseError(Exception):
                 "rate_limit": "RESOURCE_EXHAUSTED",
                 "quota_exceeded": "RESOURCE_EXHAUSTED",
                 "invalid_request": "INVALID_ARGUMENT",
+                "not_found": "NOT_FOUND",
+                "proxy_timeout": "DEADLINE_EXCEEDED",
+                "proxy_all_credentials_exhausted": "UNAVAILABLE",
             }.get(self.error_type, "INTERNAL")
             return {"error": {"code": self.http_status, "message": message, "status": status}}
         return {
@@ -122,7 +131,11 @@ class StructuredAPIResponseError(Exception):
         }
 
 
-def structured_api_response_error(response) -> StructuredAPIResponseError | None:
+def structured_api_response_error(
+    response,
+    *,
+    headers: dict | None = None,
+) -> StructuredAPIResponseError | None:
     """Normalize top-level provider error envelopes across execution modes."""
 
     if not isinstance(response, dict) or "error" not in response or response.get("error") in (None, "", False):
@@ -167,6 +180,7 @@ def structured_api_response_error(response) -> StructuredAPIResponseError | None
         error_type=error_type,
         status_code=status_code,
         response=response,
+        headers=headers,
     )
 
 

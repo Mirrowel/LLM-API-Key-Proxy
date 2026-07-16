@@ -14,9 +14,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import string
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Optional
+from urllib.parse import parse_qsl, urlparse
 
 from ..field_cache import FieldCacheInjection, FieldCacheRule
 from ..usage.costs import ModelPricing
@@ -24,7 +26,23 @@ from ..usage.costs import ModelPricing
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
 _KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses"}
 _SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "credential", "credentials", "password")
-_PROVIDER_CONFIG_KEYS = {"protocol_name", "adapter_names", "adapter_config", "native_streaming_supported", "field_cache", "model_quota_groups"}
+_PROVIDER_CONFIG_KEYS = {
+    "protocol_name",
+    "api_base",
+    "endpoint_paths",
+    "auth_mode",
+    "auth_header_name",
+    "models",
+    "default_output_protocol",
+    "adapter_names",
+    "adapter_config",
+    "native_streaming_supported",
+    "field_cache",
+    "model_quota_groups",
+}
+_HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_ENDPOINT_TEMPLATE_FIELDS = {"model", "operation", "provider"}
 
 
 class ExperimentalConfigError(ValueError):
@@ -103,6 +121,12 @@ class ProviderRuntimeConfig:
     """Safe provider metadata loaded from optional JSON config."""
 
     protocol_name: Optional[str] = None
+    api_base: Optional[str] = None
+    endpoint_paths: dict[str, str] = field(default_factory=dict)
+    auth_mode: str = "bearer"
+    auth_header_name: Optional[str] = None
+    models: tuple[str, ...] = ()
+    default_output_protocol: Optional[str] = None
     adapter_names: Optional[tuple[str, ...]] = None
     adapter_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     native_streaming_supported: Optional[bool] = None
@@ -306,6 +330,12 @@ def get_provider_runtime_config(
     model_quota_groups = _configured_quota_groups(raw.get("model_quota_groups")) if "model_quota_groups" in raw else None
     return ProviderRuntimeConfig(
         protocol_name=protocol_name,
+        api_base=_configured_api_base(raw.get("api_base")),
+        endpoint_paths=_configured_endpoint_paths(raw.get("endpoint_paths")),
+        auth_mode=_configured_auth_mode(raw.get("auth_mode")),
+        auth_header_name=_configured_auth_header_name(raw.get("auth_header_name")),
+        models=_configured_models(raw.get("models")),
+        default_output_protocol=_configured_output_protocol(raw.get("default_output_protocol")),
         adapter_names=adapter_names,
         adapter_config=adapter_config,
         native_streaming_supported=native_streaming_supported,
@@ -405,10 +435,7 @@ def _dict_section(data: Mapping[str, Any], key: str) -> dict[str, Any]:
 def _reject_secret_keys(value: Any, path: str = "config") -> None:
     if isinstance(value, Mapping):
         for key, nested in value.items():
-            key_text = str(key).lower()
-            compact_key = re.sub(r"[^a-z0-9]+", "", key_text)
-            underscored_key = re.sub(r"[^a-z0-9]+", "_", key_text)
-            if any(part in key_text or part in compact_key or part in underscored_key for part in _SECRET_KEY_PARTS):
+            if _is_secret_like_key(key):
                 raise ExperimentalConfigError(f"Unsafe secret-like key in JSON config at {path}.{key}")
             _reject_secret_keys(nested, f"{path}.{key}")
     elif isinstance(value, list):
@@ -422,14 +449,30 @@ def _validate_provider_sections(value: Any) -> None:
     if not isinstance(value, Mapping):
         raise ExperimentalConfigError("providers config section must be an object")
     for provider, raw in value.items():
+        if not _PROVIDER_NAME_RE.fullmatch(str(provider)):
+            raise ExperimentalConfigError(
+                f"providers key {provider!r} must contain only letters, numbers, underscores, or hyphens"
+            )
         if not isinstance(raw, Mapping):
             raise ExperimentalConfigError(f"providers.{provider} must be an object")
         unsupported = set(str(key) for key in raw) - _PROVIDER_CONFIG_KEYS
         if unsupported:
             raise ExperimentalConfigError(f"providers.{provider} contains unsupported keys: {', '.join(sorted(unsupported))}")
         _configured_protocol(raw.get("protocol_name"))
+        _configured_output_protocol(raw.get("default_output_protocol"))
         _configured_adapters(raw.get("adapter_names"))
         _configured_adapter_config(raw.get("adapter_config", {}))
+        _configured_api_base(raw.get("api_base"))
+        _configured_endpoint_paths(raw.get("endpoint_paths"))
+        auth_mode = _configured_auth_mode(raw.get("auth_mode"))
+        auth_header_name = _configured_auth_header_name(raw.get("auth_header_name"))
+        if auth_mode == "custom" and not auth_header_name:
+            raise ExperimentalConfigError("providers.auth_header_name is required when auth_mode is custom")
+        if auth_mode == "none" and not raw.get("protocol_name"):
+            raise ExperimentalConfigError(
+                "providers.protocol_name is required when auth_mode is none"
+            )
+        _configured_models(raw.get("models"))
         if "native_streaming_supported" in raw:
             as_bool(raw.get("native_streaming_supported"), name="providers.native_streaming_supported")
         if "model_quota_groups" in raw:
@@ -439,14 +482,130 @@ def _validate_provider_sections(value: Any) -> None:
 def _configured_protocol(value: Any) -> Optional[str]:
     if value in (None, ""):
         return None
-    name = str(value)
+    name = str(value).strip().lower()
     try:
         from ..protocols import get_protocol
 
-        get_protocol(name)
+        protocol = get_protocol(name)
     except Exception as exc:
         raise ExperimentalConfigError(f"Unknown provider protocol_name {name!r}") from exc
+    return protocol.name
+
+
+def _configured_output_protocol(value: Any) -> Optional[str]:
+    """Return one supported generative client output protocol."""
+
+    protocol_name = _configured_protocol(value)
+    if protocol_name and protocol_name not in {
+        "openai_chat",
+        "responses",
+        "anthropic_messages",
+        "gemini",
+    }:
+        raise ExperimentalConfigError(
+            f"default_output_protocol must be a generative protocol, got {protocol_name!r}"
+        )
+    return protocol_name
+
+
+def _configured_api_base(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    url = str(value).strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ExperimentalConfigError("providers.api_base must be an http(s) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ExperimentalConfigError(
+            "providers.api_base cannot contain credentials, query parameters, or fragments"
+        )
+    return url.rstrip("/")
+
+
+def _configured_endpoint_paths(value: Any) -> dict[str, str]:
+    if value in (None, {}):
+        return {}
+    if not isinstance(value, Mapping):
+        raise ExperimentalConfigError("providers.endpoint_paths must be an object")
+    result: dict[str, str] = {}
+    for operation, path in value.items():
+        name = str(operation).strip()
+        if not isinstance(path, str):
+            raise ExperimentalConfigError("providers.endpoint_paths values must be strings")
+        rendered = path.strip()
+        if not name or not rendered:
+            raise ExperimentalConfigError("providers.endpoint_paths entries require non-empty operation and path values")
+        if not _PROVIDER_NAME_RE.fullmatch(name):
+            raise ExperimentalConfigError("providers.endpoint_paths operation names are invalid")
+        try:
+            fields = {
+                field_name
+                for _, field_name, _, _ in string.Formatter().parse(rendered)
+                if field_name is not None
+            }
+        except ValueError as exc:
+            raise ExperimentalConfigError("providers.endpoint_paths contains an invalid template") from exc
+        unsupported = fields - _ENDPOINT_TEMPLATE_FIELDS
+        if unsupported:
+            raise ExperimentalConfigError(
+                f"providers.endpoint_paths contains unsupported placeholders: {', '.join(sorted(unsupported))}"
+            )
+        if not rendered.startswith("/") or rendered.startswith("//"):
+            raise ExperimentalConfigError(
+                "providers.endpoint_paths values must be absolute paths on api_base"
+            )
+        parsed_path = urlparse(rendered)
+        if parsed_path.fragment:
+            raise ExperimentalConfigError(
+                "providers.endpoint_paths cannot contain fragments"
+            )
+        for query_key, _ in parse_qsl(parsed_path.query, keep_blank_values=True):
+            if _is_secret_like_key(query_key):
+                raise ExperimentalConfigError(
+                    "providers.endpoint_paths cannot contain secret-bearing query parameters"
+                )
+        result[name] = rendered
+    return result
+
+
+def _configured_auth_mode(value: Any) -> str:
+    mode = str(value or "bearer").strip().lower().replace("_", "-")
+    aliases = {"x-api-key": "x-api-key", "x-goog-api-key": "x-goog-api-key", "none": "none", "custom": "custom", "bearer": "bearer"}
+    if mode not in aliases:
+        raise ExperimentalConfigError("providers.auth_mode must be bearer, x-api-key, x-goog-api-key, custom, or none")
+    return aliases[mode]
+
+
+def _is_secret_like_key(value: Any) -> bool:
+    """Return whether a config key names credential or authentication data."""
+
+    key_text = str(value).lower()
+    compact_key = re.sub(r"[^a-z0-9]+", "", key_text)
+    underscored_key = re.sub(r"[^a-z0-9]+", "_", key_text)
+    return any(
+        part in key_text or part in compact_key or part in underscored_key
+        for part in _SECRET_KEY_PARTS
+    )
+
+
+def _configured_auth_header_name(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    name = str(value).strip()
+    if not _HTTP_TOKEN_RE.fullmatch(name):
+        raise ExperimentalConfigError("providers.auth_header_name must be a valid HTTP header name")
     return name
+
+
+def _configured_models(value: Any) -> tuple[str, ...]:
+    if value in (None, []):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ExperimentalConfigError("providers.models must be a list")
+    if not all(isinstance(model, str) and model.strip() for model in value):
+        raise ExperimentalConfigError("providers.models entries must be non-empty strings")
+    models = tuple(model.strip() for model in value)
+    return models
 
 
 def _configured_adapters(value: Any) -> Optional[tuple[str, ...]]:

@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 
 from proxy_app import main as proxy_main
 from proxy_app.detailed_logger import RawIOLogger
-from rotator_library.responses import InMemoryResponsesStore, ResponsesService
+from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError
 
 
 class FakeClient:
@@ -81,6 +81,30 @@ def test_post_responses_missing_model_returns_400() -> None:
 
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_responses_provider_error_uses_selected_output_protocol() -> None:
+    class ErrorService(ResponsesService):
+        async def create_response(self, *args, **kwargs):
+            raise ResponsesServiceError(
+                "provider busy",
+                status_code=429,
+                error_type="rate_limit",
+            )
+
+    client = _client()
+    proxy_main.app.state.responses_service = ErrorService(store=InMemoryResponsesStore())
+
+    response = client.post(
+        "/v1/responses",
+        headers={"X-Proxy-Output-Protocol": "gemini"},
+        json={"model": "openai/gpt-test", "input": "hello"},
+    )
+
+    assert response.status_code == 429
+    assert response.json() == {
+        "error": {"code": 429, "message": "provider busy", "status": "RESOURCE_EXHAUSTED"}
+    }
 
 
 def test_post_responses_stream_missing_model_returns_400_before_sse() -> None:

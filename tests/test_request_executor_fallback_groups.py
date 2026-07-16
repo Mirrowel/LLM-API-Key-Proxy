@@ -7,7 +7,7 @@ import pytest
 
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.core.types import RequestContext
-from rotator_library.core.errors import structured_api_response_error
+from rotator_library.core.errors import StructuredAPIResponseError, structured_api_response_error
 from rotator_library.routing import parse_route_target
 from rotator_library.routing.types import FallbackGroup
 from rotator_library.transaction_logger import TransactionLogger
@@ -173,6 +173,51 @@ async def test_non_streaming_fallback_group_handles_structured_error_response() 
     )
 
     assert result == {"id": "ok", "model": "openai/gpt-5.1"}
+
+
+@pytest.mark.asyncio
+async def test_raised_credential_exhaustion_keeps_fallback_and_final_summary() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    def exhausted(provider: str) -> StructuredAPIResponseError:
+        response = {
+            "error": {
+                "type": "proxy_all_credentials_exhausted",
+                "message": f"{provider} exhausted",
+                "details": {"normal_error_summary": "2 rate_limit"},
+            }
+        }
+        return StructuredAPIResponseError(
+            f"{provider} exhausted",
+            error_type="proxy_all_credentials_exhausted",
+            status_code=503,
+            response=response,
+        )
+
+    async def fake_execute(self, context):
+        attempts.append(context.provider)
+        raise exhausted(context.provider)
+
+    executor._execute_non_streaming = MethodType(fake_execute, executor)
+    targets = (
+        parse_route_target("codex/gpt-5.1-codex"),
+        parse_route_target("openai/gpt-5.1"),
+    )
+    context = _context(routing_targets=targets)
+
+    with pytest.raises(StructuredAPIResponseError) as raised:
+        await executor._execute_non_streaming_with_fallback(context)
+
+    assert attempts == ["codex", "openai"]
+    assert [entry["error_type"] for entry in context.routing_attempt_history] == [
+        "rate_limit",
+        "rate_limit",
+    ]
+    assert [
+        failure["provider"]
+        for failure in raised.value.response["error"]["details"]["fallback_targets"]
+    ] == ["codex", "openai"]
 
 
 @pytest.mark.asyncio

@@ -133,6 +133,7 @@ litellm.suppress_debug_info = True
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
+    from rotator_library.client.protocol_selection import require_same_protocol_stream, resolve_client_output_protocol
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
@@ -698,6 +699,7 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
 
 # --- Anthropic API Key Header ---
 anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+gemini_api_key_header = APIKeyHeader(name="x-goog-api-key", auto_error=False)
 
 
 async def verify_anthropic_api_key(
@@ -714,6 +716,25 @@ async def verify_anthropic_api_key(
     # Fall back to Bearer token (OpenAI style)
     if auth and auth == f"Bearer {PROXY_API_KEY}":
         return auth
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+
+
+async def verify_gemini_api_key(
+    request: Request,
+    x_api_key: str = Depends(gemini_api_key_header),
+    auth: str = Depends(api_key_header),
+):
+    """Accept Gemini header/query authentication or the shared Bearer form."""
+
+    if not PROXY_API_KEY:
+        return x_api_key or auth or request.query_params.get("key")
+    query_key = request.query_params.get("key")
+    if (
+        x_api_key == PROXY_API_KEY
+        or query_key == PROXY_API_KEY
+        or auth == f"Bearer {PROXY_API_KEY}"
+    ):
+        return x_api_key or query_key or auth
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
@@ -969,8 +990,17 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
-            response_generator = await client.acompletion(
-                request=request, **request_data
+            selected_output = resolve_client_output_protocol(
+                client,
+                request_data,
+                input_protocol="openai_chat",
+                request=request,
+            )
+            require_same_protocol_stream("openai_chat", selected_output)
+            response_generator = await client.agenerate(
+                request_data,
+                input_protocol="openai_chat",
+                request=request,
             )
             return StreamingResponse(
                 streaming_response_wrapper(
@@ -979,7 +1009,11 @@ async def chat_completions(
                 media_type="text/event-stream",
             )
         else:
-            response = await client.acompletion(request=request, **request_data)
+            response = await client.agenerate(
+                request_data,
+                input_protocol="openai_chat",
+                request=request,
+            )
 
             if is_structured_error_payload(response):
                 if raw_logger:
@@ -1004,7 +1038,13 @@ async def chat_completions(
             return response
 
     except StructuredAPIResponseError as e:
-        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("openai_chat"))
+        output_protocol = resolve_client_output_protocol(
+            client,
+            request_data if isinstance(request_data, dict) else {},
+            input_protocol="openai_chat",
+            request=request,
+        )
+        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload(output_protocol))
     except (
         litellm.InvalidRequestError,
         ValueError,
@@ -1036,10 +1076,13 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _responses_error_response(error: ResponsesServiceError) -> dict[str, Any]:
-    """Return an OpenAI-compatible error payload for Responses routes."""
+def _responses_error_response(
+    error: ResponsesServiceError,
+    protocol: str = "responses",
+) -> dict[str, Any]:
+    """Return a Responses service failure in the selected client protocol."""
 
-    return {"error": {"message": str(error), "type": error.error_type, "code": error.status_code}}
+    return error.to_protocol_payload(protocol)
 
 
 @app.post("/v1/responses")
@@ -1049,13 +1092,10 @@ async def responses_create(
     service: ResponsesService = Depends(get_responses_service),
     _=Depends(verify_api_key),
 ):
-    """OpenAI-compatible Responses API create endpoint.
-
-    Phase 4 non-streaming requests bridge through the current completion engine.
-    Streaming requests are handled by the dedicated SSE checkpoint in this phase.
-    """
+    """Create, store, and optionally reformat an OpenAI Responses object."""
 
     logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    selected_output = "responses"
     try:
         request_data = await request.json()
     except json.JSONDecodeError:
@@ -1065,6 +1105,16 @@ async def responses_create(
             headers=dict(request.headers),
             body=service.redact_request_for_logging(request_data),
         )
+    try:
+        selected_output = resolve_client_output_protocol(
+            client,
+            request_data,
+            input_protocol="responses",
+            request=request,
+        )
+    except ValueError as e:
+        payload = _responses_error_response(ResponsesServiceError(str(e), status_code=400))
+        return JSONResponse(status_code=400, content=payload)
     transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
     try:
         request_scope = service.prepare_request_scope(request_data)
@@ -1072,6 +1122,7 @@ async def responses_create(
             "X-Proxy-Session-Domain"
         )
         if request_data.get("stream"):
+            require_same_protocol_stream("responses", selected_output)
             await service.validate_stream_request(
                 request_data,
                 request_scope=request_scope,
@@ -1109,15 +1160,25 @@ async def responses_create(
             headers={"X-Proxy-Session-Domain": request_scope.access_token},
         )
     except ResponsesServiceError as e:
-        payload = _responses_error_response(e)
+        payload = _responses_error_response(e, selected_output)
         if logger:
             logger.log_final_response(status_code=e.status_code, headers=None, body=payload)
         return JSONResponse(status_code=e.status_code, content=payload)
+    except ValueError as e:
+        payload = _responses_error_response(
+            ResponsesServiceError(str(e), status_code=400),
+            selected_output,
+        )
+        return JSONResponse(status_code=400, content=payload)
     except Exception as e:
         logging.error(f"Responses endpoint error: {e}")
+        payload = _responses_error_response(
+            ResponsesServiceError(str(e), status_code=500, error_type="internal_error"),
+            selected_output,
+        )
         if logger:
-            logger.log_final_response(status_code=500, headers=None, body={"error": str(e)})
-        return JSONResponse(status_code=500, content={"error": {"message": str(e), "type": "internal_error", "code": 500}})
+            logger.log_final_response(status_code=500, headers=None, body=payload)
+        return JSONResponse(status_code=500, content=payload)
 
 
 @app.get("/v1/responses/{response_id}")
@@ -1219,6 +1280,14 @@ async def anthropic_messages(
         )
 
         # Use the library method to handle the request
+        if body.stream:
+            selected_output = resolve_client_output_protocol(
+                client,
+                body.model_dump(exclude_none=True),
+                input_protocol="anthropic_messages",
+                request=request,
+            )
+            require_same_protocol_stream("anthropic_messages", selected_output)
         result = await client.anthropic_messages(body, raw_request=request)
 
         if body.stream:
@@ -1243,7 +1312,13 @@ async def anthropic_messages(
             return JSONResponse(content=result)
 
     except StructuredAPIResponseError as e:
-        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("anthropic_messages"))
+        output_protocol = resolve_client_output_protocol(
+            client,
+            body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages",
+            request=request,
+        )
+        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload(output_protocol))
     except (
         litellm.InvalidRequestError,
         ValueError,
@@ -1337,6 +1412,65 @@ async def anthropic_count_tokens(
             "error": {"type": "api_error", "message": str(e)},
         }
         raise HTTPException(status_code=500, detail=error_response)
+
+
+@app.post("/v1beta/models/{model:path}:generateContent")
+@app.post("/v1/models/{model:path}:generateContent")
+async def gemini_generate_content(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-compatible generation endpoint using protocol-native routing."""
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": 400, "message": "Invalid JSON in request body.", "status": "INVALID_ARGUMENT"}},
+        )
+    try:
+        if payload.get("stream"):
+            raise ValueError(
+                "Gemini generateContent does not accept stream=true; use streamGenerateContent"
+            )
+        result = await client.gemini_generate(payload, model=model, raw_request=request)
+        return JSONResponse(content=result)
+    except StructuredAPIResponseError as error:
+        output_protocol = resolve_client_output_protocol(
+            client,
+            {**payload, "model": model},
+            input_protocol="gemini",
+            request=request,
+        )
+        return JSONResponse(status_code=error.http_status, content=error.to_protocol_payload(output_protocol))
+    except (ValueError, litellm.InvalidRequestError) as error:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
+        )
+
+
+@app.post("/v1beta/models/{model:path}:countTokens")
+@app.post("/v1/models/{model:path}:countTokens")
+async def gemini_count_tokens(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-compatible token counting endpoint."""
+
+    try:
+        payload = await request.json()
+        return JSONResponse(content=client.gemini_count_tokens(payload, model=model))
+    except (json.JSONDecodeError, ValueError) as error:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
+        )
 
 
 @app.post("/v1/embeddings")

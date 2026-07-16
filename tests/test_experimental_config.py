@@ -142,7 +142,7 @@ def test_secret_key_variants_are_rejected(secret_key: str) -> None:
 
 def test_provider_config_rejects_unsupported_keys() -> None:
     with pytest.raises(ExperimentalConfigError):
-        load_config_from_mapping({"providers": {"openai": {"api_base": "https://example.test"}}})
+        load_config_from_mapping({"providers": {"openai": {"unknown_setting": True}}})
 
 
 def test_provider_config_validates_protocol_and_adapter_names() -> None:
@@ -150,6 +150,39 @@ def test_provider_config_validates_protocol_and_adapter_names() -> None:
         load_config_from_mapping({"providers": {"openai": {"protocol_name": "missing_protocol"}}})
     with pytest.raises(ExperimentalConfigError):
         load_config_from_mapping({"providers": {"openai": {"adapter_names": ["missing_adapter"]}}})
+
+
+@pytest.mark.parametrize(
+    "provider_config",
+    [
+        {"api_base": "file:///tmp/provider"},
+        {"api_base": "https://user:secret@example.test/v1"},
+        {"api_base": "https://example.test/v1?token=secret"},
+        {"auth_mode": "query-secret"},
+        {"auth_mode": "custom"},
+        {"api_base": "https://example.test", "auth_mode": "none"},
+        {"auth_mode": "custom", "auth_header_name": "Bad Header"},
+        {"models": "model-a"},
+        {"models": [{"id": "model-a"}]},
+        {"endpoint_paths": ["/chat/completions"]},
+        {"endpoint_paths": {"chat": "chat/completions"}},
+        {"endpoint_paths": {"chat": "https://other.example/chat"}},
+        {"endpoint_paths": {"chat": "/chat?api_key=secret"}},
+        {"endpoint_paths": {"chat": "/chat#token=secret"}},
+        {"endpoint_paths": {"chat": "/models/{unknown}:generate"}},
+        {"endpoint_paths": {"chat": 42}},
+        {"default_output_protocol": "missing_protocol"},
+        {"default_output_protocol": "embeddings"},
+    ],
+)
+def test_provider_config_validates_dynamic_transport_settings(provider_config) -> None:
+    with pytest.raises(ExperimentalConfigError):
+        load_config_from_mapping({"providers": {"configured": provider_config}})
+
+
+def test_provider_config_rejects_invalid_provider_names() -> None:
+    with pytest.raises(ExperimentalConfigError):
+        load_config_from_mapping({"providers": {"bad/provider": {"api_base": "https://example.test"}}})
 
 
 def test_retry_runtime_settings_malformed_env_preserves_defaults() -> None:

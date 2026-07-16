@@ -274,6 +274,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # protocol stack. Defaults are intentionally no-op so existing providers keep
     # the LiteLLM-backed execution path until they opt into native protocols.
     protocol_name: Optional[str] = None
+    default_output_protocol: Optional[str] = None
     adapter_names: Tuple[str, ...] = ()
     field_cache_rules: Tuple[Any, ...] = ()
     native_streaming_supported: bool = False
@@ -334,6 +335,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         configured = self._get_runtime_config(model).protocol_name
         return configured or self.protocol_name
+
+    def get_default_output_protocol(self, model: str = "") -> Optional[str]:
+        """Return the integration output protocol selected for this provider."""
+
+        configured = self._get_runtime_config(model).default_output_protocol
+        return configured or self.default_output_protocol
 
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
         """Return ordered adapter names for this provider/model.

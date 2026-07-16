@@ -937,6 +937,12 @@ class RequestExecutor:
                 _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
                 if not fallback_allowed:
                     self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
+                    if isinstance(exc, StructuredAPIResponseError):
+                        exc.response = _with_fallback_summary(
+                            deepcopy(exc.response),
+                            target_failures,
+                            context.routing_attempt_history,
+                        )
                     raise
                 self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
                 continue
@@ -1436,8 +1442,14 @@ class RequestExecutor:
         if last_exception and not error_accumulator.has_errors():
             raise last_exception
 
-        # Return error response
-        return error_accumulator.build_client_error_response()
+        error_response = error_accumulator.build_client_error_response()
+        error_type = str(error_response.get("error", {}).get("type") or "proxy_all_credentials_exhausted")
+        raise StructuredAPIResponseError(
+            str(error_response.get("error", {}).get("message") or "All credentials exhausted"),
+            error_type=error_type,
+            status_code=504 if error_accumulator.timeout_occurred else 503,
+            response=error_response,
+        )
 
     async def _execute_streaming(
         self,
@@ -2938,6 +2950,10 @@ def _route_error_type(error: BaseException, provider: Optional[str] = None) -> s
 
     if isinstance(error, asyncio.CancelledError):
         return "cancelled"
+    if isinstance(error, StructuredAPIResponseError):
+        response_type = _route_error_type_from_response(error.response)
+        if response_type:
+            return response_type
     explicit = getattr(error, "error_type", None)
     if explicit:
         return normalize_route_error_type(str(explicit))

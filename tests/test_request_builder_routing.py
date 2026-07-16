@@ -166,6 +166,66 @@ async def test_provider_session_hook_receives_provider_native_shape(monkeypatch)
     assert "contents" in seen[0]
     assert "messages" not in seen[0]
 
+
+@pytest.mark.asyncio
+async def test_provider_default_output_applies_only_without_explicit_override(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+
+    class Provider:
+        def get_default_output_protocol(self, model=""):
+            return "anthropic_messages"
+
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+        get_provider_instance=lambda provider: Provider(),
+    )
+    implicit = await builder.build_completion_context(
+        None,
+        None,
+        {"model": "openai/gpt-5.1", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    explicit = await builder.build_completion_context(
+        None,
+        None,
+        {
+            "_output_protocol": "responses",
+            "model": "openai/gpt-5.1",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert implicit.output_protocol_name == "anthropic_messages"
+    assert explicit.output_protocol_name == "responses"
+
+
+@pytest.mark.asyncio
+async def test_request_builder_rejects_cross_protocol_stream_for_direct_acompletion(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+    )
+
+    with pytest.raises(ValueError, match="Streaming conversion"):
+        await builder.build_completion_context(
+            None,
+            None,
+            {
+                "_input_protocol": "openai_chat",
+                "_output_protocol": "gemini",
+                "model": "openai/gpt-5.1",
+                "messages": [],
+                "stream": True,
+            },
+        )
+
 @pytest.mark.asyncio
 async def test_request_builder_classifier_domain_is_stable_across_providers(monkeypatch) -> None:
     monkeypatch.delenv("FALLBACK_GROUPS", raising=False)

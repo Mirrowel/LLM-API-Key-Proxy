@@ -100,6 +100,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
     name: ClassVar[str] = "openai_chat"
     aliases: ClassVar[tuple[str, ...]] = (
         "openai",
+        "chat",
         "chat_completions",
         "openai_chat_completions",
     )
