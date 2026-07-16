@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 import os
+import logging
 from typing import Any, Dict, Optional
+
+
+lib_logger = logging.getLogger("rotator_library")
 
 
 GLOBAL_EN = "global_en"
@@ -34,8 +38,43 @@ MINIMAX_MODEL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             "cache_read": 0.06,
             "cache_write": None,
         },
+        "pricing_tiers_usd_per_million_tokens": [
+            {
+                "service_tier": "standard",
+                "input_tokens_lte": 512_000,
+                "input": 0.3,
+                "output": 1.2,
+                "cache_read": 0.06,
+                "cache_write": None,
+            },
+            {
+                "service_tier": "standard",
+                "input_tokens_gt": 512_000,
+                "input": 0.6,
+                "output": 2.4,
+                "cache_read": 0.12,
+                "cache_write": None,
+            },
+            {
+                "service_tier": "priority",
+                "input_tokens_lte": 512_000,
+                "input": 0.45,
+                "output": 1.8,
+                "cache_read": 0.09,
+                "cache_write": None,
+            },
+            {
+                "service_tier": "priority",
+                "input_tokens_gt": 512_000,
+                "input": 0.9,
+                "output": 3.6,
+                "cache_read": 0.18,
+                "cache_write": None,
+            },
+        ],
         "input_modalities": ["text", "image", "video"],
         "thinking": ["adaptive", "disabled"],
+        "interleaved": True,
     },
     "MiniMax-M2.7": {
         "context_window": 204_800,
@@ -98,11 +137,12 @@ def get_minimax_endpoint(
     if not override:
         if selected_protocol == OPENAI_PROTOCOL:
             override = os.getenv("MINIMAX_API_BASE", "").strip()
-        else:
-            override = os.getenv("MINIMAX_ANTHROPIC_BASE_URL", "").strip()
 
     endpoint = override or MINIMAX_ENDPOINTS[selected_region][selected_protocol]
     endpoint = endpoint.rstrip("/")
     if selected_protocol == ANTHROPIC_PROTOCOL and not endpoint.endswith("/anthropic"):
-        raise ValueError("MiniMax Anthropic base URL must end with /anthropic")
+        lib_logger.warning(
+            "Invalid MiniMax Anthropic base URL; using the selected default endpoint"
+        )
+        endpoint = MINIMAX_ENDPOINTS[selected_region][selected_protocol]
     return endpoint

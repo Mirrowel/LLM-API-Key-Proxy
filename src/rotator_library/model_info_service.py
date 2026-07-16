@@ -91,10 +91,32 @@ PROVIDER_ALIASES = {
 
 def _build_minimax_model_catalog() -> Dict[str, Dict[str, Any]]:
     """Build native metadata records for the supported MiniMax models."""
+
+    def normalize_tiers(definition: Dict[str, Any]) -> List[Dict[str, Any]]:
+        tiers = []
+        for source in definition.get("pricing_tiers_usd_per_million_tokens", []):
+            tier = {
+                key: source[key]
+                for key in ("service_tier", "input_tokens_lte", "input_tokens_gt")
+                if key in source
+            }
+            for source_key, target_key in (
+                ("input", "prompt"),
+                ("output", "completion"),
+                ("cache_read", "cached_input"),
+                ("cache_write", "cache_write"),
+            ):
+                if source_key in source:
+                    value = source[source_key]
+                    tier[target_key] = value / 1_000_000 if value is not None else None
+            tiers.append(tier)
+        return tiers
+
     catalog = {}
     for model_id, definition in MINIMAX_MODEL_DEFINITIONS.items():
         pricing = definition["pricing_usd_per_million_tokens"]
         input_types = definition["input_modalities"]
+        thinking_modes = definition["thinking"]
         catalog[f"minimax/{model_id}"] = {
             "name": model_id,
             "original_id": model_id,
@@ -109,19 +131,25 @@ def _build_minimax_model_catalog() -> Dict[str, Dict[str, Any]]:
                 if pricing["cache_write"] is not None
                 else None
             ),
+            "pricing_tiers": normalize_tiers(definition),
             "context": definition["context_window"],
             "max_out": 0,
             "inputs": input_types,
             "outputs": ["text"],
-            "has_tools": False,
-            "has_functions": False,
+            "has_tools": model_id == "MiniMax-M3",
+            "has_functions": model_id == "MiniMax-M3",
             "has_reasoning": bool(definition["thinking"]),
             "has_vision": "image" in input_types,
             "has_structured_output": False,
             "has_temperature": True,
-            "has_attachments": "video" in input_types,
-            "has_interleaved": False,
-            "supported_parameters": ["thinking"],
+            "has_attachments": "file" in input_types,
+            "has_interleaved": definition.get("interleaved", False),
+            "thinking_modes": thinking_modes,
+            "supported_parameters": (
+                ["tools", "tool_choice", "thinking"]
+                if model_id == "MiniMax-M3"
+                else []
+            ),
         }
     return catalog
 
@@ -175,6 +203,7 @@ class ModelPricing:
     completion: Optional[float] = None
     cached_input: Optional[float] = None
     cache_write: Optional[float] = None
+    tiers: List[Dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -201,6 +230,7 @@ class ModelCapabilities:
     temperature: bool = True  # Most models support temperature
     attachments: bool = False  # File/document attachments
     interleaved: bool = False  # Interleaved content support
+    thinking_modes: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -271,6 +301,8 @@ class ModelMetadata:
                 response["pricing"]["cached_input"] = self.pricing.cached_input
             if self.pricing.cache_write is not None:
                 response["pricing"]["cache_write"] = self.pricing.cache_write
+            if self.pricing.tiers:
+                response["pricing"]["tiers"] = self.pricing.tiers
 
         # === Architecture/modalities (OpenRouter-style) ===
         response["architecture"] = {
@@ -294,6 +326,8 @@ class ModelMetadata:
             "attachments": self.capabilities.attachments,
             "interleaved": self.capabilities.interleaved,
         }
+        if self.capabilities.thinking_modes:
+            response["capabilities"]["thinking_modes"] = self.capabilities.thinking_modes
 
         # === Supported parameters (if available) ===
         if self.supported_parameters:
@@ -820,6 +854,7 @@ class DataMerger:
                 completion=best_record.get("completion_cost"),
                 cached_input=best_record.get("cache_read_cost"),
                 cache_write=best_record.get("cache_write_cost"),
+                tiers=best_record.get("pricing_tiers", []),
             ),
             limits=ModelLimits(
                 context_window=best_record.get("context") or None,
@@ -835,6 +870,7 @@ class DataMerger:
                 temperature=best_record.get("has_temperature", True),
                 attachments=best_record.get("has_attachments", False),
                 interleaved=best_record.get("has_interleaved", False),
+                thinking_modes=best_record.get("thinking_modes", []),
             ),
             info=ModelInfo(
                 family=best_record.get("family", ""),
@@ -1222,6 +1258,27 @@ class ModelRegistry:
         pricing = self.get_pricing(model_id)
         if not pricing:
             return None
+
+        metadata = self.lookup(model_id)
+        if metadata and metadata.pricing.tiers:
+            standard_tiers = [
+                tier
+                for tier in metadata.pricing.tiers
+                if tier.get("service_tier") == "standard"
+            ]
+            for tier in standard_tiers:
+                if tier.get("input_tokens_lte") is not None:
+                    matches = input_tokens <= tier["input_tokens_lte"]
+                else:
+                    matches = input_tokens > tier.get("input_tokens_gt", -1)
+                if matches:
+                    pricing = {
+                        "input_cost_per_token": tier.get("prompt"),
+                        "output_cost_per_token": tier.get("completion"),
+                        "cache_read_input_token_cost": tier.get("cached_input"),
+                        "cache_creation_input_token_cost": tier.get("cache_write"),
+                    }
+                    break
 
         in_rate = pricing.get("input_cost_per_token")
         out_rate = pricing.get("output_cost_per_token")

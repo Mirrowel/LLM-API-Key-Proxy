@@ -1150,7 +1150,8 @@ The library handles provider idiosyncrasies through specialized "Provider" class
 The MiniMax provider exposes the built-in `MiniMax-M3` and `MiniMax-M2.7`
 models while preserving additional models returned by the provider's model
 discovery endpoint. Native model metadata includes context limits, pricing,
-input modalities, and thinking support for the `/v1/models` and cost APIs.
+input modalities, tool use, interleaved thinking, and tiered pricing for the
+`/v1/models` and cost APIs.
 
 Configure the upstream region and protocol with these environment variables:
 
@@ -1515,4 +1516,3 @@ The GUI modifies the same environment variables that the `RotatingClient` reads:
 3. **Proxy applies rules** → `get_available_models()` filters based on rules
 
 **Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
-

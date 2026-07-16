@@ -749,6 +749,11 @@ class ProviderConfig:
         if not model:
             return kwargs
 
+        # Provider hooks may select a protocol-specific endpoint. Preserve it
+        # instead of replacing it with a global provider override.
+        if kwargs.get("api_base") and kwargs.get("custom_llm_provider"):
+            return kwargs
+
         # Extract provider from model string (e.g., "openai/gpt-4" → "openai")
         provider = model.split("/")[0].lower()
         api_base = self._api_bases.get(provider)

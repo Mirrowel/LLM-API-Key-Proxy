@@ -15,7 +15,9 @@ from rotator_library.minimax_config import (
     OPENAI_PROTOCOL,
     get_minimax_endpoint,
 )
+from rotator_library.client.transforms import ProviderTransforms
 from rotator_library.model_info_service import ModelRegistry
+from rotator_library.provider_config import ProviderConfig
 from rotator_library.providers.minimax_provider import MinimaxProvider
 
 
@@ -103,6 +105,22 @@ class MiniMaxProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(metadata.limits.context_window, 1_000_000)
         self.assertEqual(metadata.pricing.prompt, 0.3 / 1_000_000)
         self.assertEqual(metadata.input_types, ["text", "image", "video"])
+        self.assertTrue(metadata.capabilities.tools)
+        self.assertTrue(metadata.capabilities.functions)
+        self.assertTrue(metadata.capabilities.interleaved)
+        self.assertEqual(
+            metadata.capabilities.thinking_modes, ["adaptive", "disabled"]
+        )
+        self.assertEqual(len(metadata.pricing.tiers), 4)
+        self.assertEqual(metadata.pricing.tiers[1]["prompt"], 0.6 / 1_000_000)
+
+        secondary = registry.lookup("minimax/MiniMax-M2.7")
+        self.assertIsNotNone(secondary)
+        self.assertEqual(secondary.limits.context_window, 204_800)
+        self.assertEqual(secondary.pricing.cache_write, 0.375 / 1_000_000)
+        self.assertEqual(secondary.input_types, ["text"])
+        self.assertEqual(secondary.capabilities.thinking_modes, ["always_on"])
+        self.assertFalse(secondary.supported_parameters)
         self.assertEqual(
             get_minimax_endpoint(GLOBAL_EN, OPENAI_PROTOCOL),
             "https://api.minimax.io/v1",
@@ -111,3 +129,44 @@ class MiniMaxProviderTests(unittest.IsolatedAsyncioTestCase):
             get_minimax_endpoint(CN_ZH, ANTHROPIC_PROTOCOL),
             "https://api.minimaxi.com/anthropic",
         )
+
+    async def test_provider_hook_endpoint_survives_global_override(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_BASE": "https://global.example/v1",
+                "MINIMAX_API_REGION": GLOBAL_EN,
+                "MINIMAX_API_PROTOCOL": OPENAI_PROTOCOL,
+            },
+        ):
+            transforms = ProviderTransforms(
+                {"minimax": MinimaxProvider}, ProviderConfig()
+            )
+            result = await transforms.apply(
+                "minimax",
+                "minimax/MiniMax-M3",
+                "test-key",
+                {"model": "minimax/MiniMax-M3"},
+            )
+
+        self.assertEqual(result["api_base"], "https://api.minimax.io/v1")
+        self.assertEqual(result["custom_llm_provider"], "openai")
+
+    async def test_invalid_anthropic_override_uses_selected_default(self):
+        with patch.dict(
+            os.environ,
+            {
+                "MINIMAX_API_REGION": GLOBAL_EN,
+                "MINIMAX_API_PROTOCOL": ANTHROPIC_PROTOCOL,
+                "MINIMAX_GLOBAL_ANTHROPIC_BASE_URL": "https://invalid.example/v1",
+            },
+        ):
+            endpoint = get_minimax_endpoint(protocol=ANTHROPIC_PROTOCOL)
+
+        self.assertEqual(endpoint, "https://api.minimax.io/anthropic")
+
+    async def test_long_context_uses_standard_pricing_tier(self):
+        registry = ModelRegistry()
+        cost = registry.compute_cost("minimax/MiniMax-M3", 512_001, 1)
+
+        self.assertAlmostEqual(cost, (512_001 * 0.6 + 2.4) / 1_000_000)
