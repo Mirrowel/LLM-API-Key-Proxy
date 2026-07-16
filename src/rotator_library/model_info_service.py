@@ -20,6 +20,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+from .minimax_config import MINIMAX_MODEL_DEFINITIONS
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,6 +47,7 @@ NATIVE_PROVIDER_PRIORITY = [
     "meta-llama",
     "nvidia",
     "moonshotai",  # Used in nvidia_nim/moonshotai/model format
+    "minimax",
     # These are aggregators/proxies - lower priority
     "openrouter",
     "azure",
@@ -84,6 +87,46 @@ PROVIDER_ALIASES = {
     "gemini_cli": ["google"],
     "gemini": ["google"],
 }
+
+
+def _build_minimax_model_catalog() -> Dict[str, Dict[str, Any]]:
+    """Build native metadata records for the supported MiniMax models."""
+    catalog = {}
+    for model_id, definition in MINIMAX_MODEL_DEFINITIONS.items():
+        pricing = definition["pricing_usd_per_million_tokens"]
+        input_types = definition["input_modalities"]
+        catalog[f"minimax/{model_id}"] = {
+            "name": model_id,
+            "original_id": model_id,
+            "provider": "minimax",
+            "source": "native",
+            "category": "chat",
+            "prompt_cost": pricing["input"] / 1_000_000,
+            "completion_cost": pricing["output"] / 1_000_000,
+            "cache_read_cost": pricing["cache_read"] / 1_000_000,
+            "cache_write_cost": (
+                pricing["cache_write"] / 1_000_000
+                if pricing["cache_write"] is not None
+                else None
+            ),
+            "context": definition["context_window"],
+            "max_out": 0,
+            "inputs": input_types,
+            "outputs": ["text"],
+            "has_tools": False,
+            "has_functions": False,
+            "has_reasoning": bool(definition["thinking"]),
+            "has_vision": "image" in input_types,
+            "has_structured_output": False,
+            "has_temperature": True,
+            "has_attachments": "video" in input_types,
+            "has_interleaved": False,
+            "supported_parameters": ["thinking"],
+        }
+    return catalog
+
+
+MINIMAX_MODEL_CATALOG = _build_minimax_model_catalog()
 
 
 def _get_provider_priority(provider: str) -> int:
@@ -922,6 +965,7 @@ class ModelRegistry:
         # Raw data stores
         self._openrouter_store: Dict[str, Dict] = {}
         self._modelsdev_store: Dict[str, Dict] = {}
+        self._native_store: Dict[str, Dict] = MINIMAX_MODEL_CATALOG.copy()
 
         # Lookup infrastructure
         self._index = ModelIndex()
@@ -1022,6 +1066,9 @@ class ModelRegistry:
         for model_id in self._modelsdev_store:
             self._index.add(model_id)
 
+        for model_id in self._native_store:
+            self._index.add(model_id)
+
     # ---------- Query API ----------
 
     def lookup(self, model_id: str) -> Optional[ModelMetadata]:
@@ -1061,6 +1108,13 @@ class ModelRegistry:
         if model_id in self._modelsdev_store:
             records.append(
                 (self._modelsdev_store[model_id], f"modelsdev:exact:{model_id}")
+            )
+            quality = "exact"
+
+        if model_id in self._native_store:
+            records.insert(
+                0,
+                (self._native_store[model_id], f"native:exact:{model_id}"),
             )
             quality = "exact"
 
@@ -1215,6 +1269,7 @@ class ModelRegistry:
         combined = {}
         combined.update(self._openrouter_store)
         combined.update(self._modelsdev_store)
+        combined.update(self._native_store)
         return combined
 
     def diagnostics(self) -> Dict[str, Any]:
@@ -1224,6 +1279,7 @@ class ModelRegistry:
             "last_refresh": self._last_refresh,
             "openrouter_count": len(self._openrouter_store),
             "modelsdev_count": len(self._modelsdev_store),
+            "native_count": len(self._native_store),
             "cached_lookups": len(self._result_cache),
             "index_entries": self._index.entry_count(),
             "refresh_interval": self._refresh_interval,
