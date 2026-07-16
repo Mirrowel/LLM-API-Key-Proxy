@@ -208,7 +208,7 @@ def test_field_cache_rules_parse_wildcard_then_model_specific() -> None:
             "field_cache": {
                 "gemini_cli": {
                     "*": [{"name": "thought", "source": "response", "path": "$.thought", "target_path": "$.cached_thought"}],
-                    "gemini-3": [{"name": "signature", "source": "response", "path": "$.sig", "scope": ["provider", "model"]}],
+                    "gemini-3": [{"name": "signature", "source": "response", "path": "$.sig", "scope": ["provider", "model", "credential", "session"]}],
                 }
             }
         }
@@ -244,6 +244,7 @@ def test_field_cache_rule_parses_ttl_metadata_and_insert_injection() -> None:
                     "*": [
                         {
                             "name": "tool_state",
+                            "cache_key": "shared_tool_state",
                             "source": "stream_event",
                             "path": "raw.tool.state",
                             "mode": "per_tool_call",
@@ -260,6 +261,7 @@ def test_field_cache_rule_parses_ttl_metadata_and_insert_injection() -> None:
     rule = parse_field_cache_rules(config, "provider", "model")[0]
 
     assert rule.ttl_seconds == 120
+    assert rule.cache_key == "shared_tool_state"
     assert rule.metadata == {"tool_container_path": "tools"}
     assert rule.inject is not None
     assert rule.inject.insert is True
@@ -286,6 +288,24 @@ def test_field_cache_rules_reject_malformed_shapes() -> None:
     config = load_config_from_mapping({"field_cache": {"provider": {"*": ["not-a-rule"]}}})
 
     with pytest.raises(ExperimentalConfigError, match="rule entries"):
+        parse_field_cache_rules(config, "provider", "model")
+
+
+def test_field_cache_config_rejects_weakened_provider_state_scope() -> None:
+    config = load_config_from_mapping({
+        "field_cache": {
+            "provider": {
+                "*": [{
+                    "name": "unsafe",
+                    "source": "response",
+                    "path": "state",
+                    "scope": ["provider", "model", "session"],
+                }]
+            }
+        }
+    })
+
+    with pytest.raises(ExperimentalConfigError, match="credential"):
         parse_field_cache_rules(config, "provider", "model")
 
 

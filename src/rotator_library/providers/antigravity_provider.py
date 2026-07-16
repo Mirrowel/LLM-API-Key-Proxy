@@ -44,6 +44,9 @@ MODEL_ALIAS_MAP = {
 _AMBIGUOUS_REVERSE_ALIASES = {"gemini-3-pro-preview"}
 MODEL_ALIAS_REVERSE = {public: internal for internal, public in MODEL_ALIAS_MAP.items() if public not in _AMBIGUOUS_REVERSE_ALIASES}
 EXCLUDED_MODELS = {"chat_20706", "chat_23310", "gemini-2.5-flash-thinking", "gemini-2.5-pro"}
+FIELD_CACHE_TTL_SECONDS = 3600
+FIELD_CACHE_MAX_VALUES = 1024
+FIELD_CACHE_MAX_BYTES = 4 * 1024 * 1024
 
 
 class AntigravityProvider(ProviderInterface):
@@ -61,19 +64,27 @@ class AntigravityProvider(ProviderInterface):
     field_cache_rules = (
         FieldCacheRule(
             name="antigravity_thought_signature",
+            cache_key="antigravity_thought_signatures",
             source="response",
             path="candidates.*.content.parts.*.thoughtSignature",
             mode="all",
             scope=("provider", "model", "credential", "session"),
+            ttl_seconds=FIELD_CACHE_TTL_SECONDS,
+            max_values=FIELD_CACHE_MAX_VALUES,
+            max_bytes=FIELD_CACHE_MAX_BYTES,
             inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
             metadata={"purpose": "preserve Gemini thought signatures across Antigravity turns"},
         ),
         FieldCacheRule(
             name="antigravity_stream_thought_signature",
+            cache_key="antigravity_thought_signatures",
             source="stream_event",
             path="raw.candidates.*.content.parts.*.thoughtSignature",
             mode="all",
             scope=("provider", "model", "credential", "session"),
+            ttl_seconds=FIELD_CACHE_TTL_SECONDS,
+            max_values=FIELD_CACHE_MAX_VALUES,
+            max_bytes=FIELD_CACHE_MAX_BYTES,
             inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
             metadata={"purpose": "preserve streamed Gemini thought signatures across Antigravity turns"},
         ),

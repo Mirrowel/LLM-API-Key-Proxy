@@ -15,6 +15,7 @@ from .provider_interface import ProviderInterface
 
 DEFAULT_API_BASE = "https://api.openai.com"
 FALLBACK_MODELS = ["codex/codex-mini-latest", "codex/gpt-5.1-codex"]
+FIELD_CACHE_TTL_SECONDS = 3600
 
 
 class CodexProvider(ProviderInterface):
@@ -27,9 +28,11 @@ class CodexProvider(ProviderInterface):
     field_cache_rules = (
         FieldCacheRule(
             name="codex_previous_response_id",
+            cache_key="codex_previous_response_id",
             source="response",
             path="id",
             scope=("provider", "model", "credential", "session"),
+            ttl_seconds=FIELD_CACHE_TTL_SECONDS,
             inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
             metadata={
                 "purpose": "preserve Responses continuation IDs for Codex sessions",
@@ -38,9 +41,11 @@ class CodexProvider(ProviderInterface):
         ),
         FieldCacheRule(
             name="codex_stream_previous_response_id",
+            cache_key="codex_previous_response_id",
             source="stream_event",
             path="raw.response.id",
             scope=("provider", "model", "credential", "session"),
+            ttl_seconds=FIELD_CACHE_TTL_SECONDS,
             inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
             metadata={
                 "purpose": "preserve streamed Responses continuation IDs for Codex sessions",

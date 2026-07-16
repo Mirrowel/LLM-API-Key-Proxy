@@ -11,7 +11,12 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
 
 from .paths import FieldCachePathError, extract_path, inject_path, parse_path
-from .store import FieldCacheStore, InMemoryFieldCacheStore
+from .store import (
+    FieldCacheStore,
+    InMemoryFieldCacheStore,
+    _bounded_append_values,
+    _bounded_set_value,
+)
 from .types import FieldCacheContext, FieldCacheRule
 
 
@@ -30,14 +35,51 @@ class FieldCacheOperation:
 
 
 def _safe_scope_value(value: str) -> str:
-    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
-    return digest
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _unsupported_store_keyword(error: TypeError) -> bool:
+    message = str(error).lower()
+    return "unexpected keyword" in message or "keyword argument" in message
+
+
+def _shared_cache_signature(rule: FieldCacheRule) -> tuple[Any, ...]:
+    """Return settings that must agree for source-specific cache counterparts."""
+
+    injection = rule.inject
+    behavior_metadata = tuple(
+        (key, repr(rule.metadata.get(key)))
+        for key in (
+            "provider_continuation",
+            "tool_call_id_path",
+            "tool_container_path",
+            "tool_value_path",
+            "inject_tool_call_id_path",
+            "turn_container_path",
+            "turn_role_path",
+            "turn_value_path",
+        )
+    )
+    return (
+        rule.mode,
+        rule.scope,
+        rule.ttl_seconds,
+        rule.allow_missing_session,
+        rule.max_values,
+        rule.max_bytes,
+        injection.target if injection else None,
+        injection.path if injection else None,
+        injection.when_missing_only if injection else None,
+        injection.insert if injection else None,
+        injection.as_list if injection else None,
+        behavior_metadata,
+    )
 
 
 def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optional[str]:
     """Build a scoped cache key or return None when required scope is absent."""
 
-    parts = [f"rule={rule.name}"]
+    parts = [f"rule={_safe_scope_value(rule.cache_key or rule.name)}"]
     for scope in rule.scope:
         value = context.value_for_scope(scope)
         if value is None or value == "":
@@ -46,10 +88,7 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
             if scope == "session" and not rule.allow_missing_session:
                 return None
             value = "_none"
-        if scope in {"provider", "model"}:
-            safe_value = value.replace("/", "_").replace("\\", "_").replace(":", "_")
-        else:
-            safe_value = _safe_scope_value(value)
+        safe_value = _safe_scope_value(value)
         parts.append(f"{scope}={safe_value}")
     return "|".join(parts)
 
@@ -70,6 +109,7 @@ class FieldCacheEngine:
 
     def _validate_rules(self) -> None:
         names: set[str] = set()
+        shared_keys: dict[str, tuple[Any, ...]] = {}
         for rule in self.rules:
             if rule.name in names:
                 raise ValueError(f"Duplicate field-cache rule name: {rule.name}")
@@ -79,6 +119,14 @@ class FieldCacheEngine:
                 parse_path(rule.inject.path)
             if rule.mode == "per_tool_call" and not rule.metadata.get("tool_call_id_path"):
                 raise ValueError("per_tool_call field-cache mode requires metadata.tool_call_id_path")
+            if rule.cache_key:
+                signature = _shared_cache_signature(rule)
+                previous = shared_keys.get(rule.cache_key)
+                if previous is not None and previous != signature:
+                    raise ValueError(
+                        f"Field-cache rules sharing cache_key {rule.cache_key!r} must use identical mode, scope, TTL, injection, and correlation behavior"
+                    )
+                shared_keys[rule.cache_key] = signature
 
     async def extract(
         self,
@@ -175,10 +223,23 @@ class FieldCacheEngine:
 
     async def _store_values(self, rule: FieldCacheRule, cache_key: str, values: list[Any], payload: Any, operation: FieldCacheOperation) -> bool:
         if rule.mode == "all":
-            await self._store_append(cache_key, values, ttl_seconds=rule.ttl_seconds)
+            await self._store_append(
+                cache_key,
+                values,
+                ttl_seconds=rule.ttl_seconds,
+                max_values=rule.max_values,
+                max_bytes=rule.max_bytes,
+            )
             return True
         if rule.mode == "last":
-            await self._store_set(cache_key, _wrap_cached_value(values[-1]), ttl_seconds=rule.ttl_seconds)
+            await self._store_set(
+                cache_key,
+                _wrap_cached_value(values[-1]),
+                ttl_seconds=rule.ttl_seconds,
+                max_values=None,
+                max_bytes=rule.max_bytes,
+                trim_collections=False,
+            )
             return True
         if rule.mode in {"last_user_turn", "last_assistant_turn"}:
             role = "user" if rule.mode == "last_user_turn" else "assistant"
@@ -189,7 +250,14 @@ class FieldCacheEngine:
                 return False
             operation.matched = len(turn_values)
             operation.sample_values = _sample_values(turn_values)
-            await self._store_set(cache_key, _wrap_cached_value(turn_values[-1]), ttl_seconds=rule.ttl_seconds)
+            await self._store_set(
+                cache_key,
+                _wrap_cached_value(turn_values[-1]),
+                ttl_seconds=rule.ttl_seconds,
+                max_values=None,
+                max_bytes=rule.max_bytes,
+                trim_collections=False,
+            )
             return True
         if rule.mode == "per_tool_call":
             stored = _tool_call_values(rule, payload, values)
@@ -199,23 +267,81 @@ class FieldCacheEngine:
                 return False
             operation.matched = len(stored)
             operation.sample_values = _sample_values(list(stored.values()))
-            await self._store_set(cache_key, stored, ttl_seconds=rule.ttl_seconds)
+            await self._store_set(
+                cache_key,
+                stored,
+                ttl_seconds=rule.ttl_seconds,
+                max_values=rule.max_values,
+                max_bytes=rule.max_bytes,
+                trim_collections=True,
+            )
             return True
         raise ValueError(f"Unsupported field-cache mode: {rule.mode}")
 
-    async def _store_set(self, cache_key: str, value: Any, *, ttl_seconds: Optional[int]) -> None:
+    async def _store_set(
+        self,
+        cache_key: str,
+        value: Any,
+        *,
+        ttl_seconds: Optional[int],
+        max_values: Optional[int],
+        max_bytes: Optional[int],
+        trim_collections: bool,
+    ) -> None:
+        bounded = _bounded_set_value(
+            value,
+            max_values=max_values,
+            max_bytes=max_bytes,
+            trim_collections=trim_collections,
+        )
         try:
-            await self.store.set(cache_key, value, ttl_seconds=ttl_seconds)
-        except TypeError:
+            await self.store.set(cache_key, bounded, ttl_seconds=ttl_seconds)
+        except TypeError as exc:
+            if not _unsupported_store_keyword(exc):
+                raise
             # Preserve compatibility with simple injected stores that implement
             # the original set(key, value) shape. TTL is best-effort there.
-            await self.store.set(cache_key, value)
+            await self.store.set(cache_key, bounded)
 
-    async def _store_append(self, cache_key: str, values: list[Any], *, ttl_seconds: Optional[int]) -> None:
+    async def _store_append(
+        self,
+        cache_key: str,
+        values: list[Any],
+        *,
+        ttl_seconds: Optional[int],
+        max_values: Optional[int],
+        max_bytes: Optional[int],
+    ) -> None:
         try:
-            await self.store.append(cache_key, values, ttl_seconds=ttl_seconds)
-        except TypeError:
-            await self.store.append(cache_key, values)
+            await self.store.append(
+                cache_key,
+                values,
+                ttl_seconds=ttl_seconds,
+                max_values=max_values,
+                max_bytes=max_bytes,
+            )
+        except TypeError as exc:
+            if not _unsupported_store_keyword(exc):
+                raise
+            current = await self.store.get(cache_key)
+            if not isinstance(current, list):
+                current = []
+            bounded = _bounded_append_values(
+                current,
+                values,
+                max_values=max_values,
+                max_bytes=max_bytes,
+            )
+            try:
+                await self.store.set(
+                    cache_key,
+                    bounded,
+                    ttl_seconds=ttl_seconds,
+                )
+            except TypeError as set_exc:
+                if not _unsupported_store_keyword(set_exc):
+                    raise
+                await self.store.set(cache_key, bounded)
 
     def _injection_value(self, rule: FieldCacheRule, cached: Any, payload: Any, context: FieldCacheContext, operation: FieldCacheOperation) -> Any:
         """Select the cached value to inject for the rule's mode.

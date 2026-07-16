@@ -46,7 +46,7 @@ async def test_field_cache_extract_and_inject_emit_before_after_trace_entries(tm
         inject=FieldCacheInjection(target="request", path="messages[-1].reasoning_content"),
     )
     engine = FieldCacheEngine([rule])
-    context = FieldCacheContext(provider="openai", model="gpt-test", session_id="session_1", classifier="global")
+    context = FieldCacheContext(provider="openai", model="gpt-test", credential_id="credential_1", session_id="session_1", classifier="global")
 
     await engine.extract("response", {"choices": [{"message": {"reasoning_content": "hidden"}}]}, context, transaction_logger=logger)
     updated, _ = await engine.inject("request", {"messages": [{"role": "user"}]}, context, transaction_logger=logger)
@@ -80,7 +80,7 @@ async def test_stream_sourced_rule_injection_trace_uses_request_direction(tmp_pa
         inject=FieldCacheInjection(target="request", path="metadata.provider_session_id"),
     )
     engine = FieldCacheEngine([rule])
-    context = FieldCacheContext(provider="openai", model="gpt-test", session_id="session_1", classifier="global")
+    context = FieldCacheContext(provider="openai", model="gpt-test", credential_id="credential_1", session_id="session_1", classifier="global")
 
     await engine.extract("stream_event", {"metadata": {"provider_session_id": "sid_1"}}, context, transaction_logger=logger)
     await engine.inject("request", {"metadata": {}}, context, transaction_logger=logger)
@@ -100,7 +100,7 @@ async def test_field_cache_errors_emit_transform_log_error(tmp_path) -> None:
         inject=FieldCacheInjection(target="request", path="messages.*.reasoning_content"),
     )
     engine = FieldCacheEngine([rule])
-    context = FieldCacheContext(provider="openai", model="gpt-test", session_id="session_1", classifier="global")
+    context = FieldCacheContext(provider="openai", model="gpt-test", credential_id="credential_1", session_id="session_1", classifier="global")
 
     await engine.extract("response", {"choices": [{"message": {"reasoning_content": "hidden"}}]}, context, transaction_logger=logger)
     with pytest.raises(Exception):

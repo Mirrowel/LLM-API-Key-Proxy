@@ -25,7 +25,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ..utils.resilient_io import safe_write_json
 
@@ -382,6 +382,23 @@ class ProviderCache:
         Use this when you need to ensure the value is stored before continuing.
         """
         await self._async_store(key, value)
+
+    async def update_async(
+        self,
+        key: str,
+        update: Callable[[Optional[str]], str],
+    ) -> str:
+        """Atomically update one value within this cache backend instance."""
+
+        await self.retrieve_async(key)
+        async with self._lock:
+            current = self._cache.get(key)
+            raw = current[0] if current is not None else None
+            updated = update(raw)
+            self._cache[key] = (updated, time.time())
+            self._deleted_keys.discard(key)
+            self._dirty = True
+            return updated
 
     def retrieve(self, key: str) -> Optional[str]:
         """
