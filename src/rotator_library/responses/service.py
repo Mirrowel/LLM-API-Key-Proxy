@@ -20,10 +20,11 @@ from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
 from ..config.experimental import get_stream_runtime_settings
 from ..client.scopes import derive_session_isolation_key
+from ..core.errors import StructuredAPIResponseError
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from ..protocols.responses import ResponsesProtocol
-from .bridge import PROXY_ROUTING_KEYS, ResponsesBridge
+from .bridge import PROXY_ROUTING_KEYS, ResponsesBridge, responses_session_hints
 from .store import InMemoryResponsesStore, ResponsesStore
 from .streaming import (
     ResponsesSSEFormatter,
@@ -196,7 +197,6 @@ class ResponsesService:
                 parent,
                 expected_scope_key=isolation_key,
             )
-            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
         except Exception as exc:
             self._log_transform_error(
                 transaction_logger,
@@ -205,32 +205,64 @@ class ResponsesService:
                 _redact_sensitive_fields(unified.to_dict()),
             )
             raise
-        bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
-        session_hints = chat_kwargs.pop("_session_tracking_hints", None)
+        session_hints = responses_session_hints(unified.previous_response_id)
         session_info: dict[str, Any] = {
             "scope_access_hash": resolved_scope.access_token_hash,
         }
-        chat_kwargs.update(_routing_kwargs(raw_request))
-        chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
-        trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
-        self._trace(
-            transaction_logger,
-            "responses_bridge_chat_request",
-            trace_chat_kwargs,
-            direction="request",
-            stage="adapter",
-            metadata={"bridge_metadata": {"extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()), "has_session_hints": bool(session_hints)}},
-        )
-
-        chat_response = await client.acompletion(request=request, **chat_kwargs)
-        if transaction_logger:
-            self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
-
-        try:
-            response_payload = self.bridge.from_chat_response(chat_response, unified)
-        except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_bridge_chat_response", exc, self._response_to_dict(chat_response))
-            raise
+        if hasattr(client, "agenerate"):
+            native_request = _expanded_responses_request(raw_request, parent_lineage)
+            internal_kwargs = _internal_client_kwargs(client, session_hints, session_info)
+            self._trace(
+                transaction_logger,
+                "responses_native_protocol_request",
+                _redact_sensitive_fields(native_request),
+                direction="request",
+                stage="protocol",
+                metadata={"lineage_depth": len(parent_lineage), "has_session_hints": bool(session_hints)},
+            )
+            try:
+                response = await client.agenerate(
+                    native_request,
+                    input_protocol="responses",
+                    output_protocol="responses",
+                    request=request,
+                    _disable_provider_continuation=bool(parent_lineage),
+                    **_routing_kwargs(raw_request),
+                    **internal_kwargs,
+                )
+            except StructuredAPIResponseError as exc:
+                raise ResponsesServiceError(
+                    str(exc),
+                    error_type=exc.error_type,
+                    status_code=exc.http_status,
+                ) from exc
+            response_payload = self._response_to_dict(response)
+            self._trace(transaction_logger, "responses_native_protocol_response", response_payload, direction="response", stage="provider")
+        else:
+            chat_kwargs = self.bridge.to_chat_kwargs(
+                unified,
+                parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None,
+            )
+            bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
+            chat_kwargs.pop("_session_tracking_hints", None)
+            chat_kwargs.update(_routing_kwargs(raw_request))
+            chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
+            self._trace(
+                transaction_logger,
+                "responses_bridge_chat_request",
+                _without_internal_kwargs(chat_kwargs),
+                direction="request",
+                stage="adapter",
+                metadata={"bridge_metadata": {"extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()), "has_session_hints": bool(session_hints)}},
+            )
+            chat_response = await client.acompletion(request=request, **chat_kwargs)
+            if transaction_logger:
+                self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
+            try:
+                response_payload = self.bridge.from_chat_response(chat_response, unified)
+            except Exception as exc:
+                self._log_transform_error(transaction_logger, "responses_bridge_chat_response", exc, self._response_to_dict(chat_response))
+                raise
         _record_responses_session_anchor(session_info, response_payload)
         self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
@@ -1067,6 +1099,27 @@ def _input_items(raw_request: dict[str, Any]) -> list[Any]:
     if value is None:
         return []
     return deepcopy(value if isinstance(value, list) else [value])
+
+
+def _expanded_responses_request(
+    raw_request: dict[str, Any],
+    lineage: list[StoredResponse],
+) -> dict[str, Any]:
+    """Expand proxy-owned continuation history into native Responses input."""
+
+    expanded = {
+        key: deepcopy(value)
+        for key, value in raw_request.items()
+        if key not in PROXY_ROUTING_KEYS
+    }
+    input_items: list[Any] = []
+    for stored in lineage:
+        input_items.extend(deepcopy(stored.input_items))
+        input_items.extend(deepcopy(stored.output_items))
+    input_items.extend(_input_items(raw_request))
+    expanded["input"] = input_items
+    expanded.pop("previous_response_id", None)
+    return expanded
 
 
 def _routing_kwargs(raw_request: dict[str, Any]) -> dict[str, Any]:

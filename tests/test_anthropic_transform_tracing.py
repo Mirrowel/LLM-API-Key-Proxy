@@ -27,6 +27,29 @@ class FakeRotatingClient:
         }
 
 
+class FakeNativeProtocolClient:
+    enable_request_logging = False
+
+    def __init__(self) -> None:
+        self.call = None
+
+    async def agenerate(self, payload, *, input_protocol, output_protocol, **kwargs):
+        self.call = {
+            "payload": payload,
+            "input_protocol": input_protocol,
+            "output_protocol": output_protocol,
+        }
+        return {
+            "id": "msg_provider",
+            "type": "message",
+            "role": "assistant",
+            "model": payload["model"],
+            "content": [{"type": "text", "text": "native answer"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+
+
 @pytest.mark.asyncio
 async def test_anthropic_handler_traces_conversion_boundaries(tmp_path, monkeypatch) -> None:
     created: list[TransactionLogger] = []
@@ -48,6 +71,25 @@ async def test_anthropic_handler_traces_conversion_boundaries(tmp_path, monkeypa
     assert "anthropic_openai_response" in pass_names
     assert "openai_to_anthropic_response" in pass_names
     assert "anthropic_final_response" in pass_names
+
+
+@pytest.mark.asyncio
+async def test_anthropic_handler_uses_protocol_native_runtime_when_available() -> None:
+    client = FakeNativeProtocolClient()
+    request = AnthropicMessagesRequest(
+        model="claude_code/claude-test",
+        max_tokens=16,
+        system="rule",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    response = await AnthropicHandler(client).messages(request)
+
+    assert client.call["input_protocol"] == "anthropic_messages"
+    assert client.call["output_protocol"] == "anthropic_messages"
+    assert client.call["payload"]["system"] == "rule"
+    assert response["content"][0]["text"] == "native answer"
+    assert response["id"].startswith("msg_")
 
 
 class ClosingOpenAIStream:

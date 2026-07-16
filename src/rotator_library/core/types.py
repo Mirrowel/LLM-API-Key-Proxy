@@ -91,6 +91,12 @@ class RequestContext:
     routing_group: Optional[Any] = None
     routing_target_index: int = 0
     routing_attempt_history: List[Dict[str, Any]] = field(default_factory=list)
+    input_protocol_name: str = "openai_chat"
+    output_protocol_name: str = "openai_chat"
+    protocol_request: Dict[str, Any] = field(default_factory=dict)
+    unified_request: Optional[Any] = None
+    input_provider: Optional[str] = None
+    disable_provider_continuation: bool = False
 
 
 @dataclass

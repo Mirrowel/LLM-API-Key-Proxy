@@ -119,6 +119,54 @@ async def test_request_builder_passes_provider_independent_session_domain(monkey
 
 
 @pytest.mark.asyncio
+async def test_provider_session_hook_receives_provider_native_shape(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    seen = []
+
+    class GeminiPlugin:
+        def get_protocol_name(self, model=""):
+            return "gemini"
+
+        def normalize_native_model(self, model=""):
+            return model.split("/", 1)[-1]
+
+        def get_native_operation(self, model="", request=None, stream=False):
+            assert request is None
+            return "generate"
+
+        def prepare_native_request(self, request, model="", operation=""):
+            return request
+
+        def get_session_tracking_hints(self, request, model=""):
+            seen.append(request)
+            return None
+
+    plugin = GeminiPlugin()
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+        get_provider_instance=lambda provider: plugin,
+    )
+
+    await builder.build_completion_context(
+        None,
+        None,
+        {
+            "_input_protocol": "anthropic_messages",
+            "model": "gemini/gemini-3-pro",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert seen
+    assert "contents" in seen[0]
+    assert "messages" not in seen[0]
+
+@pytest.mark.asyncio
 async def test_request_builder_classifier_domain_is_stable_across_providers(monkeypatch) -> None:
     monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
     openai_tracker = FakeSessionTracker()
@@ -136,6 +184,67 @@ async def test_request_builder_classifier_domain_is_stable_across_providers(monk
 
     assert openai_context.session_isolation_key == anthropic_context.session_isolation_key
     assert openai_context.session_isolation_key.startswith("classifier:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_protocol", "payload", "source_only_key"),
+    [
+        (
+            "anthropic_messages",
+            {"model": "anthropic/claude", "system": "rule", "messages": [{"role": "user", "content": "hello"}]},
+            "system",
+        ),
+        (
+            "responses",
+            {"model": "openai/gpt-5.1", "instructions": "rule", "input": "hello"},
+            "input",
+        ),
+        (
+            "gemini",
+            {"model": "gemini/gemini-3", "systemInstruction": {"parts": [{"text": "rule"}]}, "contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+            "contents",
+        ),
+    ],
+)
+async def test_request_builder_keeps_raw_and_canonical_protocol_views(
+    monkeypatch,
+    input_protocol,
+    payload,
+    source_only_key,
+) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    context = await _builder().build_completion_context(
+        None,
+        None,
+        {**payload, "_input_protocol": input_protocol, "_output_protocol": "anthropic_messages"},
+    )
+
+    assert context.input_protocol_name == input_protocol
+    assert context.output_protocol_name == "anthropic_messages"
+    assert context.protocol_request[source_only_key] == payload[source_only_key]
+    assert context.unified_request.source_protocol == input_protocol
+    assert "messages" in context.kwargs
+    if source_only_key != "system":
+        assert source_only_key not in context.kwargs
+
+
+@pytest.mark.asyncio
+async def test_request_builder_consumes_provider_continuation_control(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    context = await _builder().build_completion_context(
+        None,
+        None,
+        {
+            "model": "openai/gpt-5.1",
+            "messages": [{"role": "user", "content": "hello"}],
+            "_disable_provider_continuation": True,
+        },
+    )
+
+    assert context.disable_provider_continuation is True
+    assert "_disable_provider_continuation" not in context.protocol_request
+    assert "_disable_provider_continuation" not in context.kwargs
 
 
 def test_only_typed_internal_hints_can_contribute_global_identity() -> None:

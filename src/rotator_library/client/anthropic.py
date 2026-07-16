@@ -61,9 +61,9 @@ class AnthropicHandler:
         """
         Handle Anthropic Messages API requests.
 
-        This method accepts requests in Anthropic's format, translates them to
-        OpenAI format internally, processes them through the existing acompletion
-        method, and returns responses in Anthropic's format.
+        Non-streaming requests use the shared canonical protocol runtime.
+        Streaming temporarily retains the established Chat wrapper until the
+        canonical stream-lifecycle phase is enabled.
 
         Args:
             request: An AnthropicMessagesRequest object
@@ -102,7 +102,39 @@ class AnthropicHandler:
                 stage="client",
             )
 
-        # Translate Anthropic request to OpenAI format
+        anthropic_request = request.model_dump(exclude_none=True)
+
+        if not request.stream and hasattr(self._client, "agenerate"):
+            response = await self._client.agenerate(
+                anthropic_request,
+                input_protocol="anthropic_messages",
+                output_protocol="anthropic_messages",
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                _parent_log_dir=anthropic_logger.log_dir if anthropic_logger and anthropic_logger.log_dir else None,
+            )
+            anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+            anthropic_response["id"] = request_id
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_native_protocol_response",
+                anthropic_response,
+                direction="response",
+                stage="final",
+            )
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_final_response",
+                anthropic_response,
+                direction="response",
+                stage="final",
+            )
+            if anthropic_logger:
+                anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
+            return anthropic_response
+
+        # Streaming remains on the established wrapper until canonical stream
+        # lifecycle conversion is enabled in the dedicated streaming phase.
         openai_request = translate_anthropic_request(request)
         _trace_anthropic(
             anthropic_logger,

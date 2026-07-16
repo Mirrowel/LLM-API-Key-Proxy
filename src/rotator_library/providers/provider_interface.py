@@ -458,10 +458,11 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     def prepare_native_request(self, request: Dict[str, Any], model: str = "", operation: str = "") -> Dict[str, Any]:
         """Return a provider-adjusted native request payload.
 
-        This hook is intentionally limited to payload shape/model aliases and is
-        called before protocol parsing. It must not add credentials; auth belongs
-        in ``get_native_headers()`` so traces never mix request payloads with
-        secrets.
+        The declared provider protocol has already built a valid native payload
+        before this hook runs. Implementations may add provider envelopes,
+        aliases, or required defaults, but must never translate a client protocol.
+        Credentials remain in ``get_native_headers()`` so payload traces never
+        mix request data with secrets.
         """
 
         return dict(request)

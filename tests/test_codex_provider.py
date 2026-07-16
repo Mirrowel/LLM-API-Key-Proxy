@@ -59,11 +59,11 @@ def test_codex_native_operation_model_and_stream_support() -> None:
     assert provider.supports_native_streaming("gpt-5.1-codex", operation="chat") is False
 
 
-def test_codex_prepare_native_request_converts_messages_to_responses_input() -> None:
+def test_codex_prepare_native_request_only_adjusts_responses_native_payload() -> None:
     provider = CodexProvider()
 
     prepared = provider.prepare_native_request(
-        {"model": "codex/gpt-5.1-codex", "messages": [{"role": "user", "content": "hello"}]},
+        {"model": "codex/gpt-5.1-codex", "input": [{"role": "user", "content": "hello"}]},
         model="gpt-5.1-codex",
         operation="responses",
     )

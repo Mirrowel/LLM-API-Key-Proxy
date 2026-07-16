@@ -378,7 +378,7 @@ State: **completed**
 
 ### Phase D: Runtime wiring
 
-State: **in progress**
+State: **completed**
 
 - Carry input/provider/output protocol identities through the common request context.
 - Parse with the input protocol and build with the provider protocol.
@@ -501,6 +501,25 @@ This correction is complete only when:
 - Runtime execution still uses provider-side parsing of Chat-shaped requests and hardcodes Chat output. This is intentionally not claimed as fixed until Phase D.
 - Canonical streaming remains intentionally deferred to Phase F.
 
+### 2026-07-16: Live non-streaming runtime checkpoint
+
+- Added `RotatingClient.agenerate()` as the protocol-independent generative entry point while preserving `acompletion()` as the Chat-compatible facade.
+- The request builder now retains the untouched client payload, parses it with the selected input protocol, and carries canonical meaning plus independent input/output identities through retries and fallback targets.
+- Native execution now follows the required sequence: client protocol reader, provider protocol writer, narrow provider preparation, provider transport, provider protocol reader, selected output protocol writer.
+- Removed provider-owned Chat-to-Responses and Chat-to-Gemini translation. Codex and Antigravity preparation hooks now receive already-valid provider-native payloads.
+- Native provider session hooks and validators receive provider-native request shapes. Native attempts bypass the legacy Chat/LiteLLM provider-transform pipeline; callbacks alone retain a Chat compatibility view.
+- Callback compatibility views are deep copies. Nested message/tool edits are merged back into canonical meaning field by field without mutating the immutable baseline or discarding source-native metadata such as Anthropic cache controls.
+- Custom and LiteLLM non-streaming responses now pass through the canonical response reader/writer when output differs from Chat.
+- Anthropic Messages and Responses non-streaming services now execute through the common protocol path. Responses retains local storage, capability, continuation expansion, and session behavior without converting through Chat.
+- Local Responses lineage disables provider continuation-cache injection, preventing locally expanded history from also receiving an upstream `previous_response_id`.
+- Opaque thought signatures are extracted from raw provider responses and cached before client formatting. They are never returned to clients, including same-protocol output, and are injected only from provider/credential/session-scoped cache state.
+- Centralized top-level provider error normalization handles object, string, and numeric-status envelopes before success parsing. Structured status survives credential rotation, fallback policy, Responses service handling, and protocol-specific HTTP formatting.
+- Fixed the public Chat route so successful native dictionaries are returned as successes instead of being mistaken for generic 429 error dictionaries. Raw response logging supports both dictionaries and SDK models.
+- Added a 64-case live runtime matrix covering all input/provider/output combinations, a real `agenerate` builder-to-native-executor handoff, real nested callback behavior, two-credential structured-error exhaustion, provider-native hook/validation shape, continuation suppression, response-adapter ordering, and hidden-signature caching/suppression.
+- Required iterative `explore` and `explore-heavy` reviews completed. Every confirmed blocker, high, and medium finding was corrected and both reviewers issued final safe-to-commit verdicts.
+- Verification: 269 focused protocol/runtime/provider tests passed; all 68 currently tracked test files passed with 763 tests and 18 subtests; compile checks and `git diff --check` passed apart from repository line-ending notices.
+- Canonical streaming, public Gemini endpoints, and configuration-defined provider protocols remain explicitly deferred to Phases E and F.
+
 ### Current next action
 
-Implement Phase D: carry independent input, provider, and output protocol identities through live execution; parse with the client protocol, build with the provider protocol, and remove provider-owned client translation.
+Implement Phase E: expose first-class Gemini client endpoints, add explicit output protocol selection, and let configuration-defined providers declare any supported native protocol and output default.

@@ -11,6 +11,7 @@ from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
+from ..core.errors import structured_api_response_error
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..protocols import ProtocolError, get_protocol, serialize_value
 from ..protocols.types import UnifiedRequest
@@ -33,25 +34,45 @@ class NativeProviderExecutor:
     def __init__(self, *, field_cache_store: Any = None) -> None:
         self.field_cache_store = field_cache_store or InMemoryFieldCacheStore()
 
-    async def execute(self, raw_request: dict[str, Any], context: NativeProviderContext, transport: NativeHTTPTransport) -> dict[str, Any]:
+    async def execute(self, raw_request: dict[str, Any] | UnifiedRequest, context: NativeProviderContext, transport: NativeHTTPTransport) -> dict[str, Any]:
         """Execute a non-streaming native provider request."""
 
         logger = context.transaction_logger
-        protocol = get_protocol(context.protocol_name)
-        self._ensure_supported_operation(protocol, context)
-        self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
+        provider_protocol = get_protocol(context.protocol_name)
+        input_protocol = get_protocol(context.input_protocol_name or context.protocol_name)
+        output_protocol = get_protocol(context.output_protocol_name or context.input_protocol_name or context.protocol_name)
+        context = _without_provider_continuation_rules(context)
+        self._ensure_supported_operation(provider_protocol, context)
+        self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": provider_protocol.name, "output_protocol": output_protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
             cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
             context = await self._inject_metadata(context, cache_engine)
-            protocol_context = context.protocol_context()
-            unified_request = protocol.parse_request(raw_request, protocol_context)
+            input_context = context.protocol_context(
+                source_protocol=input_protocol.name,
+                target_protocol=provider_protocol.name,
+                source_provider=context.metadata.get("input_provider"),
+                target_provider=context.provider,
+            )
+            unified_request = deepcopy(raw_request) if isinstance(raw_request, UnifiedRequest) else input_protocol.parse_request(raw_request, input_context)
+            unified_request.model = context.model
             self._trace(context, "parsed_native_unified_request", unified_request, direction="request", stage="protocol")
             await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
+            request_before_injection = unified_request
             unified_request = await self._inject_unified_request(unified_request, context, cache_engine)
-            provider_request = protocol.build_request(unified_request, protocol_context)
+            provider_state_compatible = unified_request is not request_before_injection
+            provider_context = context.protocol_context(
+                source_protocol=input_protocol.name,
+                target_protocol=provider_protocol.name,
+                source_provider=context.metadata.get("input_provider"),
+                target_provider=context.provider,
+                provider_state_compatible=provider_state_compatible,
+            )
+            provider_request = provider_protocol.build_request(unified_request, provider_context)
             self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
+            provider_request = self._prepare_provider_request(provider_request, context)
+            self._trace(context, "provider_native_request_prepared", provider_request, direction="request", stage="provider")
             adapters = [get_adapter(name) for name in context.adapter_names]
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
@@ -66,26 +87,36 @@ class NativeProviderExecutor:
             self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
             await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
+            await self._validate_provider_request(provider_request, context)
             self._trace(context, "native_provider_request", provider_request, direction="request", stage="provider")
             raw_response = await transport.post_json(context.endpoint, headers=context.headers, payload=provider_request)
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
+            structured_error = structured_api_response_error(raw_response)
+            if structured_error:
+                raise structured_error
             await cache_engine.extract("response", raw_response, context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_response_field_cache_extraction", {"source": "response", "payload": "raw_provider_response"}, direction="response", stage="adapter", snapshot=False)
-            unified_response = protocol.parse_response(raw_response, protocol_context)
+            response_context = context.protocol_context(
+                source_protocol=provider_protocol.name,
+                target_protocol=output_protocol.name,
+                source_provider=context.provider,
+                target_provider=None,
+                provider_state_compatible=False,
+            )
+            unified_response = provider_protocol.parse_response(raw_response, response_context)
+            unified_response.model = str(context.metadata.get("public_model") or unified_response.model or context.model)
             self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
-            response_protocol = get_protocol(context.client_protocol_name) if context.client_protocol_name else protocol
-            response_context = context.protocol_context(target_protocol=response_protocol.name)
-            self._trace(context, "native_response_protocol_selected", {"protocol": response_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
-            provider_response = response_protocol.format_response(unified_response, response_context)
-            self._trace(context, "formatted_native_response", provider_response, direction="response", stage="protocol")
+            self._trace(context, "native_response_protocol_selected", {"protocol": output_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
+            client_response = output_protocol.format_response(unified_response, response_context)
+            self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
-            provider_response = await run_adapter_chain(adapters, provider_response, adapter_context, stage="response")
-            self._trace(context, "after_response_adapter_chain", provider_response, direction="response", stage="adapter")
+            client_response = await run_adapter_chain(adapters, client_response, adapter_context, stage="response")
+            self._trace(context, "after_response_adapter_chain", client_response, direction="response", stage="adapter")
             usage_record = extract_usage_record(
-                provider_response,
+                client_response,
                 provider=context.provider,
                 model=context.model,
                 source="native_provider_response",
@@ -112,8 +143,8 @@ class NativeProviderExecutor:
                 stage="final",
                 snapshot=False,
             )
-            self._trace(context, "final_client_response", provider_response, direction="response", stage="final")
-            return provider_response
+            self._trace(context, "final_client_response", client_response, direction="response", stage="final")
+            return client_response
         except Exception as exc:
             if logger:
                 logger.log_transform_error(
@@ -126,27 +157,56 @@ class NativeProviderExecutor:
                 )
             raise
 
-    async def stream(self, raw_request: dict[str, Any], context: NativeProviderContext, transport: NativeHTTPTransport) -> AsyncGenerator[Any, None]:
+    async def stream(self, raw_request: dict[str, Any] | UnifiedRequest, context: NativeProviderContext, transport: NativeHTTPTransport) -> AsyncGenerator[Any, None]:
         """Execute a streaming native provider request and yield client events."""
 
         logger = context.transaction_logger
         protocol = get_protocol(context.protocol_name)
+        input_protocol = get_protocol(context.input_protocol_name or context.protocol_name)
+        output_protocol = get_protocol(context.output_protocol_name or context.input_protocol_name or context.protocol_name)
+        context = _without_provider_continuation_rules(context)
         self._ensure_supported_operation(protocol, context)
-        self._trace(context, "native_protocol_selected", {"protocol": protocol.name}, direction="metadata", stage="protocol")
+        self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": protocol.name, "output_protocol": output_protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
             cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
             context = await self._inject_metadata(context, cache_engine)
-            protocol_context = context.protocol_context()
-            request_payload = dict(raw_request)
-            request_payload["stream"] = True
-            unified_request = protocol.parse_request(request_payload, protocol_context)
+            input_context = context.protocol_context(
+                source_protocol=input_protocol.name,
+                target_protocol=protocol.name,
+                source_provider=context.metadata.get("input_provider"),
+                target_provider=context.provider,
+            )
+            if isinstance(raw_request, UnifiedRequest):
+                unified_request = deepcopy(raw_request)
+            else:
+                request_payload = dict(raw_request)
+                request_payload["stream"] = True
+                unified_request = input_protocol.parse_request(request_payload, input_context)
+            unified_request.model = context.model
+            unified_request.stream = True
             self._trace(context, "parsed_native_unified_request", unified_request, direction="request", stage="protocol")
             await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
+            request_before_injection = unified_request
             unified_request = await self._inject_unified_request(unified_request, context, cache_engine)
-            provider_request = protocol.build_request(unified_request, protocol_context)
+            provider_context = context.protocol_context(
+                source_protocol=input_protocol.name,
+                target_protocol=protocol.name,
+                source_provider=context.metadata.get("input_provider"),
+                target_provider=context.provider,
+                provider_state_compatible=(
+                    unified_request is not request_before_injection
+                    or (
+                        input_protocol.name == protocol.name
+                        and context.metadata.get("input_provider") == context.provider
+                    )
+                ),
+            )
+            provider_request = protocol.build_request(unified_request, provider_context)
             self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
+            provider_request = self._prepare_provider_request(provider_request, context)
+            self._trace(context, "provider_native_request_prepared", provider_request, direction="request", stage="provider")
             adapters = [get_adapter(name) for name in context.adapter_names]
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
@@ -161,11 +221,19 @@ class NativeProviderExecutor:
             self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
             await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
+            await self._validate_provider_request(provider_request, context)
             self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
             usage_record = extract_usage_record(None, provider=context.provider, model=context.model, source="native_provider_stream")
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
-                event = protocol.parse_stream_event(raw_chunk, protocol_context)
+                response_context = context.protocol_context(
+                    source_protocol=protocol.name,
+                    target_protocol=output_protocol.name,
+                    source_provider=context.provider,
+                    target_provider=context.provider if output_protocol.name == protocol.name else None,
+                    provider_state_compatible=output_protocol.name == protocol.name,
+                )
+                event = protocol.parse_stream_event(raw_chunk, response_context)
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
                 usage_record = _merge_stream_usage_records(
                     usage_record,
@@ -196,8 +264,7 @@ class NativeProviderExecutor:
                     stage="adapter",
                     snapshot=False,
                 )
-                response_protocol = get_protocol(context.client_protocol_name) if context.client_protocol_name else protocol
-                formatted = response_protocol.format_stream_event(event, context.protocol_context(target_protocol=response_protocol.name))
+                formatted = output_protocol.format_stream_event(event, response_context)
                 self._trace(context, "formatted_client_stream_event", formatted, direction="stream", stage="final", snapshot=False)
                 yield formatted
             cost_breakdown = CostCalculator().calculate(usage_record, model=context.model, provider=context.provider)
@@ -221,6 +288,51 @@ class NativeProviderExecutor:
                     metadata={"provider": context.provider, "model": context.model},
                 )
             raise
+
+    @staticmethod
+    def _prepare_provider_request(
+        provider_request: dict[str, Any],
+        context: NativeProviderContext,
+    ) -> dict[str, Any]:
+        """Apply narrow provider quirks after protocol-native formatting."""
+
+        prepared = dict(provider_request)
+        public_model = context.metadata.get("public_model")
+        if public_model:
+            prepared["_proxy_model"] = public_model
+        if context.request_preparer:
+            prepared = dict(
+                context.request_preparer(
+                    prepared,
+                    model=context.model,
+                    operation=context.operation,
+                )
+            )
+        prepared.pop("_proxy_model", None)
+        return prepared
+
+    @staticmethod
+    async def _validate_provider_request(provider_request: dict[str, Any], context: NativeProviderContext) -> None:
+        """Run provider validation only after the provider payload exists."""
+
+        validator = context.request_validator
+        if not callable(validator):
+            return
+        result = validator(provider_request, context.model)
+        if hasattr(result, "__await__"):
+            result = await result
+        if result is False:
+            raise ProtocolError(
+                f"Request validation failed for {context.provider}/{context.model}",
+                protocol=context.protocol_name,
+                pass_name="provider_validation",
+            )
+        if isinstance(result, str):
+            raise ProtocolError(
+                result,
+                protocol=context.protocol_name,
+                pass_name="provider_validation",
+            )
 
     @staticmethod
     def _trace(
@@ -325,6 +437,19 @@ def _merge_stream_usage_records(base: Any, event_record: Any, raw_record: Any) -
             cost_source=raw_record.cost_source,
         )
     return selected
+
+
+def _without_provider_continuation_rules(context: NativeProviderContext) -> NativeProviderContext:
+    """Suppress upstream continuation IDs when proxy history was expanded."""
+
+    if not context.metadata.get("disable_provider_continuation"):
+        return context
+    rules = tuple(
+        rule
+        for rule in context.field_cache_rules
+        if not (rule.metadata or {}).get("provider_continuation")
+    )
+    return context if rules == context.field_cache_rules else replace(context, field_cache_rules=rules)
 
 
 def _usage_record_has_values(record: Any) -> bool:

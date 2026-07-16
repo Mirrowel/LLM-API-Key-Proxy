@@ -139,6 +139,7 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from rotator_library.responses import ResponsesService, ResponsesServiceError
+    from rotator_library.core.errors import StructuredAPIResponseError, is_structured_error_payload
     from rotator_library.transaction_logger import TransactionLogger
 
 print("  → Discovering provider plugins...")
@@ -980,7 +981,7 @@ async def chat_completions(
         else:
             response = await client.acompletion(request=request, **request_data)
 
-            if isinstance(response, dict):
+            if is_structured_error_payload(response):
                 if raw_logger:
                     raw_logger.log_final_response(
                         status_code=429, headers=None, body=response
@@ -998,10 +999,12 @@ async def chat_completions(
                 raw_logger.log_final_response(
                     status_code=status_code,
                     headers=response_headers,
-                    body=response.model_dump(),
+                    body=response if isinstance(response, dict) else response.model_dump(),
                 )
             return response
 
+    except StructuredAPIResponseError as e:
+        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("openai_chat"))
     except (
         litellm.InvalidRequestError,
         ValueError,
@@ -1239,6 +1242,8 @@ async def anthropic_messages(
                 )
             return JSONResponse(content=result)
 
+    except StructuredAPIResponseError as e:
+        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("anthropic_messages"))
     except (
         litellm.InvalidRequestError,
         ValueError,

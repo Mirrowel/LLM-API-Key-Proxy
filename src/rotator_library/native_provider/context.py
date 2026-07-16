@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from ..adapters import AdapterContext
 from ..field_cache import FieldCacheContext, FieldCacheRule
@@ -27,7 +27,8 @@ class NativeProviderContext:
     protocol_name: str
     endpoint: str
     operation: str = "chat"
-    client_protocol_name: Optional[str] = None
+    input_protocol_name: Optional[str] = None
+    output_protocol_name: Optional[str] = None
     headers: dict[str, str] = field(default_factory=dict)
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -39,15 +40,33 @@ class NativeProviderContext:
     field_cache_rules: tuple[FieldCacheRule, ...] = ()
     transaction_logger: Optional[Any] = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    request_preparer: Optional[Callable[..., dict[str, Any]]] = None
+    request_validator: Optional[Callable[..., Any]] = None
 
-    def protocol_context(self, *, target_protocol: Optional[str] = None) -> ProtocolContext:
+    def protocol_context(
+        self,
+        *,
+        source_protocol: Optional[str] = None,
+        target_protocol: Optional[str] = None,
+        source_provider: Optional[str] = None,
+        target_provider: Optional[str] = None,
+        provider_state_compatible: bool = False,
+    ) -> ProtocolContext:
         """Build a protocol context for parse/build/format passes."""
 
+        input_protocol = self.input_protocol_name or self.protocol_name
+        output_protocol = self.output_protocol_name or input_protocol
         return ProtocolContext(
             provider=self.provider,
             model=self.model,
-            source_protocol=self.protocol_name,
-            target_protocol=target_protocol or self.client_protocol_name or self.protocol_name,
+            source_protocol=source_protocol or input_protocol,
+            target_protocol=target_protocol or self.protocol_name,
+            input_protocol=input_protocol,
+            provider_protocol=self.protocol_name,
+            output_protocol=output_protocol,
+            source_provider=source_provider,
+            target_provider=target_provider,
+            provider_state_compatible=provider_state_compatible,
             session_id=self.session_id,
             credential_stable_id=self.credential_id,
             transport=self.transport,
