@@ -86,9 +86,12 @@ def test_malformed_paths_and_rules_raise_useful_errors() -> None:
         parse_path("messages[abc]")
     with pytest.raises(ValueError):
         FieldCacheRule(name="bad/name", source="response", path="x")
+    with pytest.raises(ValueError, match="cache_key"):
+        FieldCacheRule(name="valid", cache_key="bad/key", source="response", path="x")
     assert FieldCacheRule(
         name="reasoning_content",
         source="response",
         path="choices.*.message.reasoning_content",
         inject=FieldCacheInjection(target="request", path="messages[-1].reasoning_content"),
-    ).scope == ("provider", "model", "classifier", "session")
+    ).scope == ("provider", "model", "credential", "session")
+    assert FieldCacheRule("positional", "response", "x", "all").mode == "all"

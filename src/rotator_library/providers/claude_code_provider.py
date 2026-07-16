@@ -15,6 +15,9 @@ from .provider_interface import ProviderInterface
 
 DEFAULT_API_BASE = "https://api.anthropic.com"
 FALLBACK_MODELS = ["claude_code/claude-sonnet-4-5", "claude_code/claude-opus-4-5"]
+FIELD_CACHE_TTL_SECONDS = 3600
+FIELD_CACHE_MAX_VALUES = 1024
+FIELD_CACHE_MAX_BYTES = 4 * 1024 * 1024
 
 
 class ClaudeCodeProvider(ProviderInterface):
@@ -33,19 +36,27 @@ class ClaudeCodeProvider(ProviderInterface):
     field_cache_rules = (
         FieldCacheRule(
             name="claude_code_thinking_signature",
+            cache_key="claude_code_thinking_signatures",
             source="response",
             path="content.*.signature",
             mode="all",
             scope=("provider", "model", "credential", "session"),
+            ttl_seconds=FIELD_CACHE_TTL_SECONDS,
+            max_values=FIELD_CACHE_MAX_VALUES,
+            max_bytes=FIELD_CACHE_MAX_BYTES,
             inject=FieldCacheInjection(target="request", path="metadata.thinking_signatures", as_list=True),
             metadata={"purpose": "preserve Claude thinking signatures for follow-up requests"},
         ),
         FieldCacheRule(
             name="claude_code_stream_thinking_signature",
+            cache_key="claude_code_thinking_signatures",
             source="stream_event",
             path="raw.delta.signature",
             mode="all",
             scope=("provider", "model", "credential", "session"),
+            ttl_seconds=FIELD_CACHE_TTL_SECONDS,
+            max_values=FIELD_CACHE_MAX_VALUES,
+            max_bytes=FIELD_CACHE_MAX_BYTES,
             inject=FieldCacheInjection(target="request", path="metadata.thinking_signatures", as_list=True),
             metadata={"purpose": "preserve streamed Claude thinking signatures for follow-up requests"},
         ),

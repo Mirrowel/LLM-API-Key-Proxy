@@ -397,7 +397,21 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         from ..config.experimental import get_provider_runtime_config
 
-        return get_provider_runtime_config(self._provider_config_key(), model)
+        return get_provider_runtime_config(
+            self._provider_config_key(),
+            model,
+            config=getattr(self, "_runtime_config_snapshot", None),
+        )
+
+    def bind_runtime_config(self, config: Any) -> None:
+        """Bind the immutable process-start configuration used by this instance."""
+
+        existing = getattr(self, "_runtime_config_snapshot", None)
+        if existing is not None and existing != config:
+            raise RuntimeError(
+                f"Provider singleton {self._provider_config_key()!r} is already bound to a different startup configuration"
+            )
+        self._runtime_config_snapshot = config
 
     def _provider_config_key(self) -> str:
         """Return the JSON providers-section key for this provider."""

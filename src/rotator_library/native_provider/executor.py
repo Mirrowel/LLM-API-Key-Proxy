@@ -11,6 +11,7 @@ from typing import Any, AsyncGenerator
 
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
+from ..field_cache.types import is_provider_continuation_path
 from ..core.errors import StreamedAPIError, structured_api_response_error
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..protocols import ProtocolError, get_protocol, serialize_value
@@ -458,7 +459,10 @@ def _without_provider_continuation_rules(context: NativeProviderContext) -> Nati
     rules = tuple(
         rule
         for rule in context.field_cache_rules
-        if not (rule.metadata or {}).get("provider_continuation")
+        if not (
+            (rule.metadata or {}).get("provider_continuation")
+            or (rule.inject and is_provider_continuation_path(rule.inject.path))
+        )
     )
     return context if rules == context.field_cache_rules else replace(context, field_cache_rules=rules)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -13,6 +14,7 @@ from rotator_library.field_cache import (
     ProviderCacheFieldStore,
     build_cache_key,
 )
+from rotator_library.field_cache.types import is_provider_continuation_path
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -20,7 +22,7 @@ def _trace_entries(log_dir):
     return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
 
 
-def _reasoning_rule(mode: str = "last", scope=("provider", "model", "session")) -> FieldCacheRule:
+def _reasoning_rule(mode: str = "last", scope=("provider", "model", "credential", "session")) -> FieldCacheRule:
     return FieldCacheRule(
         name="reasoning_content",
         source="response",
@@ -32,7 +34,7 @@ def _reasoning_rule(mode: str = "last", scope=("provider", "model", "session")) 
 
 
 def _context(**overrides) -> FieldCacheContext:
-    values = {"provider": "openai", "model": "gpt-test", "session_id": "session-a", "classifier": "global"}
+    values = {"provider": "openai", "model": "gpt-test", "credential_id": "credential-a", "session_id": "session-a", "classifier": "global"}
     values.update(overrides)
     return FieldCacheContext(**values)
 
@@ -75,6 +77,84 @@ async def test_all_mode_appends_values() -> None:
 
 
 @pytest.mark.asyncio
+async def test_source_counterparts_share_one_logical_cache() -> None:
+    injection = FieldCacheInjection(target="request", path="metadata.signature")
+    response_rule = FieldCacheRule(
+        name="response_signature",
+        cache_key="provider_signature",
+        source="response",
+        path="signature",
+        scope=("provider", "model", "session"),
+        inject=injection,
+    )
+    stream_rule = FieldCacheRule(
+        name="stream_signature",
+        cache_key="provider_signature",
+        source="stream_event",
+        path="raw.signature",
+        scope=("provider", "model", "session"),
+        inject=injection,
+    )
+    engine = FieldCacheEngine([response_rule, stream_rule])
+
+    await engine.extract("response", {"signature": "non-stream"}, _context())
+    first, operations = await engine.inject("request", {"metadata": {}}, _context())
+    await engine.extract("stream_event", {"raw": {"signature": "stream"}}, _context())
+    second, _ = await engine.inject("request", {"metadata": {}}, _context())
+
+    assert build_cache_key(response_rule, _context()) == build_cache_key(stream_rule, _context())
+    assert first["metadata"]["signature"] == "non-stream"
+    assert second["metadata"]["signature"] == "stream"
+    assert [operation.hit for operation in operations] == [True, True]
+
+
+def test_shared_cache_key_rejects_incompatible_counterparts() -> None:
+    response_rule = FieldCacheRule(
+        name="response_signature",
+        cache_key="provider_signature",
+        source="response",
+        path="signature",
+        mode="last",
+    )
+    stream_rule = FieldCacheRule(
+        name="stream_signature",
+        cache_key="provider_signature",
+        source="stream_event",
+        path="raw.signature",
+        mode="all",
+    )
+
+    with pytest.raises(ValueError, match="identical mode, scope, TTL, injection, and correlation"):
+        FieldCacheEngine([response_rule, stream_rule])
+
+
+def test_shared_cache_key_rejects_continuation_filter_mismatch() -> None:
+    common = {
+        "cache_key": "provider_continuation",
+        "path": "id",
+        "inject": FieldCacheInjection(
+            target="request",
+            path="previous_response_id",
+            when_missing_only=True,
+        ),
+    }
+    response_rule = FieldCacheRule(
+        name="response_id",
+        source="response",
+        metadata={"provider_continuation": True},
+        **common,
+    )
+    assert response_rule.metadata["provider_continuation"] is True
+    with pytest.raises(ValueError, match="metadata.provider_continuation"):
+        FieldCacheRule(
+            name="stream_id",
+            source="stream_event",
+            metadata={"provider_continuation": False},
+            **common,
+        )
+
+
+@pytest.mark.asyncio
 async def test_scope_isolation_by_session_and_classifier() -> None:
     rule = _reasoning_rule(scope=("provider", "model", "session", "classifier"))
     engine = FieldCacheEngine([rule])
@@ -110,6 +190,44 @@ async def test_scope_isolation_by_credential_and_provider() -> None:
     assert build_cache_key(rule, _context(provider="openai", credential_id="credential-a")) != build_cache_key(
         rule, _context(provider="other", credential_id="credential-a")
     )
+
+
+def test_scope_key_hashes_adversarial_provider_and_model_delimiters() -> None:
+    rule = _reasoning_rule()
+    keys = {
+        build_cache_key(rule, _context(model=value))
+        for value in ("a:b", "a/b", "a_b", "a|b", "a=b")
+    }
+
+    assert None not in keys
+    assert len(keys) == 5
+    assert all("a:b" not in key and "a/b" not in key and "a|b" not in key for key in keys)
+    assert all(
+        len(component.split("=", 1)[1]) == 64
+        for key in keys
+        for component in key.split("|")
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    (
+        "previous_response_id",
+        "previousResponseId",
+        "previous-response-id",
+        "metadata.conversationId",
+        "request[continuation_id]",
+    ),
+)
+def test_continuation_aliases_require_semantic_registration(path: str) -> None:
+    assert is_provider_continuation_path(path) is True
+    with pytest.raises(ValueError, match="provider_continuation"):
+        FieldCacheRule(
+            name="continuation",
+            source="response",
+            path="id",
+            inject=FieldCacheInjection(target="request", path=path),
+        )
 
 
 @pytest.mark.asyncio
@@ -326,6 +444,191 @@ async def test_in_memory_store_returns_deep_copies() -> None:
     value["nested"].append("mutated")
 
     assert await store.get("key") == {"nested": []}
+
+
+@pytest.mark.asyncio
+async def test_in_memory_store_prunes_expired_and_lru_entries() -> None:
+    now = [0.0]
+    store = InMemoryFieldCacheStore(clock=lambda: now[0], max_entries=2)
+    await store.set("a", 1, ttl_seconds=10)
+    now[0] = 1.0
+    await store.set("b", 2, ttl_seconds=10)
+    now[0] = 2.0
+    assert await store.get("a") == 1
+    now[0] = 3.0
+    await store.set("c", 3, ttl_seconds=10)
+
+    assert await store.get("b") is None
+    assert await store.get("a") == 1
+    now[0] = 20.0
+    await store.set("d", 4, ttl_seconds=10)
+    assert await store.get("a") is None
+    assert await store.get("c") is None
+    assert await store.get("d") == 4
+
+
+@pytest.mark.asyncio
+async def test_all_mode_enforces_value_count_and_byte_bounds() -> None:
+    rule = FieldCacheRule(
+        name="bounded",
+        source="response",
+        path="value",
+        mode="all",
+        max_values=2,
+        max_bytes=32,
+        inject=FieldCacheInjection(target="request", path="metadata.values", as_list=True),
+    )
+    engine = FieldCacheEngine([rule])
+    for value in ("one", "two", "three"):
+        await engine.extract("response", {"value": value}, _context())
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context())
+
+    assert updated["metadata"]["values"] == ["two", "three"]
+    with pytest.raises(ValueError, match="exceeds max_bytes"):
+        await engine.extract("response", {"value": "x" * 64}, _context())
+
+
+@pytest.mark.asyncio
+async def test_last_mode_rejects_oversized_opaque_state() -> None:
+    rule = FieldCacheRule(
+        name="provider_response_id",
+        source="response",
+        path="id",
+        max_bytes=16,
+        inject=FieldCacheInjection(
+            target="request",
+            path="previous_response_id",
+            when_missing_only=True,
+        ),
+        metadata={"provider_continuation": True},
+    )
+
+    with pytest.raises(ValueError, match="exceeds max_bytes"):
+        await FieldCacheEngine([rule]).extract(
+            "response",
+            {"id": "resp_" + "x" * 64},
+            _context(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_per_tool_call_mode_bounds_correlated_entries() -> None:
+    rule = FieldCacheRule(
+        name="tool_state",
+        source="response",
+        path="tool_calls.*",
+        mode="per_tool_call",
+        max_values=2,
+        max_bytes=256,
+        inject=FieldCacheInjection(target="request", path="metadata.state"),
+        metadata={"tool_call_id_path": "id"},
+    )
+    engine = FieldCacheEngine([rule])
+    await engine.extract(
+        "response",
+        {"tool_calls": [
+            {"id": "a", "state": "one"},
+            {"id": "b", "state": "two"},
+            {"id": "c", "state": "three"},
+        ]},
+        _context(),
+    )
+    missing, missing_ops = await engine.inject(
+        "request",
+        {"metadata": {}},
+        _context(metadata={"tool_call_id": "a"}),
+    )
+    retained, retained_ops = await engine.inject(
+        "request",
+        {"metadata": {}},
+        _context(metadata={"tool_call_id": "c"}),
+    )
+
+    assert missing == {"metadata": {}}
+    assert missing_ops[0].skipped is True
+    assert missing_ops[0].reason == "tool_call_cache_miss"
+    assert retained_ops[0].hit is True
+    assert retained["metadata"]["state"] == {"id": "c", "state": "three"}
+
+
+@pytest.mark.asyncio
+async def test_provider_cache_append_is_atomic() -> None:
+    class YieldingProviderCache:
+        def __init__(self) -> None:
+            self.values = {}
+
+        async def retrieve_async(self, key):
+            await asyncio.sleep(0)
+            return self.values.get(key)
+
+        async def store_async(self, key, value):
+            await asyncio.sleep(0)
+            self.values[key] = value
+
+        async def clear(self):
+            self.values.clear()
+
+    backend = YieldingProviderCache()
+    first_store = ProviderCacheFieldStore(backend)
+    second_store = ProviderCacheFieldStore(backend)
+    await asyncio.gather(
+        first_store.append("key", ["a"], max_values=8, max_bytes=128),
+        second_store.append("key", ["b"], max_values=8, max_bytes=128),
+    )
+
+    assert await first_store.get("key") == ["a", "b"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_append_fallback_remains_bounded() -> None:
+    class LegacyStore:
+        def __init__(self):
+            self.values = {}
+
+        async def get(self, key):
+            return self.values.get(key)
+
+        async def set(self, key, value):
+            self.values[key] = value
+
+        async def append(self, key, values):
+            self.values.setdefault(key, []).extend(values)
+
+    rule = FieldCacheRule(
+        name="legacy_all",
+        source="response",
+        path="value",
+        mode="all",
+        max_values=2,
+        max_bytes=64,
+        inject=FieldCacheInjection(target="request", path="metadata.values", as_list=True),
+    )
+    engine = FieldCacheEngine([rule], store=LegacyStore())
+    for value in ("one", "two", "three"):
+        await engine.extract("response", {"value": value}, _context())
+    updated, _ = await engine.inject("request", {"metadata": {}}, _context())
+
+    assert updated["metadata"]["values"] == ["two", "three"]
+
+
+@pytest.mark.asyncio
+async def test_store_internal_type_error_is_not_treated_as_legacy_signature() -> None:
+    class BrokenStore:
+        async def get(self, key):
+            return None
+
+        async def set(self, key, value, *, ttl_seconds=None):
+            raise TypeError("internal serialization failure")
+
+        async def append(self, key, values, **kwargs):
+            raise TypeError("internal serialization failure")
+
+    with pytest.raises(TypeError, match="internal serialization"):
+        await FieldCacheEngine([_reasoning_rule()], store=BrokenStore()).extract(
+            "response",
+            {"choices": [{"message": {"reasoning_content": "x"}}]},
+            _context(),
+        )
 
 
 @pytest.mark.asyncio

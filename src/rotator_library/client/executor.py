@@ -123,6 +123,7 @@ class RequestExecutor:
         litellm_provider_params: Optional[Dict[str, Any]] = None,
         litellm_logger_fn: Optional[Any] = None,
         provider_instances: Optional[Dict[str, Any]] = None,
+        experimental_config: Optional[Any] = None,
     ):
         """
         Initialize RequestExecutor.
@@ -157,6 +158,7 @@ class RequestExecutor:
         self._abort_on_callback_error = abort_on_callback_error
         self._litellm_provider_params = litellm_provider_params or {}
         self._litellm_logger_fn = litellm_logger_fn
+        self._experimental_config = experimental_config
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
         self._native_executor = NativeProviderExecutor()
@@ -217,7 +219,10 @@ class RequestExecutor:
                     self._plugin_instances[provider] = plugin_class
             else:
                 return None
-        return self._plugin_instances[provider]
+        instance = self._plugin_instances[provider]
+        if self._experimental_config is not None and hasattr(instance, "bind_runtime_config"):
+            instance.bind_runtime_config(self._experimental_config)
+        return instance
 
     def _has_tier_support(self, provider: str) -> bool:
         """
@@ -765,7 +770,12 @@ class RequestExecutor:
             transport=transport,
             adapter_names=tuple(plugin.get_adapter_names(native_model) if hasattr(plugin, "get_adapter_names") else ()),
             adapter_config=dict(plugin.get_adapter_config(native_model) if hasattr(plugin, "get_adapter_config") else {}),
-            field_cache_rules=_merged_field_cache_rules(provider, public_model, plugin),
+            field_cache_rules=_merged_field_cache_rules(
+                provider,
+                public_model,
+                plugin,
+                config=getattr(self, "_experimental_config", None),
+            ),
             transaction_logger=context.transaction_logger,
             metadata={
                 "public_model": public_model,
@@ -1345,7 +1355,13 @@ class RequestExecutor:
                                     kwargs,
                                     context,
                                 )
-                                trace_response = _redact_context_field_cache_paths(response, context, "response", plugin)
+                                trace_response = _redact_context_field_cache_paths(
+                                    response,
+                                    context,
+                                    "response",
+                                    plugin,
+                                    config=getattr(self, "_experimental_config", None),
+                                )
                                 self._log_executor_trace(
                                     context,
                                     "raw_provider_response",
@@ -1388,7 +1404,13 @@ class RequestExecutor:
                                 )
 
                                 normalized_response = self._normalize_response_usage(response, model)
-                                trace_normalized_response = _redact_context_field_cache_paths(normalized_response, context, "response", plugin)
+                                trace_normalized_response = _redact_context_field_cache_paths(
+                                    normalized_response,
+                                    context,
+                                    "response",
+                                    plugin,
+                                    config=getattr(self, "_experimental_config", None),
+                                )
                                 self._log_executor_trace(
                                     context,
                                     "post_usage_normalization_response",
@@ -2570,7 +2592,12 @@ class RequestExecutor:
         chunks = []
 
         async for sse_line in stream:
-            trace_sse_line = _redact_stream_sse_for_trace(sse_line, context, plugin)
+            trace_sse_line = _redact_stream_sse_for_trace(
+                sse_line,
+                context,
+                plugin,
+                config=getattr(self, "_experimental_config", None),
+            )
             transaction_logger.log_transform_pass(
                 "raw_stream_chunk",
                 trace_sse_line,
@@ -2599,7 +2626,13 @@ class RequestExecutor:
                     if content:
                         chunk_data = json.loads(content)
                         chunks.append(chunk_data)
-                        trace_chunk_data = _redact_context_field_cache_paths(chunk_data, context, "stream", plugin) if context else chunk_data
+                        trace_chunk_data = _redact_context_field_cache_paths(
+                            chunk_data,
+                            context,
+                            "stream",
+                            plugin,
+                            config=getattr(self, "_experimental_config", None),
+                        ) if context else chunk_data
                         transaction_logger.log_stream_chunk(trace_chunk_data)
                         if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
                             transaction_logger.log_transform_pass(
@@ -2619,7 +2652,13 @@ class RequestExecutor:
         if chunks:
             try:
                 final_response = TransactionLogger.assemble_streaming_response(chunks)
-                trace_final_response = _redact_context_field_cache_paths(final_response, context, "stream", plugin) if context else final_response
+                trace_final_response = _redact_context_field_cache_paths(
+                    final_response,
+                    context,
+                    "stream",
+                    plugin,
+                    config=getattr(self, "_experimental_config", None),
+                ) if context else final_response
                 transaction_logger.log_transform_pass(
                     "assembled_stream_response",
                     trace_final_response,
@@ -2849,7 +2888,14 @@ def _should_use_native_streaming(plugin: Any, model: str, target: Optional[Route
     return _provider_supports_native_streaming(plugin, model)
 
 
-def _redact_context_field_cache_paths(payload: Any, context: RequestContext, direction: str, plugin: Any) -> Any:
+def _redact_context_field_cache_paths(
+    payload: Any,
+    context: RequestContext,
+    direction: str,
+    plugin: Any,
+    *,
+    config: Any = None,
+) -> Any:
     """Redact configured field-cache paths before executor-level traces.
 
     Native provider execution already redacts its internal trace passes. The
@@ -2860,7 +2906,12 @@ def _redact_context_field_cache_paths(payload: Any, context: RequestContext, dir
     if direction not in {"response", "stream"} or not plugin or not _provider_native_protocol(plugin, context.model, _current_route_target(context)):
         return payload
     try:
-        rules = _merged_field_cache_rules(context.provider, context.model, plugin)
+        rules = _merged_field_cache_rules(
+            context.provider,
+            context.model,
+            plugin,
+            config=config,
+        )
     except RoutingExecutionError:
         raise
     except Exception:
@@ -2894,7 +2945,13 @@ def _trace_redaction_paths(paths: tuple[str, ...] | list[str], *, direction: str
     return expanded
 
 
-def _redact_stream_sse_for_trace(sse_line: str, context: Optional[RequestContext], plugin: Any) -> str:
+def _redact_stream_sse_for_trace(
+    sse_line: str,
+    context: Optional[RequestContext],
+    plugin: Any,
+    *,
+    config: Any = None,
+) -> str:
     """Return a trace-only SSE line with configured native cache paths redacted."""
 
     if not context or not isinstance(sse_line, str) or not sse_line.startswith("data: ") or sse_line.startswith("data: [DONE]"):
@@ -2903,7 +2960,13 @@ def _redact_stream_sse_for_trace(sse_line: str, context: Optional[RequestContext
         payload = json.loads(sse_line[6:].strip())
     except json.JSONDecodeError:
         return sse_line
-    redacted = _redact_context_field_cache_paths(payload, context, "stream", plugin)
+    redacted = _redact_context_field_cache_paths(
+        payload,
+        context,
+        "stream",
+        plugin,
+        config=config,
+    )
     if redacted is payload:
         return sse_line
     return f"data: {json.dumps(redacted, separators=(',', ':'))}\n\n"
@@ -2962,7 +3025,13 @@ def _redact_trace_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
             _redact_trace_leaf_key(item, tokens)
 
 
-def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[Any, ...]:
+def _merged_field_cache_rules(
+    provider: str,
+    model: str,
+    plugin: Any,
+    *,
+    config: Any = None,
+) -> tuple[Any, ...]:
     """Merge provider-declared and JSON-configured field-cache rules.
 
     Provider declarations are the safe default. Optional JSON config can add or
@@ -2975,7 +3044,13 @@ def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[A
     try:
         from ..config.experimental import load_experimental_config, parse_field_cache_rules
 
-        configured = list(parse_field_cache_rules(load_experimental_config(), provider, model))
+        configured = list(
+            parse_field_cache_rules(
+                config if config is not None else load_experimental_config(),
+                provider,
+                model,
+            )
+        )
     except Exception as exc:
         raise RoutingExecutionError(f"Invalid field-cache configuration for {provider}/{model}", error_type="configuration_error") from exc
     if not configured:
@@ -2987,8 +3062,47 @@ def _merged_field_cache_rules(provider: str, model: str, plugin: Any) -> tuple[A
         if name and name not in merged:
             order.append(name)
         if name:
+            declared_rule = merged.get(name)
+            if declared_rule is not None and not _safe_field_cache_override(
+                declared_rule,
+                rule,
+            ):
+                raise RoutingExecutionError(
+                    f"Configured field-cache rule {name!r} cannot weaken provider state isolation or injection behavior",
+                    error_type="configuration_error",
+                )
             merged[name] = rule
     return tuple(merged[name] for name in order if name in merged)
+
+
+def _safe_field_cache_override(declared: Any, configured: Any) -> bool:
+    """Allow extraction tuning only when provider-state behavior is unchanged."""
+
+    behavior_keys = (
+        "provider_continuation",
+        "tool_call_id_path",
+        "tool_container_path",
+        "tool_value_path",
+        "inject_tool_call_id_path",
+        "turn_container_path",
+        "turn_role_path",
+        "turn_value_path",
+    )
+    return (
+        getattr(configured, "cache_key", None) == getattr(declared, "cache_key", None)
+        and getattr(configured, "mode", None) == getattr(declared, "mode", None)
+        and getattr(configured, "scope", None) == getattr(declared, "scope", None)
+        and getattr(configured, "ttl_seconds", None) == getattr(declared, "ttl_seconds", None)
+        and getattr(configured, "allow_missing_session", None) == getattr(declared, "allow_missing_session", None)
+        and getattr(configured, "max_values", None) == getattr(declared, "max_values", None)
+        and getattr(configured, "max_bytes", None) == getattr(declared, "max_bytes", None)
+        and getattr(configured, "inject", None) == getattr(declared, "inject", None)
+        and all(
+            (getattr(configured, "metadata", {}) or {}).get(key)
+            == (getattr(declared, "metadata", {}) or {}).get(key)
+            for key in behavior_keys
+        )
+    )
 
 
 def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:

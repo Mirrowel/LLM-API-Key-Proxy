@@ -61,6 +61,45 @@ def test_provider_json_protocol_adapters_field_cache_and_quota_groups_are_wired(
     assert provider.get_model_quota_group("base-model") == "base"
 
 
+def test_provider_runtime_config_can_be_bound_to_startup_snapshot(tmp_path, monkeypatch) -> None:
+    class SnapshotProvider(ProviderInterface):
+        provider_env_name = "snapshot_provider"
+
+        async def get_models(self, api_key, client):
+            return []
+
+    startup = load_config_from_mapping({
+        "providers": {"snapshot_provider": {"protocol_name": "gemini"}}
+    })
+    changed_path = _write_config(
+        tmp_path,
+        {"providers": {"snapshot_provider": {"protocol_name": "responses"}}},
+    )
+    monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", changed_path)
+    provider = SnapshotProvider()
+    provider.bind_runtime_config(startup)
+
+    assert provider.get_protocol_name("model") == "gemini"
+
+
+def test_provider_singleton_rejects_incompatible_snapshot_rebinding() -> None:
+    class BoundProvider(ProviderInterface):
+        provider_env_name = "bound_provider"
+
+        async def get_models(self, api_key, client):
+            return []
+
+    first = load_config_from_mapping({"providers": {"bound_provider": {"protocol_name": "gemini"}}})
+    equivalent = load_config_from_mapping({"providers": {"bound_provider": {"protocol_name": "gemini"}}})
+    incompatible = load_config_from_mapping({"providers": {"bound_provider": {"protocol_name": "responses"}}})
+    provider = BoundProvider()
+
+    provider.bind_runtime_config(first)
+    provider.bind_runtime_config(equivalent)
+    with pytest.raises(RuntimeError, match="already bound"):
+        provider.bind_runtime_config(incompatible)
+
+
 def test_provider_json_quota_groups_still_allow_env_override(tmp_path, monkeypatch) -> None:
     config_path = _write_config(tmp_path, {"providers": {"configured": {"model_quota_groups": {"json_group": ["json-model"]}}}})
     monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", config_path)

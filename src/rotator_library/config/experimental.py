@@ -769,18 +769,23 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
         raise ExperimentalConfigError("field_cache.inject must be an object")
     elif data.get("target_path"):
         inject = FieldCacheInjection(target=str(data.get("target", "request")), path=str(data["target_path"]))
-    scope = data.get("scope", ("provider", "model", "classifier", "session"))
+    scope = data.get("scope", ("provider", "model", "credential", "session"))
     if isinstance(scope, str):
         scope_values = tuple(part.strip() for part in scope.split(",") if part.strip())
     elif isinstance(scope, (list, tuple)):
         scope_values = tuple(str(part) for part in scope)
     else:
         raise ExperimentalConfigError("field_cache.scope must be a string or list")
+    if {"provider", "model", "credential", "session"}.difference(scope_values):
+        raise ExperimentalConfigError(
+            "field_cache.scope must include provider, model, credential, and session"
+        )
     try:
         return FieldCacheRule(
             name=str(data["name"]),
             source=str(data["source"]),
             path=str(data["path"]),
+            cache_key=_optional_string(data.get("cache_key")),
             mode=str(data.get("mode", "last")),
             scope=scope_values,
             inject=inject,
@@ -788,6 +793,8 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
             ttl_seconds=int(data["ttl_seconds"]) if data.get("ttl_seconds") is not None else None,
             metadata=_metadata_dict(data.get("metadata", {})),
             allow_missing_session=as_bool(data.get("allow_missing_session", False), name="field_cache.allow_missing_session"),
+            max_values=int(data.get("max_values", 1024)),
+            max_bytes=int(data.get("max_bytes", 4 * 1024 * 1024)),
         )
     except KeyError as exc:
         raise ExperimentalConfigError(f"Missing field-cache rule key {exc.args[0]}") from exc

@@ -409,7 +409,7 @@ State: **completed**
 
 ### Phase G: Provider state and integration validation
 
-State: **pending**
+State: **completed**
 
 - Verify hidden signature and provider continuation caching.
 - Verify provider/credential/model/session isolation.
@@ -419,7 +419,7 @@ State: **pending**
 
 ### Phase H: Independent review and correction
 
-State: **pending**
+State: **in progress**
 
 - Run an `explore` mapping review after implementation appears complete.
 - Run an `explore-heavy` reasoning review after implementation appears complete.
@@ -628,8 +628,49 @@ This correction is complete only when:
   matrix passes 958 tests and 18 subtests; `compileall` and `git diff --check`
   pass apart from repository line-ending notices.
 
+### 2026-07-17: Provider-state isolation checkpoint
+
+- Streaming and non-streaming extraction counterparts for Antigravity thought
+  signatures, Claude thinking signatures, and Codex continuation IDs now share
+  one validated logical cache identity. Mixed-mode turns cannot read stale state
+  from a source-specific cache.
+- Cache identity plus every provider, model, credential, session, classifier,
+  and conversation component uses a full SHA-256 digest. Adversarial delimiter
+  forms remain distinct and raw scope values never appear in cache keys.
+- JSON-configured provider-state rules must retain provider/model/credential/
+  session isolation. A configured replacement may tune extraction only while
+  preserving logical identity, mode, TTL, bounds, injection, continuation, and
+  tool/turn correlation behavior.
+- Continuation destinations are recognized across snake_case, camelCase, and
+  hyphenated forms. Local Responses lineage suppresses provider continuation by
+  semantic destination as well as explicit rule metadata.
+- `RotatingClient` binds one immutable startup configuration into the executor
+  and provider singleton instances. Equivalent clients may share it; an
+  incompatible singleton rebind fails explicitly instead of mutating live
+  provider behavior.
+- Every cache mode enforces serialized byte limits; accumulating and per-tool
+  modes also enforce value-count limits. Active signature caches retain at most
+  1,024 values / 4 MiB for one hour. The process-local store is capped at 10,000
+  LRU entries, and ProviderCache uses one atomic backend update for append.
+- Legacy injected stores remain compatible without bypassing bounds or masking
+  unrelated internal `TypeError`s.
+- Real `NativeProviderExecutor` contracts cover every stateful provider across
+  all four output protocols, non-stream -> stream -> non-stream state, model/
+  credential/session isolation, missing scopes, Codex local-lineage suppression,
+  hidden output, and Copilot's explicit no-state behavior.
+- Repeated light/heavy audits found and drove fixes for mixed-mode stale state,
+  key collisions, scope weakening, continuation aliases, config mutation,
+  unbounded values, append races, singleton rebinding, and mode-specific bounds.
+  Final heavy verdict: safe to commit.
+- Final verification: the complete tracked suite plus the force-added real-
+  provider contract passes 1,011 tests and 18 subtests; five known
+  `datetime.utcnow()` deprecation warnings only. Focused provider-state/native/
+  config verification passes 298 tests; `compileall` and `git diff --check` pass
+  apart from repository line-ending notices.
+
 ### Current next action
 
-Commit Phase F, then complete Phase G provider-state and native-provider contract
-validation across non-streaming and streaming execution before final Phase H
-whole-system review.
+Commit Phase G, then execute Phase H whole-system verification across protocol
+matrices, public routes, native/LiteLLM/custom execution, fallback and retry,
+continuation/storage, transaction logging, startup configuration, and active
+documentation before issuing the beta-readiness verdict.

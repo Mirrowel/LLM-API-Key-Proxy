@@ -8,6 +8,7 @@ from rotator_library.client import executor as executor_module
 from rotator_library.client.executor import RequestExecutor, RoutingExecutionError
 from rotator_library.core.types import RequestContext
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
+from rotator_library.config.experimental import load_config_from_mapping
 from rotator_library.providers.antigravity_provider import AntigravityProvider
 from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
 from rotator_library.providers.codex_provider import CodexProvider
@@ -83,7 +84,6 @@ class NativePluginWithRule(NativePlugin):
                 source="response",
                 path="choices.0.message.reasoning_content",
                 inject=FieldCacheInjection(target="request", path="metadata.state"),
-                allow_missing_session=True,
             ),
         )
 
@@ -97,6 +97,7 @@ class NativePluginWithVendorRule(NativePlugin):
                 path="choices.0.message.vendor_state",
                 inject=FieldCacheInjection(target="request", path="metadata.vendor_state"),
                 allow_missing_session=True,
+                scope=("provider", "model"),
             ),
         )
 
@@ -109,6 +110,7 @@ class NativePluginWithStreamVendorRule(NativePlugin):
                 source="stream_event",
                 path="raw.choices.0.message.vendor_state",
                 allow_missing_session=True,
+                scope=("provider", "model"),
             ),
         )
 
@@ -152,6 +154,7 @@ def _context(target=None) -> RequestContext:
         protocol_request=dict(kwargs),
         unified_request=get_protocol("openai_chat").parse_request(kwargs),
         input_provider="provider",
+        session_id="session-a",
     )
 
 
@@ -167,6 +170,7 @@ def _provider_context(provider: str, model: str, kwargs: dict, target=None) -> R
         protocol_request=dict(kwargs),
         unified_request=get_protocol("openai_chat").parse_request(kwargs),
         input_provider=provider,
+        session_id="session-a",
     )
 
 
@@ -271,6 +275,67 @@ def test_native_context_merges_json_field_cache_rules(monkeypatch, tmp_path) -> 
 
     assert [rule.name for rule in native_context.field_cache_rules] == ["state", "extra"]
     assert native_context.field_cache_rules[0].path == "json.path"
+
+
+def test_native_context_uses_bound_field_cache_snapshot(monkeypatch, tmp_path) -> None:
+    startup = load_config_from_mapping({
+        "field_cache": {
+            "provider": {
+                "*": [{"name": "startup", "source": "response", "path": "startup.path"}]
+            }
+        }
+    })
+    changed_path = tmp_path / "changed.json"
+    changed_path.write_text(json.dumps({
+        "field_cache": {
+            "provider": {
+                "*": [{"name": "changed", "source": "response", "path": "changed.path"}]
+            }
+        }
+    }), encoding="utf-8")
+    monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", str(changed_path))
+    executor = _executor()
+    executor._experimental_config = startup
+
+    native_context = executor._build_native_provider_context(
+        "provider",
+        "provider/gpt-test",
+        NativePlugin(),
+        "secret",
+        "stable",
+        _context(),
+        None,
+    )
+
+    assert [rule.name for rule in native_context.field_cache_rules] == ["startup"]
+
+
+def test_native_context_rejects_behavior_weakening_rule_override() -> None:
+    config = load_config_from_mapping({
+        "field_cache": {
+            "provider": {
+                "*": [{
+                    "name": "state",
+                    "source": "response",
+                    "path": "changed.path",
+                    "inject": {"target": "request", "path": "metadata.different"},
+                }]
+            }
+        }
+    })
+    executor = _executor()
+    executor._experimental_config = config
+
+    with pytest.raises(RoutingExecutionError, match="cannot weaken"):
+        executor._build_native_provider_context(
+            "provider",
+            "provider/gpt-test",
+            NativePluginWithRule(),
+            "secret",
+            "stable",
+            _context(),
+            None,
+        )
 
 
 @pytest.mark.asyncio

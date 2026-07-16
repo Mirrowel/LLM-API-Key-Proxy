@@ -125,6 +125,7 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
         path="choices.0.message.reasoning_content",
         inject=FieldCacheInjection(target="request", path="metadata.reasoning_content"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -185,6 +186,7 @@ async def test_native_provider_default_field_cache_persists_across_requests() ->
         path="choices.0.message.reasoning_content",
         inject=FieldCacheInjection(target="request", path="metadata.reasoning_content"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -224,6 +226,7 @@ async def test_native_provider_trace_redacts_configured_injection_paths(tmp_path
         path="choices.0.message.reasoning_content",
         inject=FieldCacheInjection(target="request", path="metadata.state"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -299,6 +302,7 @@ async def test_native_runtime_executes_unified_request_source_and_target() -> No
         path="metadata.client_state",
         inject=FieldCacheInjection(target="unified_request", path="metadata.cached_client_state"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -332,6 +336,7 @@ async def test_native_runtime_executes_unified_response_source() -> None:
         path="metadata.object",
         inject=FieldCacheInjection(target="request", path="metadata.cached_object"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -358,6 +363,7 @@ async def test_native_response_source_extracts_raw_provider_response_before_clie
         mode="all",
         inject=FieldCacheInjection(target="request", path="metadata.signatures", as_list=True),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="claude_code",
@@ -399,6 +405,7 @@ async def test_native_runtime_executes_metadata_target_before_adapters() -> None
         path="choices.0.message.reasoning_content",
         inject=FieldCacheInjection(target="metadata", path="cached_state"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -426,6 +433,7 @@ async def test_native_adapter_generic_traces_are_suppressed_for_field_cache_safe
         path="choices.0.message.reasoning_content",
         inject=FieldCacheInjection(target="request", path="metadata.hidden_state"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -460,6 +468,7 @@ async def test_native_runtime_executes_request_source() -> None:
         path="metadata.outgoing_state",
         inject=FieldCacheInjection(target="unified_request", path="metadata.reused_request_state"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",
@@ -490,6 +499,7 @@ async def test_native_metadata_injection_trace_redacts_configured_paths(tmp_path
         path="choices.0.message.reasoning_content",
         inject=FieldCacheInjection(target="metadata", path="cached_blob"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",

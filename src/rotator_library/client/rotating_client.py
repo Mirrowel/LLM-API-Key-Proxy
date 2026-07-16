@@ -156,6 +156,9 @@ class RotatingClient:
         """
         # Resolve data directory
         self.data_dir = Path(data_dir).resolve() if data_dir else get_default_root()
+        from ..config.experimental import load_experimental_config
+
+        self._experimental_config = load_experimental_config()
         (
             session_persistence_enabled,
             session_persistence_flush_interval_seconds,
@@ -203,6 +206,7 @@ class RotatingClient:
         _add_configured_no_auth_credentials(
             self.all_credentials,
             set(PROVIDER_PLUGINS),
+            config=self._experimental_config,
         )
         if not self.all_credentials:
             lib_logger.warning(
@@ -333,6 +337,7 @@ class RotatingClient:
             litellm_provider_params=self.litellm_provider_params,
             litellm_logger_fn=self._litellm_logger_fn,
             provider_instances=self._provider_instances,
+            experimental_config=self._experimental_config,
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}
@@ -830,7 +835,10 @@ class RotatingClient:
         if provider not in self._provider_instances:
             plugin_class = self._provider_plugins.get(provider)
             if plugin_class:
-                self._provider_instances[provider] = plugin_class()
+                instance = plugin_class()
+                if hasattr(instance, "bind_runtime_config"):
+                    instance.bind_runtime_config(self._experimental_config)
+                self._provider_instances[provider] = instance
             else:
                 return None
 

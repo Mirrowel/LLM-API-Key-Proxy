@@ -38,8 +38,8 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
         protocol_name="openai_chat",
         endpoint="https://example.test/chat",
         field_cache_rules=(
-            FieldCacheRule(name="stream_reasoning", source="stream_event", path="raw.choices.0.delta.reasoning_content", allow_missing_session=True),
-            FieldCacheRule(name="stream_vendor_state", source="stream_event", path="raw.choices.0.delta.vendor_state", allow_missing_session=True),
+            FieldCacheRule(name="stream_reasoning", source="stream_event", path="raw.choices.0.delta.reasoning_content", allow_missing_session=True, scope=("provider", "model")),
+            FieldCacheRule(name="stream_vendor_state", source="stream_event", path="raw.choices.0.delta.vendor_state", allow_missing_session=True, scope=("provider", "model")),
         ),
         transaction_logger=logger,
     )
@@ -258,6 +258,7 @@ async def test_native_provider_stream_extracts_unified_stream_events_for_later_r
         path="delta.content.0.text",
         inject=FieldCacheInjection(target="request", path="metadata.cached_stream_text"),
         allow_missing_session=True,
+        scope=("provider", "model"),
     )
     context = NativeProviderContext(
         provider="native",

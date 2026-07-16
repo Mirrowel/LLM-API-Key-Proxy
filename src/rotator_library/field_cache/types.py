@@ -20,7 +20,8 @@ FieldCacheTarget = Literal["request", "unified_request", "metadata"]
 FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"]
 FieldCacheScope = Literal["provider", "model", "credential", "session", "conversation", "classifier"]
 
-DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "classifier", "session")
+DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
+REQUIRED_PROVIDER_STATE_SCOPE = frozenset({"provider", "model", "credential", "session"})
 _VALID_SOURCES = {"request", "response", "stream_event", "unified_request", "unified_response", "unified_stream_event"}
 _VALID_TARGETS = {"request", "unified_request", "metadata"}
 _VALID_SCOPES = {"provider", "model", "credential", "session", "conversation", "classifier"}
@@ -56,10 +57,17 @@ class FieldCacheRule:
     ttl_seconds: Optional[int] = None
     metadata: dict[str, Any] = field(default_factory=dict)
     allow_missing_session: bool = False
+    cache_key: Optional[str] = None
+    max_values: Optional[int] = 1024
+    max_bytes: Optional[int] = 4 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if not self.name or any(char in self.name for char in "/\\:"):
             raise ValueError("FieldCacheRule.name must be non-empty and filesystem-safe")
+        if self.cache_key is not None and (
+            not self.cache_key or any(char in self.cache_key for char in "/\\:")
+        ):
+            raise ValueError("FieldCacheRule.cache_key must be non-empty and filesystem-safe")
         if self.mode not in {"last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"}:
             raise ValueError(f"Unsupported field-cache mode: {self.mode}")
         if self.source not in _VALID_SOURCES:
@@ -71,6 +79,27 @@ class FieldCacheRule:
         invalid_scopes = [scope for scope in self.scope if scope not in _VALID_SCOPES]
         if invalid_scopes:
             raise ValueError(f"Unsupported field-cache scope: {invalid_scopes[0]}")
+        if self.max_values is not None and self.max_values <= 0:
+            raise ValueError("FieldCacheRule.max_values must be positive")
+        if self.max_bytes is not None and self.max_bytes <= 0:
+            raise ValueError("FieldCacheRule.max_bytes must be positive")
+        if self.inject and is_provider_continuation_path(self.inject.path):
+            if self.metadata.get("provider_continuation") is not True:
+                raise ValueError(
+                    "Continuation field-cache injection requires metadata.provider_continuation=true"
+                )
+
+
+def is_provider_continuation_path(path: str) -> bool:
+    normalized = path.replace("[", ".").replace("]", "")
+    leaf = normalized.rsplit(".", 1)[-1]
+    leaf = "".join(character for character in leaf.lower() if character.isalnum())
+    return leaf in {
+        "previousresponseid",
+        "providerresponseid",
+        "continuationid",
+        "conversationid",
+    }
 
 
 @dataclass(frozen=True)
