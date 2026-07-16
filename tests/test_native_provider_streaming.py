@@ -5,8 +5,12 @@ import json
 import pytest
 
 from rotator_library.adapters import PayloadAdapter, register_adapter
+from rotator_library.core.errors import StreamedAPIError
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from rotator_library.providers.antigravity_provider import AntigravityProvider
+from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
+from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.transaction_logger import TransactionLogger
 
 
@@ -47,7 +51,12 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
 
     events = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(client))]
 
-    assert events == [chunks[0]]
+    assert len(events) == 2
+    first_payload = json.loads(events[0].removeprefix("data: "))
+    assert first_payload["choices"][0]["delta"]["content"] == "hi"
+    assert first_payload["choices"][0]["delta"]["reasoning_content"] == "hidden"
+    assert "vendor_state" not in first_payload["choices"][0]["delta"]
+    assert events[-1] == "data: [DONE]\n\n"
     assert client.calls[0]["json"]["stream"] is True
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "native_provider_stream_request" in pass_names
@@ -55,7 +64,7 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     assert pass_names.count("parsed_native_stream_event") == 2
     assert "after_field_cache_extraction" in pass_names
     assert "after_field_cache_stream_extraction" in pass_names
-    assert pass_names.count("formatted_client_stream_event") == 1
+    assert pass_names.count("formatted_client_stream_event") == 2
     trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
     assert "opaque-vendor-state" not in trace_text
 
@@ -159,6 +168,28 @@ async def test_native_provider_stream_logs_errors(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_native_provider_error_event_raises_for_rotation_before_client_formatting() -> None:
+    context = NativeProviderContext(
+        provider="native",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://example.test/chat",
+    )
+
+    with pytest.raises(StreamedAPIError) as raised:
+        _ = [
+            event
+            async for event in NativeProviderExecutor().stream(
+                {"model": "gpt-test", "messages": []},
+                context,
+                NativeHTTPTransport(FakeStreamingClient([{"error": {"type": "rate_limit", "message": "rotate me"}}])),
+            )
+        ]
+
+    assert raised.value.data["error"]["type"] == "rate_limit"
+
+
+@pytest.mark.asyncio
 async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) -> None:
     class StreamTextAdapter(PayloadAdapter):
         name = "test_stream_text_adapter"
@@ -188,7 +219,8 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
         )
     ]
 
-    assert events[0]["choices"][0]["delta"]["content"] == "adapted"
+    payload = json.loads(events[0].removeprefix("data: "))
+    assert payload["choices"][0]["delta"]["content"] == "adapted"
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "after_stream_event_adapter_chain" in pass_names
 
@@ -255,3 +287,89 @@ async def test_native_provider_stream_extracts_unified_stream_events_for_later_r
     ]
 
     assert second_client.calls[0]["json"]["metadata"]["cached_stream_text"] == "stream-state"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider", "protocol", "operation", "request_payload", "chunks", "injected_path", "expected"),
+    [
+        (
+            AntigravityProvider(),
+            "gemini",
+            "stream_generate",
+            {"model": "gpt-test", "contents": []},
+            [{"candidates": [{"content": {"role": "model", "parts": [{"text": "private", "thought": True, "thoughtSignature": "gem-signature"}]}}]}, "[DONE]"],
+            ("request", "metadata", "thoughtSignatures"),
+            ["gem-signature"],
+        ),
+        (
+            ClaudeCodeProvider(),
+            "anthropic_messages",
+            "messages",
+            {"model": "gpt-test", "messages": [], "max_tokens": 1},
+            [{"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "claude-signature"}}, {"type": "message_stop"}],
+            ("metadata", "thinking_signatures"),
+            ["claude-signature"],
+        ),
+        (
+            CodexProvider(),
+            "responses",
+            "responses",
+            {"model": "gpt-test", "input": []},
+            [{"type": "response.completed", "response": {"id": "resp-continuation", "status": "completed", "model": "gpt-test", "output": []}}, "[DONE]"],
+            ("previous_response_id",),
+            "resp-continuation",
+        ),
+    ],
+)
+async def test_provider_stream_state_is_cached_for_followups_but_not_exposed(
+    provider,
+    protocol,
+    operation,
+    request_payload,
+    chunks,
+    injected_path,
+    expected,
+) -> None:
+    stream_rules = tuple(rule for rule in provider.get_field_cache_rules("gpt-test") if rule.source == "stream_event")
+    context = NativeProviderContext(
+        provider=provider.provider_env_name,
+        model="gpt-test",
+        protocol_name=protocol,
+        input_protocol_name=protocol,
+        output_protocol_name="openai_chat",
+        endpoint="https://example.test/stream",
+        operation=operation,
+        credential_id="credential-1",
+        session_id="session-1",
+        scope_key="scope-1",
+        field_cache_rules=stream_rules,
+    )
+    executor = NativeProviderExecutor()
+
+    first_output = [
+        frame
+        async for frame in executor.stream(
+            request_payload,
+            context,
+            NativeHTTPTransport(FakeStreamingClient(chunks)),
+        )
+    ]
+    second_client = FakeStreamingClient(["[DONE]"])
+    _ = [
+        frame
+        async for frame in executor.stream(
+            request_payload,
+            context,
+            NativeHTTPTransport(second_client),
+        )
+    ]
+
+    current = second_client.calls[0]["json"]
+    for key in injected_path:
+        current = current[key]
+    assert current == expected
+    output_text = "".join(first_output)
+    assert "gem-signature" not in output_text
+    assert "claude-signature" not in output_text
+    assert "resp-continuation" not in output_text

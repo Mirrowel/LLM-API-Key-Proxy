@@ -706,6 +706,21 @@ class RotatingClient:
 
         return await self._gemini_handler.generate(payload, model=model, raw_request=raw_request)
 
+    async def gemini_stream_generate(
+        self,
+        payload: Dict[str, Any],
+        *,
+        model: str,
+        raw_request: Optional[Any] = None,
+    ) -> Any:
+        """Execute a Gemini streamGenerateContent request through shared routing."""
+
+        return await self._gemini_handler.stream_generate(
+            payload,
+            model=model,
+            raw_request=raw_request,
+        )
+
     def gemini_count_tokens(self, payload: Dict[str, Any], *, model: str) -> Dict[str, int]:
         """Return Gemini-compatible local token usage for a request."""
 

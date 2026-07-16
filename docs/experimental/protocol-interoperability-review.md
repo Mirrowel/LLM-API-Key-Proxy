@@ -389,7 +389,7 @@ State: **completed**
 
 ### Phase E: Public Gemini and configurable providers
 
-State: **completed for non-streaming; streamGenerateContent moves with Phase F**
+State: **completed**
 
 - Add Gemini generateContent and countTokens-compatible routes.
 - Reserve streamGenerateContent for the canonical streaming checkpoint so the
@@ -400,7 +400,7 @@ State: **completed for non-streaming; streamGenerateContent moves with Phase F**
 
 ### Phase F: Canonical streaming
 
-State: **pending**
+State: **completed**
 
 - Implement canonical stream lifecycle.
 - Implement all four input/output stream formatters.
@@ -569,8 +569,67 @@ This correction is complete only when:
   process startup; Gemini `countTokens` is locally estimated; cross-protocol
   streaming and the public `streamGenerateContent` route remain Phase F work.
 
+### 2026-07-16: Canonical streaming checkpoint
+
+- Added one stateful canonical stream formatter shared by Chat, Anthropic
+  Messages, Responses, and Gemini. One canonical provider event may expand into
+  the destination's required start, block, delta, item, usage, terminal, and
+  error lifecycle frames without replaying provider-native raw fields.
+- Added complete four-by-four semantic stream conversion and native
+  provider/output matrices for text, reasoning, tool calls, fragmented JSON
+  arguments, usage, completion, failure, hidden signatures, and destination
+  lifecycle ordering. The actual LiteLLM executor is also exercised against all
+  four outputs.
+- Kept the existing operational stream handler authoritative for timeout,
+  heartbeat, disconnect, cancellation, cost/accounting, completion-gated session
+  identity, and retry mechanics. Provider streams normalize to canonical Chat SSE
+  for this operational pass, then one persistent destination formatter writes the
+  independently selected client protocol.
+- Preserved one destination lifecycle across same-target credential retries.
+  Anthropic `message_start` and Responses `response.created` are not duplicated
+  when a role-only or other nonsemantic frame precedes a retryable failure. Each
+  route-fallback target retains an independent lifecycle because failed-target
+  pending frames are not exposed.
+- Native, LiteLLM, and custom in-band stream errors now enter the same
+  classification, cooldown, credential-rotation, and route-fallback pipeline.
+  Provider errors are never yielded as successful content; post-output failures
+  close the active selected-protocol lifecycle without rotating or changing the
+  Responses ID.
+- Extended visibility policy to Anthropic content/tool events, Responses
+  reasoning/function items including zero-argument calls, and Gemini candidate
+  parts. Heartbeats, usage, lifecycle starts, and role-only frames remain
+  nonsemantic; Chat reasoning-only retry remains behind its existing feature
+  flag.
+- Added a stateful native SSE decoder that assembles `event:` and multiline
+  `data:` fields at blank-line boundaries and survives byte fragmentation. Bare
+  NDJSON remains supported.
+- Enabled native streaming for Antigravity, Claude Code, Codex, and Copilot.
+  Stream-event cache rules capture Gemini thought signatures, Anthropic thinking
+  signatures, and Responses continuation IDs before client formatting within
+  provider/model/credential/session scope.
+- Added first-class Gemini `streamGenerateContent` routes for `/v1beta` and `/v1`.
+  Anthropic and Responses streaming now use `agenerate()` directly; their old
+  translation bridges remain only for minimal external facades without that
+  entry point. Responses stores its terminal Responses object before optional
+  output reformatting.
+- Evidence-less termination is never upgraded to success. Bare `[DONE]`/EOF does
+  not fabricate OpenAI `stop`, Anthropic `end_turn`, or Gemini `STOP`; Responses
+  reports `incomplete`. Incomplete Responses items are marked incomplete.
+- Gemini tool-call arguments are buffered until one complete JSON object exists,
+  emitted exactly once, and fail closed on invalid continuation. Genuine
+  zero-argument calls flush once at terminal.
+- Multiple iterative `explore` and `explore-heavy` audits found and drove fixes
+  for native and in-band errors, failed Responses conversion, zero-argument tool
+  visibility, lifecycle identity reuse, multiline SSE, Gemini duplicate calls,
+  active-lifecycle terminal errors, and completion evidence. Both reviewers gave
+  final safe-to-commit verdicts with no unresolved blocker, high, or medium
+  findings.
+- Final verification: the complete tracked suite plus the force-added stream
+  matrix passes 958 tests and 18 subtests; `compileall` and `git diff --check`
+  pass apart from repository line-ending notices.
+
 ### Current next action
 
-Finish Phase E sign-off and commit, then implement Phase F: canonical streaming
-across Chat, Anthropic, Responses, and Gemini, including the public
-`streamGenerateContent` surface.
+Commit Phase F, then complete Phase G provider-state and native-provider contract
+validation across non-streaming and streaming execution before final Phase H
+whole-system review.

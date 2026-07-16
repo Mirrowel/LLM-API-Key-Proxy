@@ -104,7 +104,7 @@ class AnthropicHandler:
 
         anthropic_request = request.model_dump(exclude_none=True)
 
-        if not request.stream and hasattr(self._client, "agenerate"):
+        if hasattr(self._client, "agenerate"):
             selected_output = (
                 self._client.resolve_output_protocol(
                     anthropic_request,
@@ -122,6 +122,8 @@ class AnthropicHandler:
                 pre_request_callback=pre_request_callback,
                 _parent_log_dir=anthropic_logger.log_dir if anthropic_logger and anthropic_logger.log_dir else None,
             )
+            if request.stream:
+                return response
             anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
             if selected_output != "anthropic_messages":
                 return anthropic_response
@@ -144,8 +146,8 @@ class AnthropicHandler:
                 anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
             return anthropic_response
 
-        # Streaming remains on the established wrapper until canonical stream
-        # lifecycle conversion is enabled in the dedicated streaming phase.
+        # Compatibility fallback for external facades that have not implemented
+        # the protocol-aware agenerate entry point.
         openai_request = translate_anthropic_request(request)
         _trace_anthropic(
             anthropic_logger,

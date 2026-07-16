@@ -70,7 +70,8 @@ from ..routing import FallbackPolicy, clone_context_for_target
 from ..routing.policy import normalize_route_error_type
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
-from ..protocols import ProtocolContext, get_protocol
+from ..protocols import ProtocolContext, UnifiedStreamEvent, get_protocol
+from ..protocols.streaming import convert_protocol_stream, format_canonical_stream_event
 from ..native_provider.streaming import provider_supports_native_streaming as native_provider_supports_streaming
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..transform_trace import REDACTED
@@ -752,7 +753,10 @@ class RequestExecutor:
             endpoint=endpoint,
             operation=operation,
             input_protocol_name=context.input_protocol_name,
-            output_protocol_name=context.output_protocol_name,
+            # The operational stream handler consumes canonical Chat SSE. The
+            # selected client protocol is applied once after timeout/retry/usage
+            # and completion-gated session handling.
+            output_protocol_name="openai_chat" if stream else context.output_protocol_name,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,
@@ -1146,11 +1150,36 @@ class RequestExecutor:
             snapshot=snapshot,
         )
 
-    def _terminal_stream_error_lines(self, context: RequestContext, error_data: Dict[str, Any]) -> Tuple[str, str]:
+    def _terminal_stream_error_lines(
+        self,
+        context: RequestContext,
+        error_data: Dict[str, Any],
+        *,
+        protocol_context: Optional[ProtocolContext] = None,
+    ) -> Tuple[str, ...]:
         """Return executor-created terminal SSE lines and trace them first."""
 
-        error_line = f"data: {json.dumps(error_data)}\n\n"
-        done_line = "data: [DONE]\n\n"
+        output_protocol = getattr(context, "output_protocol_name", None) or "openai_chat"
+        input_protocol = getattr(context, "input_protocol_name", None) or "openai_chat"
+        protocol_context = protocol_context or ProtocolContext(
+                provider=context.provider,
+                model=context.model,
+                source_protocol="openai_chat",
+                target_protocol=output_protocol,
+                input_protocol=input_protocol,
+                output_protocol=output_protocol,
+                request_id=getattr(context, "request_id", None),
+                session_id=context.session_id,
+                transport="sse",
+            )
+        error = error_data.get("error", error_data)
+        lines = tuple(
+            format_canonical_stream_event(
+                UnifiedStreamEvent(type="error", error=error),
+                output_protocol,
+                protocol_context,
+            )
+        )
         self._log_executor_trace(
             context,
             "stream_error_event",
@@ -1162,12 +1191,12 @@ class RequestExecutor:
         self._log_executor_trace(
             context,
             "stream_done_event",
-            {"raw": done_line},
+            {"frames": lines},
             direction="stream",
             stage="final",
             snapshot=False,
         )
-        return error_line, done_line
+        return lines
 
     async def _prepare_execution(
         self,
@@ -1469,6 +1498,7 @@ class RequestExecutor:
         provider = context.provider
         model = context.model
         deadline = context.deadline
+        client_protocol_context: Optional[ProtocolContext] = None
 
         try:
             (
@@ -1596,6 +1626,7 @@ class RequestExecutor:
                                     )
                                     target = _current_route_target(context)
                                     execution = target.execution if target else "auto"
+                                    stream_provider_protocol = "openai_chat"
 
                                     # Make the API call. Keep execution-mode precedence aligned with
                                     # the non-streaming path: explicit LiteLLM wins, explicit custom
@@ -1653,6 +1684,7 @@ class RequestExecutor:
                                             metadata={"protocol": native_context.protocol_name, "operation": native_context.operation},
                                         )
                                         stream = self._get_native_executor().stream(native_request, native_context, NativeHTTPTransport(self._http_client))
+                                        stream_provider_protocol = native_context.protocol_name
                                     else:
                                         kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True
@@ -1696,6 +1728,29 @@ class RequestExecutor:
                                         success_callback=lambda: self._clear_failure_history_on_success(provider, model),
                                         transaction_logger=context.transaction_logger,
                                     )
+                                    if client_protocol_context is None:
+                                        client_protocol_context = ProtocolContext(
+                                            provider=provider,
+                                            model=model,
+                                            source_protocol="openai_chat",
+                                            target_protocol=context.output_protocol_name,
+                                            input_protocol=context.input_protocol_name,
+                                            provider_protocol=stream_provider_protocol,
+                                            output_protocol=context.output_protocol_name,
+                                            source_provider=provider,
+                                            target_provider=None,
+                                            provider_state_compatible=False,
+                                            request_id=getattr(context, "request_id", None),
+                                            session_id=context.session_id,
+                                            credential_stable_id=cred_context.stable_id,
+                                            transport="sse",
+                                        )
+                                    client_stream = convert_protocol_stream(
+                                        base_stream,
+                                        source_protocol=get_protocol("openai_chat"),
+                                        output_protocol=get_protocol(context.output_protocol_name),
+                                        context=client_protocol_context,
+                                    )
 
                                     lib_logger.info(
                                         f"Stream connection established for credential {mask_credential(cred)}. "
@@ -1707,7 +1762,7 @@ class RequestExecutor:
                                         async for (
                                             chunk
                                         ) in self._transaction_logging_stream_wrapper(
-                                            base_stream,
+                                            client_stream,
                                             context.transaction_logger,
                                             context.kwargs,
                                             context=context,
@@ -1719,7 +1774,7 @@ class RequestExecutor:
                                                 stream_visible_output_emitted = True
                                             yield chunk
                                     else:
-                                        async for chunk in base_stream:
+                                        async for chunk in client_stream:
                                             if not is_stream_heartbeat_or_comment(chunk):
                                                 last_streamed_chunk = chunk
                                             if _stream_chunk_is_visible_output(chunk):
@@ -1763,7 +1818,7 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            for line in self._terminal_stream_error_lines(context, error_data):
+                                            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                                 yield line
                                             return
                                     else:
@@ -1776,7 +1831,7 @@ class RequestExecutor:
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = _streamed_error_payload(e, classified)
-                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                             yield line
                                         return
 
@@ -1845,7 +1900,7 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            for line in self._terminal_stream_error_lines(context, error_data):
+                                            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                                 yield line
                                             return
                                     else:
@@ -1858,7 +1913,7 @@ class RequestExecutor:
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
-                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                             yield line
                                         return
 
@@ -1917,7 +1972,7 @@ class RequestExecutor:
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
-                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                             yield line
                                         return
 
@@ -1961,7 +2016,7 @@ class RequestExecutor:
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
-                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                             yield line
                                         return
                                     cred_context.mark_failure(classified)
@@ -1993,7 +2048,7 @@ class RequestExecutor:
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
-                                        for line in self._terminal_stream_error_lines(context, error_data):
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                             yield line
                                         return
 
@@ -2045,20 +2100,20 @@ class RequestExecutor:
             error_data = error_accumulator.build_client_error_response()
             if last_stream_error_payload:
                 _merge_stream_error_details(error_data, last_stream_error_payload)
-            for line in self._terminal_stream_error_lines(context, error_data):
+            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                 yield line
 
         except NoAvailableKeysError as e:
             lib_logger.error(f"No keys available: {e}")
             error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
-            for line in self._terminal_stream_error_lines(context, error_data):
+            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                 yield line
 
         except Exception as e:
             lib_logger.error(f"Unhandled exception in streaming: {e}", exc_info=True)
             classified = classify_error(e, context.provider)
             error_data = {"error": {"message": "Streaming request failed", "type": classified.error_type, "details": {"status_code": classified.status_code}}}
-            for line in self._terminal_stream_error_lines(context, error_data):
+            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                 yield line
 
     def _apply_litellm_provider_params(
@@ -3212,7 +3267,8 @@ def _stream_chunk_error_type(chunk: str) -> Optional[str]:
         error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
         return _route_error_type_from_response({"error": error}) or "server_error"
     if event_type == "response.failed":
-        error = payload.get("error") if isinstance(payload.get("error"), dict) else {"type": "server_error"}
+        response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else response.get("error") if isinstance(response.get("error"), dict) else {"type": "server_error"}
         return _route_error_type_from_response({"error": error}) or "server_error"
     if isinstance(payload.get("error"), dict):
         return _route_error_type_from_response({"error": payload["error"]}) or "server_error"

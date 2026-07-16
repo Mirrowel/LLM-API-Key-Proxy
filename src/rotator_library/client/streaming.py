@@ -614,7 +614,8 @@ class StreamingHandler:
                 return True
         return False
 
-    def _sse_data_payloads(self, sse_string: str) -> List[str]:
+    @staticmethod
+    def _sse_data_payloads(sse_string: str) -> List[str]:
         """Extract SSE data payloads from plain or event-prefixed frames."""
 
         payloads: List[str] = []
@@ -722,6 +723,12 @@ class StreamingHandler:
             if stripped == "[DONE]" or stripped == "data: [DONE]":
                 return ProcessedChunk(sse_string="", finish_reason="stop")
             if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
+                error = self._in_band_error_payload(chunk)
+                if error is not None:
+                    raise StreamedAPIError(
+                        str(error.get("message") or error.get("type") or "Provider stream failed"),
+                        data={"error": error},
+                    )
                 usage = _usage_from_sse_string(chunk)
                 return ProcessedChunk(sse_string=chunk if chunk.endswith("\n\n") else f"{chunk}\n\n", usage=usage)
         if hasattr(chunk, "model_dump"):
@@ -730,6 +737,13 @@ class StreamingHandler:
             chunk_dict = chunk.dict()
         else:
             chunk_dict = chunk
+
+        error = self._in_band_error_payload(chunk_dict)
+        if error is not None:
+            raise StreamedAPIError(
+                str(error.get("message") or error.get("type") or "Provider stream failed"),
+                data={"error": error},
+            )
 
         # Extract metadata before modifying. Providers can report cost as a
         # sibling of `usage`, so keep those fields attached for normalization.
@@ -797,6 +811,46 @@ class StreamingHandler:
             finish_reason=finish_reason,
             has_tool_calls=chunk_has_tool_calls,
         )
+
+    @classmethod
+    def _in_band_error_payload(cls, chunk: Any) -> Optional[Dict[str, Any]]:
+        """Return a structured provider error embedded in a stream frame."""
+
+        event_name = None
+        payload = chunk
+        if isinstance(chunk, str):
+            event_names = [line[6:].strip() for line in chunk.splitlines() if line.startswith("event:")]
+            event_name = event_names[-1] if event_names else None
+            data_payloads = cls._sse_data_payloads(chunk)
+            if not data_payloads:
+                return None
+            try:
+                payload = json.loads(data_payloads[-1])
+            except json.JSONDecodeError:
+                if event_name == "error":
+                    return {"type": "upstream_error", "message": data_payloads[-1]}
+                return None
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return deepcopy(error)
+        if error is not None:
+            return {"type": "upstream_error", "message": str(error)}
+        event_type = str(event_name or payload.get("event_type") or payload.get("type") or "")
+        if event_type == "response.failed":
+            response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+            nested = response.get("error")
+            if isinstance(nested, dict):
+                return deepcopy(nested)
+        if event_type in {"error", "response.error"}:
+            result = deepcopy(payload)
+            result.pop("event_type", None)
+            if result.get("type") in {None, "error", "response.error"}:
+                result["type"] = str(result.get("error_type") or "upstream_error")
+            result.setdefault("message", "Provider stream failed")
+            return result
+        return None
 
     def _try_extract_error(
         self,

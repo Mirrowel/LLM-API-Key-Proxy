@@ -64,14 +64,14 @@ class FakeHttpxClient:
 
 @pytest.mark.asyncio
 async def test_native_http_transport_streams_httpx_lines() -> None:
-    response = FakeStreamResponse(["", ": heartbeat", 'data: {"delta":"hi"}', "data: [DONE]"])
+    response = FakeStreamResponse(["", ": heartbeat", "event: content_block_delta", 'data: {"delta":', 'data: "hi"}', "", "data: [DONE]", ""])
     client = FakeHttpxClient(response)
 
     chunks = [chunk async for chunk in NativeHTTPTransport(client).stream_json_lines("https://example.test/stream", headers={"h": "v"}, payload={"p": True})]
 
     assert client.calls == [("POST", "https://example.test/stream", {"h": "v"}, {"p": True})]
     assert response.raised is True
-    assert chunks == [{"delta": "hi"}, "[DONE]"]
+    assert chunks == [{"delta": "hi", "type": "content_block_delta"}, "[DONE]"]
 
 
 class FakeByteResponse:
@@ -79,12 +79,13 @@ class FakeByteResponse:
         pass
 
     async def aiter_bytes(self):
-        yield b'data: {"a": 1}\n\n'
-        yield b'data: [DONE]\n'
+        yield b'event: response.output_text.delta\ndata: {"a":'
+        yield b' 1}\n\ndata: [DO'
+        yield b'NE]\n\n'
 
 
 @pytest.mark.asyncio
 async def test_native_http_transport_streams_httpx_bytes() -> None:
     chunks = [chunk async for chunk in NativeHTTPTransport(FakeHttpxClient(FakeByteResponse())).stream_json_lines("url", headers={}, payload={})]
 
-    assert chunks == [{"a": 1}, "[DONE]"]
+    assert chunks == [{"a": 1, "type": "response.output_text.delta"}, "[DONE]"]

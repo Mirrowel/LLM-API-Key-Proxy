@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, NoReturn, Optional
 
 from ..protocols import ProtocolContext, get_protocol
+from ..protocols.streaming import ProtocolStreamConverter
 from ..streaming import StreamEvent, StreamMonitor
 from ..config.experimental import get_stream_runtime_settings
 from ..client.scopes import derive_session_isolation_key
@@ -341,6 +342,19 @@ class ResponsesService:
     ) -> AsyncGenerator[str, None]:
         """Stream a Responses API request as HTTP SSE events."""
 
+        if hasattr(client, "agenerate"):
+            async for frame in self._stream_native_response(
+                raw_request,
+                client,
+                request=request,
+                transaction_logger=transaction_logger,
+                transport=transport,
+                request_scope=request_scope,
+                previous_response_access_token=previous_response_access_token,
+            ):
+                yield frame
+            return
+
         formatter = ResponsesSSEFormatter()
         async for event in self.stream_events(
             raw_request,
@@ -372,6 +386,125 @@ class ResponsesService:
                     scrub_strings=True,
                 )
             yield formatted
+
+    async def _stream_native_response(
+        self,
+        raw_request: dict[str, Any],
+        client: Any,
+        *,
+        request: Optional[Any],
+        transaction_logger: Optional[Any],
+        transport: str,
+        request_scope: Optional[ResponsesRequestScope],
+        previous_response_access_token: Optional[str],
+    ) -> AsyncGenerator[str, None]:
+        """Stream through the canonical runtime while retaining Responses storage."""
+
+        stream_request = dict(raw_request)
+        stream_request["stream"] = True
+        resolved_scope = self._resolve_request_scope(stream_request, request_scope)
+        unified = self.protocol.parse_request(
+            stream_request,
+            ProtocolContext(source_protocol="responses", transport=transport),
+        )
+        parent = await self._load_previous_response(
+            unified.previous_response_id,
+            transaction_logger,
+            expected_scope_key=resolved_scope.key,
+            access_token=previous_response_access_token,
+        )
+        parent_lineage = await self._load_response_lineage(
+            parent,
+            expected_scope_key=resolved_scope.key,
+        )
+        native_request = _expanded_responses_request(stream_request, parent_lineage)
+        session_hints = responses_session_hints(unified.previous_response_id)
+        session_info: dict[str, Any] = {
+            "scope_access_hash": resolved_scope.access_token_hash,
+        }
+        selected_output = (
+            client.resolve_output_protocol(
+                stream_request,
+                input_protocol="responses",
+                request=request,
+            )
+            if hasattr(client, "resolve_output_protocol")
+            else "responses"
+        )
+        self._trace(
+            transaction_logger,
+            "responses_native_protocol_stream_request",
+            _redact_sensitive_fields(native_request),
+            direction="request",
+            stage="protocol",
+            metadata={"lineage_depth": len(parent_lineage), "selected_output": selected_output},
+        )
+        response_stream = await client.agenerate(
+            native_request,
+            input_protocol="responses",
+            output_protocol="responses",
+            request=request,
+            _disable_provider_continuation=bool(parent_lineage),
+            **_routing_kwargs(raw_request),
+            **_internal_client_kwargs(client, session_hints, session_info),
+        )
+        response_context = ProtocolContext(
+            model=unified.model,
+            source_protocol="responses",
+            target_protocol=selected_output,
+            input_protocol="responses",
+            provider_protocol="responses",
+            output_protocol=selected_output,
+            transport=transport,
+            provider_state_compatible=False,
+        )
+        converter = (
+            ProtocolStreamConverter(
+                self.protocol,
+                get_protocol(selected_output),
+                response_context,
+            )
+            if selected_output != "responses"
+            else None
+        )
+        completed = False
+        async for raw_frame in response_stream:
+            if isinstance(raw_frame, str) and raw_frame.lstrip().startswith(":"):
+                yield raw_frame
+                continue
+            event = self.protocol.parse_stream_event(raw_frame, response_context)
+            payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
+            response_payload = payload.get("response") if isinstance(payload, dict) and isinstance(payload.get("response"), dict) else None
+            if response_payload and event.type in {"response.completed", "response.failed", "response.incomplete"}:
+                completed = True
+                _record_responses_session_anchor(session_info, response_payload)
+                self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_stream")
+                stored = await self._store_stream_response(
+                    stream_request,
+                    response_payload,
+                    parent,
+                    failed=event.type == "response.failed",
+                    transaction_logger=transaction_logger,
+                    session_info=session_info,
+                )
+                self._trace(
+                    transaction_logger,
+                    "responses_stored_stream_response" if stored else "responses_store_skipped",
+                    response_payload if stored else {"response_id": response_payload.get("id")},
+                    direction="metadata",
+                    stage="final",
+                )
+            if converter is None:
+                yield raw_frame
+            else:
+                for formatted in converter.convert(raw_frame):
+                    yield formatted
+        if not completed:
+            raise ResponsesServiceError(
+                "Responses stream ended without a terminal response event",
+                status_code=502,
+                error_type="upstream_error",
+            )
 
     async def validate_stream_request(
         self,

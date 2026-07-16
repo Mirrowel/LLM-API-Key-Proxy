@@ -1453,6 +1453,50 @@ async def gemini_generate_content(
         )
 
 
+@app.post("/v1beta/models/{model:path}:streamGenerateContent")
+@app.post("/v1/models/{model:path}:streamGenerateContent")
+async def gemini_stream_generate_content(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-compatible streaming generation through canonical routing."""
+
+    try:
+        payload = await request.json()
+        response_stream = await client.gemini_stream_generate(
+            payload,
+            model=model,
+            raw_request=request,
+        )
+        return StreamingResponse(
+            streaming_response_wrapper(request, payload, response_stream),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except (json.JSONDecodeError, ValueError, litellm.InvalidRequestError) as error:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
+        )
+    except StructuredAPIResponseError as error:
+        output_protocol = resolve_client_output_protocol(
+            client,
+            {**payload, "model": model},
+            input_protocol="gemini",
+            request=request,
+        )
+        return JSONResponse(
+            status_code=error.http_status,
+            content=error.to_protocol_payload(output_protocol),
+        )
+
+
 @app.post("/v1beta/models/{model:path}:countTokens")
 @app.post("/v1/models/{model:path}:countTokens")
 async def gemini_count_tokens(

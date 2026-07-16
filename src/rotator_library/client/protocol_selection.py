@@ -32,13 +32,14 @@ def canonical_protocol_name(value: str) -> str:
 
 
 def require_same_protocol_stream(input_protocol: str, output_protocol: str) -> None:
-    """Reject cross-protocol streams until canonical event formatting is active."""
+    """Validate that both stream protocols use canonical generative events."""
 
     source = canonical_protocol_name(input_protocol)
     target = canonical_protocol_name(output_protocol)
-    if source != target:
+    supported = {"openai_chat", "anthropic_messages", "responses", "gemini"}
+    if source not in supported or target not in supported:
         raise ValueError(
-            f"Streaming conversion from {source} to {target} is not enabled yet"
+            f"Streaming conversion from {source} to {target} is not supported"
         )
 
 

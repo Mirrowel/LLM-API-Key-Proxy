@@ -47,23 +47,27 @@ class NativeHTTPTransport:
             async with self.client.stream("POST", endpoint, headers=headers, json=payload) as response:
                 await _raise_for_http_error(response, read_stream=True)
                 if hasattr(response, "aiter_lines"):
+                    decoder = _SSELineDecoder()
                     async for line in response.aiter_lines():
-                        parsed = _parse_stream_line(line)
-                        if parsed is not None:
+                        for parsed in decoder.feed(line):
                             yield parsed
+                    for parsed in decoder.flush():
+                        yield parsed
                     return
                 if hasattr(response, "aiter_bytes"):
                     buffer = ""
+                    decoder = _SSELineDecoder()
                     async for chunk in response.aiter_bytes():
                         text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
                         buffer += text
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
-                            parsed = _parse_stream_line(line)
-                            if parsed is not None:
+                            for parsed in decoder.feed(line):
                                 yield parsed
-                    parsed = _parse_stream_line(buffer)
-                    if parsed is not None:
+                    if buffer:
+                        for parsed in decoder.feed(buffer):
+                            yield parsed
+                    for parsed in decoder.flush():
                         yield parsed
                     return
         raise NotImplementedError("Injected native HTTP client does not expose streaming support")
@@ -138,3 +142,48 @@ def _parse_stream_line(line: Any) -> Any:
         return json.loads(text)
     except json.JSONDecodeError:
         return text
+
+
+class _SSELineDecoder:
+    """Assemble SSE fields until the blank-line event delimiter."""
+
+    def __init__(self) -> None:
+        self.event_name: str | None = None
+        self.data_lines: list[str] = []
+
+    def feed(self, line: Any) -> list[Any]:
+        text = line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+        text = text.rstrip("\r")
+        if not text:
+            return self.flush()
+        if text.startswith(":"):
+            return []
+        if text.startswith("event:"):
+            self.event_name = text[len("event:") :].strip()
+            return []
+        if text.startswith("data:"):
+            self.data_lines.append(text[len("data:") :].lstrip())
+            return []
+        output = self.flush()
+        parsed = _parse_stream_line(text)
+        if parsed is not None:
+            output.append(parsed)
+        return output
+
+    def flush(self) -> list[Any]:
+        if not self.data_lines:
+            self.event_name = None
+            return []
+        text = "\n".join(self.data_lines).strip()
+        event_name = self.event_name
+        self.event_name = None
+        self.data_lines = []
+        if text == "[DONE]":
+            return ["[DONE]"]
+        try:
+            parsed: Any = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+        if isinstance(parsed, dict) and event_name and not (parsed.get("type") or parsed.get("event")):
+            parsed["type"] = event_name
+        return [parsed]

@@ -99,6 +99,24 @@ async def test_streaming_fallback_blocks_after_visible_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_streaming_fallback_blocks_after_zero_argument_responses_tool_call() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_stream(self, context):
+        attempts.append(context.provider)
+        yield 'event: response.output_item.added\ndata: {"type":"response.output_item.added","item":{"id":"fc_0","type":"function_call","call_id":"call_1","name":"lookup","arguments":""}}\n\n'
+        raise StreamFailure("rate_limit")
+
+    executor._execute_streaming = MethodType(fake_stream, executor)
+
+    with pytest.raises(StreamFailure):
+        _ = [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
+
+    assert attempts == ["codex"]
+
+
+@pytest.mark.asyncio
 async def test_streaming_fallback_trace_records_blocked_after_output(tmp_path) -> None:
     executor = RequestExecutor.__new__(RequestExecutor)
     logger = TransactionLogger("routing", "code", parent_dir=tmp_path)
@@ -128,6 +146,26 @@ async def test_streaming_fallback_treats_error_chunk_as_not_visible_output() -> 
         if len(attempts) == 1:
             yield 'data: {"error":{"type":"rate_limit"}}\n\n'
             yield "data: [DONE]\n\n"
+            return
+        yield "data: [DONE]\n\n"
+
+    executor._execute_streaming = MethodType(fake_stream, executor)
+
+    chunks = [chunk async for chunk in executor._execute_streaming_with_fallback(_context())]
+
+    assert attempts == ["codex", "openai"]
+    assert chunks == ["data: [DONE]\n\n"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_fallback_classifies_nested_responses_failure() -> None:
+    executor = RequestExecutor.__new__(RequestExecutor)
+    attempts = []
+
+    async def fake_stream(self, context):
+        attempts.append(context.provider)
+        if len(attempts) == 1:
+            yield 'event: response.failed\ndata: {"type":"response.failed","response":{"status":"failed","error":{"type":"rate_limit","message":"slow down"}}}\n\n'
             return
         yield "data: [DONE]\n\n"
 

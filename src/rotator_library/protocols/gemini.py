@@ -210,15 +210,21 @@ class GeminiProtocol(ProtocolAdapter):
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, raw=deepcopy(raw_event))
+            return UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))
         data = _as_dict(event)
+        if data.get("error") is not None:
+            return UnifiedStreamEvent(type="error", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="error", error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})
         response = self.parse_response(data, context)
         message = response.messages[0] if response.messages else None
         return UnifiedStreamEvent(
             type="message_delta" if message else "chunk",
             operation=response.operation,
+            logical_operation=OPERATION_GENERATE,
+            source_protocol=self.name,
+            native_type="gemini.chunk",
             delta=message,
             usage=response.usage,
+            stop_reason=response.stop_reason,
             raw=deepcopy(raw_event),
             extra={"payload": data, "finish_reason": response.stop_reason},
         )
@@ -539,17 +545,9 @@ def _response_operation(response: dict[str, Any], context: ProtocolContext | Non
 
 
 def _decode_sse_data(raw_event: Any) -> Any:
-    if not isinstance(raw_event, str):
-        return raw_event
-    text = raw_event.strip()
-    if text.startswith("data:"):
-        text = text[5:].strip()
-    if text == "[DONE]":
-        return text
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return raw_event
+    from .streaming import decode_sse_data
+
+    return decode_sse_data(raw_event)
 
 
 def _without(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:

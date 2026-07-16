@@ -23,7 +23,7 @@ class CodexProvider(ProviderInterface):
     provider_env_name = "codex"
     protocol_name = "responses"
     adapter_names: tuple[str, ...] = ()
-    native_streaming_supported = False
+    native_streaming_supported = True
     field_cache_rules = (
         FieldCacheRule(
             name="codex_previous_response_id",
@@ -33,6 +33,17 @@ class CodexProvider(ProviderInterface):
             inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
             metadata={
                 "purpose": "preserve Responses continuation IDs for Codex sessions",
+                "provider_continuation": True,
+            },
+        ),
+        FieldCacheRule(
+            name="codex_stream_previous_response_id",
+            source="stream_event",
+            path="raw.response.id",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
+            metadata={
+                "purpose": "preserve streamed Responses continuation IDs for Codex sessions",
                 "provider_continuation": True,
             },
         ),
@@ -74,11 +85,11 @@ class CodexProvider(ProviderInterface):
         return model.split("/", 1)[1] if model.startswith("codex/") else model
 
     def supports_native_streaming(self, model: str = "", operation: str = "responses") -> bool:
-        """Return false until the generic native stream wrapper is compatible."""
+        """Return whether Responses SSE is enabled for this model."""
 
         if self._get_runtime_config(model).native_streaming_supported is not None:
             return super().supports_native_streaming(model, operation)
-        return False
+        return operation == "responses"
 
     def prepare_native_request(self, request: dict[str, Any], model: str = "", operation: str = "") -> dict[str, Any]:
         """Apply the normalized upstream model to a Responses-native payload."""

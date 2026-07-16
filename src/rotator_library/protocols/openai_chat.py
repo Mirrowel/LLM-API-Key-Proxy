@@ -248,6 +248,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             native_type="chat.completion.chunk",
             delta=delta_message,
             usage=usage,
+            stop_reason=canonical_stop_reason(finish_reason),
             raw=deepcopy(raw_event),
             extra={
                 "id": data.get("id"),
@@ -258,32 +259,9 @@ class OpenAIChatProtocol(ProtocolAdapter):
         )
 
     def format_stream_event(self, unified_event: UnifiedStreamEvent, context: ProtocolContext | None = None) -> Any:
-        if unified_event.type == "done":
-            return "data: [DONE]\n\n"
-        if unified_event.raw is not None and (context is None or context.source_protocol in {None, "openai_chat"}):
-            payload = deepcopy(unified_event.raw)
-            if unified_event.delta is not None and isinstance(payload, dict) and isinstance(payload.get("choices"), list) and payload["choices"]:
-                choice = payload["choices"][0]
-                if isinstance(choice, dict):
-                    formatted_delta = self._format_message(unified_event.delta, preserve_source=True)
-                    original_delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-                    if "role" not in original_delta:
-                        formatted_delta.pop("role", None)
-                    choice["delta"] = formatted_delta
-            return payload
-        if unified_event.delta is not None:
-            delta = _format_response_message(self._format_message(unified_event.delta, preserve_source=False), unified_event.delta)
-            if unified_event.extra.get("finish_reason") is None:
-                delta.pop("role", None)
-            payload = {
-                "id": unified_event.extra.get("id"),
-                "object": "chat.completion.chunk",
-                "model": unified_event.extra.get("model"),
-                "choices": [{"index": 0, "delta": delta, "finish_reason": format_stop_reason(unified_event.stop_reason or unified_event.extra.get("finish_reason"), self.name)}],
-                "usage": _format_openai_usage(unified_event.usage),
-            }
-            return f"data: {json.dumps({k: v for k, v in payload.items() if v is not None})}\n\n"
-        return f"data: {json.dumps(unified_event.to_dict())}\n\n"
+        from .streaming import format_canonical_stream_event
+
+        return format_canonical_stream_event(unified_event, self.name, context)
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):
@@ -617,17 +595,9 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _decode_sse_data(raw_event: Any) -> Any:
-    if not isinstance(raw_event, str):
-        return raw_event
-    text = raw_event.strip()
-    if text.startswith("data:"):
-        text = text[5:].strip()
-    if text == "[DONE]":
-        return text
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return raw_event
+    from .streaming import decode_sse_data
+
+    return decode_sse_data(raw_event)
 
 
 def _extract_reasoning(payload: dict[str, Any]) -> list[ReasoningBlock]:
