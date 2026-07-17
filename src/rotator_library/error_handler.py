@@ -23,6 +23,23 @@ from litellm.exceptions import (
 
 lib_logger = logging.getLogger("rotator_library")
 
+_CONTEXT_WINDOW_ERROR_PATTERNS = (
+    "context_length",
+    "context length",
+    "max_tokens",
+    "token limit",
+    "context window",
+    "too many tokens",
+    "too long",
+)
+
+
+def is_context_window_error_text(value: Any) -> bool:
+    """Return whether provider text describes an oversized context request."""
+
+    normalized = str(value or "").lower()
+    return any(pattern in normalized for pattern in _CONTEXT_WINDOW_ERROR_PATTERNS)
+
 
 def _parse_duration_string(duration_str: str) -> Optional[int]:
     """
@@ -946,17 +963,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             )
         if status_code == 400:
             # Check for context window / token limit errors with more specific patterns
-            if any(
-                pattern in error_body
-                for pattern in [
-                    "context_length",
-                    "max_tokens",
-                    "token limit",
-                    "context window",
-                    "too many tokens",
-                    "too long",
-                ]
-            ):
+            if is_context_window_error_text(error_body):
                 return ClassifiedError(
                     error_type="context_window_exceeded",
                     original_exception=e,

@@ -7,7 +7,7 @@ from rotator_library.providers.provider_interface import ProviderInterface
 from rotator_library.providers import PROVIDER_PLUGINS, _create_dynamic_plugin_class, _register_providers
 from rotator_library.client.rotating_client import _add_configured_no_auth_credentials
 from rotator_library.client.scopes import NO_AUTH_CREDENTIAL, ScopeManager
-from rotator_library.config.experimental import load_config_from_mapping
+from rotator_library.config.experimental import ExperimentalConfigError, load_config_from_mapping
 from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
 from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.providers.copilot_provider import CopilotProvider
@@ -222,6 +222,15 @@ def test_custom_provider_rejects_non_generative_protocol(tmp_path, monkeypatch) 
 
     with pytest.raises(ValueError, match="supported generative protocol"):
         _register_providers()
+
+
+def test_builtin_provider_rejects_non_generative_protocol_override() -> None:
+    with pytest.raises(ExperimentalConfigError, match="supported generative protocol"):
+        load_config_from_mapping({
+            "providers": {
+                "claude_code": {"protocol_name": "openai_embeddings"}
+            }
+        })
 
 
 def test_dynamic_provider_transport_config_is_snapshotted_at_construction(tmp_path, monkeypatch) -> None:

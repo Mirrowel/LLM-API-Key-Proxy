@@ -133,14 +133,14 @@ litellm.suppress_debug_info = True
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
-    from rotator_library.client.protocol_selection import require_same_protocol_stream, resolve_client_output_protocol
+    from rotator_library.client.protocol_selection import format_client_protocol_error, require_same_protocol_stream, resolve_client_output_protocol
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from rotator_library.responses import ResponsesService, ResponsesServiceError
-    from rotator_library.core.errors import StructuredAPIResponseError, is_structured_error_payload
+    from rotator_library.core.errors import StructuredAPIResponseError
     from rotator_library.transaction_logger import TransactionLogger
 
 print("  → Discovering provider plugins...")
@@ -710,6 +710,8 @@ async def verify_anthropic_api_key(
     Dependency to verify API key for Anthropic endpoints.
     Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
     """
+    if not PROXY_API_KEY:
+        return x_api_key or auth
     # Check x-api-key first (Anthropic style)
     if x_api_key and x_api_key == PROXY_API_KEY:
         return x_api_key
@@ -930,12 +932,22 @@ async def chat_completions(
     """
     # Raw I/O logger captures unmodified HTTP data at proxy boundary (disabled by default)
     raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    request_data: dict[str, Any] = {}
     try:
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+            status, content = format_client_protocol_error(
+                client,
+                request_data,
+                input_protocol="openai_chat",
+                request=request,
+                error="Invalid JSON in request body.",
+                error_type="invalid_request",
+                status_code=400,
+            )
+            return JSONResponse(status_code=status, content=content)
 
         # Global temperature=0 override (controlled by .env variable, default: OFF)
         # Low temperature makes models deterministic and prone to following training data
@@ -1015,14 +1027,6 @@ async def chat_completions(
                 request=request,
             )
 
-            if is_structured_error_payload(response):
-                if raw_logger:
-                    raw_logger.log_final_response(
-                        status_code=429, headers=None, body=response
-                    )
-                error_detail = response.get("error", {}).get("message", str(response))
-                raise HTTPException(status_code=429, detail=error_detail)
-
             if raw_logger:
                 response_headers = (
                     response.headers if hasattr(response, "headers") else None
@@ -1050,17 +1054,50 @@ async def chat_completions(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+        status, content = format_client_protocol_error(
+            client,
+            request_data if isinstance(request_data, dict) else {},
+            input_protocol="openai_chat",
+            request=request,
+            error=e,
+            error_type=(
+                "context_window_exceeded"
+                if isinstance(e, litellm.ContextWindowExceededError)
+                else "invalid_request"
+            ),
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+        status, content = format_client_protocol_error(
+            client, request_data, input_protocol="openai_chat", request=request,
+            error=e, error_type="authentication", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+        status, content = format_client_protocol_error(
+            client, request_data, input_protocol="openai_chat", request=request,
+            error=e, error_type="rate_limit", status_code=429,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+        status, content = format_client_protocol_error(
+            client, request_data, input_protocol="openai_chat", request=request,
+            error=e, error_type="server_error", status_code=503,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+        status, content = format_client_protocol_error(
+            client, request_data, input_protocol="openai_chat", request=request,
+            error=e, error_type="proxy_timeout", status_code=504,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
+        status, content = format_client_protocol_error(
+            client, request_data, input_protocol="openai_chat", request=request,
+            error=e, error_type="server_error", status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Request failed after all retries: {e}")
         # Optionally log the failed request
@@ -1073,7 +1110,16 @@ async def chat_completions(
                 raw_logger.log_final_response(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = format_client_protocol_error(
+            client,
+            request_data if isinstance(request_data, dict) else {},
+            input_protocol="openai_chat",
+            request=request,
+            error=e,
+            error_type="internal_error",
+            status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 def _responses_error_response(
@@ -1099,7 +1145,16 @@ async def responses_create(
     try:
         request_data = await request.json()
     except json.JSONDecodeError:
-        return JSONResponse(status_code=400, content={"error": {"message": "Invalid JSON in request body.", "type": "invalid_request_error", "code": 400}})
+        status, content = format_client_protocol_error(
+            client,
+            {},
+            input_protocol="responses",
+            request=request,
+            error="Invalid JSON in request body.",
+            error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     if logger:
         logger.log_request(
             headers=dict(request.headers),
@@ -1113,8 +1168,16 @@ async def responses_create(
             request=request,
         )
     except ValueError as e:
-        payload = _responses_error_response(ResponsesServiceError(str(e), status_code=400))
-        return JSONResponse(status_code=400, content=payload)
+        status, content = format_client_protocol_error(
+            client,
+            request_data,
+            input_protocol="responses",
+            request=request,
+            error=e,
+            error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
     try:
         request_scope = service.prepare_request_scope(request_data)
@@ -1252,8 +1315,8 @@ async def anthropic_messages(
     """
     Anthropic-compatible Messages API endpoint.
 
-    Accepts requests in Anthropic's format and returns responses in Anthropic's format.
-    Internally translates to OpenAI format for processing via LiteLLM.
+    Accepts Anthropic requests and returns the selected client protocol through
+    the shared canonical runtime.
 
     This endpoint is compatible with Claude Code and other Anthropic API clients.
     """
@@ -1324,35 +1387,41 @@ async def anthropic_messages(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=400, detail=error_response)
+        status, content = format_client_protocol_error(
+            client, body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages", request=request, error=e,
+            error_type=("context_window_exceeded" if isinstance(e, litellm.ContextWindowExceededError) else "invalid_request"),
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "authentication_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=401, detail=error_response)
+        status, content = format_client_protocol_error(
+            client, body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages", request=request, error=e,
+            error_type="authentication", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "rate_limit_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=429, detail=error_response)
+        status, content = format_client_protocol_error(
+            client, body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages", request=request, error=e,
+            error_type="rate_limit", status_code=429,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=503, detail=error_response)
+        status, content = format_client_protocol_error(
+            client, body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages", request=request, error=e,
+            error_type="server_error", status_code=503,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": f"Request timed out: {str(e)}"},
-        }
-        raise HTTPException(status_code=504, detail=error_response)
+        status, content = format_client_protocol_error(
+            client, body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages", request=request, error=e,
+            error_type="proxy_timeout", status_code=504,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Anthropic messages endpoint error: {e}")
         if logger:
@@ -1361,11 +1430,12 @@ async def anthropic_messages(
                 headers=None,
                 body={"error": str(e)},
             )
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=500, detail=error_response)
+        status, content = format_client_protocol_error(
+            client, body.model_dump(exclude_none=True),
+            input_protocol="anthropic_messages", request=request, error=e,
+            error_type="internal_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 # --- Anthropic Count Tokens Endpoint ---
@@ -1424,13 +1494,16 @@ async def gemini_generate_content(
 ):
     """Gemini-compatible generation endpoint using protocol-native routing."""
 
+    payload: dict[str, Any] = {}
     try:
         payload = await request.json()
     except json.JSONDecodeError:
-        return JSONResponse(
+        status, content = format_client_protocol_error(
+            client, payload, input_protocol="gemini", request=request,
+            error="Invalid JSON in request body.", error_type="invalid_request",
             status_code=400,
-            content={"error": {"code": 400, "message": "Invalid JSON in request body.", "status": "INVALID_ARGUMENT"}},
         )
+        return JSONResponse(status_code=status, content=content)
     try:
         if payload.get("stream"):
             raise ValueError(
@@ -1447,10 +1520,19 @@ async def gemini_generate_content(
         )
         return JSONResponse(status_code=error.http_status, content=error.to_protocol_payload(output_protocol))
     except (ValueError, litellm.InvalidRequestError) as error:
-        return JSONResponse(
+        status, content = format_client_protocol_error(
+            client, {**payload, "model": model}, input_protocol="gemini",
+            request=request, error=error, error_type="invalid_request",
             status_code=400,
-            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
         )
+        return JSONResponse(status_code=status, content=content)
+    except Exception as error:
+        status, content = format_client_protocol_error(
+            client, {**payload, "model": model}, input_protocol="gemini",
+            request=request, error=error, error_type="internal_error",
+            status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1beta/models/{model:path}:streamGenerateContent")
@@ -1463,6 +1545,7 @@ async def gemini_stream_generate_content(
 ):
     """Gemini-compatible streaming generation through canonical routing."""
 
+    payload: dict[str, Any] = {}
     try:
         payload = await request.json()
         response_stream = await client.gemini_stream_generate(
@@ -1480,10 +1563,12 @@ async def gemini_stream_generate_content(
             },
         )
     except (json.JSONDecodeError, ValueError, litellm.InvalidRequestError) as error:
-        return JSONResponse(
+        status, content = format_client_protocol_error(
+            client, {**payload, "model": model}, input_protocol="gemini",
+            request=request, error=error, error_type="invalid_request",
             status_code=400,
-            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
         )
+        return JSONResponse(status_code=status, content=content)
     except StructuredAPIResponseError as error:
         output_protocol = resolve_client_output_protocol(
             client,
@@ -1495,6 +1580,13 @@ async def gemini_stream_generate_content(
             status_code=error.http_status,
             content=error.to_protocol_payload(output_protocol),
         )
+    except Exception as error:
+        status, content = format_client_protocol_error(
+            client, {**payload, "model": model}, input_protocol="gemini",
+            request=request, error=error, error_type="internal_error",
+            status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1beta/models/{model:path}:countTokens")

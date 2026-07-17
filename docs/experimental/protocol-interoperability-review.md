@@ -44,7 +44,11 @@ Providers must not need to know which protocol the client used. A provider decla
 
 Custom providers configured at runtime must be able to declare a supported provider protocol. Custom integrations must also be able to select an output protocol rather than being limited to OpenAI-compatible output.
 
-## Review Verdict
+## Original Review Verdict (Superseded)
+
+The following verdict and reproduced failures describe the branch before the
+Phase A-H correction. They are retained as the audit baseline, not as current
+behavior. The current beta-readiness verdict is recorded in the final checkpoint.
 
 The existing branch contains useful protocol primitives but does not implement the product contract end to end.
 
@@ -419,7 +423,7 @@ State: **completed**
 
 ### Phase H: Independent review and correction
 
-State: **in progress**
+State: **completed**
 
 - Run an `explore` mapping review after implementation appears complete.
 - Run an `explore-heavy` reasoning review after implementation appears complete.
@@ -668,9 +672,57 @@ This correction is complete only when:
   config verification passes 298 tests; `compileall` and `git diff --check` pass
   apart from repository line-ending notices.
 
+### 2026-07-17: Final whole-system interoperability verdict
+
+- Re-ran the complete client-input x provider-protocol x selected-output
+  contract for non-streaming and streaming behavior, including native,
+  LiteLLM, and custom execution; public Chat, Anthropic, Responses, and Gemini
+  routes; fallback and credential rotation; Responses storage/continuation;
+  provider state; startup config; and non-generative protocol regressions.
+- Proxy-side validation, authentication, capacity, timeout, context-window,
+  and internal failures now use the selected output protocol on every
+  generative route. Malformed Responses JSON honors an Anthropic or Gemini
+  selector, and an invalid selector fails with status 400 in the input
+  protocol rather than producing an internal error.
+- Context-window phrase classification is shared by HTTP and structured native
+  errors, including the common `Context length exceeded` form, so oversized
+  requests do not rotate credentials or enter route fallback.
+- Both custom and code-backed provider `protocol_name` overrides are restricted
+  at configuration validation to Chat, Responses, Anthropic Messages, or
+  Gemini. Non-generative adapters remain independently available for their
+  dedicated operations but cannot be misdeclared as a generative provider.
+- Anthropic authentication now honors open-access mode when no proxy API key is
+  configured, matching Chat and Gemini behavior.
+- Removed the obsolete Chat returned-error-dictionary branch. Structured
+  runtime errors are raised and formatted once, rather than guessed from a
+  successful dictionary response.
+- The tracked suite plus the relevant local-only transaction, error-handler,
+  and session-forwarding suites pass 1,046 tests and 18 subtests. Five known
+  `datetime.utcnow()` deprecation warnings remain. `compileall` and
+  `git diff --check` pass apart from repository line-ending notices.
+- The ignored `tests/refactor/` directory is a historical parity suite: 115
+  tests still pass and 14 assert superseded cap encodings, state layouts,
+  transform defaults, or removed private executor methods. It is not used as
+  current product evidence; current tracked replacements cover those systems.
+- Final repeated `explore` and `explore-heavy` reviews report no unresolved
+  blocker, high, or medium findings and explicitly approve the protocol work
+  as beta-ready.
+- Intentional low-risk boundaries: raw provider transaction captures remain
+  complete, local, opt-in diagnostics while field-cache traces and all client
+  output redact opaque state; Gemini token counting is locally estimated;
+  streaming media/structured-output combinations do not have dedicated matrix
+  cells beyond the canonical text/reasoning/tool lifecycle coverage.
+
+**Verdict: the four-protocol interoperability core is beta-ready.** The original
+review failures are corrected end to end: input, provider, and output languages
+are independent; required meaning is preserved or rejected before transport;
+streaming and errors use the selected client language; provider state remains
+isolated; and configured providers declare one supported native language
+without learning the client's language.
+
 ### Current next action
 
-Commit Phase G, then execute Phase H whole-system verification across protocol
-matrices, public routes, native/LiteLLM/custom execution, fallback and retry,
-continuation/storage, transaction logging, startup configuration, and active
-documentation before issuing the beta-readiness verdict.
+Protocol interoperability Phases A-H are complete and beta-ready. No protocol
+implementation work remains in this review packet. Continue the wider
+experimental-branch beta review with the next concern (transaction/transform
+observability noise) only as a separate packet.

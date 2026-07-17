@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from rotator_library.error_handler import ClassifiedError, PreRequestCallbackError, classify_error
+from rotator_library.core.errors import structured_api_response_error
 from rotator_library.retry_policy import (
     FailureHistory,
     classify_route_error,
@@ -233,6 +234,15 @@ def test_shared_classifier_handles_structured_dict_type_and_code_text() -> None:
     assert classify_error({"error": {"code": "context_length_exceeded"}}).error_type == "context_window_exceeded"
     assert classify_error({"error": {"status_code": 400, "code": "context_length_exceeded"}}).error_type == "context_window_exceeded"
     assert classify_error({"error": {"type": "rate_limit"}}).error_type == "rate_limit"
+
+
+def test_structured_context_length_error_is_not_generic_invalid_request() -> None:
+    error = structured_api_response_error({
+        "error": {"status_code": 400, "message": "Context length exceeded"}
+    })
+
+    assert error is not None
+    assert error.error_type == "context_window_exceeded"
 
 
 def test_shared_classifier_preserves_explicit_error_type_attributes() -> None:
