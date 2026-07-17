@@ -34,6 +34,7 @@ from ..error_handler import (
     is_rate_limit_error,
     is_server_error,
     is_unrecoverable_error,
+    is_context_window_error_text,
     # Constants
     ABNORMAL_ERROR_TYPES,
     NORMAL_ERROR_TYPES,
@@ -90,6 +91,7 @@ class StructuredAPIResponseError(Exception):
             "rate_limit": 429,
             "quota_exceeded": 429,
             "invalid_request": 400,
+            "context_window_exceeded": 400,
             "server_error": 502,
             "proxy_timeout": 504,
             "proxy_all_credentials_exhausted": 503,
@@ -107,6 +109,7 @@ class StructuredAPIResponseError(Exception):
                 "rate_limit": "rate_limit_error",
                 "quota_exceeded": "rate_limit_error",
                 "invalid_request": "invalid_request_error",
+                "context_window_exceeded": "invalid_request_error",
                 "not_found": "not_found_error",
             }.get(self.error_type, "api_error")
             return {"type": "error", "error": {"type": error_type, "message": message}}
@@ -117,6 +120,7 @@ class StructuredAPIResponseError(Exception):
                 "rate_limit": "RESOURCE_EXHAUSTED",
                 "quota_exceeded": "RESOURCE_EXHAUSTED",
                 "invalid_request": "INVALID_ARGUMENT",
+                "context_window_exceeded": "INVALID_ARGUMENT",
                 "not_found": "NOT_FOUND",
                 "proxy_timeout": "DEADLINE_EXCEEDED",
                 "proxy_all_credentials_exhausted": "UNAVAILABLE",
@@ -164,7 +168,9 @@ def structured_api_response_error(
         str(details.get(key) or "")
         for key in ("type", "status", "code", "message")
     ).lower()
-    if status_code == 429 or any(token in descriptor for token in ("rate", "quota", "resource_exhausted")):
+    if is_context_window_error_text(descriptor):
+        error_type = "context_window_exceeded"
+    elif status_code == 429 or any(token in descriptor for token in ("rate", "quota", "resource_exhausted")):
         error_type = "quota_exceeded" if "quota" in descriptor or "resource_exhausted" in descriptor else "rate_limit"
     elif status_code == 401 or "auth" in descriptor or "unauthorized" in descriptor or "unauthenticated" in descriptor:
         error_type = "authentication"
@@ -190,6 +196,23 @@ def is_structured_error_payload(response) -> bool:
     return isinstance(response, dict) and "error" in response and response.get("error") not in (None, "", False)
 
 
+def protocol_error_payload(
+    error: BaseException | str,
+    protocol: str,
+    *,
+    error_type: str,
+    status_code: int,
+) -> tuple[int, dict]:
+    """Render one proxy-side terminal failure in the selected client protocol."""
+
+    structured = StructuredAPIResponseError(
+        str(error),
+        error_type=error_type,
+        status_code=status_code,
+    )
+    return structured.http_status, structured.to_protocol_payload(protocol)
+
+
 __all__ = [
     # Exception classes
     "NoAvailableKeysError",
@@ -201,6 +224,7 @@ __all__ = [
     "StructuredAPIResponseError",
     "structured_api_response_error",
     "is_structured_error_payload",
+    "protocol_error_payload",
     # Error classification
     "ClassifiedError",
     "RequestErrorAccumulator",

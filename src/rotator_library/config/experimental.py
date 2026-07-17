@@ -320,7 +320,7 @@ def get_provider_runtime_config(
     if not isinstance(raw, Mapping) or not raw:
         return ProviderRuntimeConfig()
     _validate_provider_sections({provider: raw})
-    protocol_name = _configured_protocol(raw.get("protocol_name"))
+    protocol_name = _configured_provider_protocol(raw.get("protocol_name"))
     adapter_names = _configured_adapters(raw.get("adapter_names"))
     adapter_config = _configured_adapter_config(raw.get("adapter_config", {}))
     native_streaming_supported = None
@@ -458,7 +458,7 @@ def _validate_provider_sections(value: Any) -> None:
         unsupported = set(str(key) for key in raw) - _PROVIDER_CONFIG_KEYS
         if unsupported:
             raise ExperimentalConfigError(f"providers.{provider} contains unsupported keys: {', '.join(sorted(unsupported))}")
-        _configured_protocol(raw.get("protocol_name"))
+        _configured_provider_protocol(raw.get("protocol_name"))
         _configured_output_protocol(raw.get("default_output_protocol"))
         _configured_adapters(raw.get("adapter_names"))
         _configured_adapter_config(raw.get("adapter_config", {}))
@@ -504,6 +504,22 @@ def _configured_output_protocol(value: Any) -> Optional[str]:
     }:
         raise ExperimentalConfigError(
             f"default_output_protocol must be a generative protocol, got {protocol_name!r}"
+        )
+    return protocol_name
+
+
+def _configured_provider_protocol(value: Any) -> Optional[str]:
+    """Return one protocol supported by the generative provider runtime."""
+
+    protocol_name = _configured_protocol(value)
+    if protocol_name and protocol_name not in {
+        "openai_chat",
+        "responses",
+        "anthropic_messages",
+        "gemini",
+    }:
+        raise ExperimentalConfigError(
+            f"protocol_name must be a supported generative protocol, got {protocol_name!r}"
         )
     return protocol_name
 
