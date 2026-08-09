@@ -1150,7 +1150,7 @@ The library handles provider idiosyncrasies through specialized "Provider" class
 The MiniMax provider exposes the built-in `MiniMax-M3` and `MiniMax-M2.7`
 models while preserving additional models returned by the provider's model
 discovery endpoint. Native model metadata includes context limits, pricing,
-input modalities, tool use, interleaved thinking, and tiered pricing for the
+input modalities, tool use, and interleaved thinking for the
 `/v1/models` and cost APIs.
 
 Configure the upstream region and protocol with these environment variables:

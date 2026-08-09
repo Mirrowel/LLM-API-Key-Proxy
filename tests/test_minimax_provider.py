@@ -103,7 +103,9 @@ class MiniMaxProviderTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(metadata)
         self.assertEqual(metadata.limits.context_window, 1_000_000)
-        self.assertEqual(metadata.pricing.prompt, 0.3 / 1_000_000)
+        self.assertEqual(metadata.pricing.prompt, 0.6 / 1_000_000)
+        self.assertEqual(metadata.pricing.completion, 2.4 / 1_000_000)
+        self.assertEqual(metadata.pricing.cached_input, 0.12 / 1_000_000)
         self.assertEqual(metadata.input_types, ["text", "image", "video"])
         self.assertTrue(metadata.capabilities.tools)
         self.assertTrue(metadata.capabilities.functions)
@@ -111,8 +113,7 @@ class MiniMaxProviderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             metadata.capabilities.thinking_modes, ["adaptive", "disabled"]
         )
-        self.assertEqual(len(metadata.pricing.tiers), 4)
-        self.assertEqual(metadata.pricing.tiers[1]["prompt"], 0.6 / 1_000_000)
+        self.assertFalse(metadata.pricing.tiers)
 
         secondary = registry.lookup("minimax/MiniMax-M2.7")
         self.assertIsNotNone(secondary)
@@ -164,9 +165,3 @@ class MiniMaxProviderTests(unittest.IsolatedAsyncioTestCase):
             endpoint = get_minimax_endpoint(protocol=ANTHROPIC_PROTOCOL)
 
         self.assertEqual(endpoint, "https://api.minimax.io/anthropic")
-
-    async def test_long_context_uses_standard_pricing_tier(self):
-        registry = ModelRegistry()
-        cost = registry.compute_cost("minimax/MiniMax-M3", 512_001, 1)
-
-        self.assertAlmostEqual(cost, (512_001 * 0.6 + 2.4) / 1_000_000)
