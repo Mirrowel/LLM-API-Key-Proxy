@@ -22,6 +22,7 @@
     "uniq*": "allow",
     "mkdir*": "allow",
     "touch*": "allow",
+    "date*": "allow",
     "sed*": "allow",
     "awk*": "allow",
     "diff*": "allow",
