@@ -536,6 +536,9 @@ jobs:
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
           cp .github/prompts/pr-review.md /tmp/pr-review.md
+          cp .github/prompts/pr-review-protocol-first.md /tmp/pr-review-protocol-first.md
+          cp .github/prompts/pr-review-protocol-followup.md /tmp/pr-review-protocol-followup.md
+          cp .github/prompts/pr-review-tail.md /tmp/pr-review-tail.md
 
       - name: Checkout PR head
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
@@ -660,17 +663,22 @@ jobs:
           PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
           REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
         run: |
-          # Build DIFF_FILE_PATH pointing to the generated diff in the repository workspace
+          # Build DIFF_FILE_PATH pointing to the generated diff in the repository
+          # workspace, and select the matching protocol section. Only the selected
+          # protocol is included in the assembled prompt, so the review type can
+          # never read as contradictory.
           if [ "$IS_FIRST_REVIEW" = "true" ]; then
             DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+            PROTOCOL_FILE=/tmp/pr-review-protocol-first.md
           else
             DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+            PROTOCOL_FILE=/tmp/pr-review-protocol-followup.md
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
           # Prepend the security brief (with the verified requester context line)
-          { envsubst '$REQUESTER_CONTEXT' < /tmp/security-brief.md; DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS" < /tmp/pr-review.md; } > "$TMP_DIR/assembled_prompt.txt"
+          { envsubst '$REQUESTER_CONTEXT' < /tmp/security-brief.md; cat /tmp/pr-review.md "$PROTOCOL_FILE" /tmp/pr-review-tail.md | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
           echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
           # Clear small, now-redundant flags included in the context summary
