@@ -6,7 +6,7 @@
 - `gh pr comment <number> --repo <owner/repo> --body "<text>"` - Post comments to the PR
 - `gh api <endpoint> --method <METHOD> -H "Accept: application/vnd.github+json" --input -` - Make GitHub API calls
 - `gh pr view <number> --repo <owner/repo> --json <fields>` - Fetch PR metadata
-- All `gh` commands are allowed by OPENCODE_PERMISSION and have GITHUB_TOKEN set
+- All `gh` commands are allowed by the agent permission profile and have GITHUB_TOKEN set
 
 **Git Commands:**
 - The PR code is checked out at HEAD - you are in the working directory
@@ -61,6 +61,7 @@ Your actions are constrained by the permissions granted to your underlying GitHu
 **Job-Level Permissions (via workflow token):**
 - contents: read
 - pull-requests: write
+- statuses: write (compliance pending status)
 
 **GitHub App Permissions (via App installation):**
 - contents: read & write

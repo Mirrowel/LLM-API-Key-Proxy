@@ -1,0 +1,98 @@
+# ============================================================================
+# PR REVIEW TRIGGER (stub)
+# ============================================================================
+# Purpose: restores automatic PR reviews (instant, event-driven) without the
+#          pull_request_target secret-exposure hole that the old PR Review
+#          workflow had.
+#
+# SECURITY MODEL — READ BEFORE EDITING:
+#   pull_request_target executes THIS FILE from the PR's BASE branch. Any
+#   branch can be a base (including bot-created feature branches), so assume
+#   an attacker-influenced copy of this file can run. This workflow is safe
+#   ONLY in its honest form, and the honest copy's ceiling is:
+#     - ZERO secrets referenced (worst case: review-timing control + status
+#       noise with a 1-hour token).
+#   A TAMPERED copy of this file on an attacker-influenced branch is a
+#   platform-level exposure that this design accepts (same exposure the
+#   original status-check-init.yml had): a tampered pull_request_target copy
+#   can declare its own permissions block and reference repo secrets by name.
+#   The defense is preventing tampered branches (agent edit-denies on .github,
+#   scrub taint alarms, merge scrutiny), not this file.
+#   All privileged logic lives in PR Review, which GitHub guarantees to run
+#   from the DEFAULT branch when triggered by this workflow's completion.
+#
+# Decision rules (identical to the original auto-review behavior):
+#   - PR opened (non-draft)            -> review
+#   - PR marked ready for review       -> review
+#   - PR reopened (non-draft)          -> review
+#   - Push/synchronize + 'Agent Monitored' label -> review
+#   - Everything else                  -> exit 1 (skipped; the completion
+#     event still fires, but PR Review's resolve step ignores non-success)
+# ============================================================================
+
+name: PR Review Trigger
+
+# Carries the PR number to PR Review's resolve step (workflow_run identity
+# channel: pull_requests[] is empty for fork PRs). pull_request_target events
+# always carry the PR number.
+run-name: 'AutoTrigger PR #${{ github.event.pull_request.number }}'
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  statuses: write   # pending compliance-check marker only
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    steps:
+      # continue-on-error: a failed status POST (transient API error, fork-SHA
+      # quirk) must NOT suppress the review decision — the job's conclusion
+      # must reflect ONLY the decide step (downstream contract).
+      - name: Post pending compliance status
+        if: github.event.pull_request.draft == false
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+            -f state='pending' \
+            -f context='compliance-check' \
+            -f description='run /mirrobot-check when ready to merge'
+
+      - name: Decide whether to review
+        # NOTE: never gate this step with an `if:` — a SKIPPED step still
+        # yields job conclusion 'success', which PR Review's resolve step
+        # would misread as "review wanted". Unwanted outcomes MUST exit 1.
+        env:
+          ACTION: ${{ github.event.action }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          review=false
+          if [ "$DRAFT" != "true" ]; then
+            case "$ACTION" in
+              opened|ready_for_review|reopened)
+                review=true
+                ;;
+              synchronize)
+                # Only re-review labeled PRs on push (original auto rule)
+                if printf '%s' "$LABELS_JSON" | jq -e 'map(.name) | index("Agent Monitored")' >/dev/null; then
+                  review=true
+                fi
+                ;;
+            esac
+          fi
+
+          if [ "$review" = true ]; then
+            echo "Review requested for $ACTION event."
+            exit 0
+          fi
+          echo "No review for $ACTION event (draft, or no 'Agent Monitored' label)."
+          exit 1
