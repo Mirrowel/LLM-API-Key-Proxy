@@ -216,6 +216,20 @@ jobs:
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
 
+      # Builds the factual requester context line (comment author association on
+      # issue_comment, PR author association on pull_request_target, dispatch
+      # actor otherwise) consumed by the security brief. Any user may trigger
+      # the check; this only informs the agent's judgment.
+      - name: Build requester context
+        id: requester
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: ./.github/actions/requester-context
+        with:
+          login: ${{ github.event.comment.user.login || github.event.pull_request.user.login || github.actor }}
+          association: ${{ github.event.comment.author_association || github.event.pull_request.author_association }}
+          trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
+          trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
+
       # Initialize bot credentials and OpenCode API access
       - name: Bot Setup
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
@@ -239,6 +253,7 @@ jobs:
         if: (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && github.event.action == 'ready_for_review'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          PR_HEAD_SHA_INPUT: ${{ github.event.pull_request.head.sha }}
         run: |
           echo "Triggered by ready_for_review - waiting for PR Review to complete..."
           
@@ -252,7 +267,7 @@ jobs:
               --repo ${{ github.repository }} \
               --workflow "PR Review" \
               --json status,conclusion,headSha \
-              --jq "[.[] | select(.headSha == \"${{ github.event.pull_request.head.sha }}\")][0] | {status, conclusion}")
+              --jq "[.[] | select(.headSha == \"${PR_HEAD_SHA_INPUT}\")][0] | {status, conclusion}")
             
             STATUS=$(echo "$REVIEW_STATUS" | jq -r '.status // "not_found"')
             CONCLUSION=$(echo "$REVIEW_STATUS" | jq -r '.conclusion // ""')
@@ -367,7 +382,9 @@ jobs:
       # checking out PR code. This prevents prompt injection attacks.
       - name: Save secure prompt from base branch
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
-        run: cp .github/prompts/compliance-check.md /tmp/compliance-check.md
+        run: |
+          cp .github/prompts/security-brief.md /tmp/security-brief.md
+          cp .github/prompts/compliance-check.md /tmp/compliance-check.md
 
       # NOW it's safe to checkout the PR code (untrusted)
       # The prompt is already secured in /tmp
@@ -459,18 +476,28 @@ jobs:
 
       # Create template structure for the compliance report
       # AI will fill in the analysis sections
+      #
+      # SECURITY: untrusted values (PR title, author) must never be interpolated
+      # into the shell script via ${{ }} — they are written as ${VAR} placeholders
+      # inside a quoted heredoc and substituted afterwards by envsubst, which
+      # performs no command evaluation.
       - name: Generate Report Template
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: template
+        env:
+          PR_NUMBER: ${{ env.PR_NUMBER }}
+          PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
+          PR_AUTHOR: ${{ steps.pr_info.outputs.pr_author }}
+          PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
         run: |
           cat > /tmp/report_template.md <<'TEMPLATE'
           ## 🔍 Compliance Check Results
 
           ### Status: [TO_BE_DETERMINED]
 
-          **PR**: #${{ env.PR_NUMBER }} - ${{ steps.pr_info.outputs.pr_title }}
-          **Author**: @${{ steps.pr_info.outputs.pr_author }}
-          **Commit**: ${{ steps.pr_info.outputs.head_sha }}
+          **PR**: #${PR_NUMBER} - ${PR_TITLE}
+          **Author**: @${PR_AUTHOR}
+          **Commit**: ${PR_HEAD_SHA}
           **Checked**: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
           ---
@@ -493,8 +520,12 @@ jobs:
 
           ---
           _Compliance verification by AI agent • Re-run with `/mirrobot-check`_
-          <!-- compliance-check-id: ${{ env.PR_NUMBER }}-${{ steps.pr_info.outputs.head_sha }} -->
+          <!-- compliance-check-id: ${PR_NUMBER}-${PR_HEAD_SHA} -->
           TEMPLATE
+
+          envsubst '$PR_NUMBER $PR_TITLE $PR_AUTHOR $PR_HEAD_SHA' \
+            < /tmp/report_template.md > /tmp/report_template.subst.md
+          mv /tmp/report_template.subst.md /tmp/report_template.md
 
           echo "TEMPLATE_PATH=/tmp/report_template.md" >> $GITHUB_OUTPUT
 
@@ -519,10 +550,12 @@ jobs:
           REPORT_TEMPLATE: ${{ steps.template.outputs.TEMPLATE_PATH }}
           DIFF_PATH: ${{ steps.diff.outputs.diff_path }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${GITHUB_REPOSITORY}'
-          envsubst "$VARS" < /tmp/compliance-check.md > "$TMP_DIR/assembled_prompt.txt"
+          # Prepend the security brief (with the verified requester context line)
+          { envsubst '$REQUESTER_CONTEXT' < /tmp/security-brief.md; envsubst "$VARS" < /tmp/compliance-check.md; } > "$TMP_DIR/assembled_prompt.txt"
 
       # Execute the AI compliance check
       # The AI will analyze the PR using multiple turns (5-20+ expected)
@@ -531,17 +564,8 @@ jobs:
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
-          OPENCODE_PERMISSION: |
-            {
-              "bash": {
-                "gh*": "allow",
-                "git*": "allow",
-                "jq*": "allow",
-                "cat*": "allow"
-              },
-              "external_directory": "allow",
-              "webfetch": "deny"
-            }
+          # OPENCODE_PERMISSION is exported by the bot-setup action (hardened
+          # permission profile; single source of truth).
           PR_NUMBER: ${{ env.PR_NUMBER }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}

@@ -97,6 +97,20 @@ jobs:
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
 
+      # Builds the factual requester context line (comment author association on
+      # issue_comment, PR author association on pull_request_target, dispatch
+      # actor otherwise) consumed by the security brief. Any user may trigger
+      # the review; this only informs the agent's judgment.
+      - name: Build requester context
+        id: requester
+        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        uses: ./.github/actions/requester-context
+        with:
+          login: ${{ github.event.comment.user.login || github.event.pull_request.user.login || github.actor }}
+          association: ${{ github.event.comment.author_association || github.event.pull_request.author_association }}
+          trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
+          trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
+
       - name: Bot Setup
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         id: setup
@@ -510,7 +524,6 @@ jobs:
             echo "$resolved_sha" > last_review_sha.txt
             # Keep is_first_review as previously set (default false unless none found)
           else
-            if [ "${{ steps.review_type.outputs.is_first_review }}" != "true" ]; then :; fi
             echo "Could not determine last reviewed SHA automatically. Agent will need to identify the last summary in-session."
             echo "last_reviewed_sha=" >> $GITHUB_OUTPUT
             echo "" > last_review_sha.txt
@@ -520,7 +533,9 @@ jobs:
 
       - name: Save secure prompt from base branch
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
-        run: cp .github/prompts/pr-review.md /tmp/pr-review.md
+        run: |
+          cp .github/prompts/security-brief.md /tmp/security-brief.md
+          cp .github/prompts/pr-review.md /tmp/pr-review.md
 
       - name: Checkout PR head
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
@@ -589,8 +604,10 @@ jobs:
       - name: Generate Incremental Diff
         if: (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && steps.review_type.outputs.is_first_review == 'false' && steps.review_type.outputs.last_reviewed_sha != ''
         id: incremental_diff
+        env:
+          LAST_REVIEWED_SHA_INPUT: ${{ steps.review_type.outputs.last_reviewed_sha }}
         run: |
-          LAST_SHA=${{ steps.review_type.outputs.last_reviewed_sha }}
+          LAST_SHA="${LAST_REVIEWED_SHA_INPUT}"
           CURRENT_SHA="${PR_HEAD_SHA}"
           DIFF_CONTENT=""
           # Ensure dedicated diff folder exists in the workspace (hidden to avoid accidental use)
@@ -641,9 +658,10 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
           PULL_REQUEST_CONTEXT: ${{ env.PULL_REQUEST_CONTEXT }}
+          REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
         run: |
           # Build DIFF_FILE_PATH pointing to the generated diff in the repository workspace
-          if [ "${{ steps.review_type.outputs.is_first_review }}" = "true" ]; then
+          if [ "$IS_FIRST_REVIEW" = "true" ]; then
             DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
           else
             DIFF_FILE_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
@@ -651,7 +669,8 @@ jobs:
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${IS_FIRST_REVIEW} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
-          DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS" < /tmp/pr-review.md > "$TMP_DIR/assembled_prompt.txt"
+          # Prepend the security brief (with the verified requester context line)
+          { envsubst '$REQUESTER_CONTEXT' < /tmp/security-brief.md; DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS" < /tmp/pr-review.md; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
           echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
           # Clear small, now-redundant flags included in the context summary
@@ -664,16 +683,8 @@ jobs:
         if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
-          OPENCODE_PERMISSION: |
-            {
-              "bash": {
-                "gh*": "allow",
-                "git*": "allow",
-                "jq*": "allow"
-              },
-              "external_directory": "allow",
-              "webfetch": "deny"
-            }
+          # OPENCODE_PERMISSION is exported by the bot-setup action (hardened
+          # permission profile; single source of truth).
           REVIEW_TYPE: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST' || 'FOLLOW-UP' }}
           PR_AUTHOR: ${{ env.PR_AUTHOR }}
           IS_FIRST_REVIEW: ${{ steps.review_type.outputs.is_first_review }}

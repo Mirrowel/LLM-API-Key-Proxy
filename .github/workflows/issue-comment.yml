@@ -28,6 +28,18 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Builds the factual requester context line (issue author association on
+      # issues events, dispatch actor otherwise) consumed by the security brief.
+      # Any user's issue is analyzed; this only informs the agent's judgment.
+      - name: Build requester context
+        id: requester
+        uses: ./.github/actions/requester-context
+        with:
+          login: ${{ github.event.issue.user.login || github.actor }}
+          association: ${{ github.event.issue.author_association }}
+          trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
+          trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
+
       - name: Bot Setup
         id: setup
         uses: ./.github/actions/bot-setup
@@ -50,7 +62,9 @@ jobs:
             -f content='eyes'
 
       - name: Save secure prompt from base branch
-        run: cp .github/prompts/issue-comment.md /tmp/issue-comment.md
+        run: |
+          cp .github/prompts/security-brief.md /tmp/security-brief.md
+          cp .github/prompts/issue-comment.md /tmp/issue-comment.md
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -142,16 +156,11 @@ jobs:
           ISSUE_CONTEXT: ${{ env.ISSUE_CONTEXT }}
           ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
           ISSUE_AUTHOR: ${{ env.ISSUE_AUTHOR }}
-          OPENCODE_PERMISSION: |
-            {
-              "bash": {
-                "gh*": "allow",
-                "git*": "allow",
-                "jq*": "allow"
-              },
-              "webfetch": "deny"
-            }
+          REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
+          # OPENCODE_PERMISSION is exported by the bot-setup action (hardened
+          # permission profile; single source of truth).
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
             VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR}'
-            envsubst "$VARS" < /tmp/issue-comment.md | opencode run --share -
+            # Prepend the security brief (with the verified requester context line)
+            { envsubst '$REQUESTER_CONTEXT' < /tmp/security-brief.md; envsubst "$VARS" < /tmp/issue-comment.md; } | opencode run --share -

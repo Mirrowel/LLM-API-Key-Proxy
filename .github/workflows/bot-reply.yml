@@ -14,10 +14,12 @@ jobs:
       (contains(github.event.comment.body, '@mirrobot') || 
        contains(github.event.comment.body, '@mirrobot-agent'))
     runs-on: ubuntu-latest
+    # Least privilege for the built-in GITHUB_TOKEN: it is only used by the
+    # initial actions/checkout. All bot operations (reactions, comments, pushes)
+    # authenticate with the GitHub App installation token from bot-setup, whose
+    # scopes come from the App installation settings, not this block.
     permissions:
-      contents: write
-      issues: write
-      pull-requests: write
+      contents: read
 
     env:
       THREAD_NUMBER: ${{ github.event.issue.number }}
@@ -78,6 +80,19 @@ jobs:
         if: steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
 
+      # Builds the factual requester context line (GitHub author association +
+      # optional vars.TRUSTED_AGENT_USERS list) consumed by the security brief.
+      # Any user may trigger the bot; this only informs the agent's judgment.
+      - name: Build requester context
+        id: requester
+        if: steps.validate.outputs.should_proceed == 'true'
+        uses: ./.github/actions/requester-context
+        with:
+          login: ${{ github.event.comment.user.login }}
+          association: ${{ github.event.comment.author_association }}
+          trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
+          trigger-note: 'issue_comment on #${{ github.event.issue.number }}'
+
       - name: Bot Setup
         if: steps.validate.outputs.should_proceed == 'true'
         id: setup
@@ -94,11 +109,13 @@ jobs:
         if: steps.validate.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          REPO: ${{ github.repository }}
+          COMMENT_ID: ${{ github.event.comment.id }}
         run: |
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
-            /repos/${{ github.repository }}/issues/comments/${{ github.event.comment.id }}/reactions \
+            /repos/$REPO/issues/comments/$COMMENT_ID/reactions \
             -f content='eyes'
 
       - name: Gather Full Thread Context
@@ -108,14 +125,20 @@ jobs:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           IGNORE_BOT_NAMES_JSON: ${{ env.IGNORE_BOT_NAMES_JSON }}
+          # SECURITY: untrusted event fields must reach the script only through
+          # environment variables — never via ${{ }} interpolation inside run:,
+          # which is evaluated before the shell starts (command injection).
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          ISSUE_IS_PR: ${{ github.event.issue.pull_request != '' && 'true' || 'false' }}
         run: |
           # Common Info
-          echo "NEW_COMMENT_AUTHOR=${{ github.event.comment.user.login }}" >> $GITHUB_ENV
+          echo "NEW_COMMENT_AUTHOR=$COMMENT_AUTHOR" >> $GITHUB_ENV
           # Use a unique delimiter for safety
           COMMENT_DELIMITER="GH_BODY_DELIMITER_$(openssl rand -hex 8)"
-          { echo "NEW_COMMENT_BODY<<$COMMENT_DELIMITER"; echo "${{ github.event.comment.body }}"; echo "$COMMENT_DELIMITER"; } >> "$GITHUB_ENV"
+          { echo "NEW_COMMENT_BODY<<$COMMENT_DELIMITER"; echo "$COMMENT_BODY"; echo "$COMMENT_DELIMITER"; } >> "$GITHUB_ENV"
           # Determine if PR or Issue
-          if [ -n '${{ github.event.issue.pull_request }}' ]; then
+          if [ "$ISSUE_IS_PR" = "true" ]; then
             IS_PR="true"
           else
             IS_PR="false"
@@ -529,7 +552,9 @@ jobs:
 
       - name: Save secure prompt from base branch
         if: steps.validate.outputs.should_proceed == 'true'
-        run: cp .github/prompts/bot-reply.md /tmp/bot-reply.md
+        run: |
+          cp .github/prompts/security-brief.md /tmp/security-brief.md
+          cp .github/prompts/bot-reply.md /tmp/bot-reply.md
 
       - name: Checkout PR head
         if: steps.validate.outputs.should_proceed == 'true' && steps.context.outputs.IS_PR == 'true'
@@ -544,11 +569,12 @@ jobs:
         id: generate_diffs
         env:
           BASE_BRANCH: ${{ env.BASE_BRANCH }}
+          LAST_REVIEWED_SHA_INPUT: ${{ steps.review_type.outputs.last_reviewed_sha }}
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.mirrobot_files"
           BASE_BRANCH="${BASE_BRANCH}"
           CURRENT_SHA="${PR_HEAD_SHA}"
-          LAST_SHA="${{ steps.review_type.outputs.last_reviewed_sha }}"
+          LAST_SHA="${LAST_REVIEWED_SHA_INPUT}"
           
           # Always generate full diff against base branch
           echo "Generating full PR diff against base branch: $BASE_BRANCH"
@@ -613,26 +639,21 @@ jobs:
           THREAD_AUTHOR: ${{ env.THREAD_AUTHOR }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
           IS_FIRST_REVIEW: ${{ steps.review_type.outputs.is_first_review }}
-          OPENCODE_PERMISSION: |
-            {
-              "bash": {
-                "gh*": "allow",
-                "git*": "allow",
-                "jq*": "allow"
-              },
-              "external_directory": "allow",
-              "webfetch": "deny"
-            }
+          REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
+          IS_PR: ${{ steps.context.outputs.IS_PR }}
+          LAST_REVIEWED_SHA: ${{ steps.review_type.outputs.last_reviewed_sha }}
+          # OPENCODE_PERMISSION is exported by the bot-setup action (hardened
+          # permission profile; single source of truth).
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
-            if [ "${{ steps.context.outputs.IS_PR }}" = "true" ]; then
+            if [ "$IS_PR" = "true" ]; then
               FULL_DIFF_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
               INCREMENTAL_DIFF_PATH="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
-              LAST_REVIEWED_SHA="${{ steps.review_type.outputs.last_reviewed_sha }}"
             else
               FULL_DIFF_PATH=""
               INCREMENTAL_DIFF_PATH=""
               LAST_REVIEWED_SHA=""
             fi
             VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA'
-            FULL_DIFF_PATH="$FULL_DIFF_PATH" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS" < /tmp/bot-reply.md | opencode run --share -
+            # Prepend the security brief (with the verified requester context line)
+            { envsubst '$REQUESTER_CONTEXT' < /tmp/security-brief.md; FULL_DIFF_PATH="$FULL_DIFF_PATH" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS" < /tmp/bot-reply.md; } | opencode run --share -

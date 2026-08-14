@@ -1,5 +1,5 @@
 name: 'Bot Setup'
-description: 'Performs all common setup steps for bot workflows, including token generation, git config, and dependency installation.'
+description: 'Performs all common setup steps for bot workflows, including token generation, git config, dependency installation, and the hardened agent permission profile (written to opencode.json and exported as OPENCODE_PERMISSION).'
 
 inputs:
   bot-app-id:
@@ -103,6 +103,119 @@ runs:
         if [ -n "$FAST_MODEL" ]; then
           configure_model "$FAST_MODEL" "small_model"
         fi
+
+        # --- HARDENED AGENT PERMISSION PROFILE (security) ---
+        # Single source of truth for the agent permission profile, applied to the
+        # generated opencode.json AND exported as OPENCODE_PERMISSION for the job
+        # (replaces the per-workflow OPENCODE_PERMISSION env blocks).
+        # This intentionally OVERRIDES any permission block supplied via
+        # opencode-config-json: the permission profile is a security invariant.
+        #
+        # opencode permission rules are last-match-wins with simple wildcards
+        # (* = any chars). Ordering below is load-bearing:
+        #   1. bash catch-all deny (makes the allowlist real — unmatched commands
+        #      would otherwise default to allow)
+        #   2. allows for the commands the agent workflows rely on
+        #   3. targeted denies LAST (secrets disclosure, egress, privilege pivots)
+        #
+        # FUTURE OPTION (deliberately NOT enabled): route unverified requesters to
+        # the fast model using the trust classification from
+        # .github/actions/requester-context.
+        cat > /tmp/hardened_permissions.json <<'PERMS_EOF'
+        {
+          "bash": {
+            "*": "deny",
+            "gh*": "allow",
+            "git*": "allow",
+            "jq*": "allow",
+            "cat*": "allow",
+            "ls*": "allow",
+            "head*": "allow",
+            "tail*": "allow",
+            "wc*": "allow",
+            "grep*": "allow",
+            "rg*": "allow",
+            "find*": "allow",
+            "sort*": "allow",
+            "uniq*": "allow",
+            "mkdir*": "allow",
+            "touch*": "allow",
+            "sed*": "allow",
+            "awk*": "allow",
+            "diff*": "allow",
+            "echo*": "deny",
+            "printf*": "deny",
+            "curl*": "deny",
+            "wget*": "deny",
+            "env": "deny",
+            "env *": "deny",
+            "printenv*": "deny",
+            "gh gist*": "deny",
+            "gh api *gist*": "deny",
+            "gh secret*": "deny",
+            "gh api *secret*": "deny",
+            "gh workflow*": "deny",
+            "gh api *dispatch*": "deny",
+            "gh run rerun*": "deny",
+            "gh repo delete*": "deny",
+            "gh repo edit*": "deny",
+            "git push --force*": "deny",
+            "git push -f*": "deny",
+            "git config --global*": "deny",
+            "git config -l*": "deny",
+            "git config --list*": "deny",
+            "git config --get*": "deny",
+            "cat ~/.config*": "deny",
+            "cat $HOME*": "deny",
+            "cat /home/runner/.config*": "deny",
+            "head ~/.config*": "deny",
+            "head $HOME*": "deny",
+            "tail ~/.config*": "deny",
+            "tail $HOME*": "deny",
+            "grep*~/.config*": "deny",
+            "grep*$HOME*": "deny",
+            "rg*~/.config*": "deny",
+            "rg*$HOME*": "deny",
+            "sed*~/.config*": "deny",
+            "sed*$HOME*": "deny",
+            "awk*~/.config*": "deny",
+            "awk*$HOME*": "deny",
+            "jq*~/.config*": "deny",
+            "jq*$HOME*": "deny",
+            "jq -n *env*": "deny",
+            "jq -n *$ENV*": "deny",
+            "*$GITHUB_TOKEN*": "deny",
+            "*$GH_TOKEN*": "deny"
+          },
+          "read": {
+            "*": "allow",
+            "~/.config/opencode/*": "deny"
+          },
+          "edit": {
+            ".github/workflows/*": "deny",
+            ".github/actions/*": "deny",
+            ".github/prompts/*": "deny"
+          },
+          "external_directory": "allow",
+          "webfetch": "deny",
+          "websearch": "allow"
+        }
+        PERMS_EOF
+
+        if ! jq -e . /tmp/hardened_permissions.json >/dev/null 2>&1; then
+          echo "::error::Internal error: hardened permission profile is not valid JSON."
+          exit 1
+        fi
+
+        CONFIG=$(jq --slurpfile perms /tmp/hardened_permissions.json '.permission = $perms[0]' <<< "$CONFIG")
+
+        # Export the same profile as OPENCODE_PERMISSION for the job so the env
+        # contract used by opencode run stays satisfied from one canonical source.
+        {
+          echo "OPENCODE_PERMISSION<<OPENCODE_PERMS_EOF"
+          cat /tmp/hardened_permissions.json
+          echo "OPENCODE_PERMS_EOF"
+        } >> "$GITHUB_ENV"
 
         # --- FINALIZATION ---
         jq -e . <<< "$CONFIG" > ~/.config/opencode/opencode.json
