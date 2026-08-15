@@ -1,0 +1,135 @@
+name: Agent Router
+
+# ============================================================================
+# SINGLE COMMENT-TRIGGER ENTRYPOINT (noise consolidation)
+# ============================================================================
+# Every issue_comment[created] event fired ALL THREE agent workflows, of which
+# at most one proceeded (the rest skipped). This router is now the only
+# comment-triggered workflow: it parses the comment once and dispatches ONLY
+# the matching target workflow(s). Per comment: 3 workflow entries -> 1.
+#
+# Routing rules replicate the targets' former triggers EXACTLY:
+#   - /mirrobot-review or /mirrobot_review  -> PR Review        (PRs only)
+#   - /mirrobot-check  or /mirrobot_check   -> Compliance Check  (PRs only)
+#   - @mirrobot / @mirrobot-agent mention   -> Bot Reply
+#   - compound comments dispatch ALL matches (parallel agents, as before)
+#   - bot-authored comments ([bot] suffix, mirrobot, mirrobot-agent): no route
+#   - trigger words only inside quotes/code fences/inline code: no route
+#
+# Security model:
+#   - issue_comment is default-branch-guaranteed: this file, and everything
+#     it dispatches, always comes from the default branch.
+#   - The ONLY privilege is GITHUB_TOKEN with actions:write (workflow dispatch)
+#     and contents:read (comment/thread reads). No App key, no LLM key, no
+#     checkout, no untrusted code execution: comment text is parsed with
+#     awk/sed/grep and never interpolated into shell via ${{ }} (env: only).
+#   - GITHUB_TOKEN CAN trigger workflow_dispatch (documented GitHub exception
+#     to the token-recursion rule).
+#   - Routing decisions are logged to the run step summary: this run is the
+#     audit trail for "why did/didn't the agent respond".
+#   - Targets re-fetch comment context from the API by id (comment_id input):
+#     author/association/body arrive from GitHub, never from this run's
+#     inputs, so the requester-verification chain is unchanged.
+# ============================================================================
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read   # read comment/thread/PR context for routing decisions
+  actions: write   # dispatch the target agent workflows
+
+concurrency:
+  group: agent-router-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    # Bot-loop guard: never route comments authored by bots or by the agent
+    # itself (its own replies/comments must not re-trigger agents).
+    if: |
+      !endsWith(github.event.comment.user.login, '[bot]') &&
+      github.event.comment.user.login != 'mirrobot' &&
+      github.event.comment.user.login != 'mirrobot-agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Parse comment and route
+        env:
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          THREAD_NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request != '' && 'true' || 'false' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # --- Clean the comment body (identical stripping to the targets'
+          # former validate steps): drop fenced code blocks, inline code, and
+          # quoted lines, so trigger words inside quotes/code never route.
+          CLEAN_BODY=$(printf '%s' "$COMMENT_BODY" | awk '
+            /^```/ { in_code = !in_code; next }
+            !in_code { print }
+          ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
+
+          route_review=false
+          route_compliance=false
+          route_reply=false
+          if printf '%s' "$CLEAN_BODY" | grep -qE '/mirrobot[-_]review'; then route_review=true; fi
+          if printf '%s' "$CLEAN_BODY" | grep -qE '/mirrobot[-_]check'; then route_compliance=true; fi
+          if printf '%s' "$CLEAN_BODY" | grep -qE '@mirrobot(-agent)?'; then route_reply=true; fi
+
+          # The review/compliance commands only apply to pull requests.
+          if [ "$IS_PR" != "true" ]; then
+            route_review=false
+            route_compliance=false
+          fi
+
+          # --- Audit trail: this run's summary is the record of the decision.
+          {
+            echo "### Agent Router — comment #$COMMENT_ID on #$THREAD_NUMBER"
+            echo "- Thread is PR: $IS_PR"
+            echo "- Commands found: review=$route_review compliance=$route_compliance mention=$route_reply"
+            echo "- (Words inside quotes/code fences are ignored; bot authors never route.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          dispatched=0
+          failed=0
+          # Each dispatch is isolated: one failing target (renamed workflow
+          # file, API hiccup) must not silently kill the remaining routes for
+          # compound comments - warn, record, keep routing.
+          if [ "$route_review" = "true" ]; then
+            echo "::notice::Routing to PR Review (PR #$THREAD_NUMBER)"
+            if ! gh workflow run pr-review.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f prNumber="$THREAD_NUMBER" -f commentId="$COMMENT_ID"; then
+              echo "::warning::Failed to dispatch PR Review for #$THREAD_NUMBER"
+              failed=1
+            fi
+            dispatched=1
+          fi
+          if [ "$route_compliance" = "true" ]; then
+            echo "::notice::Routing to Compliance Check (PR #$THREAD_NUMBER)"
+            if ! gh workflow run compliance-check.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$THREAD_NUMBER" -f commentId="$COMMENT_ID"; then
+              echo "::warning::Failed to dispatch Compliance Check for #$THREAD_NUMBER"
+              failed=1
+            fi
+            dispatched=1
+          fi
+          if [ "$route_reply" = "true" ]; then
+            echo "::notice::Routing to Bot Reply (thread #$THREAD_NUMBER)"
+            if ! gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f commentId="$COMMENT_ID" -f threadNumber="$THREAD_NUMBER"; then
+              echo "::warning::Failed to dispatch Bot Reply for #$THREAD_NUMBER"
+              failed=1
+            fi
+            dispatched=1
+          fi
+
+          if [ "$dispatched" = "0" ]; then
+            echo "::notice::No agent trigger found in comment #$COMMENT_ID; nothing dispatched."
+          elif [ "$failed" = "1" ]; then
+            # A dispatch failure is a REAL failure: fail the router run so the
+            # miss is visible in the Actions tab, not just a warning line.
+            echo "::error::One or more target dispatches failed for comment #$COMMENT_ID"
+            exit 1
+          fi

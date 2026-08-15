@@ -36,7 +36,8 @@
 # so the agent can surface them (path + reason) in its final summary.
 # Exit code: 0 on success (including fail-closed scrub), 1 only when the
 # workspace is not a git repository.
-set -u
+set -u -o pipefail  # pipefail: a failed git log/diff inside a pipeline must not
+                    # masquerade as an empty (clean) result via cut/sed/awk.
 
 ALLOWED_BRANCHES="main dev"
 DEFAULT_ANCHOR="main"

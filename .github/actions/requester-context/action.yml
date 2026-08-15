@@ -54,8 +54,12 @@ runs:
         else
           trusted_listed=0
           if [ -n "$TRUSTED_USERS" ]; then
+            # GitHub logins are case-insensitive; compare lowercased so a
+            # non-canonical-cased TRUSTED_AGENT_USERS entry still matches
+            # (keeps this line consistent with fetch-roster.sh's downcasing).
+            login_lc=$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]')
             for candidate in $(printf '%s' "$TRUSTED_USERS" | tr ',;' '  '); do
-              if [ -n "$candidate" ] && [ "$candidate" = "$login" ]; then
+              if [ -n "$candidate" ] && [ "$(printf '%s' "$candidate" | tr '[:upper:]' '[:lower:]')" = "$login_lc" ]; then
                 trusted_listed=1
               fi
             done

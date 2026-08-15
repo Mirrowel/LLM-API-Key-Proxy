@@ -74,6 +74,22 @@ got2=$(printf '[{"login":"Mirrowel"}]\n' | jq -sr --arg extra "" \
   '[.[][].login] + ($extra | split("[,; \t\n]+"; null) | map(select(length > 0))) | map(ascii_downcase) | sort | unique | join(", ")')
 check "roster: empty extras" "mirrowel" "$got2"
 
+# ---- requester-context trusted-user compare (case-insensitive parity) -----
+rc_match() { # login trusted_list -> 1 if listed (replicates action.yml loop)
+  local login="$1" list="$2" trusted=0 login_lc cand_lc cand
+  login_lc=$(printf '%s' "$login" | tr '[:upper:]' '[:lower:]')
+  for cand in $(printf '%s' "$list" | tr ',;' '  '); do
+    [ -n "$cand" ] || continue
+    cand_lc=$(printf '%s' "$cand" | tr '[:upper:]' '[:lower:]')
+    [ "$cand_lc" = "$login_lc" ] && trusted=1
+  done
+  echo "$trusted"
+}
+check "requester-context: non-canonical case entry matches" 1 "$(rc_match SomeUser 'other, SOMEUSER, x')"
+check "requester-context: exact entry matches"              1 "$(rc_match octocat 'octocat')"
+check "requester-context: different user does not match"    0 "$(rc_match octocat 'someoneelse')"
+check "requester-context: semicolon-separated matches"      1 "$(rc_match octocat 'a; OCTOCAT')"
+
 # ---- permission pattern matrix (fnmatch semantics, as opencode uses) -------
 Q="'"
 deny_rules=("jq -n env*" "jq -n ${Q}env*" "jq -n \"env*" "jq -n \$ENV*" "jq -n ${Q}\$ENV*" "jq *\$ENV*")
@@ -83,6 +99,41 @@ pt=0; for t in "${allowed_tests[@]}"; do for r in "${deny_rules[@]}"; do [[ $t =
 check "permission: legit jq flows unaffected" 0 "$pt"
 pt=0; for t in "${denied_tests[@]}"; do hit=0; for r in "${deny_rules[@]}"; do [[ $t == $r ]] && hit=1; done; [ $hit -eq 0 ] && pt=1; done
 check "permission: all env-dump forms denied" 0 "$pt"
+
+# ---- agent-router decision matrix (replicates agent-router.yml parsing) ----
+route() { # body is_pr -> "review compliance reply" flags or "none"
+  local body="$1" is_pr="$2" clean r="" c="" m="" out=""
+  clean=$(printf '%s' "$body" | awk '
+    /^```/ { in_code = !in_code; next }
+    !in_code { print }
+  ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
+  printf '%s' "$clean" | grep -qE '/mirrobot[-_]review' && r=review
+  printf '%s' "$clean" | grep -qE '/mirrobot[-_]check'  && c=compliance
+  printf '%s' "$clean" | grep -qE '@mirrobot(-agent)?'  && m=reply
+  [ "$is_pr" != "true" ] && { r=""; c=""; }
+  [ -n "$r" ] && out="$r"
+  [ -n "$c" ] && out="${out:+$out }$c"
+  [ -n "$m" ] && out="${out:+$out }$m"
+  echo "${out:-none}"
+}
+check "router: plain mention (PR)"          "reply"                  "$(route 'hey @mirrobot look at this' true)"
+check "router: plain mention (issue)"       "reply"                  "$(route 'hey @mirrobot look at this' false)"
+check "router: review command (PR)"         "review"                 "$(route 'please /mirrobot-review' true)"
+check "router: review command (issue)"      "none"                   "$(route 'please /mirrobot-review' false)"
+check "router: check underscore (PR)"       "compliance"             "$(route '/mirrobot_check' true)"
+check "router: compound comment (PR)"       "review compliance reply" "$(route '@mirrobot run /mirrobot-review then /mirrobot-check' true)"
+check "router: mention in code fence"       "none"                   "$(route 'look:
+````
+@mirrobot
+````
+done' false)"
+check "router: mention inline code"         "none"                   "$(route 'the `@mirrobot` token' false)"
+check "router: mention quoted"              "none"                   "$(route '> @mirrobot said that' false)"
+check "router: review cmd quoted"           "none"                   "$(route '> /mirrobot-review' true)"
+check "router: mention agent suffix"        "reply"                  "$(route '@mirrobot-agent ping' false)"
+check "router: substring (matches - original semantics were substring too)" "reply" "$(route 'email support@mirrobotics.com' false)"
+check "router: quoted cmd + real mention"   "reply"                  "$(route '> /mirrobot-review
+@mirrobot hi' true)"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

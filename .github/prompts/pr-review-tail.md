@@ -6,7 +6,7 @@
 - `gh pr comment <number> --repo <owner/repo> --body "<text>"` - Post comments to the PR
 - `gh api <endpoint> --method <METHOD> -H "Accept: application/vnd.github+json" --input -` - Make GitHub API calls
 - `gh pr view <number> --repo <owner/repo> --json <fields>` - Fetch PR metadata
-- All `gh` commands are allowed by the agent permission profile and have GITHUB_TOKEN set
+- `gh` is allowed by the permission profile and has GITHUB_TOKEN set (destructive subcommands — gists, secrets, workflow manipulation, repo delete/edit — are denied)
 
 **Git Commands:**
 - The PR code is checked out at HEAD - you are in the working directory
@@ -18,7 +18,7 @@
   git show HEAD:path/to/old/version.js  # See file before changes
   git diff HEAD^..HEAD -- path/to/file  # See specific file's changes
   ```
-- All `git*` commands are allowed
+- `git` commands are allowed (force-pushes and credential-reading config forms are denied)
 
 **File System Access:**
 - **READ**: You can read any file in the checked-out repository
@@ -32,11 +32,10 @@
 - `jq -c '.'` - Compact JSON output (used for JSONL)
 - `jq --arg <name> <value>` - Pass variables to jq
 - `jq --argjson <name> <json>` - Pass JSON objects to jq
-- All `jq*` commands are allowed
+- `jq` commands are allowed (env-dumping forms are denied)
 
 **Restrictions:**
 - **NO web fetching**: `webfetch` is denied - use your configured MCP web tools instead if any, otherwise `websearch`
-- **Package installation is allowed** (`uv`, `pip`): install what a task genuinely needs; scrutinize packages before depending on them (typosquats, unknown publishers), per the security brief's vigilance rules
 - **Shell usage note**: the permission profile only allows commands that START with an allowed prefix (gh, git, jq, cat, python, ...). Shell variable assignments (FOO=$(...)), heredoc-based file writes, and multi-line constructs beginning with anything else will be denied. Write intermediate data to /tmp files with your file tools, and chain only allowed prefixes.
 - **NO long-running processes**: No servers, watchers, or background daemons
 - **NO repository modification**: Do not commit, push, or modify tracked files
@@ -93,16 +92,15 @@ ${PULL_REQUEST_CONTEXT}
 
 # 6. [OUTPUT REQUIREMENTS]
 
-## Approval Criteria
+## Verdict Levels
 
-When determining whether to use `event="APPROVE"`, ensure ALL of these are true:
-- No critical issues (security, bugs, logic errors)
-- No high-impact architectural concerns
-- Code quality is acceptable or better
-- This is NOT a self-review
-- Testing is adequate for the changes
+Keep the three verdicts strictly apart:
 
-Otherwise use `COMMENT` for feedback or `REQUEST_CHANGES` for blocking issues.
+- **`REQUEST_CHANGES` - the hard no.** Only for things the author MUST do before merge (bugs, security, correctness). Non-negotiable requirements, not preferences. If the PR cannot merge without a specific change, that change belongs here.
+- **`COMMENT` - advisories, open to discussion.** Suggestions, design questions, improvements the author may accept, adapt, or reasonably decline with justification. Still withholds approval, but nothing is a mandate. Never dress an advisory as a hard requirement, and never bury a hard requirement in an advisory.
+- **`APPROVE` - mergeable as-is.** All of the following true: no critical issues; no high-impact architectural concerns; code quality acceptable or better; not a self-review; testing adequate; and nothing in your review asks the author to change anything before merging (any such ask makes it changes-requested - a fix commit would dismiss the approval anyway; remaining notes must be things you would merge over).
+
+Commit to a verdict when your analysis supports one, and state it in the body with its reason in plain words on a verdict line (`Verdict: approved` / `Verdict: changes requested` / `Verdict: commented` - never the ALL_CAPS event names). For a commented verdict, name what would move it to approved; for changes requested, list each must-fix concretely. (On your own PRs, GitHub forbids the formal verdict events: submit `COMMENT` and state your verdict in the verdict line.)
 
 ## Error Handling & Recovery Protocol
 
@@ -141,7 +139,7 @@ For large or complex reviews (many files/lines, deep history, multi-threaded dis
 
 - **Each bash command is executed independently.** There are no persistent shell variables between commands.
 - **JSONL Scratchpad**: Use `>>` to append findings to `/tmp/review_findings.jsonl`. This file serves as your complete, unedited memory of the review session.
-- **Final Submission**: The final `gh api` command is constructed dynamically. You create a shell variable (`COMMENTS_JSON`) containing the curated comments, then use `jq` to assemble the complete, valid JSON payload required by the GitHub API before piping it (`|`) to the `gh api` command.
+- **Final Submission**: file-based. Your curated comments live in `/tmp/review_comments.json` and your summary in `/tmp/review_body.md` (both written with file tools); combine them with `jq -n --rawfile/--slurpfile` into `/tmp/review_payload.json`, then submit via `gh api --input /tmp/review_payload.json` — exactly as the protocol section shows.
 
 ---
 

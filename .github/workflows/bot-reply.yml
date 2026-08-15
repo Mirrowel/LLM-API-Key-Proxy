@@ -1,21 +1,26 @@
 name: Bot Reply on Mention
 
 on:
-  issue_comment:
-    types: [created]
+  # Routed by agent-router.yml (the single issue_comment entrypoint). The
+  # router passes the triggering comment's id; this workflow re-fetches the
+  # comment, its author, and association from the GitHub API — identity
+  # signals come from GitHub, not from the dispatch payload.
+  workflow_dispatch:
+    inputs:
+      commentId:
+        description: 'Id of the comment that triggered the reply'
+        required: true
+        type: string
+      threadNumber:
+        description: 'Issue/PR number the comment belongs to (concurrency key)'
+        required: true
+        type: string
 
 jobs:
   continuous-reply:
-    # Skip if comment author is a bot (workflow will show as "skipped").
-    # The [bot] suffix guard also excludes OTHER GitHub App bots echoing the
-    # mention (e.g. build-failure comments quoting user text) — only human
-    # accounts can invoke the agent.
-    if: |
-      !endsWith(github.event.comment.user.login, '[bot]') &&
-      github.event.comment.user.login != 'mirrobot' &&
-      github.event.comment.user.login != 'mirrobot-agent' &&
-      (contains(github.event.comment.body, '@mirrobot') || 
-       contains(github.event.comment.body, '@mirrobot-agent'))
+    # The bot-loop guard and mention detection live in the router; this
+    # resolve step below re-validates both from the API (defense in depth:
+    # manual dispatch of a bot-authored or mention-less comment no-ops).
     runs-on: ubuntu-latest
     # Least privilege for the built-in GITHUB_TOKEN: it is only used by the
     # initial actions/checkout. All bot operations (reactions, comments, pushes)
@@ -25,7 +30,7 @@ jobs:
       contents: read
 
     env:
-      THREAD_NUMBER: ${{ github.event.issue.number }}
+      THREAD_NUMBER: ${{ inputs.threadNumber }}
       BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
       IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
       COMMENT_FETCH_LIMIT: '20'
@@ -35,49 +40,80 @@ jobs:
 
     steps:
       # ========================================================================
-      # COMMENT VALIDATION STEP
+      # COMMENT RESOLVE STEP (dispatch path)
       # ========================================================================
-      # Validates that trigger words are in actual content (not in quotes/code)
-      # If validation fails, all subsequent steps are skipped
-      # ========================================================================
-      - name: Validate comment trigger
+      # Re-fetches the triggering comment from the GitHub API by id and
+      # re-validates it (defense in depth): bot-authored comments never
+      # proceed, and the mention must appear in actual content (not inside
+      # quotes or code fences). On failure, all subsequent steps are skipped.
+      # The job token (contents: read) suffices: this is a public-repo read.
+      - name: Resolve and validate comment
         id: validate
         env:
-          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID_INPUT: ${{ inputs.commentId }}
+          THREAD_NUM_INPUT: ${{ inputs.threadNumber }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          
-          # Save comment to temp file for processing
-          TEMP_FILE=$(mktemp)
-          echo "$COMMENT_BODY" > "$TEMP_FILE"
-          
-          # Remove fenced code blocks (```...```)
-          CLEAN_BODY=$(awk '
+          set -euo pipefail
+          if ! comment_json=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID_INPUT}" 2>/dev/null); then
+            echo "::notice::Comment ${COMMENT_ID_INPUT} not readable; nothing to do."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          author=$(printf '%s' "$comment_json" | jq -r '.user.login')
+          association=$(printf '%s' "$comment_json" | jq -r '.author_association')
+          case "$author" in
+            *'[bot]'|mirrobot|mirrobot-agent)
+              echo "::notice::Comment authored by ${author} (bot/agent); bot-loop guard."
+              echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          body=$(printf '%s' "$comment_json" | jq -r '.body')
+
+          # Clean the body exactly as the router does: drop fenced code
+          # blocks, inline code, and quoted lines before matching triggers.
+          clean=$(printf '%s' "$body" | awk '
             /^```/ { in_code = !in_code; next }
             !in_code { print }
-          ' "$TEMP_FILE")
-          
-          # Remove inline code (`...`)
-          CLEAN_BODY=$(echo "$CLEAN_BODY" | sed 's/`[^`]*`//g')
-          
-          # Remove quoted lines (lines starting with >)
-          CLEAN_BODY=$(echo "$CLEAN_BODY" | grep -v '^[[:space:]]*>' || true)
-          
-          rm -f "$TEMP_FILE"
-          
-          echo "Clean body after stripping quotes/code:"
-          echo "$CLEAN_BODY"
-          echo "---"
-          
-          # Check for trigger words in clean text
-          # Trigger: @mirrobot or @mirrobot-agent
-          if echo "$CLEAN_BODY" | grep -qE '@mirrobot(-agent)?'; then
-            echo "::notice::Valid trigger found in non-quoted, non-code text."
-            echo "should_proceed=true" >> $GITHUB_OUTPUT
-          else
-            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
-            echo "should_proceed=false" >> $GITHUB_OUTPUT
+          ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
+
+          if ! printf '%s' "$clean" | grep -qE '@mirrobot(-agent)?'; then
+            echo "::notice::No mention found in non-quoted, non-code text. Skipping."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+
+          # PR or plain issue (the comment endpoint does not distinguish).
+          is_pr=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${THREAD_NUM_INPUT}" \
+            --jq 'if .pull_request then "true" else "false" end' 2>/dev/null || echo unknown)
+
+          # Comment-thread consistency: the fetched comment must belong to the
+          # dispatched thread (guards manual dispatch with mismatched inputs).
+          comment_thread=$(printf '%s' "$comment_json" | jq -r '.issue_url' | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
+          if [ -n "$comment_thread" ] && [ "$comment_thread" != "$THREAD_NUM_INPUT" ]; then
+            echo "::notice::Comment ${COMMENT_ID_INPUT} belongs to thread #${comment_thread}, not #${THREAD_NUM_INPUT}; refusing mismatched dispatch."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::notice::Valid mention from @${author}; proceeding."
+          # SECURITY: unguessable delimiter - a static/predictable one could be
+          # forged by a body line, letting comment content inject additional
+          # GITHUB_ENV directives (e.g. faking RESOLVED_ASSOCIATION).
+          COMMENT_DELIMITER="RESOLVED_BODY_EOF_$(openssl rand -hex 8)"
+          {
+            echo "RESOLVED_COMMENT_ID=${COMMENT_ID_INPUT}"
+            echo "RESOLVED_COMMENT_AUTHOR=${author}"
+            echo "RESOLVED_ASSOCIATION=${association}"
+            echo "RESOLVED_IS_PR=${is_pr}"
+            printf 'RESOLVED_COMMENT_BODY<<%s\n' "$COMMENT_DELIMITER"
+            printf '%s\n' "$body"
+            printf '%s\n' "$COMMENT_DELIMITER"
+          } >> "$GITHUB_ENV"
+          echo "should_proceed=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout repository
         if: steps.validate.outputs.should_proceed == 'true'
@@ -93,10 +129,10 @@ jobs:
         if: steps.validate.outputs.should_proceed == 'true'
         uses: ./.github/actions/requester-context
         with:
-          login: ${{ github.event.comment.user.login }}
-          association: ${{ github.event.comment.author_association }}
+          login: ${{ env.RESOLVED_COMMENT_AUTHOR }}
+          association: ${{ env.RESOLVED_ASSOCIATION }}
           trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
-          trigger-note: 'issue_comment on #${{ github.event.issue.number }}'
+          trigger-note: 'routed comment on #${{ inputs.threadNumber }}'
 
       - name: Bot Setup
         if: steps.validate.outputs.should_proceed == 'true'
@@ -116,7 +152,7 @@ jobs:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           REPO: ${{ github.repository }}
-          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
         run: |
           gh api \
             --method POST \
@@ -132,12 +168,13 @@ jobs:
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           IGNORE_BOT_NAMES_JSON: ${{ env.IGNORE_BOT_NAMES_JSON }}
-          # SECURITY: untrusted event fields must reach the script only through
-          # environment variables — never via ${{ }} interpolation inside run:,
-          # which is evaluated before the shell starts (command injection).
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
-          ISSUE_IS_PR: ${{ github.event.issue.pull_request != '' && 'true' || 'false' }}
+          # SECURITY: untrusted comment content reaches the script only through
+          # environment variables (resolved from the API by id in the first
+          # step) - never via ${{ }} interpolation inside run:, which is
+          # evaluated before the shell starts (command injection).
+          COMMENT_BODY: ${{ env.RESOLVED_COMMENT_BODY }}
+          COMMENT_AUTHOR: ${{ env.RESOLVED_COMMENT_AUTHOR }}
+          ISSUE_IS_PR: ${{ env.RESOLVED_IS_PR }}
         run: |
           # Common Info
           echo "NEW_COMMENT_AUTHOR=$COMMENT_AUTHOR" >> $GITHUB_ENV

@@ -26,8 +26,10 @@
 #   - PR marked ready for review       -> review
 #   - PR reopened (non-draft)          -> review
 #   - Push/synchronize + 'Agent Monitored' label -> review
-#   - Everything else                  -> exit 1 (skipped; the completion
-#     event still fires, but PR Review's resolve step ignores non-success)
+#   - Everything else                  -> no review (EXPECTED outcome: the run
+#     still concludes green — a declined review is not a failure — but the
+#     "Signal review" step stays SKIPPED, which is what PR Review's resolve
+#     step keys on. A skipped signal step cannot masquerade as success.)
 # ============================================================================
 
 name: PR Review Trigger
@@ -49,8 +51,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # continue-on-error: a failed status POST (transient API error, fork-SHA
-      # quirk) must NOT suppress the review decision — the job's conclusion
-      # must reflect ONLY the decide step (downstream contract).
+      # quirk) must NOT suppress the review decision (the signal step below
+      # is the downstream contract, not this step).
       - name: Post pending compliance status
         if: github.event.pull_request.draft == false
         continue-on-error: true
@@ -67,9 +69,10 @@ jobs:
             -f description='run /mirrobot-check when ready to merge'
 
       - name: Decide whether to review
-        # NOTE: never gate this step with an `if:` — a SKIPPED step still
-        # yields job conclusion 'success', which PR Review's resolve step
-        # would misread as "review wanted". Unwanted outcomes MUST exit 1.
+        # Always exits 0 — a declined review is a normal outcome, not a
+        # failure (the run stays green). The decision travels via the step
+        # output; the "Signal review" step below is what PR Review reads.
+        id: decide
         env:
           ACTION: ${{ github.event.action }}
           DRAFT: ${{ github.event.pull_request.draft }}
@@ -92,7 +95,17 @@ jobs:
 
           if [ "$review" = true ]; then
             echo "Review requested for $ACTION event."
-            exit 0
+            echo "review_wanted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No review for $ACTION event (draft, or no 'Agent Monitored' label)."
+            echo "review_wanted=false" >> "$GITHUB_OUTPUT"
           fi
-          echo "No review for $ACTION event (draft, or no 'Agent Monitored' label)."
-          exit 1
+
+      - name: Signal review
+        # DOWNSTREAM CONTRACT: PR Review's resolve_auto reads THIS STEP's
+        # conclusion via the jobs API. Runs (and succeeds) only when a review
+        # is wanted; a skipped conclusion means "no review" — and a skipped
+        # step can never yield success, so the old skip-misread trap cannot
+        # recur. Never add side effects or `if:` overrides here.
+        if: steps.decide.outputs.review_wanted == 'true'
+        run: echo "review wanted - PR Review will proceed on completion"

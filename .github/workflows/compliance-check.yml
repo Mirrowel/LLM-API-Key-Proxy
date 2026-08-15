@@ -15,7 +15,7 @@
 #
 # Security Model:
 #   - Runs ONLY from the default branch: triggers are limited to
-#     issue_comment and workflow_dispatch — event types GitHub guarantees to
+#     workflow_dispatch (manual or agent-router-routed) - an event type GitHub guarantees to
 #     execute with the default branch's workflow file, actions, and prompts.
 #     pull_request* triggers are BANNED (they execute the PR's base-branch copy
 #     with secrets in scope for same-repo branches).
@@ -32,33 +32,26 @@ name: Compliance Check
 
 # Prevent concurrent runs for the same PR
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.issue.number || inputs.pr_number }}
+  group: ${{ github.workflow }}-${{ inputs.pr_number }}
   cancel-in-progress: false
 
 on:
-  issue_comment:
-    types: [created]
   workflow_dispatch:
     inputs:
       pr_number:
         description: 'PR number to check'
         required: true
         type: string
+      commentId:
+        description: 'Id of the comment that requested the check (set by agent-router; empty for manual runs)'
+        required: false
+        type: string
 
 jobs:
   compliance-check:
-    # Bot check is in the issue_comment branch - workflow shows "skipped" for bot comments
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      (
-        github.event_name == 'issue_comment' && 
-        github.event.issue.pull_request &&
-        !endsWith(github.event.comment.user.login, '[bot]') &&
-        github.event.comment.user.login != 'mirrobot' &&
-        github.event.comment.user.login != 'mirrobot-agent' &&
-        (contains(github.event.comment.body, '/mirrobot-check') || 
-         contains(github.event.comment.body, '/mirrobot_check'))
-      )
+    # Comment-triggered runs arrive exclusively via agent-router.yml dispatch
+    # (the router owns the bot-loop guard and trigger-word validation).
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     
     # Minimal permissions following principle of least privilege
@@ -72,7 +65,7 @@ jobs:
       # -----------------------------------------------------------------------
       # BASIC CONFIGURATION
       # -----------------------------------------------------------------------
-      PR_NUMBER: ${{ github.event.issue.number || inputs.pr_number }}
+      PR_NUMBER: ${{ inputs.pr_number }}
       MAINTAINED_BASE_BRANCHES: 'main dev'
       BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
       
@@ -147,50 +140,38 @@ jobs:
 
     steps:
       # ========================================================================
-      # COMMENT VALIDATION STEP (only for issue_comment events)
+      # ROUTED-COMMENT RESOLUTION STEP (dispatch runs carrying a commentId only)
       # ========================================================================
       # Validates that trigger words are in actual content (not in quotes/code)
       # If validation fails, subsequent steps are skipped
       # ========================================================================
-      - name: Validate comment trigger
+      - name: Resolve routed comment (dispatch with commentId)
         id: validate
-        if: github.event_name == 'issue_comment'
+        if: github.event_name == 'workflow_dispatch' && inputs.commentId != ''
         env:
-          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_ID_INPUT: ${{ inputs.commentId }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          
-          # Save comment to temp file for processing
-          TEMP_FILE=$(mktemp)
-          echo "$COMMENT_BODY" > "$TEMP_FILE"
-          
-          # Remove fenced code blocks (```...```)
-          CLEAN_BODY=$(awk '
-            /^```/ { in_code = !in_code; next }
-            !in_code { print }
-          ' "$TEMP_FILE")
-          
-          # Remove inline code (`...`)
-          CLEAN_BODY=$(echo "$CLEAN_BODY" | sed 's/`[^`]*`//g')
-          
-          # Remove quoted lines (lines starting with >)
-          CLEAN_BODY=$(echo "$CLEAN_BODY" | grep -v '^[[:space:]]*>' || true)
-          
-          rm -f "$TEMP_FILE"
-          
-          echo "Clean body after stripping quotes/code:"
-          echo "$CLEAN_BODY"
-          echo "---"
-          
-          # Check for trigger words in clean text
-          # Trigger: /mirrobot-check or /mirrobot_check
-          if echo "$CLEAN_BODY" | grep -qE '/mirrobot[-_]check'; then
-            echo "::notice::Valid trigger found in non-quoted, non-code text."
-            echo "should_proceed=true" >> $GITHUB_OUTPUT
-          else
-            echo "::notice::Trigger only found in quotes/code blocks. Skipping."
-            echo "should_proceed=false" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          # The router validated the trigger phrase; recover the REQUESTER
+          # IDENTITY from the GitHub API (never trust the dispatch payload for
+          # identity) and re-apply the bot-loop guard.
+          comment_json=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID_INPUT}" 2>/dev/null) || {
+            echo "::notice::Comment ${COMMENT_ID_INPUT} not readable; requester falls back to dispatch actor."
+            exit 0
+          }
+          author=$(printf '%s' "$comment_json" | jq -r '.user.login')
+          association=$(printf '%s' "$comment_json" | jq -r '.author_association')
+          case "$author" in
+            *'[bot]'|mirrobot|mirrobot-agent)
+              echo "::notice::Routed comment authored by ${author} (bot/agent); ignoring its identity."
+              exit 0
+              ;;
+          esac
+          {
+            echo "RESOLVED_COMMENT_AUTHOR=${author}"
+            echo "RESOLVED_ASSOCIATION=${association}"
+          } >> "$GITHUB_ENV"
 
       # ======================================================================
       # PHASE 1: SECURE SETUP
@@ -198,27 +179,27 @@ jobs:
       # SECURITY: Checkout base branch first to access trusted prompt file.
       # This prevents malicious PRs from injecting code into the AI prompt.
       - name: Checkout base branch (for trusted prompt)
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v4
         with:
           persist-credentials: false  # no credentials in .git/config (public repo: anonymous fetches still work)
 
-      # Builds the factual requester context line (comment author association on
-      # issue_comment, dispatch actor otherwise) consumed by the security brief.
+# Builds the factual requester context line (routed-comment author when
+# dispatched by the router, dispatch actor otherwise) consumed by the security brief.
       # Any user may trigger the check; this only informs the agent's judgment.
       - name: Build requester context
         id: requester
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/requester-context
         with:
-          login: ${{ github.event.comment.user.login || github.actor }}
-          association: ${{ github.event.comment.author_association }}
+          login: ${{ env.RESOLVED_COMMENT_AUTHOR || github.actor }}
+          association: ${{ env.RESOLVED_ASSOCIATION }}
           trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
           trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
 
       # Initialize bot credentials and OpenCode API access
       - name: Bot Setup
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: setup
         uses: ./.github/actions/bot-setup
         with:
@@ -235,7 +216,7 @@ jobs:
       # Fetch PR metadata: title, author, files changed, labels, reviewers
       # (Also exports BASE_BRANCH for the scrub anchor and trust context.)
       - name: Get PR Metadata
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: pr_info
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -293,7 +274,7 @@ jobs:
       # Retrieve previous compliance check results for this PR
       # This allows the AI to track previously identified issues
       - name: Fetch Previous Compliance Reviews
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: prev_reviews
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -334,7 +315,7 @@ jobs:
       # BEFORE checking out PR code. actions/checkout cannot write outside the
       # workspace, so a PR can never overwrite these copies.
       - name: Save trusted artifacts (prompts + scrub script)
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
           cp .github/prompts/compliance-check.md /tmp/compliance-check.md
@@ -345,7 +326,7 @@ jobs:
       # NOW it's safe to checkout the PR code (untrusted)
       # The trusted artifacts are already secured in /tmp
       - name: Checkout PR Head for Diff Generation
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.pr_info.outputs.head_sha }}
@@ -356,14 +337,14 @@ jobs:
       # branches (anchor: PR base when maintained, else main — the script
       # self-enforces the allowlist) BEFORE any agent work on the tree.
       - name: Scrub workspace
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         run: bash /tmp/scrub-workspace.sh --anchor "${BASE_BRANCH}"
 
       # Factual trust context for the security brief: PRs targeting maintained
       # branches vs everything else, plus the scrub's .github taint alarm.
       # Runs AFTER the scrub so /tmp/scrub-taint.txt exists.
       - name: Build trust context
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
@@ -388,7 +369,7 @@ jobs:
       # Generate a unified diff of all PR changes for the AI to analyze
       # The diff is saved to a file for efficient context usage
       - name: Generate PR Diff
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: diff
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -448,7 +429,7 @@ jobs:
       # ======================================================================
       # Convert FILE_GROUPS_JSON to human-readable format for AI prompt
       - name: Format File Groups for Prompt
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: file_groups
         run: |
           # Convert JSON config to human-readable format for the AI
@@ -474,7 +455,7 @@ jobs:
       # inside a quoted heredoc and substituted afterwards by envsubst, which
       # performs no command evaluation.
       - name: Generate Report Template
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: template
         env:
           PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
@@ -526,7 +507,7 @@ jobs:
       # Substitute environment variables into the prompt template
       # Uses the TRUSTED prompt from /tmp (not from PR code)
       - name: Assemble Compliance Prompt
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           PR_TITLE: ${{ steps.pr_info.outputs.pr_title }}
           PR_BODY: ${{ steps.pr_info.outputs.pr_body }}
@@ -554,7 +535,7 @@ jobs:
       # The AI will analyze the PR using multiple turns (5-20+ expected)
       # and post its findings as a comment + status check
       - name: Run Compliance Check with OpenCode
-        if: github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           # Agent permissions are owned by the OPENCODE_CONFIG_JSON secret
@@ -571,7 +552,7 @@ jobs:
       # If enabled, prepend @reviewer mentions to the compliance report
       # This is controlled by ENABLE_REVIEWER_MENTIONS at the top
       - name: Prepend Reviewer Mentions to Posted Comment
-        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true') && env.ENABLE_REVIEWER_MENTIONS == 'true'
+        if: always() && github.event_name == 'workflow_dispatch' && env.ENABLE_REVIEWER_MENTIONS == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -617,7 +598,7 @@ jobs:
           fi
 
       - name: Verify Compliance Review Footers
-        if: always() && (github.event_name != 'issue_comment' || steps.validate.outputs.should_proceed == 'true')
+        if: always() && github.event_name == 'workflow_dispatch'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
