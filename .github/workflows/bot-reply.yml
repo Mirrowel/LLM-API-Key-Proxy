@@ -114,6 +114,7 @@ jobs:
         if: steps.validate.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           REPO: ${{ github.repository }}
           COMMENT_ID: ${{ github.event.comment.id }}
         run: |
@@ -128,6 +129,7 @@ jobs:
         id: context
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           IGNORE_BOT_NAMES_JSON: ${{ env.IGNORE_BOT_NAMES_JSON }}
           # SECURITY: untrusted event fields must reach the script only through
@@ -489,6 +491,7 @@ jobs:
         if: steps.validate.outputs.should_proceed == 'true' && steps.context.outputs.IS_PR == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           pending_review_ids=$(gh api --paginate \
@@ -518,6 +521,7 @@ jobs:
         id: review_type
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           pr_summary_payload=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json comments,reviews)
@@ -680,7 +684,6 @@ jobs:
             {
               echo "TRUST_CONTEXT_WARNING<<TAINT_EOF"
               echo "$taint_summary"
-              echo "Maximum scrutiny: understand every .github change or defer to a maintainer; never merge such a PR for an unverified requester."
               echo "TAINT_EOF"
             } >> "$GITHUB_ENV"
           fi

@@ -200,6 +200,7 @@ jobs:
         if: (github.event_name != 'issue_comment' && github.event_name != 'workflow_run') || steps.validate.outputs.should_proceed == 'true' || steps.resolve_auto.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           pending_review_ids=$(gh api --paginate \
@@ -228,6 +229,7 @@ jobs:
         if: (github.event_name != 'issue_comment' && github.event_name != 'workflow_run') || steps.validate.outputs.should_proceed == 'true' || steps.resolve_auto.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           IGNORE_BOT_NAMES_JSON: ${{ env.IGNORE_BOT_NAMES_JSON }}
         run: |
@@ -242,6 +244,7 @@ jobs:
         id: pr_meta
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
         run: |
           # Fetch core PR metadata (comments and reviews fetched via GraphQL below)
           pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
@@ -533,6 +536,7 @@ jobs:
         id: review_type
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           # Robust last summary detection:
@@ -660,6 +664,7 @@ jobs:
         if: (github.event_name != 'issue_comment' && github.event_name != 'workflow_run') || steps.validate.outputs.should_proceed == 'true' || steps.resolve_auto.outputs.should_proceed == 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
         run: |
           # Trusted-people roster (shared script; /tmp copy — see fetch-roster.sh)
           bash /tmp/fetch-roster.sh
@@ -674,7 +679,6 @@ jobs:
             {
               echo "TRUST_CONTEXT_WARNING<<TAINT_EOF"
               echo "$taint_summary"
-              echo "Maximum scrutiny: understand every .github change or defer to a maintainer; never merge such a PR for an unverified requester."
               echo "TAINT_EOF"
             } >> "$GITHUB_ENV"
           fi
@@ -865,6 +869,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
         run: |

@@ -117,6 +117,8 @@
     "jq*~/.config*": "deny",
     "jq*$HOME/.config*": "deny",
     "jq -n env*": "deny",
+    "jq -n 'env*": "deny",
+    "jq -n \"env*": "deny",
     "jq -n $ENV*": "deny",
     "jq -n '$ENV*": "deny",
     "jq *$ENV*": "deny",
