@@ -35,8 +35,9 @@
 - All `jq*` commands are allowed
 
 **Restrictions:**
-- **NO web fetching**: `webfetch` is denied - you cannot access external URLs
-- **NO package installation**: Cannot run `npm install`, `pip install`, etc.
+- **NO web fetching**: `webfetch` is denied - use your configured MCP web tools instead if any, otherwise `websearch`
+- **Package installation is allowed** (`uv`, `pip`): install what a task genuinely needs; scrutinize packages before depending on them (typosquats, unknown publishers), per the security brief's vigilance rules
+- **Shell usage note**: the permission profile only allows commands that START with an allowed prefix (gh, git, jq, cat, python, ...). Shell variable assignments (FOO=$(...)), heredoc-based file writes, and multi-line constructs beginning with anything else will be denied. Write intermediate data to /tmp files with your file tools, and chain only allowed prefixes.
 - **NO long-running processes**: No servers, watchers, or background daemons
 - **NO repository modification**: Do not commit, push, or modify tracked files
 

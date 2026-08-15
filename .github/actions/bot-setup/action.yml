@@ -114,6 +114,15 @@ runs:
         # recommended profile to paste into the secret.
         if ! jq -e 'has("permission")' <<< "$CONFIG" >/dev/null 2>&1; then
           echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste .github/actions/bot-setup/permissions.example.json into the secret."
+        else
+          # Drift check: warn when the secret's permission block differs from
+          # the recommended example (e.g. after the example evolves but the
+          # secret was not refreshed). Comparison is informational only — the
+          # secret always wins; this just makes silent drift visible.
+          if ! diff <(jq -S . <<< "$CONFIG" | jq -S '.permission') \
+                     <(jq -S . "${GITHUB_ACTION_PATH}/permissions.example.json") >/dev/null 2>&1; then
+            echo "::warning::OPENCODE_CONFIG_JSON permission block differs from .github/actions/bot-setup/permissions.example.json. If intentional, update the example to match; otherwise refresh the secret from the example."
+          fi
         fi
 
         # --- FINALIZATION ---
