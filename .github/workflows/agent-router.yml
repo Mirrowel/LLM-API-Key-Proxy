@@ -19,10 +19,12 @@ name: Agent Router
 # Security model:
 #   - issue_comment is default-branch-guaranteed: this file, and everything
 #     it dispatches, always comes from the default branch.
-#   - The ONLY privilege is GITHUB_TOKEN with actions:write (workflow dispatch)
-#     and contents:read (comment/thread reads). No App key, no LLM key, no
-#     checkout, no untrusted code execution: comment text is parsed with
-#     awk/sed/grep and never interpolated into shell via ${{ }} (env: only).
+#   - The ONLY privileges are GITHUB_TOKEN with actions:write (workflow
+#     dispatch) and contents:read (the single sparse default-branch checkout
+#     of the shared routing script). No App key, no LLM key, no PR/fork
+#     checkout, no untrusted code execution: comment text is parsed by
+#     route-comment.sh and never interpolated into shell via ${{ }} (env:
+#     only).
 #   - GITHUB_TOKEN CAN trigger workflow_dispatch (documented GitHub exception
 #     to the token-recursion rule).
 #   - Routing decisions are logged to the run step summary: this run is the
@@ -37,8 +39,9 @@ on:
     types: [created]
 
 permissions:
-  contents: read   # read comment/thread/PR context for routing decisions
-  actions: write   # dispatch the target agent workflows
+  actions: write    # dispatch the target agent workflows
+  contents: read    # sparse default-branch checkout of .github/scripts only
+                    # (the shared route-comment.sh; see Checkout routing script)
 
 concurrency:
   group: agent-router-${{ github.event.comment.id }}
@@ -55,6 +58,17 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:
+      # Default-branch checkout for the SHARED routing script ONLY.
+      # issue_comment always executes this workflow from the default branch,
+      # so this tree is trusted-by-construction (same trust level as this
+      # workflow file itself) - NOT the untrusted-PR-code case the security
+      # model prohibits. No PR/fork ref is ever checked out here.
+      - name: Checkout routing script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       - name: Parse comment and route
         env:
           COMMENT_ID: ${{ github.event.comment.id }}
@@ -66,26 +80,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          # --- Clean the comment body (identical stripping to the targets'
-          # former validate steps): drop fenced code blocks, inline code, and
-          # quoted lines, so trigger words inside quotes/code never route.
-          CLEAN_BODY=$(printf '%s' "$COMMENT_BODY" | awk '
-            /^```/ { in_code = !in_code; next }
-            !in_code { print }
-          ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
+          # --- Shared decision logic (route-comment.sh): same cleaning and
+          # matching as every former per-workflow guard, from the one file
+          # bot-reply re-validation and the fixture suite also use.
+          ROUTES=$(printf '%s' "$COMMENT_BODY" | bash .github/scripts/route-comment.sh "$IS_PR")
 
           route_review=false
           route_compliance=false
           route_reply=false
-          if printf '%s' "$CLEAN_BODY" | grep -qE '/mirrobot[-_]review'; then route_review=true; fi
-          if printf '%s' "$CLEAN_BODY" | grep -qE '/mirrobot[-_]check'; then route_compliance=true; fi
-          if printf '%s' "$CLEAN_BODY" | grep -qE '@mirrobot(-agent)?'; then route_reply=true; fi
-
-          # The review/compliance commands only apply to pull requests.
-          if [ "$IS_PR" != "true" ]; then
-            route_review=false
-            route_compliance=false
-          fi
+          case " $ROUTES " in
+            *" review "*)     route_review=true ;;
+          esac
+          case " $ROUTES " in
+            *" compliance "*) route_compliance=true ;;
+          esac
+          case " $ROUTES " in
+            *" reply "*)      route_reply=true ;;
+          esac
 
           # --- Audit trail: this run's summary is the record of the decision.
           {

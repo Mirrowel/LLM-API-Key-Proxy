@@ -88,6 +88,15 @@ jobs:
             echo "::notice::Comment ${COMMENT_ID_INPUT} not readable; requester falls back to dispatch actor."
             exit 0
           }
+          # Comment-thread consistency: the fetched comment must belong to the
+          # dispatched PR (guards manual dispatch with mismatched inputs) -
+          # otherwise requester identity would be attributed from an
+          # unrelated thread.
+          comment_thread=$(printf '%s' "$comment_json" | jq -r '.issue_url' | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
+          if [ -n "$comment_thread" ] && [ "$comment_thread" != "$PR_NUMBER" ]; then
+            echo "::notice::Comment ${COMMENT_ID_INPUT} belongs to thread #${comment_thread}, not PR #${PR_NUMBER}; ignoring it for requester identity."
+            exit 0
+          fi
           author=$(printf '%s' "$comment_json" | jq -r '.user.login')
           association=$(printf '%s' "$comment_json" | jq -r '.author_association')
           case "$author" in
@@ -616,6 +625,11 @@ jobs:
           cp .github/prompts/pr-review-protocol-first.md /tmp/pr-review-protocol-first.md
           cp .github/prompts/pr-review-protocol-followup.md /tmp/pr-review-protocol-followup.md
           cp .github/prompts/pr-review-tail.md /tmp/pr-review-tail.md
+          # Shared prompt blocks (single source of truth across agent prompts)
+          cp .github/prompts/shared/identity.md /tmp/shared-identity.md
+          cp .github/prompts/shared/review-verdicts.md /tmp/shared-review-verdicts.md
+          cp .github/prompts/shared/review-submission.md /tmp/shared-review-submission.md
+          cp .github/prompts/shared/tool-restrictions.md /tmp/shared-tool-restrictions.md
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           chmod +x /tmp/scrub-workspace.sh
@@ -836,7 +850,7 @@ jobs:
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
           # Prepend the security brief (with the verified requester + trust context lines)
-          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; cat /tmp/pr-review.md "$PROTOCOL_FILE" /tmp/pr-review-tail.md | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
+          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; cat /tmp/pr-review.md /tmp/shared-identity.md "$PROTOCOL_FILE" /tmp/shared-review-verdicts.md /tmp/shared-review-submission.md /tmp/shared-tool-restrictions.md /tmp/pr-review-tail.md | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
           echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
           # Clear small, now-redundant flags included in the context summary

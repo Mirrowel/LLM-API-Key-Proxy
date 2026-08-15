@@ -160,6 +160,15 @@ jobs:
             echo "::notice::Comment ${COMMENT_ID_INPUT} not readable; requester falls back to dispatch actor."
             exit 0
           }
+          # Comment-thread consistency: the fetched comment must belong to the
+          # dispatched PR (guards manual dispatch with mismatched inputs) -
+          # otherwise requester identity would be attributed from an
+          # unrelated thread.
+          comment_thread=$(printf '%s' "$comment_json" | jq -r '.issue_url' | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
+          if [ -n "$comment_thread" ] && [ "$comment_thread" != "$PR_NUMBER" ]; then
+            echo "::notice::Comment ${COMMENT_ID_INPUT} belongs to thread #${comment_thread}, not PR #${PR_NUMBER}; ignoring it for requester identity."
+            exit 0
+          fi
           author=$(printf '%s' "$comment_json" | jq -r '.user.login')
           association=$(printf '%s' "$comment_json" | jq -r '.author_association')
           case "$author" in
@@ -184,8 +193,8 @@ jobs:
         with:
           persist-credentials: false  # no credentials in .git/config (public repo: anonymous fetches still work)
 
-# Builds the factual requester context line (routed-comment author when
-# dispatched by the router, dispatch actor otherwise) consumed by the security brief.
+      # Builds the factual requester context line (routed-comment author when
+      # dispatched by the router, dispatch actor otherwise) consumed by the security brief.
       # Any user may trigger the check; this only informs the agent's judgment.
       - name: Build requester context
         id: requester

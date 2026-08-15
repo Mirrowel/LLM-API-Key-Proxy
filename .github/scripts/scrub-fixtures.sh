@@ -100,21 +100,12 @@ check "permission: legit jq flows unaffected" 0 "$pt"
 pt=0; for t in "${denied_tests[@]}"; do hit=0; for r in "${deny_rules[@]}"; do [[ $t == $r ]] && hit=1; done; [ $hit -eq 0 ] && pt=1; done
 check "permission: all env-dump forms denied" 0 "$pt"
 
-# ---- agent-router decision matrix (replicates agent-router.yml parsing) ----
-route() { # body is_pr -> "review compliance reply" flags or "none"
-  local body="$1" is_pr="$2" clean r="" c="" m="" out=""
-  clean=$(printf '%s' "$body" | awk '
-    /^```/ { in_code = !in_code; next }
-    !in_code { print }
-  ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
-  printf '%s' "$clean" | grep -qE '/mirrobot[-_]review' && r=review
-  printf '%s' "$clean" | grep -qE '/mirrobot[-_]check'  && c=compliance
-  printf '%s' "$clean" | grep -qE '@mirrobot(-agent)?'  && m=reply
-  [ "$is_pr" != "true" ] && { r=""; c=""; }
-  [ -n "$r" ] && out="$r"
-  [ -n "$c" ] && out="${out:+$out }$c"
-  [ -n "$m" ] && out="${out:+$out }$m"
-  echo "${out:-none}"
+# ---- agent-router decision matrix (exercises the REAL route-comment.sh) ----
+route() { # body is_pr -> flags or "none" — delegates to the shared script
+  # SCRIPT_DIR is the absolute path computed at script start (line 9); do NOT
+  # re-derive it here — the fixture sections above change CWD, so a relative
+  # re-derivation would resolve against the fixture repo and break in CI.
+  printf '%s' "$1" | bash "$SCRIPT_DIR/route-comment.sh" "$2"
 }
 check "router: plain mention (PR)"          "reply"                  "$(route 'hey @mirrobot look at this' true)"
 check "router: plain mention (issue)"       "reply"                  "$(route 'hey @mirrobot look at this' false)"

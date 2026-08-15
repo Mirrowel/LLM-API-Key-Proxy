@@ -12,9 +12,20 @@ on:
         required: true
         type: string
       threadNumber:
-        description: 'Issue/PR number the comment belongs to (concurrency key)'
+        description: 'Issue/PR number the comment belongs to (concurrency key: same-thread replies serialize)'
         required: true
         type: string
+
+# Serialize same-thread agent runs: a second mention on a thread waits for the
+# in-flight run to finish instead of racing a parallel agent session against
+# it. Different threads are unaffected (distinct groups). KNOWN CAVEAT:
+# GitHub keeps only ONE pending run per concurrency group - a THIRD rapid
+# mention can supersede a still-queued second. Accepted trade-off: the
+# superseded mention's content is still in the thread history and the next
+# run on that thread sees it.
+concurrency:
+  group: bot-reply-${{ inputs.threadNumber }}
+  cancel-in-progress: false
 
 jobs:
   continuous-reply:
@@ -39,13 +50,24 @@ jobs:
       THREAD_COMMENT_FETCH_LIMIT: '5'
 
     steps:
+      # Sparse default-branch checkout for the SHARED routing script, so the
+      # re-validation below runs the exact same decision logic as the router
+      # (single source of truth: .github/scripts/route-comment.sh). The
+      # workflow_dispatch event is default-branch-guaranteed; no PR ref here.
+      - name: Checkout routing script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
       # ========================================================================
       # COMMENT RESOLVE STEP (dispatch path)
       # ========================================================================
       # Re-fetches the triggering comment from the GitHub API by id and
       # re-validates it (defense in depth): bot-authored comments never
       # proceed, and the mention must appear in actual content (not inside
-      # quotes or code fences). On failure, all subsequent steps are skipped.
+      # quotes or code fences) per the shared route-comment.sh logic. On
+      # failure, all subsequent steps are skipped.
       # The job token (contents: read) suffices: this is a public-repo read.
       - name: Resolve and validate comment
         id: validate
@@ -71,20 +93,11 @@ jobs:
               ;;
           esac
 
+          # Note: the fetched body is the comment's text AT RUN TIME - if the
+          # author edited it after the router dispatched, this re-validation
+          # judges the CURRENT text (edited-in trigger words count; edited-out
+          # mentions cause a skip). That is the safe direction.
           body=$(printf '%s' "$comment_json" | jq -r '.body')
-
-          # Clean the body exactly as the router does: drop fenced code
-          # blocks, inline code, and quoted lines before matching triggers.
-          clean=$(printf '%s' "$body" | awk '
-            /^```/ { in_code = !in_code; next }
-            !in_code { print }
-          ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
-
-          if ! printf '%s' "$clean" | grep -qE '@mirrobot(-agent)?'; then
-            echo "::notice::No mention found in non-quoted, non-code text. Skipping."
-            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
 
           # PR or plain issue (the comment endpoint does not distinguish).
           is_pr=$(gh api "/repos/${GITHUB_REPOSITORY}/issues/${THREAD_NUM_INPUT}" \
@@ -95,6 +108,16 @@ jobs:
           comment_thread=$(printf '%s' "$comment_json" | jq -r '.issue_url' | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
           if [ -n "$comment_thread" ] && [ "$comment_thread" != "$THREAD_NUM_INPUT" ]; then
             echo "::notice::Comment ${COMMENT_ID_INPUT} belongs to thread #${comment_thread}, not #${THREAD_NUM_INPUT}; refusing mismatched dispatch."
+            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Mention re-validation via the SHARED script (same cleaning and
+          # matching as the router). Bot Reply triggers on the MENTION route
+          # only - original guard semantics: a bare /mirrobot-review comment
+          # routes to PR Review, not to a conversational reply.
+          if ! printf '%s' "$body" | bash .github/scripts/route-comment.sh "$is_pr" | grep -q 'reply'; then
+            echo "::notice::No mention found in non-quoted, non-code text. Skipping."
             echo "should_proceed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -606,6 +629,11 @@ jobs:
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
           cp .github/prompts/bot-reply.md /tmp/bot-reply.md
+          # Shared prompt blocks (single source of truth across agent prompts)
+          cp .github/prompts/shared/identity.md /tmp/shared-identity.md
+          cp .github/prompts/shared/review-verdicts.md /tmp/shared-review-verdicts.md
+          cp .github/prompts/shared/review-submission.md /tmp/shared-review-submission.md
+          cp .github/prompts/shared/tool-restrictions.md /tmp/shared-tool-restrictions.md
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           chmod +x /tmp/scrub-workspace.sh
@@ -754,6 +782,6 @@ jobs:
               INCREMENTAL_DIFF_PATH=""
               LAST_REVIEWED_SHA=""
             fi
-            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA'
+            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER'
             # Prepend the security brief (with the verified requester and trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; FULL_DIFF_PATH="$FULL_DIFF_PATH" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS" < /tmp/bot-reply.md; } | opencode run --share -
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; cat /tmp/shared-identity.md /tmp/shared-review-verdicts.md /tmp/shared-review-submission.md /tmp/shared-tool-restrictions.md /tmp/bot-reply.md | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share -
