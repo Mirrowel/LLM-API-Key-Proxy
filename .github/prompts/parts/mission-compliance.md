@@ -109,6 +109,8 @@ For each file in the affected groups:
    - Requirements: All dependencies? Correct versions?
    - CHANGELOG: Entry has proper details?
    - Build script: All necessary updates?
+   - Provider files: Are ALL necessary changes present?
+   - DOCUMENTATION.md: Does the technical documentation include proper details?
 5. State your findings for THIS FILE with detailed description
 6. Proceed to the next file
 

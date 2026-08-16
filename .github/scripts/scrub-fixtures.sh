@@ -152,7 +152,7 @@ vars_for() {
     pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}' ;;
     bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER}' ;;
     issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR}' ;;
-    compliance-check) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${DIFF_FILE_PATH} ${GITHUB_REPOSITORY}' ;;
+    compliance-check) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${GITHUB_REPOSITORY}' ;;
   esac
 }
 
@@ -165,7 +165,7 @@ for mode in pr-review-first pr-review-followup bot-reply issue-comment complianc
         c="$contract"
         # envsubst already ran: substitute the two literal vars in expectations
         c=$(printf '%s' "$contract" | REVIEW_TYPE=FIRST GITHUB_REPOSITORY=Own/repo PR_NUMBER=42 envsubst '${GITHUB_REPOSITORY} ${PR_NUMBER}')
-        if printf '%s' "$out" | grep -qF -- "$c"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
+        if grep -qF -- "$c" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
       done
       ;;
     compliance-check)
@@ -173,7 +173,7 @@ for mode in pr-review-first pr-review-followup bot-reply issue-comment complianc
                       'All compliance checks passed' 'Compliance issues found - see comment for details' \
                       'Minor concerns found - review recommended'; do
         c=$(printf '%s' "$contract" | GITHUB_REPOSITORY=Own/repo envsubst '${GITHUB_REPOSITORY}')
-        if printf '%s' "$out" | grep -qF -- "$c"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
+        if grep -qF -- "$c" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
       done
       ;;
   esac
@@ -186,17 +186,30 @@ if [ -n "$residue" ]; then echo "FAIL: raw variable residue after envsubst:"; pr
 if bash "$ASM" nonexistent-mode >/dev/null 2>&1; then echo "FAIL: assembler did not fail closed on missing manifest"; FAIL=1; else echo "PASS: assembler fails closed on missing manifest"; fi
 if bash "$ASM" --verify >/dev/null 2>&1; then echo "PASS: assembler --verify green"; else echo "FAIL: assembler --verify"; FAIL=1; fi
 
-# fixture-vs-workflow VARS drift check: vars_for() must mirror the real lists
-wf="$SCRIPT_DIR/../workflows"
-pr_v=$(grep -o "VARS='[^']*'" "$wf/pr-review.yml" | head -1 | sed "s/VARS='//; s/'//")
-br_v=$(grep -o 'VARS=.[^"]*"' "$wf/bot-reply.yml" | head -1 | sed 's/VARS=.//; s/"$//')
-if ! printf '%s' "$pr_v" | grep -q 'DIFF_FILE_PATH' 2>/dev/null; then :; fi
-# (weak textual check: fail if a workflow's VARS line references a var missing from vars_for union)
-union='$REVIEW_TYPE $PR_AUTHOR $PR_NUMBER $GITHUB_REPOSITORY $PR_HEAD_SHA $PULL_REQUEST_CONTEXT $DIFF_FILE_PATH $THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $THREAD_AUTHOR $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR $PR_TITLE $PR_BODY $PR_LABELS $CHANGED_FILES $CHANGED_FILES_JSON $PREVIOUS_REVIEWS $FILE_GROUPS $REPORT_TEMPLATE $DIFF_PATH $DIFF_FILE_PATH'
-missing=$(cat "$wf/pr-review.yml" "$wf/bot-reply.yml" "$wf/issue-comment.yml" "$wf/compliance-check.yml" | grep -E '^\s*VARS=' | sed "s/[${}'\"]//g; s/.*VARS=//" | tr ' ' '\n' | grep -E '^[A-Z_]+$' | sort -u | while read -r v; do
-  case "$union" in *" $v "*) ;; *) echo "$v" ;; esac
-done)
-if [ -n "$missing" ]; then echo "FAIL: workflow VARS not mirrored in fixtures vars: $missing"; FAIL=1; else echo "PASS: workflow VARS fully mirrored in fixtures"; fi
+# fixture-vs-workflow VARS drift check: vars_for() must mirror the real lists.
+# All extraction happens in awk/sed with single-quoted programs so no shell
+# expansion can silently vacuate the check (the double-quoted-sed ${}
+# bad-substitution bug class this check once had).
+extract_vars() { # file -> bare names, one per line, sorted
+  awk '/^[[:space:]]*VARS=/ {print; exit}' "$1" \
+    | sed 's/.*VARS=//' | tr -d "'\"" | tr -d '$}{' | tr ' ' '\n' \
+    | grep -E '^[A-Z][A-Z_]*$' | sort -u
+}
+vars_for_names() { # mode -> bare names from vars_for(), sorted
+  vars_for "$1" | tr -d '$}{' | tr ' ' '\n' | grep -E '^[A-Z][A-Z_]*$' | sort -u
+}
+drift_ok=1
+for pair in "pr-review.yml:pr-review-first" "bot-reply.yml:bot-reply" "issue-comment.yml:issue-comment" "compliance-check.yml:compliance-check"; do
+  wf_file="${pair%%:*}"; mode="${pair##*:}"
+  a=$(extract_vars "$SCRIPT_DIR/../workflows/$wf_file")
+  b=$(vars_for_names "$mode")
+  d=$(diff <(printf '%s\n' "$a") <(printf '%s\n' "$b"))
+  if [ -n "$d" ]; then
+    echo "FAIL: VARS drift between $wf_file and fixtures vars_for($mode):$d"
+    drift_ok=0; FAIL=1
+  fi
+done
+[ "$drift_ok" = 1 ] && echo "PASS: workflow VARS exactly mirrored in fixtures (both directions)"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

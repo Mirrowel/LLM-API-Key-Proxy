@@ -9,15 +9,13 @@ on:
     branches: ['**']
     paths:
       - '.github/scripts/**'
-      - '.github/actions/bot-setup/permissions.example.json'
-      - '.github/workflows/agent-router.yml'
       - '.github/prompts/**'
+      - '.github/workflows/agent-router.yml'
   pull_request:
     paths:
       - '.github/scripts/**'
-      - '.github/actions/bot-setup/permissions.example.json'
-      - '.github/workflows/agent-router.yml'
       - '.github/prompts/**'
+      - '.github/workflows/agent-router.yml'
   workflow_dispatch:
 
 permissions:
@@ -37,3 +35,5 @@ jobs:
           persist-credentials: false
       - name: Run scrub/roster/permission fixtures
         run: bash .github/scripts/scrub-fixtures.sh
+      - name: Run prompt rule-survival battery
+        run: bash .github/scripts/prompt-rule-fixtures.sh
