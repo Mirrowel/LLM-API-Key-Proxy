@@ -311,6 +311,9 @@ After posting the report, set the commit status. You own the `compliance-check` 
 
 The statuses API accepts ONLY these states: `error`, `failure`, `pending`, `success`. Anything else (e.g. `neutral`) is rejected by the API with a 422 - never attempt it. `pending` is reserved for the trigger stub's initial marker; you never post it. `error` is only for the check itself breaking (infrastructure) - never for PR findings.
 
+
+**Hex SHA discipline (use the file, don't type).** The commit SHA you are auditing is in `/tmp/head_sha.txt` (workflow-written; pinned at checkout = the commit you were given, even if the head moves mid-run). Source SHAs from that file or fresh `git rev-parse` output — hand-typing hex is unreliable, and a one-character typo posts a status to a nonexistent commit. If you deliberately audit a different commit, use ITS real SHA (from `git rev-parse`, not memory) and say so in the report.
+
 Map your verdict:
 
 **PASS (All Compliant):**
@@ -318,7 +321,7 @@ Map your verdict:
 gh api \
   --method POST \
   -H "Accept: application/vnd.github+json" \
-  "/repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" \
+  "/repos/${GITHUB_REPOSITORY}/statuses/$(cat /tmp/head_sha.txt)" \
   -f state='success' \
   -f context='compliance-check' \
   -f description='All compliance checks passed' \
@@ -330,7 +333,7 @@ gh api \
 gh api \
   --method POST \
   -H "Accept: application/vnd.github+json" \
-  "/repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" \
+  "/repos/${GITHUB_REPOSITORY}/statuses/$(cat /tmp/head_sha.txt)" \
   -f state='success' \
   -f context='compliance-check' \
   -f description='Passed with warnings - see report' \
@@ -343,7 +346,7 @@ Warnings are advisories: they do not block merging. A human (or agent) reviewing
 gh api \
   --method POST \
   -H "Accept: application/vnd.github+json" \
-  "/repos/${GITHUB_REPOSITORY}/statuses/${PR_HEAD_SHA}" \
+  "/repos/${GITHUB_REPOSITORY}/statuses/$(cat /tmp/head_sha.txt)" \
   -f state='failure' \
   -f context='compliance-check' \
   -f description='Blocking issues - see report' \

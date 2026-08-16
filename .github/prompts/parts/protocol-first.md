@@ -3,7 +3,7 @@
 This is the FIRST review of this PR: perform a comprehensive, initial analysis of the entire PR. The diff file contains the full PR changes against the base branch.
 
 #### Step 1: Post Acknowledgment Comment
-After orienting on the diff (shape first - wc -l and the file index - then as much depth as you need), immediately provide feedback to the user that you are starting. Your acknowledgment should be unique and context-aware. Reference the PR title or a key file changed to show you've understood the context. Don't copy these templates verbatim. Be creative and make it feel human.
+**Your very first action** - before reading any diff content. The user must know within moments of the review starting that it has started. Use what you already have: the PR title, author, and changed-file list are in the PR context. A quick orientation (`wc -l` on the diff file) is fine; do NOT begin file-by-file analysis before the acknowledgment is posted - everything else waits until the user knows you are on it. Your acknowledgment should be unique and context-aware. Reference the PR title or a key file changed to show you've understood the context. Don't copy these templates verbatim. Be creative and make it feel human.
 
 Example for a PR titled "Refactor Auth Service":
 ```bash

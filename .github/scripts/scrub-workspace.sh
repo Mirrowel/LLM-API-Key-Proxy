@@ -267,11 +267,34 @@ else
 (anchor unresolvable - full fail-closed listing)"
 fi
 if [ -n "$taint" ]; then
+  # Compact alert for the flattened single-line warning: counts + AREAS only
+  # (derived from the touched paths); the per-commit file list lives in the
+  # details file - nothing enumerated here can be truncated mid-filename.
+  taint_paths=$(git log --name-only --format='@' "${TAINT_BASE}"..HEAD -- .github 2>/dev/null | grep -v '^@' | grep -v '^$' | sort -u)
+  n_commits=$(printf '%s\n' "$taint" | grep -c '^- ' || true)
+  n_files=$(printf '%s\n' "$taint_paths" | grep -c . || true)
+  areas=$(printf '%s\n' "$taint_paths" | awk -F/ '
+    $2 == "workflows" { a["workflows"]=1; next }
+    $2 == "actions"   { a["actions"]=1; next }
+    $2 == "prompts"   { a["prompts"]=1; next }
+    $2 == "scripts"   { a["scripts"]=1; next }
+    NF >= 1           { a["other"]=1 }
+    END {
+      # Fixed order, joined with ", " in ONE place - paste -sd uses a cyclic
+      # char list and does NOT join multi-char separators (reviewer-caught).
+      # NOTE: keys must be space-free ("other", not "other .github") - the
+      # order list is split on spaces.
+      n = split("workflows actions prompts scripts other", order, " ")
+      sep = ""
+      for (i = 1; i <= n; i++) if (a[order[i]] == 1) { printf "%s%s", sep, order[i]; sep = ", " }
+    }')
   {
-    echo "⚠ TAINT ALERT — .github/ is modified on this branch's side of the ${TAINT_BASE_DESC}. MAXIMUM SCRUTINY: understand every .github change (workflow/action/prompt) or defer to a maintainer; never merge such a PR on behalf of an unverified requester. Details:"
-    printf '%s\n' "$taint" | sed 's/^/  /'
+    echo "⚠ TAINT ALERT - .github/ is modified on this branch's side of the ${TAINT_BASE_DESC} (${n_commits} commit(s), ${n_files} file(s); areas: ${areas}). MAXIMUM SCRUTINY: understand every .github change (workflow/action/prompt) or defer to a maintainer; never merge such a PR on behalf of an unverified requester. Full per-commit details: ${TAINT_FILE}"
   } | tee -a "$TAINT_FILE"
-  echo "scrub: TAINT - .github/ changed since ${TAINT_BASE_DESC} (see ${TAINT_FILE}); NOT removed — flagging for maximum-scrutiny review."
+  # Details (per-commit bullets) go to the FILE only - the warning line above
+  # must never truncate.
+  printf '%s\n' "$taint" | sed 's/^/  /' >> "$TAINT_FILE"
+  echo "scrub: TAINT - .github/ changed since ${TAINT_BASE_DESC} (see ${TAINT_FILE}); NOT removed - flagging for maximum-scrutiny review."
 elif [ -n "$tree_diff" ]; then
   {
     echo "ℹ .github discrepancy — EXPLAINED, benign: the workspace .github differs from the ${anchor} TIP only because this branch predates recent ${anchor}-side .github changes (stale base). No commit on this branch modifies .github; merging keeps ${anchor}'s versions of every file this branch never touched. Context, not an alarm. If in doubt, compare .github against ${anchor} directly."

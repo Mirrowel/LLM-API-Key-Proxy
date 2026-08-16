@@ -1,10 +1,12 @@
 trigger-message
+on-topic-guardrail
 identity
 role
 tool-restrictions
 tools
 posting
 communication
+reactions
 error-handling
 iteration
 context-intensive

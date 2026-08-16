@@ -179,19 +179,15 @@ jobs:
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
 
-      - name: Add reaction to comment
+      - name: Add reaction to comment (lifecycle start)
+        # Eyes on the mention comment via the shared lifecycle script; the
+        # session-success/failure steps below transition it to rocket/confused.
         if: steps.validate.outputs.should_proceed == 'true'
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
-          REPO: ${{ github.repository }}
           COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
-        run: |
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            /repos/$REPO/issues/comments/$COMMENT_ID/reactions \
-            -f content='eyes'
+        run: bash .github/scripts/react.sh start comment "$COMMENT_ID"
 
       - name: Gather Full Thread Context
         if: steps.validate.outputs.should_proceed == 'true'
@@ -234,6 +230,9 @@ jobs:
             timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$THREAD_NUMBER/timeline")
 
             echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
+          # Trusted SHA file (see pr-review.yml note): agents reference the
+          # file instead of hand-typing hex SHAs.
+          printf '%s' "$(echo "$pr_json" | jq -r .headRefOid)" > /tmp/head_sha.txt
             echo "THREAD_AUTHOR=$(echo "$pr_json" | jq -r .author.login)" >> $GITHUB_ENV
             echo "BASE_BRANCH=$(echo "$pr_json" | jq -r .baseRefName)" >> $GITHUB_ENV
 
@@ -563,3 +562,21 @@ jobs:
             VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY'
             # Prepend the security brief (with the verified requester and trust context lines)
             { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh bot-reply | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share -
+
+      - name: Lifecycle reaction (session success)
+        # Mention comment: eyes -> rocket on completed reply.
+        continue-on-error: true
+        if: success() && steps.validate.outputs.should_proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
+        run: bash .github/scripts/react.sh success comment "$COMMENT_ID"
+
+      - name: Lifecycle reaction (session failure)
+        # Mention comment: eyes -> confused on failure.
+        continue-on-error: true
+        if: failure() && steps.validate.outputs.should_proceed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
+        run: bash .github/scripts/react.sh failure comment "$COMMENT_ID"

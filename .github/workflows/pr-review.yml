@@ -237,13 +237,12 @@ jobs:
             fi
           done <<< "$pending_review_ids"
 
-      - name: React to trigger
-        # "The bot listened" signal: eyes on the triggering COMMENT when the
-        # run was routed from one (user knows their comment was heard); eyes
-        # on the PR itself for auto-triggered and manual runs.
-        # continue-on-error: a deleted comment (or transient API error) must
-        # not abort the whole run - the reaction is cosmetic, the review is
-        # the mission.
+      - name: React to trigger (lifecycle start)
+        # "The bot listened" signal via the shared lifecycle script: eyes on
+        # the triggering COMMENT when routed from one; eyes on the PR itself
+        # for auto-triggered and manual runs. Comments later transition to
+        # rocket (success) / confused (failure); PR/issue targets keep eyes
+        # by design. Cosmetic: never aborts the run.
         continue-on-error: true
         if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
         env:
@@ -251,13 +250,9 @@ jobs:
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
         run: |
           if [ -n "$ROUTED_COMMENT_ID" ]; then
-            gh api --method POST -H "Accept: application/vnd.github+json" \
-              "/repos/${{ github.repository }}/issues/comments/$ROUTED_COMMENT_ID/reactions" \
-              -f content='eyes'
+            bash .github/scripts/react.sh start comment "$ROUTED_COMMENT_ID"
           else
-            gh api --method POST -H "Accept: application/vnd.github+json" \
-              "/repos/${{ github.repository }}/issues/$PR_NUMBER/reactions" \
-              -f content='eyes'
+            bash .github/scripts/react.sh start issue "$PR_NUMBER"
           fi
 
       - name: Fetch PR metadata
@@ -334,6 +329,16 @@ jobs:
           echo "</cross_references>" >> "$GITHUB_ENV"
           echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
+          # Run-start timestamp (runner clock, ~equal to run creation): the
+          # footer verifier attributes reviews to THIS run by submitted_at >
+          # RUN_STARTED - prevents rewriting another run's artifacts.
+          echo "RUN_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          # Trusted SHA file for the agent: pinned at fetch time = the commit
+          # actually checked out and reviewed (even if the PR head moves
+          # mid-run). Agents read this file instead of hand-typing hex SHAs -
+          # LLM transcription of hex is unreliable (live incident: e->a typo
+          # at position 17 caused a 422 on review submission).
+          printf '%s' "$(echo "$pr_json" | jq -r .headRefOid)" > /tmp/head_sha.txt
           echo "PR_AUTHOR=$author" >> $GITHUB_ENV
           echo "BASE_BRANCH=$base_branch" >> $GITHUB_ENV
 
@@ -691,9 +696,30 @@ jobs:
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
 
+      - name: Lifecycle reaction (session success)
+        # Comment targets: eyes -> rocket. PR/issue targets keep eyes by
+        # design (a rocket on the PR itself could read as endorsing it).
+        continue-on-error: true
+        if: success() && (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true') && inputs.commentId != ''
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          ROUTED_COMMENT_ID: ${{ inputs.commentId }}
+        run: bash .github/scripts/react.sh success comment "$ROUTED_COMMENT_ID"
+
+      - name: Lifecycle reaction (session failure)
+        # Comment targets: eyes -> confused. PR/issue targets keep eyes.
+        continue-on-error: true
+        if: failure() && (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true') && inputs.commentId != ''
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          ROUTED_COMMENT_ID: ${{ inputs.commentId }}
+        run: bash .github/scripts/react.sh failure comment "$ROUTED_COMMENT_ID"
+
       - name: Verify AI Review Footers
         if: always() && (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true')
-        continue-on-error: true
+        # No continue-on-error: repair-path failures must FAIL this step
+        # loudly (the no-candidate path above exits 0 softly). A swallowed
+        # repair failure would leave the repo believing footers are hardened.
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
@@ -701,103 +727,148 @@ jobs:
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
         run: |
           set -e # Fail fast on errors
-          
+
+          # Degenerate-env guard: if the earlier context step died before
+          # writing these, run-scoping would silently vanish (empty cutoff
+          # matches everything). Fail loudly instead of auditing blind.
+          if [ -z "${RUN_STARTED:-}" ] || [ -z "${PR_HEAD_SHA:-}" ]; then
+            echo "::error::RUN_STARTED/PR_HEAD_SHA missing from env - cannot attribute reviews to this run. Skipping verification rather than auditing blind."
+            exit 0
+          fi
+
           # Wait briefly for API consistency
           sleep 5
 
-          echo "Verifying latest bot review for required footers..."
-          
-          # 1. Define a cutoff timestamp (e.g., 2 minutes ago)
-          cutoff_ts=$(date -u -d "2 minutes ago" +"%Y-%m-%dT%H:%M:%SZ")
-          echo "Looking for reviews submitted after: $cutoff_ts"
+          echo "Verifying latest bot review footers against the INTENDED head SHA..."
 
-          # Retry loop to handle API eventual consistency
+          # Authoritative reference: this run's PR_HEAD_SHA (pinned at checkout =
+          # the commit the agent actually reviewed). The posted footer marker is
+          # the agent's declaration of what it reviewed and is audited against
+          # the intended SHA below - misspelled or mismatched markers are
+          # repaired. The posted review's commit_id field is NOT authoritative
+          # and is deliberately not audited (the original head SHA governs the
+          # repair; a differing commit_id merely reflects the agent's own
+          # declaration and can no longer be edited after posting anyway).
+          EXPECTED_SIGNATURE="_This review was generated by an AI assistant._"
+          EXPECTED_MARKER="<!-- last_reviewed_sha:${PR_HEAD_SHA} -->"
+
+          cutoff_ts="$RUN_STARTED"
+          echo "Attributing bot reviews submitted after run start: $cutoff_ts"
+
           MAX_RETRIES=3
           RETRY_DELAY=5
           latest_review_json=""
 
           for ((i=1; i<=MAX_RETRIES; i++)); do
             echo "Attempt $i: Fetching reviews..."
-            
             if ! reviews=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" --paginate); then
                echo "::warning::Failed to fetch reviews on attempt $i"
                sleep $RETRY_DELAY
                continue
             fi
-            
-            # Extract latest bot review (id and body)
+            # REST review objects carry `id` (databaseId is null on this
+            # endpoint). Null-guard: `last` on an empty list is null - emit a
+            # real null so the wait loop actually waits.
             latest_review_json=$(echo "$reviews" | jq -c --argjson bots "$BOT_NAMES_JSON" --arg cutoff "$cutoff_ts" '
-              map(select(.user.login as $u | $bots | index($u))) 
-              | map(select(.submitted_at > $cutoff))
-              | sort_by(.submitted_at) 
-              | last 
-              | {id: .databaseId, body: (.body // "")}
+              map(select(.user.login as $u | $bots | index($u)))
+              | map(select(.submitted_at != null and .submitted_at > $cutoff))
+              | sort_by(.submitted_at)
+              | last
+              | if . == null then null else {id: .id, body: (.body // "")} end
             ')
-
             if [ -n "$latest_review_json" ] && [ "$latest_review_json" != "null" ]; then
               echo "Found recent review."
               break
             fi
-            
             echo "No recent review found yet. Waiting ${RETRY_DELAY}s..."
             sleep $RETRY_DELAY
           done
 
           if [ -z "$latest_review_json" ] || [ "$latest_review_json" == "null" ]; then
-            echo "::warning::No recent bot review found (within last 2 mins) after $MAX_RETRIES attempts. The AI may have decided not to review, or failed."
+            echo "::warning::No bot review from THIS run found (submitted after run start) after $MAX_RETRIES attempts. The AI may have decided not to review, or failed."
             exit 0
           fi
 
           review_id=$(echo "$latest_review_json" | jq -r .id)
           current_body=$(echo "$latest_review_json" | jq -r .body)
-          
-          # Define expected footers
-          EXPECTED_SIGNATURE="_This review was generated by an AI assistant._"
-          EXPECTED_MARKER="<!-- last_reviewed_sha:${PR_HEAD_SHA} -->"
 
           needs_fix=false
+          repair_full=false
+          deliberate_seen=false
 
           # Check 1: Signature
           if [[ "$current_body" != *"$EXPECTED_SIGNATURE"* ]]; then
             echo "::warning::Missing or malformed AI signature footer."
             needs_fix=true
           else
-            echo "✓ Found correct AI signature."
+            echo "Found correct AI signature."
           fi
 
-          # Check 2: SHA Marker
-          if [[ "$current_body" != *"$EXPECTED_MARKER"* ]]; then
-            echo "::warning::Missing or malformed last_reviewed_sha footer."
+          # Check 2: SHA marker. Three outcomes: matches intended; declares a
+          # DIFFERENT REAL commit (agent's deliberate declaration - e.g. it
+          # reviewed an older base - which must be preserved, not rewritten);
+          # or is unresolvable (transcription typo) -> full repair.
+          posted_sha=$(printf '%s' "$current_body" | grep -oE 'last_reviewed_sha:[a-f0-9]+' | tail -1 | cut -d: -f2)
+          if [ -z "$posted_sha" ]; then
+            echo "::warning::Missing last_reviewed_sha footer."
             needs_fix=true
+            repair_full=true
+          elif [ "$posted_sha" != "$PR_HEAD_SHA" ]; then
+            if git cat-file -e "${posted_sha}^{commit}" 2>/dev/null; then
+              echo "::notice::Marker declares a different REAL commit (${posted_sha}) - treating as the agent's deliberate declaration; preserving it."
+              deliberate_seen=true
+            else
+              echo "::warning::last_reviewed_sha mismatch: posted ${posted_sha} is not a real commit (transcription error); intended ${PR_HEAD_SHA}."
+              needs_fix=true
+              repair_full=true
+            fi
           else
-            echo "✓ Found correct SHA marker."
+            echo "Marker matches the intended head SHA."
           fi
 
           if [ "$needs_fix" = true ]; then
-            echo "Attempting to auto-correct review $review_id..."
-            
-            # Remove existing/malformed footers using regex (in perl mode for robustness)
-            # 1. Remove signature
-            clean_body=$(echo "$current_body" | perl -0777 -pe 's/\Q_This review was generated by an AI assistant._\E//g')
-            # 2. Remove any sha marker
-            clean_body=$(echo "$clean_body" | perl -0777 -pe 's/<!-- last_reviewed_sha:[a-f0-9]+ -->//g')
-            # 3. Trim trailing whitespace
-            clean_body=$(echo "$clean_body" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+            if [ "$repair_full" = true ]; then
+              echo "Full repair on review $review_id (authoritative SHA: $PR_HEAD_SHA)..."
+              # Strip ALL signatures and markers (including ones merely quoted in
+              # prose - a quoted contract line is not a footer), trim the tail,
+              # then append the canonical footers with the intended SHA.
+              clean_body=$(printf '%s' "$current_body" | perl -0777 -pe 's/_This review was generated by an AI assistant\._//g')
+              clean_body=$(printf '%s' "$clean_body" | perl -0777 -pe 's/<!--\s*last_reviewed_sha:[a-f0-9]+\s*-->//g')
+              clean_body=$(printf '%s' "$clean_body" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' | sed -e 's/[[:space:]]*$//')
+              printf '%s\n\n%s\n%s\n' "$clean_body" "$EXPECTED_SIGNATURE" "$EXPECTED_MARKER" > /tmp/repaired_review_body.txt
+              gh api --method PUT "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$review_id" -F body=@/tmp/repaired_review_body.txt
 
-            # Construct new body
-            new_body="${clean_body}
-
-            ${EXPECTED_SIGNATURE}
-            ${EXPECTED_MARKER}"
-
-            # Update review
-            if gh api --method PUT "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$review_id" -f body="$new_body"; then
-              echo "::notice::Successfully auto-corrected review footers."
-              exit 0
+              # Re-verify the repair actually landed
+              sleep 3
+              recheck=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$review_id" --jq .body)
+              if [[ "$recheck" == *"$EXPECTED_SIGNATURE"* && "$recheck" == *"$EXPECTED_MARKER"* ]]; then
+                echo "::notice::Review footers repaired and verified (marker = intended head ${PR_HEAD_SHA})."
+              else
+                echo "::error::Footer repair did not land; review $review_id still malformed. The next follow-up diff base may be wrong - manual check needed."
+                exit 1
+              fi
             else
-              echo "::error::Failed to auto-correct review footers."
-              exit 1
+              # Signature-only repair: the marker is the agent's deliberate
+              # declaration - preserve it exactly.
+              deliberate_marker="<!-- last_reviewed_sha:${posted_sha} -->"
+              echo "Signature-only repair on review $review_id (preserving declared marker ${posted_sha})..."
+              clean_body=$(printf '%s' "$current_body" | perl -0777 -pe 's/_This review was generated by an AI assistant\._//g')
+              clean_body=$(printf '%s' "$clean_body" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' | sed -e 's/[[:space:]]*$//')
+              printf '%s\n\n%s\n%s\n' "$clean_body" "$EXPECTED_SIGNATURE" "$deliberate_marker" > /tmp/repaired_review_body.txt
+              gh api --method PUT "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$review_id" -F body=@/tmp/repaired_review_body.txt
+              sleep 3
+              recheck=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews/$review_id" --jq .body)
+              if [[ "$recheck" == *"$EXPECTED_SIGNATURE"* && "$recheck" == *"$deliberate_marker"* ]]; then
+                echo "::notice::Signature repaired; deliberate marker ${posted_sha} preserved."
+              else
+                echo "::error::Signature-only repair did not land on review $review_id."
+                exit 1
+              fi
             fi
           else
-            echo "Verification passed! No corrections needed."
+            if [ "$deliberate_seen" = true ]; then
+              echo "Marker left as the agent's deliberate declaration; signature already correct. Done."
+            else
+              echo "Verification passed! No corrections needed."
+            fi
           fi

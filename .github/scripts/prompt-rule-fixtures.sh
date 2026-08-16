@@ -18,7 +18,7 @@ export PR_TITLE=t PR_BODY=b PR_LABELS=l FILE_GROUPS=g REPORT_TEMPLATE=r DIFF_PAT
 export TRIGGER_MESSAGE='<tm>' PREVIOUS_BOT_REVIEWS='<pbr>' AGENT_REVIEW_HISTORY='<arh>' PREVIOUS_COMPLIANCE_REPORT='<pcr>'
 RV='$REVIEW_TYPE $PR_AUTHOR $PR_NUMBER $GITHUB_REPOSITORY $PR_HEAD_SHA $PULL_REQUEST_CONTEXT $DIFF_FILE_PATH $TRIGGER_MESSAGE $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $THREAD_CONTEXT'
 BV='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY'
-IV='$ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR $TRIGGER_MESSAGE'
+IV='$ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR $TRIGGER_MESSAGE $GITHUB_REPOSITORY'
 CV='$PR_NUMBER $PR_TITLE $PR_BODY $PR_AUTHOR $PR_HEAD_SHA $CHANGED_FILES $CHANGED_FILES_JSON $PR_LABELS $PREVIOUS_COMPLIANCE_REPORT $TRIGGER_MESSAGE $THREAD_CONTEXT $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_TYPE $DIFF_PATH $INCREMENTAL_DIFF_PATH $FILE_GROUPS $REPORT_TEMPLATE $GITHUB_REPOSITORY'
 bash .github/scripts/assemble-prompt.sh pr-review-first     | envsubst "$RV" > "$TMP/rf.txt"
 REVIEW_TYPE=FOLLOW-UP bash .github/scripts/assemble-prompt.sh pr-review-followup | REVIEW_TYPE=FOLLOW-UP envsubst "$RV" > "$TMP/ru.txt"
@@ -37,6 +37,9 @@ neednt() { # file pattern label (must NOT appear)
 # ---- universal rules (all five modes) ----
 for f in rf ru br ic cc; do
   need $f 'mirrobot-agent'                     "$f: identity names"
+  need $f 'ON-TOPIC GUARDRAIL'                 "$f: on-topic guardrail present"
+  need $f 'Off-topic .refuse it.'              "$f: refusal duty"
+  need $f 'You may react to comments'          "$f: dynamic reactions part"
   need $f 'older mention'                      "$f: old-mentions-are-history"
   need $f 'fresh shell'                        "$f: fresh-shell key point"
   need $f 'body-file'                          "$f: file-based posting"
@@ -65,7 +68,8 @@ for f in rf ru br; do
   need $f 'mergeable as-is'                    "$f: approval rule"
   need $f 'testing adequate'                   "$f: APPROVE checklist"
   need $f 'Verdict:'                           "$f: verdict line mandate"
-  need $f 'last_reviewed_sha:abc123'           "$f: footer contract"
+  need $f 'last_reviewed_sha:'                 "$f: footer contract"
+  need $f 'head_sha.txt'                       "$f: mechanical SHA file"
   need $f 'jq -e'                              "$f: array guard"
   need $f 'review_comments.json'               "$f: comments file"
   need $f 'review_payload'                     "$f: payload file"
@@ -118,7 +122,10 @@ need cc 'target_url'                          "cc: status links to report"
 need cc 'Post the report BEFORE the status'   "cc: post-report-first order"
 need cc 'FOLLOW-UP'                           "cc: follow-up protocol present"
 need cc 'Resolved'                            "cc: re-verify previous findings"
-need cc 'good-practices|GOOD PRACTICES'       "cc: practices-audit framing"
+need cc 'good-practices|GOOD PRACTICES'      "cc: practices-audit framing"
+need cc 'Hex SHA discipline'                "cc: sha-file rule"
+need cc 'deliberately audit a different commit' "cc: honest-declaration carve-out"
+need cc 'cat /tmp/head_sha.txt'              "cc: status URL sources sha file"
 
 # ---- CI status discipline (WS5, all modes via tool-restrictions) ----
 for f in rf ru br ic cc; do

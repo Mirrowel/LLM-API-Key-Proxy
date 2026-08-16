@@ -188,11 +188,20 @@ jobs:
           # Also export author for the acknowledgment comment
           echo "ISSUE_AUTHOR=$author" >> $GITHUB_ENV
 
+      - name: React (lifecycle start)
+        # Eyes on the ISSUE itself - issue targets keep eyes by design
+        # (no terminal reaction; see react.sh).
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: bash .github/scripts/react.sh start issue "$ISSUE_NUMBER"
+
       - name: Analyze issue and suggest resolution
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           ISSUE_CONTEXT: ${{ env.ISSUE_CONTEXT }}
           ISSUE_AUTHOR: ${{ env.ISSUE_AUTHOR }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
           TRUST_CONTEXT: ${{ env.TRUST_CONTEXT }}
           TRUST_CONTEXT_WARNING: ''  # issue path never has taint; substituted for brief parity
@@ -201,6 +210,6 @@ jobs:
           # (passed through by bot-setup; see permissions.example.json).
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
-            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE}'
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}'
             # Prepend the security brief (with the verified requester + trust context lines)
             { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share -

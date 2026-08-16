@@ -546,6 +546,12 @@ jobs:
           PR_AUTHOR: ${{ steps.pr_info.outputs.pr_author }}
           PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
         run: |
+          # Trusted SHA file (see pr-review.yml note): the agent references
+          # /tmp/head_sha.txt instead of hand-typing hex SHAs.
+          printf '%s' "$PR_HEAD_SHA" > /tmp/head_sha.txt
+          # Run-start timestamp: footer verifier attributes comments to THIS
+          # run by created_at > RUN_STARTED.
+          echo "RUN_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
           cat > /tmp/report_template.md <<'TEMPLATE'
           ## 🔍 Compliance Check Results
 
@@ -622,6 +628,22 @@ jobs:
           { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh compliance-check | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
 
       # Execute the AI compliance check
+      - name: React to trigger (lifecycle start)
+        # Eyes on the routed comment when one exists; eyes on the PR itself
+        # for manual runs. Comment targets transition to rocket/confused on
+        # session end; PR targets keep eyes by design.
+        continue-on-error: true
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          ROUTED_COMMENT_ID: ${{ inputs.commentId }}
+        run: |
+          if [ -n "$ROUTED_COMMENT_ID" ]; then
+            bash .github/scripts/react.sh start comment "$ROUTED_COMMENT_ID"
+          else
+            bash .github/scripts/react.sh start issue "$PR_NUMBER"
+          fi
+
       # The AI will analyze the PR using multiple turns (5-20+ expected)
       # and post its findings as a comment + status check
       - name: Run Compliance Check with OpenCode
@@ -635,6 +657,22 @@ jobs:
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
+
+      - name: Lifecycle reaction (session success)
+        continue-on-error: true
+        if: success() && github.event_name == 'workflow_dispatch' && inputs.commentId != ''
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          ROUTED_COMMENT_ID: ${{ inputs.commentId }}
+        run: bash .github/scripts/react.sh success comment "$ROUTED_COMMENT_ID"
+
+      - name: Lifecycle reaction (session failure)
+        continue-on-error: true
+        if: failure() && github.event_name == 'workflow_dispatch' && inputs.commentId != ''
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+          ROUTED_COMMENT_ID: ${{ inputs.commentId }}
+        run: bash .github/scripts/react.sh failure comment "$ROUTED_COMMENT_ID"
 
       # ======================================================================
       # PHASE 6: POST-PROCESSING (OPTIONAL)
@@ -689,7 +727,8 @@ jobs:
 
       - name: Verify Compliance Review Footers
         if: always() && github.event_name == 'workflow_dispatch'
-        continue-on-error: true
+        # No continue-on-error: repair-path failures must FAIL this step
+        # loudly (the no-candidate path above exits 0 softly).
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
@@ -697,40 +736,95 @@ jobs:
           PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
         run: |
           set -e
+
+          # Degenerate-env guard (see pr-review.yml twin): empty RUN_STARTED
+          # would match everything - fail loudly instead of auditing blind.
+          if [ -z "${RUN_STARTED:-}" ] || [ -z "${PR_HEAD_SHA:-}" ]; then
+            echo "::error::RUN_STARTED/PR_HEAD_SHA missing from env - cannot attribute comments to this run. Skipping verification."
+            exit 0
+          fi
           sleep 5  # Wait for API consistency
-          
-          echo "Verifying latest compliance review for required footers..."
-          
-          # Find latest bot comment with compliance marker
-          latest_comment=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
-            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
-              map(select(.user.login as $u | $bots | index($u)))
-              | sort_by(.created_at)
-              | last
-              | {id: .id, body: .body}
-            ')
-          
-          comment_id=$(echo "$latest_comment" | jq -r .id)
-          current_body=$(echo "$latest_comment" | jq -r .body)
-          
+
+          echo "Verifying latest compliance report footers against the INTENDED id..."
+
+          # Authoritative reference: this run's PR number + head SHA (pinned at
+          # checkout). The posted marker is the agent's declaration and is
+          # audited against the intended pair - misspelled, mismatched, or
+          # missing markers are REPAIRED, not just warned about.
           EXPECTED_SIGNATURE="_Compliance verification by AI agent"
           EXPECTED_MARKER="<!-- compliance-check-id: ${PR_NUMBER}-${PR_HEAD_SHA} -->"
-          
+
+          latest_comment=""
+          for ((i=1; i<=3; i++)); do
+            if latest_comment=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+              --paginate | jq -c --argjson bots "$BOT_NAMES_JSON" --arg runstart "$RUN_STARTED" '
+                map(select(.user.login as $u | $bots | index($u)))
+                | map(select(.created_at != null and .created_at > $runstart))
+                | sort_by(.created_at)
+                | last
+                | if . == null then null else {id: .id, body: (.body // "")} end
+            '); then :; fi
+            if [ -n "$latest_comment" ] && [ "$latest_comment" != "null" ]; then break; fi
+            echo "No bot comment from this run yet. Waiting 5s..."
+            sleep 5
+          done
+
+          if [ -z "$latest_comment" ] || [ "$latest_comment" == "null" ]; then
+            echo "::warning::No bot comment found to verify. The agent may have failed before posting."
+            exit 0
+          fi
+
+          comment_id=$(echo "$latest_comment" | jq -r .id)
+          current_body=$(echo "$latest_comment" | jq -r .body)
+
           needs_fix=false
-          
+
           if [[ "$current_body" != *"$EXPECTED_SIGNATURE"* ]]; then
             echo "::warning::Missing compliance signature footer."
             needs_fix=true
           fi
-          
-          if [[ "$current_body" != *"compliance-check-id:"* ]]; then
+
+          posted_id=$(printf '%s' "$current_body" | grep -oE 'compliance-check-id: [0-9]+-[a-f0-9]+' | tail -1 | sed 's/compliance-check-id: //')
+          posted_marker_sha=$(printf '%s' "$posted_id" | sed -n 's/^[0-9]*-//p')
+          deliberate=false
+          if [ -z "$posted_id" ]; then
             echo "::warning::Missing compliance-check-id marker."
             needs_fix=true
+          elif [ "$posted_id" != "${PR_NUMBER}-${PR_HEAD_SHA}" ]; then
+            posted_marker_pr=$(printf '%s' "$posted_id" | sed -n 's/^\([0-9]*\)-.*/\1/p')
+            if [ "$posted_marker_pr" = "$PR_NUMBER" ] && [ -n "$posted_marker_sha" ] && git cat-file -e "${posted_marker_sha}^{commit}" 2>/dev/null; then
+              echo "::notice::Marker declares a different REAL commit (${posted_marker_sha}) on this PR - the agent's deliberate declaration; preserving it."
+              deliberate=true
+            else
+              echo "::warning::compliance-check-id mismatch: posted ${posted_id} (wrong PR prefix or not a real commit - transcription error); intended ${PR_NUMBER}-${PR_HEAD_SHA}."
+              needs_fix=true
+            fi
           fi
-          
+
           if [ "$needs_fix" = true ]; then
-            echo "::error::Compliance review missing required footers."
-            exit 1
+            if [ "$deliberate" = true ]; then
+              # Preserve the agent's declared commit; repair only what's broken.
+              effective_marker="<!-- compliance-check-id: ${posted_id} -->"
+            else
+              effective_marker="$EXPECTED_MARKER"
+            fi
+            echo "Repairing compliance report footers on comment $comment_id (marker: ${effective_marker})..."
+            clean_body=$(printf '%s' "$current_body" | perl -0777 -pe 's/<!--\s*compliance-check-id:\s*[0-9]+-[a-f0-9]+\s*-->//g')
+            clean_body=$(printf '%s' "$clean_body" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' | sed -e 's/[[:space:]]*$//')
+            printf '%s\n\n%s\n%s\n' "$clean_body" "$EXPECTED_SIGNATURE" "$effective_marker" > /tmp/repaired_compliance_body.txt
+            gh api --method PATCH "/repos/${{ github.repository }}/issues/comments/$comment_id" -F body=@/tmp/repaired_compliance_body.txt
+
+            # Re-verify the repair actually landed
+            sleep 3
+            recheck=$(gh api "/repos/${{ github.repository }}/issues/comments/$comment_id" --jq .body)
+            if [[ "$recheck" == *"$EXPECTED_SIGNATURE"* && "$recheck" == *"$effective_marker"* ]]; then
+              echo "::notice::Compliance footers repaired and verified (marker = ${posted_id:-${PR_NUMBER}-${PR_HEAD_SHA}})."
+            else
+              echo "::error::Compliance footer repair did not land on comment $comment_id; FOLLOW-UP detection may read a wrong base. Manual check needed."
+              exit 1
+            fi
+          elif [ "$deliberate" = true ]; then
+            echo "Marker left as the agent's deliberate declaration; signature already correct. Done."
           else
-            echo "✓ Verification passed!"
+            echo "Compliance footer verification passed!"
           fi

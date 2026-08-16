@@ -67,10 +67,11 @@ ${PULL_REQUEST_CONTEXT}
 </pull_request>
 
 ### Head SHA Rules (Critical)
-- Always use the provided `${PR_HEAD_SHA}` for both the review `commit_id` and the marker `<!-- last_reviewed_sha:${PR_HEAD_SHA} -->` in your review body.
+- The SHA of the commit you are reviewing lives in **`/tmp/head_sha.txt`** (workflow-written at checkout; it is the commit actually checked out, even if the PR head moves mid-run). Source SHAs from that file or fresh `git rev-parse` output — hand-typing hex from prose or memory is unreliable and has caused live failures. Use the file's value for the review `commit_id` and the `<!-- last_reviewed_sha:... -->` marker; the marker declares what commit you actually reviewed.
+- If you deliberately review a different commit than the file's (e.g., re-verifying against an older base), write THAT commit's real SHA (from `git rev-parse`, never from memory) and state in the summary which commit you reviewed and why.
 - Do not scrape or infer the head SHA from comments, reviews, or any textual sources. Do not reuse a previously parsed `last_reviewed_sha` as the `commit_id`.
-- The only purpose of `last_reviewed_sha` is to serve as the base for incremental diffs. It must not replace `${PR_HEAD_SHA}` anywhere.
-- If `${PR_HEAD_SHA}` is missing, prefer a strict fallback of `git rev-parse HEAD` and clearly state this as a warning in your review summary.
+- The only purpose of `last_reviewed_sha` is to serve as the base for incremental diffs. It must not replace the current head anywhere.
+- If `/tmp/head_sha.txt` is missing, recreate it (`git rev-parse HEAD > /tmp/head_sha.txt`) and state this as a warning in your review summary.
 
 ---
 

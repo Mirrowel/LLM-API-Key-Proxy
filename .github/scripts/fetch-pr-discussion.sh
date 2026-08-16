@@ -168,12 +168,19 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   # THIS agent reviews, newest first
   (($pr.reviews.nodes // []) | sort_by(.submittedAt) | reverse
     | map(select((.author.login? // "") as $l | $agentbots | index($l)))) as $agent_reviews |
+  # Section-level clarification: GitHub auto-dismisses APPROVED reviews on new
+  # pushes (CHANGES_REQUESTED/COMMENT survive); the state field loses the
+  # original verdict. One note per section, only when a DISMISSED review is in it.
+  def dismissed_note: if any(.[]?; .state == "DISMISSED") then "\nNote: DISMISSED here usually means an APPROVED review auto-cleared by a later push - the Verdict line in the body holds the original verdict. Treat it as re-review-the-delta, not a wrong review.\n" else "" end;
   # Human/other reviews with correlated active comments (agent reviews excluded)
-  [ ($pr.reviews.nodes // [])[]?
-    | select(
+  (($pr.reviews.nodes // [])
+    | map(select(
         ((.author.login? // "unknown") as $login | $ignored | index($login) | not)
         and (((.author.login? // "unknown") as $abot | $agentbots | index($abot)) | not)
-        and (.isMinimized != true))
+        and (.isMinimized != true)))) as $other_reviews |
+  # ($other_reviews already carries these filters - never duplicate the
+  # predicate list; duplicated predicates drift apart on later edits.)
+  [ $other_reviews[]?
     | . as $r
     | [ ($allc | map(select((.pullRequestReview.databaseId? // null) == $r.databaseId)) | .[] | fmt_c_kept) ] as $lines
     | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + " - " + (.state // "UNKNOWN") + " <" + (.url // "") + ">\n"
@@ -185,9 +192,9 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
    + (if ($unlinked | length) > 0 then "\nStandalone inline comments:\n" + ($unlinked | join("\n")) + "\n" else "" end)) as $threadreviews |
   ([ $allc[] | select((thread_ok and cmt_ok) | not) ] | length) as $n_filtered |
   {
-    elevated: (([$agent_reviews[0:$count][] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end),
-    history: (([$agent_reviews[$count:][] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end),
-    threadreviews: $threadreviews,
+    elevated: (([$agent_reviews[0:$count][] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end) + ($agent_reviews[0:$count] | dismissed_note),
+    history: (([$agent_reviews[$count:][] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end) + ($agent_reviews[$count:] | dismissed_note),
+    threadreviews: ($threadreviews + ($other_reviews | dismissed_note)),
     filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, or minimized comments in active threads). The elevated block bypasses the filter on purpose.</filtering_summary>")
   }
 '); then
