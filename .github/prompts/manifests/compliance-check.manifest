@@ -1,3 +1,4 @@
+trigger-message
 identity
 role
 tool-restrictions
@@ -7,4 +8,7 @@ communication
 error-handling
 iteration
 context-intensive
+previous-reviews
+agent-review-history
+thread-context
 mission-compliance

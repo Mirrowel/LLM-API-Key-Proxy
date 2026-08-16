@@ -14,11 +14,12 @@ export THREAD_CONTEXT='<tc>' NEW_COMMENT_AUTHOR=someone NEW_COMMENT_BODY='<b>'
 export THREAD_NUMBER=42 THREAD_AUTHOR=octo IS_FIRST_REVIEW=true
 export FULL_DIFF_PATH=/tmp/f.txt INCREMENTAL_DIFF_PATH=/tmp/i.txt LAST_REVIEWED_SHA=abc123
 export ISSUE_CONTEXT='<ic>' ISSUE_NUMBER=7 ISSUE_AUTHOR=octo REVIEW_TYPE=FIRST
-export PR_TITLE=t PR_BODY=b PR_LABELS=l PREVIOUS_REVIEWS=p FILE_GROUPS=g REPORT_TEMPLATE=r DIFF_PATH=/tmp/c.txt CHANGED_FILES=c CHANGED_FILES_JSON=cj
-RV='$REVIEW_TYPE $PR_AUTHOR $PR_NUMBER $GITHUB_REPOSITORY $PR_HEAD_SHA $PULL_REQUEST_CONTEXT $DIFF_FILE_PATH'
-BV='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER'
-IV='$ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR'
-CV='$PR_NUMBER $PR_TITLE $PR_BODY $PR_AUTHOR $PR_HEAD_SHA $CHANGED_FILES $CHANGED_FILES_JSON $PR_LABELS $PREVIOUS_REVIEWS $FILE_GROUPS $REPORT_TEMPLATE $DIFF_PATH $GITHUB_REPOSITORY'
+export PR_TITLE=t PR_BODY=b PR_LABELS=l FILE_GROUPS=g REPORT_TEMPLATE=r DIFF_PATH=/tmp/c.txt CHANGED_FILES=c CHANGED_FILES_JSON=cj
+export TRIGGER_MESSAGE='<tm>' PREVIOUS_BOT_REVIEWS='<pbr>' AGENT_REVIEW_HISTORY='<arh>' PREVIOUS_COMPLIANCE_REPORT='<pcr>'
+RV='$REVIEW_TYPE $PR_AUTHOR $PR_NUMBER $GITHUB_REPOSITORY $PR_HEAD_SHA $PULL_REQUEST_CONTEXT $DIFF_FILE_PATH $TRIGGER_MESSAGE $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $THREAD_CONTEXT'
+BV='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY'
+IV='$ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR $TRIGGER_MESSAGE'
+CV='$PR_NUMBER $PR_TITLE $PR_BODY $PR_AUTHOR $PR_HEAD_SHA $CHANGED_FILES $CHANGED_FILES_JSON $PR_LABELS $PREVIOUS_COMPLIANCE_REPORT $TRIGGER_MESSAGE $THREAD_CONTEXT $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_TYPE $DIFF_PATH $INCREMENTAL_DIFF_PATH $FILE_GROUPS $REPORT_TEMPLATE $GITHUB_REPOSITORY'
 bash .github/scripts/assemble-prompt.sh pr-review-first     | envsubst "$RV" > "$TMP/rf.txt"
 REVIEW_TYPE=FOLLOW-UP bash .github/scripts/assemble-prompt.sh pr-review-followup | REVIEW_TYPE=FOLLOW-UP envsubst "$RV" > "$TMP/ru.txt"
 bash .github/scripts/assemble-prompt.sh bot-reply          | envsubst "$BV" > "$TMP/br.txt"
@@ -95,6 +96,34 @@ need cc 'file group'                           "cc: file groups wiring"
 need cc 'template'                             "cc: report template wiring"
 need ic 'Initial Analysis Report'              "ic: analysis output shape"
 need ic 'thanks'                               "ic: acknowledgment duty"
+
+# ---- trigger-message + three-block context (WS4/WS2+3) ----
+for f in rf ru br ic cc; do
+  need $f 'THE REQUEST THAT TRIGGERED YOU'    "$f: trigger-message block present"
+  need $f 'This is the request to answer'     "$f: trigger primacy rule"
+done
+for f in rf ru br cc; do
+  need $f 'YOUR PREVIOUS REVIEWS'             "$f: elevated agent reviews block"
+  need $f 'YOUR OLDER REVIEWS'                "$f: agent review history block"
+  need $f 'THREAD CONTEXT'                    "$f: thread context block"
+  need $f 'untrusted data'                    "$f: thread context untrusted rule"
+done
+
+# ---- compliance status semantics (WS1) ----
+need cc 'error., .failure., .pending., .success.|accepts ONLY these states' "cc: status enum documented"
+neednt cc "state='neutral'"                   "cc: neutral state banned"
+need cc 'Passed with warnings - see report'   "cc: warnings status string"
+need cc 'Blocking issues - see report'        "cc: blocking status string"
+need cc 'target_url'                          "cc: status links to report"
+need cc 'Post the report BEFORE the status'   "cc: post-report-first order"
+need cc 'FOLLOW-UP'                           "cc: follow-up protocol present"
+need cc 'Resolved'                            "cc: re-verify previous findings"
+need cc 'good-practices|GOOD PRACTICES'       "cc: practices-audit framing"
+
+# ---- CI status discipline (WS5, all modes via tool-restrictions) ----
+for f in rf ru br ic cc; do
+  need $f 'compliance-check. status is owned'  "$f: status exclusivity rule"
+done
 
 # ---- clean-prose invariants (generator-artifact class) ----
 for f in rf ru br ic cc; do

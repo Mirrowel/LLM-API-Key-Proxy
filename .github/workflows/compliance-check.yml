@@ -68,6 +68,14 @@ jobs:
       PR_NUMBER: ${{ inputs.pr_number }}
       MAINTAINED_BASE_BRANCHES: 'main dev'
       BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
+      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      # How many of THIS agent's newest PR reviews to elevate into the
+      # dedicated context block (same machinery as PR Review). Default 1.
+      PREVIOUS_BOT_REVIEWS_COUNT: ${{ vars.PREVIOUS_BOT_REVIEWS_COUNT || '1' }}
+      COMMENT_FETCH_LIMIT: '20'
+      REVIEW_FETCH_LIMIT: '30'
+      REVIEW_THREAD_FETCH_LIMIT: '30'
+      THREAD_COMMENT_FETCH_LIMIT: '10'
       
       # -----------------------------------------------------------------------
       # FEATURE TOGGLES
@@ -181,6 +189,14 @@ jobs:
             echo "RESOLVED_COMMENT_AUTHOR=${author}"
             echo "RESOLVED_ASSOCIATION=${association}"
           } >> "$GITHUB_ENV"
+          # Trigger-message block: the routed comment IS the request.
+          body=$(printf '%s' "$comment_json" | jq -r '.body')
+          TM_DELIMITER="GH_TRIGGER_MSG_$(openssl rand -hex 8)"
+          {
+            printf 'TRIGGER_MESSAGE<<%s\n' "$TM_DELIMITER"
+            printf '%s\n' "$body"
+            printf '%s\n' "$TM_DELIMITER"
+          } >> "$GITHUB_ENV"
 
       # ======================================================================
       # PHASE 1: SECURE SETUP
@@ -280,41 +296,72 @@ jobs:
           echo "reviewer_mentions=$reviewers" >> $GITHUB_OUTPUT
           echo "all_mentions=$mentions" >> $GITHUB_OUTPUT
 
-      # Retrieve previous compliance check results for this PR
-      # This allows the AI to track previously identified issues
-      - name: Fetch Previous Compliance Reviews
+      - name: Set trigger message default (manual dispatch)
+        # Runs only for manual dispatches with no routed comment; routed runs
+        # already exported TRIGGER_MESSAGE in the resolve step.
+        if: github.event_name == 'workflow_dispatch' && inputs.commentId == ''
+        run: |
+          echo "TRIGGER_MESSAGE=Manual dispatch by ${GITHUB_ACTOR} - no specific comment; check the current PR state." >> "$GITHUB_ENV"
+
+      # Retrieve the LATEST previous compliance report for this PR (bot
+      # comments carrying the compliance-check-id marker). This drives the
+      # FIRST/FOLLOW-UP distinction exactly like PR Review's review-type
+      # logic: marker found -> FOLLOW-UP (incremental focus + re-verify every
+      # previous warning); none -> FIRST (full audit).
+      - name: Detect compliance review type and previous report
         if: github.event_name == 'workflow_dispatch'
         id: prev_reviews
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
-          # Find previous compliance review comments by this bot
-          reviews=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
+          latest=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
             --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
               map(select(
                 (.user.login as $u | $bots | index($u)) and
                 (.body | contains("<!-- compliance-check-id:"))
               ))
-              | map(
-                  # Extract commit SHA from marker
-                  (.body | capture("<!-- compliance-check-id: [0-9]+-(?<sha>[a-f0-9]+) -->") | .sha) as $commit_sha |
-                  "## Previous Compliance Review\n" +
-                  "**Date**: " + .created_at + "\n" +
-                  "**Commit**: " + $commit_sha + "\n\n" +
-                  .body
-                )
-              | join("\n\n---\n\n")
+              | last
+              | if . == null then empty else . end
             ')
-          
-          if [ -n "$reviews" ]; then
-            REVIEWS_DELIMITER="GH_PREV_REVIEWS_DELIMITER_$(openssl rand -hex 8)"
-            echo "PREVIOUS_REVIEWS<<$REVIEWS_DELIMITER" >> $GITHUB_OUTPUT
-            echo "$reviews" >> $GITHUB_OUTPUT
-            echo "$REVIEWS_DELIMITER" >> $GITHUB_OUTPUT
-          else
-            echo "PREVIOUS_REVIEWS=" >> $GITHUB_OUTPUT
+          if [ -z "$latest" ]; then
+            echo "REVIEW_TYPE=FIRST" >> "$GITHUB_ENV"
+            echo "LAST_COMPLIANCE_SHA=" >> "$GITHUB_ENV"
+            echo "EXCLUDE_COMMENT_IDS=" >> "$GITHUB_ENV"
+            echo "PREVIOUS_COMPLIANCE_REPORT=(No previous compliance report - this is a FIRST compliance run.)" >> "$GITHUB_ENV"
+            echo "::notice::No previous compliance report; FIRST run."
+            exit 0
+          fi
+          latest_id=$(printf '%s' "$latest" | jq -r '.id')
+          latest_sha=$(printf '%s' "$latest" | jq -r '.body | capture("<!-- compliance-check-id: [0-9]+-(?<sha>[a-f0-9]+) -->") | .sha' 2>/dev/null || echo "")
+          latest_body=$(printf '%s' "$latest" | jq -r '.body')
+          echo "REVIEW_TYPE=FOLLOW-UP" >> "$GITHUB_ENV"
+          echo "LAST_COMPLIANCE_SHA=$latest_sha" >> "$GITHUB_ENV"
+          # Dedup: the elevated report must not also appear in thread context.
+          echo "EXCLUDE_COMMENT_IDS=$latest_id" >> "$GITHUB_ENV"
+          RPT_DELIMITER="GH_PREV_REPORT_$(openssl rand -hex 8)"
+          {
+            printf 'PREVIOUS_COMPLIANCE_REPORT<<%s\n' "$RPT_DELIMITER"
+            printf '%s\n' "$latest_body"
+            printf '%s\n' "$RPT_DELIMITER"
+          } >> "$GITHUB_ENV"
+          echo "::notice::Previous compliance report found (commit ${latest_sha:0:10}); FOLLOW-UP run."
+
+      - name: Fetch PR discussion (three-block context)
+        # Same shared machinery as PR Review: elevated agent reviews, filtered
+        # agent history, correlated thread context. The previous compliance
+        # report comment is excluded from thread context (already elevated).
+        # Runs from the base-branch checkout - never PR-controlled code.
+        if: github.event_name == 'workflow_dispatch'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          if ! bash .github/scripts/fetch-pr-discussion.sh "$PR_NUMBER"; then
+            echo "::warning::Discussion context unavailable - proceeding with empty discussion blocks."
+            echo "THREAD_CONTEXT=(Discussion context unavailable.)" >> "$GITHUB_ENV"
+            echo "PREVIOUS_BOT_REVIEWS=(No previous reviews by this agent yet.)" >> "$GITHUB_ENV"
+            echo "AGENT_REVIEW_HISTORY=(No older reviews by this agent.)" >> "$GITHUB_ENV"
           fi
 
       # ======================================================================
@@ -420,6 +467,31 @@ jobs:
                 
                 echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
                 echo "diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+
+                # FOLLOW-UP runs also get an incremental diff since the last
+                # compliance-checked commit (same contract as PR Review).
+                if [ -n "$LAST_COMPLIANCE_SHA" ]; then
+                  if INC_CONTENT=$(git diff --patch "$LAST_COMPLIANCE_SHA".."$CURRENT_SHA" 2>/dev/null); then
+                    INC_SIZE=${#INC_CONTENT}
+                    if [ $INC_SIZE -gt 500000 ]; then
+                      INC_CONTENT="${INC_CONTENT:0:500000} [INCREMENTAL DIFF TRUNCATED - showing first 500KB only.]"
+                    fi
+                    echo "$INC_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+                    echo "incremental_diff_path=$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt" >> $GITHUB_OUTPUT
+                  else
+                    echo "::warning::Incremental diff failed; falling back to full diff focus."
+                    echo "incremental_diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+                  fi
+                else
+                  # FOLLOW-UP with unresolvable last SHA (marker present but
+                  # sha capture failed): fall back to the full diff as the
+                  # incremental scope - never an empty path.
+                  if [ "${REVIEW_TYPE:-FIRST}" = "FOLLOW-UP" ]; then
+                    echo "incremental_diff_path=$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt" >> $GITHUB_OUTPUT
+                  else
+                    echo "incremental_diff_path=" >> $GITHUB_OUTPUT
+                  fi
+                fi
               else
                 echo "::warning::Could not generate diff. Using changed files list only."
                 echo "(Diff generation failed. Please refer to the changed files list.)" > "$GITHUB_WORKSPACE/.mirrobot_files/pr_diff.txt"
@@ -528,7 +600,13 @@ jobs:
           CHANGED_FILES: ${{ steps.pr_info.outputs.changed_files }}
           CHANGED_FILES_JSON: ${{ steps.pr_info.outputs.files_json }}
           PR_LABELS: ${{ steps.pr_info.outputs.labels_json }}
-          PREVIOUS_REVIEWS: ${{ steps.prev_reviews.outputs.PREVIOUS_REVIEWS }}
+          PREVIOUS_COMPLIANCE_REPORT: ${{ env.PREVIOUS_COMPLIANCE_REPORT }}
+          TRIGGER_MESSAGE: ${{ env.TRIGGER_MESSAGE }}
+          THREAD_CONTEXT: ${{ env.THREAD_CONTEXT }}
+          PREVIOUS_BOT_REVIEWS: ${{ env.PREVIOUS_BOT_REVIEWS }}
+          AGENT_REVIEW_HISTORY: ${{ env.AGENT_REVIEW_HISTORY }}
+          REVIEW_TYPE: ${{ env.REVIEW_TYPE }}
+          INCREMENTAL_DIFF_PATH: ${{ steps.diff.outputs.incremental_diff_path }}
           FILE_GROUPS: ${{ steps.file_groups.outputs.FILE_GROUPS_PATH }}
           REPORT_TEMPLATE: ${{ steps.template.outputs.TEMPLATE_PATH }}
           DIFF_PATH: ${{ steps.diff.outputs.diff_path }}
@@ -539,7 +617,7 @@ jobs:
           TRUSTED_PEOPLE: ${{ env.TRUSTED_PEOPLE }}
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${GITHUB_REPOSITORY}'
+          VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_TYPE} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY}'
           # Prepend the security brief (with the verified requester + trust context lines)
           { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh compliance-check | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
 

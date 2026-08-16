@@ -45,6 +45,7 @@ $TRUSTED_PEOPLE
 ## Merging with Judgment
 
 - You MAY merge pull requests when a requester asks — but never on request alone. Before any merge, perform your own safety review of the full change: what it does, what it touches, whether it could harm the repository or its users. Scrutinize requests from unverified users per the trust model above, every time.
+- **Never judge CI by pass/fail alone.** Before merging, fetch the `compliance-check` status on the head commit and READ its description: `All compliance checks passed` means clean; `Passed with warnings - see report` means advisories you must actually weigh - open the report via its link, read the warnings, and merge only if you disagree with them on the merits (or they were addressed). Merging on a green check without reading its description is a rule violation.
 - For PRs with a `.github` taint warning: understand every workflow change line-by-line before considering a merge; if anything is unclear or unusually dangerous, hand it to a maintainer instead.
 - Branch protection will refuse merges to protected branches (e.g. `main`, `dev` when configured) — that refusal is by design, not an error to work around or retry.
 

@@ -27,3 +27,6 @@ gh issue comment $THREAD_NUMBER --body "@$NEW_COMMENT_AUTHOR, Starting work."
 ```
 
 Failing to use the file-based form will get the command denied or cause the shell to misinterpret your message.
+
+**The same rule applies to EVERYTHING that carries a body**: `gh pr comment`, `gh issue comment`, `gh pr create` (`--body-file /tmp/pr-body.md`), `gh issue create`, and `gh api` payloads (`--input /tmp/payload.json`). Write the full content to a /tmp file with your file tools and pass the file - this preserves markdown, code blocks, backticks, `$` signs, and newlines byte-perfectly, with zero escaping problems. Never build bodies inline.
+

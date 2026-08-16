@@ -69,6 +69,12 @@ jobs:
 
       # SECURITY: capture every file the agent consumes from the DEFAULT BRANCH
       # checkout (done above) into /tmp before the second, full checkout.
+      - name: Set trigger message
+        # Issue analysis is never comment-triggered (router owns comments);
+        # the issue body itself - in ISSUE_CONTEXT below - is the request.
+        run: |
+          echo "TRIGGER_MESSAGE=Issue #${ISSUE_NUMBER} opened by @${ISSUE_AUTHOR} - the issue body in the context below is the request." >> "$GITHUB_ENV"
+
       - name: Save trusted artifacts (prompt parts + scrub script)
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
@@ -195,6 +201,6 @@ jobs:
           # (passed through by bot-setup; see permissions.example.json).
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
-            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR}'
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE}'
             # Prepend the security brief (with the verified requester + trust context lines)
             { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share -

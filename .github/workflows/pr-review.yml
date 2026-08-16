@@ -13,14 +13,15 @@ name: PR Review
 #   and is safe to run from any base branch.
 
 concurrency:
-  # workflow_run fallback = the stub's run name ("AutoTrigger PR #N"), the
-  # only reliable PR identity for completion-triggered runs. NOTE: this means
-  # an auto run ("PR Review-AutoTrigger PR #123") and a comment/dispatch run
-  # ("PR Review-123") for the same PR use DIFFERENT groups — the group is
-  # evaluated before any step can normalize the number, so a manual review
-  # requested mid-auto-review runs in parallel (bounded: both post reviews;
-  # per-group serialization still prevents pileups of each kind). Accepted.
-  group: ${{ github.workflow }}-${{ inputs.prNumber || github.event.workflow_run.name }}
+  # ONE group per PR across ALL trigger paths, so auto and comment/manual
+  # reviews of the same PR serialize (a manual review requested mid-auto-run
+  # waits; both then render correct FIRST/FOLLOW-UP types instead of racing
+  # on stale review state). Resolution order: dispatch input -> the stub
+  # run's pull_requests[0] (populated for same-repo PRs; empty for forks) ->
+  # head_branch (per-PR-branch fallback, mainly forks) -> run_id (last
+  # resort: degrades to no cross-path serialization rather than wrongly
+  # blocking unrelated runs). cancel-in-progress stays false: reviews queue.
+  group: ${{ github.workflow }}-${{ inputs.prNumber || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch || github.run_id }}
   cancel-in-progress: false
 
 on:
@@ -61,10 +62,14 @@ jobs:
       MAINTAINED_BASE_BRANCHES: 'main dev'
       BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
       IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      # How many of THIS agent's newest reviews to elevate (bypassing the
+      # resolved/outdated filter) into the dedicated context block. Repo
+      # variable overrides; default 1 (latest only).
+      PREVIOUS_BOT_REVIEWS_COUNT: ${{ vars.PREVIOUS_BOT_REVIEWS_COUNT || '1' }}
       COMMENT_FETCH_LIMIT: '20'
       REVIEW_FETCH_LIMIT: '30'
       REVIEW_THREAD_FETCH_LIMIT: '40'
-      THREAD_COMMENT_FETCH_LIMIT: '5'
+      THREAD_COMMENT_FETCH_LIMIT: '10'
 
     steps:
       # ========================================================================
@@ -108,6 +113,14 @@ jobs:
           {
             echo "RESOLVED_COMMENT_AUTHOR=${author}"
             echo "RESOLVED_ASSOCIATION=${association}"
+          } >> "$GITHUB_ENV"
+          # Trigger-message block: the routed comment IS the request.
+          body=$(printf '%s' "$comment_json" | jq -r '.body')
+          TM_DELIMITER="GH_TRIGGER_MSG_$(openssl rand -hex 8)"
+          {
+            printf 'TRIGGER_MESSAGE<<%s\n' "$TM_DELIMITER"
+            printf '%s\n' "$body"
+            printf '%s\n' "$TM_DELIMITER"
           } >> "$GITHUB_ENV"
 
       # ========================================================================
@@ -156,6 +169,9 @@ jobs:
           echo "Auto-review of PR #$pr_number confirmed."
           echo "should_proceed=true" >> "$GITHUB_OUTPUT"
           echo "PR_NUMBER=$pr_number" >> "$GITHUB_ENV"
+          # Trigger-message block for auto runs (no comment exists). The stub
+          # run name carries the causing action, e.g. "(synchronize)".
+          echo "TRIGGER_MESSAGE=Automatically triggered by PR activity (stub run: $TRIGGER_RUN_NAME) - no human comment requested this; the PR event itself did." >> "$GITHUB_ENV"
 
       - name: Checkout repository
         if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
@@ -244,89 +260,18 @@ jobs:
               -f content='eyes'
           fi
 
-      - name: Fetch and Format Full PR Context
+      - name: Fetch PR metadata
+        # Metadata only (title/body/files/labels/linked issues/xrefs). The PR
+        # DISCUSSION (comments, reviews, inline comments - the three-block
+        # separation) is built by the shared fetch-pr-discussion.sh step next.
         if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
         id: pr_meta
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
         run: |
-          # Fetch core PR metadata (comments and reviews fetched via GraphQL below)
           pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
-          # Fetch timeline data to find cross-references
           timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/timeline")
 
-          repo_owner="${GITHUB_REPOSITORY%/*}"
-          repo_name="${GITHUB_REPOSITORY#*/}"
-          GRAPHQL_QUERY='query($owner:String!, $name:String!, $number:Int!, $commentLimit:Int!, $reviewLimit:Int!, $threadLimit:Int!, $threadCommentLimit:Int!) {
-            repository(owner: $owner, name: $name) {
-              pullRequest(number: $number) {
-                comments(last: $commentLimit) {
-                  nodes {
-                    databaseId
-                    author { login }
-                    body
-                    createdAt
-                    isMinimized
-                    minimizedReason
-                  }
-                }
-                reviews(last: $reviewLimit) {
-                  nodes {
-                    databaseId
-                    author { login }
-                    body
-                    state
-                    submittedAt
-                    isMinimized
-                    minimizedReason
-                  }
-                }
-                reviewThreads(last: $threadLimit) {
-                  nodes {
-                    id
-                    isResolved
-                    isOutdated
-                    comments(last: $threadCommentLimit) {
-                      nodes {
-                        databaseId
-                        author { login }
-                        body
-                        createdAt
-                        path
-                        line
-                        originalLine
-                        diffHunk
-                        isMinimized
-                        minimizedReason
-                        pullRequestReview {
-                          databaseId
-                          isMinimized
-                          minimizedReason
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }'
-
-          discussion_data=$(gh api graphql \
-            -F owner="$repo_owner" \
-            -F name="$repo_name" \
-            -F number=$PR_NUMBER \
-            -F commentLimit=${{ env.COMMENT_FETCH_LIMIT }} \
-            -F reviewLimit=${{ env.REVIEW_FETCH_LIMIT }} \
-            -F threadLimit=${{ env.REVIEW_THREAD_FETCH_LIMIT }} \
-            -F threadCommentLimit=${{ env.THREAD_COMMENT_FETCH_LIMIT }} \
-            -f query="$GRAPHQL_QUERY")
-
-          # Debug: Output pr_json and the discussion GraphQL payload for inspection
-          echo "$pr_json" > pr_json.txt
-          echo "$discussion_data" > discussion_data.txt
-          
-          # Prepare metadata
           author=$(echo "$pr_json" | jq -r .author.login)
           created_at=$(echo "$pr_json" | jq -r .createdAt)
           base_branch=$(echo "$pr_json" | jq -r .baseRefName)
@@ -338,132 +283,7 @@ jobs:
           changed_files_count=$(echo "$pr_json" | jq -r '.files | length')
           title=$(echo "$pr_json" | jq -r .title)
           body=$(echo "$pr_json" | jq -r '.body // "(No description provided)"')
-          # Build changed files list with correct jq interpolations for additions and deletions
-          # Previous pattern had a missing backslash before the deletions interpolation, leaving a literal '((.deletions))'.
           changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-\((.deletions))"')
-          comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
-            ((.data.repository.pullRequest.comments.nodes // [])
-              | map(select((.isMinimized != true) and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
-            | if length > 0 then
-                map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n")
-                | join("")
-              else
-                "No general comments."
-              end')
-          
-          # ===== ACCURATE FILTERING & COUNTING (Fixed math logic) =====
-          
-          # Calculate all stats using jq integers directly to avoid grep/text parsing errors
-          stats_json=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
-            # Define filter logic
-            def is_valid_review:
-              (.author.login? // "unknown") as $login | $ignored | index($login) | not
-              and (.isMinimized != true);
-            
-            def is_valid_comment:
-               .isResolved != true 
-               and .isOutdated != true
-               and (((.comments.nodes // []) | first | .isMinimized) != true)
-               and ((((.comments.nodes // []) | first | .pullRequestReview.isMinimized) // false) != true);
-            
-            def is_valid_inline:
-              .isMinimized != true
-              and ((.pullRequestReview.isMinimized // false) != true)
-              and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not);
-
-            # Calculate Reviews
-            def raw_reviews: (.data.repository.pullRequest.reviews.nodes // []);
-            def total_reviews: (raw_reviews | length);
-            def included_reviews: ([raw_reviews[]? | select(is_valid_review)] | length);
-
-            # Calculate Review Comments
-            def raw_threads: (.data.repository.pullRequest.reviewThreads.nodes // []);
-            def valid_threads: (raw_threads | map(select(is_valid_comment)));
-            def all_valid_comments: (valid_threads | map(.comments.nodes // []) | flatten | map(select(is_valid_inline)));
-            
-            # We count total comments as "active/unresolved threads comments"
-            def total_review_comments: (raw_threads | map(select(.isResolved != true and .isOutdated != true)) | map(.comments.nodes // []) | flatten | length);
-            def included_review_comments: (all_valid_comments | length);
-
-            {
-              total_reviews: total_reviews,
-              included_reviews: included_reviews,
-              excluded_reviews: (total_reviews - included_reviews),
-              total_review_comments: total_review_comments,
-              included_review_comments: included_review_comments,
-              excluded_comments: (total_review_comments - included_review_comments)
-            }
-          ')
-          
-          # Export stats to env vars
-          filtered_reviews=$(echo "$stats_json" | jq .included_reviews)
-          excluded_reviews=$(echo "$stats_json" | jq .excluded_reviews)
-          filtered_comments=$(echo "$stats_json" | jq .included_review_comments)
-          excluded_comments=$(echo "$stats_json" | jq .excluded_comments)
-          
-          echo "✓ Filtered reviews: $filtered_reviews included, $excluded_reviews excluded (ignored bots/hidden)"
-          echo "✓ Filtered review comments: $filtered_comments included, $excluded_comments excluded (outdated/hidden)"
-          
-          # Generate Text Content (using same filters as stats)
-          
-          # Reviews Text
-          review_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_filter_err.log")
-          if reviews=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
-            if ((((.data.repository.pullRequest.reviews.nodes // []) | length) > 0)) then 
-              ((.data.repository.pullRequest.reviews.nodes // [])[]? 
-              | select(
-                  ((.author.login? // "unknown") as $login | $ignored | index($login) | not)
-                  and (.isMinimized != true)
-                ) 
-              | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + ":\n - Review body: " + (.body // "(No summary comment)") + "\n - State: " + (.state // "UNKNOWN") + "\n") 
-            else 
-              "No formal reviews." 
-            end' 2>"$review_filter_err"); then
-             if [ -s "$review_filter_err" ]; then
-               echo "::debug::jq stderr (reviews) emitted output:" 
-               cat "$review_filter_err"
-             fi
-          else
-             echo "::warning::Review formatting failed, using unfiltered data"
-             reviews="Error processing reviews."
-             echo "FILTER_ERROR_REVIEWS=true" >> $GITHUB_ENV
-          fi
-          rm -f "$review_filter_err" || true
-          
-          # Review Comments Text
-          review_comment_filter_err=$(mktemp 2>/dev/null || echo "/tmp/review_comment_filter_err.log")
-          if review_comments=$(echo "$discussion_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" '
-            ((.data.repository.pullRequest.reviewThreads.nodes // [])
-              | map(select(
-                  .isResolved != true and .isOutdated != true
-                  and (((.comments.nodes // []) | first | .isMinimized) != true)
-                  and ((((.comments.nodes // []) | first | .pullRequestReview.isMinimized) // false) != true)
-                ))
-              | map(.comments.nodes // [])
-              | flatten
-              | map(select((.isMinimized != true)
-                           and ((.pullRequestReview.isMinimized // false) != true)
-                           and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not))))
-            | if length > 0 then
-                map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + " (" + (.path // "Unknown file") + ":" + ((.line // .originalLine // "N/A") | tostring) + "):\n   " + ((.body // "") | tostring) + "\n")
-                | join("")
-              else
-                "No inline review comments."
-              end' 2>"$review_comment_filter_err"); then
-             if [ -s "$review_comment_filter_err" ]; then
-               echo "::debug::jq stderr (review comments) emitted output:"
-               cat "$review_comment_filter_err"
-             fi
-          else
-             echo "::warning::Review comment formatting failed"
-             review_comments="Error processing review comments."
-             echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
-          fi
-          rm -f "$review_comment_filter_err" || true
-          
-          # Store filtering statistics
-          echo "EXCLUDED_REVIEWS=$excluded_reviews" >> $GITHUB_ENV
-          echo "EXCLUDED_COMMENTS=$excluded_comments" >> $GITHUB_ENV
 
           # Prepare linked issues robustly by fetching each one individually
           linked_issues_content=""
@@ -484,14 +304,9 @@ jobs:
           references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
           if [ -z "$references" ]; then references="This PR has not been mentioned in other issues or PRs."; fi
 
-          # Build filtering summary for AI context
-          # Ensure numeric fallbacks so blanks never appear if variables are empty
-          filter_summary="Context filtering applied: ${excluded_reviews:-0} reviews and ${excluded_comments:-0} review comments excluded from this context."
-          if [ "${FILTER_ERROR_REVIEWS}" = "true" ] || [ "${FILTER_ERROR_COMMENTS}" = "true" ]; then
-            filter_summary="$filter_summary"$'\n'"Warning: Some filtering operations encountered errors. Context may include items that should have been filtered."
-          fi
-
-          # Assemble the final context block
+          # Assemble the metadata context block (discussion lives in
+          # THREAD_CONTEXT / PREVIOUS_BOT_REVIEWS / AGENT_REVIEW_HISTORY,
+          # exported by fetch-pr-discussion.sh)
           CONTEXT_DELIMITER="GH_PR_CONTEXT_DELIMITER_$(openssl rand -hex 8)"
           echo "PULL_REQUEST_CONTEXT<<$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           echo "Author: $author" >> "$GITHUB_ENV"
@@ -508,15 +323,6 @@ jobs:
           echo "---" >> "$GITHUB_ENV"
           echo "$body" >> "$GITHUB_ENV"
           echo "</pull_request_body>" >> "$GITHUB_ENV"
-          echo "<pull_request_comments>" >> "$GITHUB_ENV"
-          echo "$comments" >> "$GITHUB_ENV"
-          echo "</pull_request_comments>" >> "$GITHUB_ENV"
-          echo "<pull_request_reviews>" >> "$GITHUB_ENV"
-          echo "$reviews" >> "$GITHUB_ENV"
-          echo "</pull_request_reviews>" >> "$GITHUB_ENV"
-          echo "<pull_request_review_comments>" >> "$GITHUB_ENV"
-          echo "$review_comments" >> "$GITHUB_ENV"
-          echo "</pull_request_review_comments>" >> "$GITHUB_ENV"
           echo "<pull_request_changed_files>" >> "$GITHUB_ENV"
           echo "$changed_files_list" >> "$GITHUB_ENV"
           echo "</pull_request_changed_files>" >> "$GITHUB_ENV"
@@ -526,15 +332,28 @@ jobs:
           echo "<cross_references>" >> "$GITHUB_ENV"
           echo "$references" >> "$GITHUB_ENV"
           echo "</cross_references>" >> "$GITHUB_ENV"
-          echo "<filtering_summary>" >> "$GITHUB_ENV"
-          echo "$filter_summary" >> "$GITHUB_ENV"
-          echo "</filtering_summary>" >> "$GITHUB_ENV"
           echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
           echo "PR_AUTHOR=$author" >> $GITHUB_ENV
           echo "BASE_BRANCH=$base_branch" >> $GITHUB_ENV
 
-      
+      - name: Fetch PR discussion (three-block context)
+        # Shared single-source-of-truth script (same machinery as Compliance
+        # Check): elevates THIS agent's newest reviews (filter-bypass with
+        # markers), keeps older agent reviews filtered, and correlates all
+        # remaining reviews with their inline comments in THREAD_CONTEXT.
+        # Runs from the default-branch checkout - never PR-controlled code.
+        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          if ! bash .github/scripts/fetch-pr-discussion.sh "$PR_NUMBER"; then
+            echo "::warning::Discussion context unavailable - proceeding with empty discussion blocks."
+            echo "THREAD_CONTEXT=(Discussion context unavailable.)" >> "$GITHUB_ENV"
+            echo "PREVIOUS_BOT_REVIEWS=(No previous reviews by this agent yet.)" >> "$GITHUB_ENV"
+            echo "AGENT_REVIEW_HISTORY=(No older reviews by this agent.)" >> "$GITHUB_ENV"
+          fi
 
       - name: Determine Review Type and Last Reviewed SHA
         if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
@@ -617,6 +436,13 @@ jobs:
       # checkout (done above, before the PR-head checkout) into /tmp.
       # actions/checkout cannot write outside the workspace, so a PR can never
       # overwrite these copies.
+      - name: Set trigger message default (manual dispatch)
+        # Runs only for manual dispatches with no routed comment; routed and
+        # auto runs already exported TRIGGER_MESSAGE in their resolve steps.
+        if: github.event_name == 'workflow_dispatch' && inputs.commentId == ''
+        run: |
+          echo "TRIGGER_MESSAGE=Manual dispatch by ${GITHUB_ACTOR} - no specific comment; review the current PR state." >> "$GITHUB_ENV"
+
       - name: Save trusted artifacts (prompt parts + scrub script)
         if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
         run: |
@@ -844,16 +670,11 @@ jobs:
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH}'
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT}'
           # Prepend the security brief (with the verified requester + trust context lines)
           { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh "$MANIFEST" | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
           echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
-          # Clear small, now-redundant flags included in the context summary
-          echo "EXCLUDED_REVIEWS=" >> "$GITHUB_ENV" || true
-          echo "EXCLUDED_COMMENTS=" >> "$GITHUB_ENV" || true
-          echo "FILTER_ERROR_REVIEWS=" >> "$GITHUB_ENV" || true
-          echo "FILTER_ERROR_COMMENTS=" >> "$GITHUB_ENV" || true
 
       - name: Review PR with OpenCode
         if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'

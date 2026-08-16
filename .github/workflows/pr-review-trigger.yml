@@ -34,10 +34,11 @@
 
 name: PR Review Trigger
 
-# Carries the PR number to PR Review's resolve step (workflow_run identity
-# channel: pull_requests[] is empty for fork PRs). pull_request_target events
-# always carry the PR number.
-run-name: 'AutoTrigger PR #${{ github.event.pull_request.number }}'
+# Carries the PR number + causing action to PR Review's resolve step
+# (workflow_run identity channel: pull_requests[] is empty for fork PRs).
+# resolve_auto parses digits-only #N - the trailing action is metadata for
+# the agent's trigger-message block and does not affect the parse.
+run-name: 'AutoTrigger PR #${{ github.event.pull_request.number }} (${{ github.event.action }})'
 
 on:
   pull_request_target:
@@ -58,15 +59,25 @@ jobs:
         continue-on-error: true
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # A synchronize push invalidates prior compliance findings (new
+          # commits = new code to audit - mirrors how a push dismisses stale
+          # reviews). The description says so explicitly; other events keep
+          # the generic "not run yet" wording.
+          EVENT_ACTION: ${{ github.event.action }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          if [ "$EVENT_ACTION" = "synchronize" ]; then
+            DESC='New commits pushed - compliance reset. Run /mirrobot-check when ready'
+          else
+            DESC='run /mirrobot-check when ready to merge'
+          fi
           gh api \
             --method POST \
             -H "Accept: application/vnd.github+json" \
             "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
             -f state='pending' \
             -f context='compliance-check' \
-            -f description='run /mirrobot-check when ready to merge'
+            -f description="$DESC"
 
       - name: Decide whether to review
         # Always exits 0 — a declined review is a normal outcome, not a
