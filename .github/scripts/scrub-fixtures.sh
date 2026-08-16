@@ -268,5 +268,60 @@ else
 fi
 rm -rf "$RSIM_DIR"
 
+# ---- strict YAML structural check (workflows + composite action files) ----
+# Plain yaml.safe_load accepts duplicate keys (last-wins silently); GitHub's
+# parser REJECTS them and the workflow dies at 0s with zero jobs (live
+# observed: a double-stacked env: block in a reaction step). This loader
+# fails on duplicates AND unparsable files, naming the file and the key.
+# Interpreter probe: prefer python3, fall back to python. Must EXECUTE and
+# import yaml - on Windows the python3 App-Store shim exists in PATH but
+# fails to run (command -v alone would pick it).
+PY_BIN=""
+for cand in python3 python; do
+  if "$cand" -c 'import sys, yaml' >/dev/null 2>&1; then PY_BIN="$cand"; break; fi
+done
+if [ -z "$PY_BIN" ]; then
+  echo "FAIL: strict YAML check - no working python with PyYAML found"; FAIL=1
+fi
+if [ -n "$PY_BIN" ] && "$PY_BIN" - "$SCRIPT_DIR" <<'PYEOF'
+import glob, os, sys
+import yaml
+
+class StrictLoader(yaml.SafeLoader):
+    def construct_mapping(self, node, deep=False):
+        seen = set()
+        for key_node, _ in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if key in seen:
+                raise yaml.constructor.ConstructorError(
+                    None, None, "duplicate key %r" % (key,), key_node.start_mark)
+            seen.add(key)
+        return super().construct_mapping(node, deep=deep)
+
+root = os.path.abspath(os.path.join(sys.argv[1], "..", ".."))
+files = sorted(
+    glob.glob(os.path.join(root, ".github/workflows/*.yml"))
+    + glob.glob(os.path.join(root, ".github/workflows/*.yaml"))
+    + glob.glob(os.path.join(root, ".github/actions/*/action.yml"))
+)
+bad = 0
+for f in files:
+    try:
+        with open(f, encoding="utf-8") as fh:
+            yaml.load(fh, Loader=StrictLoader)
+    except yaml.YAMLError as e:
+        print("INVALID: %s: %s" % (os.path.relpath(f, root), str(e).replace("\n", " ")[:200]))
+        bad += 1
+if bad:
+    sys.exit(1)
+print("strict-yaml: %d workflow/action files parse with no duplicate keys" % len(files))
+PYEOF
+then
+  echo "PASS: strict YAML (workflows + actions)"
+else
+  echo "FAIL: strict YAML check (GitHub would reject these files - fix before pushing)"
+  FAIL=1
+fi
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

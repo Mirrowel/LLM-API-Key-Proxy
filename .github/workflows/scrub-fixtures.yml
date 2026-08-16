@@ -10,12 +10,14 @@ on:
     paths:
       - '.github/scripts/**'
       - '.github/prompts/**'
-      - '.github/workflows/agent-router.yml'
+      - '.github/actions/**'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - '.github/scripts/**'
       - '.github/prompts/**'
-      - '.github/workflows/agent-router.yml'
+      - '.github/actions/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 permissions:
