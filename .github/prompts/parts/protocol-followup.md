@@ -5,10 +5,10 @@ This is a FOLLOW-UP review: new commits have been pushed since your (or the agen
 **DO NOT** post an acknowledgment comment. Follow the same three-step process: **Collect**, **Curate**, **Submit**.
 
 #### Step 1: Collect All Potential Findings
-Review the incremental diff and collect findings using the same file-based approach as a first review — one file (or small related set) per turn, everything appended as JSON objects to `/tmp/review_findings.jsonl` (object shape: `path`, `line`, optional `start_line`, `side`, `body`; wrap proposed fixes in ```suggestion``` blocks). Focus only on new issues or regressions.
+Review the incremental diff and collect findings using the same file-based approach (one file per turn, findings appended to the scratchpad; see the Review Submission Flow section of this prompt for the mechanics) — one file (or small related set) per turn, everything appended as JSON objects to `/tmp/review_findings.jsonl` (object shape: `path`, `line`, optional `start_line`, `side`, `body`; wrap proposed fixes in ```suggestion``` blocks). Focus only on new issues or regressions.
 
 #### Step 2: Curate and Select Important Findings
-Read `/tmp/review_findings.jsonl`, apply the same HIGH-SIGNAL, LOW-NOISE curation as a first review (critical issues and high-impact improvements first; drop trivial nits, duplicates of existing discussion, and praise-only entries), and decide which findings are important enough to include.
+Read `/tmp/review_findings.jsonl`, apply the HIGH-SIGNAL, LOW-NOISE curation described in the Feedback Philosophy section of this prompt (critical issues and high-impact improvements first; drop trivial nits, duplicates of existing discussion, and praise-only entries), and decide which findings are important enough to include.
 
 #### Step 3: Submit Bundled Follow-up Review
 Choose the review event and state your verdict per the **Verdict Levels** section (below), then build and submit using the **Review Submission Flow** section (below).

@@ -7,10 +7,13 @@ After reading the diff file to get context, immediately provide feedback to the 
 
 Example for a PR titled "Refactor Auth Service":
 ```bash
-gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPOSITORY} --body "I'm starting my review of the authentication service refactor. Diving into the new logic now and will report back shortly."
+# Write the following body to /tmp/comment-body.md with your file tools:
+# I'm starting my review of the authentication service refactor. Diving into the new logic now and will report back shortly.
+# Then post it:
+gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPOSITORY} --body-file /tmp/comment-body.md
 ```
 
-If reviewing your own code, adopt the humorous tone from the Special Instructions section.
+If reviewing your own code, adopt the humorous tone from the Self-Review Tone section.
 
 #### Step 2: Collect All Potential Findings (File by File)
 Analyze the changed files one by one. For each file, generate EVERY finding you notice and append them as JSON objects to `/tmp/review_findings.jsonl`. This file is your external memory, or "scratchpad"; do not filter or curate at this stage.
@@ -52,7 +55,7 @@ First, read the raw findings file to load its contents into your context:
 cat /tmp/review_findings.jsonl
 ```
 
-Next, apply the **HIGH-SIGNAL, LOW-NOISE** philosophy from the mission section:
+Next, apply the **HIGH-SIGNAL, LOW-NOISE** philosophy from the Feedback Philosophy section of this prompt:
 - Which findings are critical (security, bugs)? Which are high-impact improvements?
 - Which are duplicates of existing discussion?
 - Which are trivial nits that can be ignored?
@@ -61,6 +64,6 @@ Next, apply the **HIGH-SIGNAL, LOW-NOISE** philosophy from the mission section:
 In your internal monologue, explicitly state your curation logic before proceeding. The key is: **don't just include everything** — select the comments that will provide the most value to the author. If nothing actionable remains, proceed with 0 inline comments and submit only the summary (use `APPROVE` when all approval criteria are met, otherwise `COMMENT`).
 
 #### Step 4: Build and Submit the Final Bundled Review
-Choose the review event and state your verdict per the **Verdict Levels** section (below), then build and submit using the **Review Submission Flow** section (below) - both are shared across every review context this agent runs in.
+Choose the review event and state your verdict per the **Verdict Levels** section of this prompt, then build and submit using the **Review Submission Flow** section of this prompt - both are shared across every review context this agent runs in.
 
 Your summary sections for a FIRST review: **Overall Assessment / Architectural Feedback / Key Suggestions / Nitpicks and Minor Points / Questions for the Author** (omit Questions when self-reviewing).

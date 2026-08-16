@@ -323,14 +323,17 @@ jobs:
       # CRITICAL: Save the trusted artifacts from the default branch to /tmp
       # BEFORE checking out PR code. actions/checkout cannot write outside the
       # workspace, so a PR can never overwrite these copies.
-      - name: Save trusted artifacts (prompts + scrub script)
+      - name: Save trusted artifacts (prompt parts + scrub script)
         if: github.event_name == 'workflow_dispatch'
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
-          cp .github/prompts/compliance-check.md /tmp/compliance-check.md
+          cp -r .github/prompts/parts /tmp/parts
+          cp -r .github/prompts/manifests /tmp/manifests
+          cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
-          chmod +x /tmp/scrub-workspace.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh
+          bash /tmp/assemble-prompt.sh --verify
 
       # NOW it's safe to checkout the PR code (untrusted)
       # The trusted artifacts are already secured in /tmp
@@ -538,7 +541,7 @@ jobs:
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_REVIEWS} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH} ${GITHUB_REPOSITORY}'
           # Prepend the security brief (with the verified requester + trust context lines)
-          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; envsubst "$VARS" < /tmp/compliance-check.md; } > "$TMP_DIR/assembled_prompt.txt"
+          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh compliance-check | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
 
       # Execute the AI compliance check
       # The AI will analyze the PR using multiple turns (5-20+ expected)

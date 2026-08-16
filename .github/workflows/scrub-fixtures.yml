@@ -11,11 +11,13 @@ on:
       - '.github/scripts/**'
       - '.github/actions/bot-setup/permissions.example.json'
       - '.github/workflows/agent-router.yml'
+      - '.github/prompts/**'
   pull_request:
     paths:
       - '.github/scripts/**'
       - '.github/actions/bot-setup/permissions.example.json'
       - '.github/workflows/agent-router.yml'
+      - '.github/prompts/**'
   workflow_dispatch:
 
 permissions:

@@ -69,16 +69,16 @@ jobs:
 
       # SECURITY: capture every file the agent consumes from the DEFAULT BRANCH
       # checkout (done above) into /tmp before the second, full checkout.
-      - name: Save trusted artifacts (prompts + scrub script)
+      - name: Save trusted artifacts (prompt parts + scrub script)
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
-          cp .github/prompts/issue-comment.md /tmp/issue-comment.md
-          # Shared prompt blocks (single source of truth across agent prompts)
-          cp .github/prompts/shared/identity.md /tmp/shared-identity.md
-          cp .github/prompts/shared/tool-restrictions.md /tmp/shared-tool-restrictions.md
+          cp -r .github/prompts/parts /tmp/parts
+          cp -r .github/prompts/manifests /tmp/manifests
+          cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
-          chmod +x /tmp/scrub-workspace.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh
+          bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -197,4 +197,4 @@ jobs:
             # Only substitute the variables we intend; leave example $vars and secrets intact
             VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR}'
             # Prepend the security brief (with the verified requester + trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; cat /tmp/shared-identity.md /tmp/shared-tool-restrictions.md /tmp/issue-comment.md | envsubst "$VARS"; } | opencode run --share -
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share -
