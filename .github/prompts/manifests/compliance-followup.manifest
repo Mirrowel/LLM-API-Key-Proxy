@@ -1,5 +1,6 @@
 trigger-message
 on-topic-guardrail
+scope-of-action
 identity
 role
 tool-restrictions
@@ -14,3 +15,5 @@ previous-reviews
 agent-review-history
 thread-context
 mission-compliance
+severity
+protocol-compliance-followup

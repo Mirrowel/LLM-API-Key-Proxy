@@ -692,6 +692,9 @@ jobs:
           IS_FIRST_REVIEW: ${{ steps.review_type.outputs.is_first_review }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
+          # Optional public-account token for verified-lead actions abroad
+          # (scope-of-action rules). Absent secret => empty => unavailable.
+          ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"

@@ -133,3 +133,6 @@ cache/antigravity/thought_signatures.json
 /oauth_creds/
 
 /usage/
+
+# locally rendered assembled agent prompts (generated, not source)
+.github/prompts/rendered/

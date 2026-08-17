@@ -208,6 +208,9 @@ jobs:
           TRUSTED_PEOPLE: ${{ env.TRUSTED_PEOPLE }}
           # Agent permissions are owned by the OPENCODE_CONFIG_JSON secret
           # (passed through by bot-setup; see permissions.example.json).
+          # Optional public-account token for verified-lead actions abroad
+          # (scope-of-action rules). Absent secret => empty => unavailable.
+          ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
         run: |
             # Only substitute the variables we intend; leave example $vars and secrets intact
             VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}'

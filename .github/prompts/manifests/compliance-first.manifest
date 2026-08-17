@@ -11,5 +11,9 @@ reactions
 error-handling
 iteration
 context-intensive
-mission-analyst
+previous-reviews
+agent-review-history
+thread-context
+mission-compliance
 severity
+protocol-compliance-first

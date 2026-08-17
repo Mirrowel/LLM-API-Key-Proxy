@@ -623,9 +623,17 @@ jobs:
           TRUSTED_PEOPLE: ${{ env.TRUSTED_PEOPLE }}
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_TYPE} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY}'
+          VARS='${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY}'
+          # Protocol split: the run-type manifest carries its own protocol part
+          # (first = full audit, followup = incremental + re-verify), so
+          # REVIEW_TYPE picks the manifest instead of being substituted.
+          if [ "${REVIEW_TYPE:-FIRST}" = "FOLLOW-UP" ]; then
+            MODE=compliance-followup
+          else
+            MODE=compliance-first
+          fi
           # Prepend the security brief (with the verified requester + trust context lines)
-          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh compliance-check | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
+          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh "$MODE" | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
 
       # Execute the AI compliance check
       - name: React to trigger (lifecycle start)
@@ -654,6 +662,9 @@ jobs:
           # (passed through by bot-setup; see permissions.example.json).
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_HEAD_SHA: ${{ steps.pr_info.outputs.head_sha }}
+          # Optional public-account token for verified-lead actions abroad
+          # (scope-of-action rules). Absent secret => empty => unavailable.
+          ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt"

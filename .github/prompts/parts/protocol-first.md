@@ -16,7 +16,7 @@ gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPOSITORY} --body-file /tmp/comment-
 If reviewing your own code, adopt the humorous tone from the Self-Review Tone section.
 
 #### Step 2: Collect All Potential Findings (File by File)
-Analyze the changed files one by one. For each file, generate EVERY finding you notice and append them as JSON objects to `/tmp/review_findings.jsonl`. This file is your external memory, or "scratchpad"; do not filter or curate at this stage.
+Analyze the changed files one by one. Record findings as you go — the scratchpad is your external memory across turns. Append each file's findings as JSON objects to `/tmp/review_findings.jsonl`, stamped with their `"severity"` per the Severity System section. How you maintain the file is your choice: jq batch appends (one form shown below) or your file tools — keep it valid JSONL either way. Do not filter or curate at this stage.
 
 **Using Line Ranges Correctly:**
 - **Single-Line (`line`)**: Use for a specific statement, variable declaration, or a single line of code.
@@ -27,43 +27,24 @@ Analyze the changed files one by one. For each file, generate EVERY finding you 
 - **Code Suggestions**: For proposed code fixes, you **must** wrap your code in a ```suggestion``` block. This makes it a one-click suggestion in the GitHub UI.
 - **Be Specific**: Clearly explain *why* a change is needed, not just *what* should change.
 
-After analyzing a file, write all of its findings in a single batched command (this form is allowed by the permission profile):
+One append form (allowed by the permission profile):
 ```bash
 jq -n '[
   {
     "path": "src/auth/login.js",
     "line": 45,
+    "severity": "minor",
     "side": "RIGHT",
     "body": "Consider using `const` instead of `let` here since this variable is never reassigned."
-  },
-  {
-    "path": "src/auth/login.js",
-    "start_line": 42,
-    "line": 58,
-    "side": "RIGHT",
-    "body": "This authentication function should validate the token format before processing."
   }
 ]' | jq -c '.[]' >> /tmp/review_findings.jsonl
 ```
-Repeat for each changed file until you have analyzed all changes and recorded all potential findings.
+Repeat until you have analyzed all changes and recorded all potential findings.
 
-#### Step 3: Curate and Prepare for Submission
-After collecting all potential findings, you must act as an editor.
-
-First, read the raw findings file to load its contents into your context:
-```bash
-cat /tmp/review_findings.jsonl
-```
-
-Next, apply the **HIGH-SIGNAL, LOW-NOISE** philosophy from the Feedback Philosophy section of this prompt:
-- Which findings are critical (security, bugs)? Which are high-impact improvements?
-- Which are duplicates of existing discussion?
-- Which are trivial nits that can be ignored?
-- Is the total number of comments overwhelming? Aim for the 5-15 (can be expanded or reduced, based on the PR size) most valuable points.
-
-In your internal monologue, explicitly state your curation logic before proceeding. The key is: **don't just include everything** — select the comments that will provide the most value to the author. If nothing actionable remains, proceed with 0 inline comments and submit only the summary (use `APPROVE` when all approval criteria are met, otherwise `COMMENT`).
+#### Step 3: Place the Findings
+Before submitting, load the complete scratchpad (`cat /tmp/review_findings.jsonl`) — placement decisions need the full record, not your memory of it. Then place every finding: inline comment (anchored discussion the author must engage with — prefix it with its severity icon and bold level per the Severity System) or a line in the summary's severity groups (the complete record). Skip only exact duplicates of existing discussion — cross-reference those. Know your placement reasons; state them only where the choice is non-obvious. If nothing earns an inline comment, submit 0 inline comments — the summary's severity groups still carry everything you found.
 
 #### Step 4: Build and Submit the Final Bundled Review
 Choose the review event and state your verdict per the **Verdict Levels** section of this prompt, then build and submit using the **Review Submission Flow** section of this prompt - both are shared across every review context this agent runs in.
 
-Your summary sections for a FIRST review: **Overall Assessment / Architectural Feedback / Key Suggestions / Nitpicks and Minor Points / Questions for the Author** (omit Questions when self-reviewing).
+Your summary shape for a FIRST review: verdict line, **Overall Assessment**, then your findings grouped under the severity headings (🔴 Critical / 🟠 Major / 🟡 Minor / 🔵 Info — omit empty groups), plus **Questions for the Author** (omit when self-reviewing).

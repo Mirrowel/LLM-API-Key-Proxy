@@ -1,5 +1,6 @@
 trigger-message
 on-topic-guardrail
+scope-of-action
 identity
 role
 tool-restrictions
@@ -15,6 +16,7 @@ agent-review-history
 thread-context
 mission-review
 feedback-philosophy
+severity
 self-review-tone
 protocol-first
 review-verdicts

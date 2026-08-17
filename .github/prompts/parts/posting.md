@@ -9,8 +9,8 @@
 ```bash
 # 1. Write the full body (markdown, special characters, newlines — all safe) to a file with your file tool:
 #    /tmp/comment-body.md
-# 2. Post it:
-gh issue comment $THREAD_NUMBER --body-file /tmp/comment-body.md
+# 2. Post it (use the thread/PR number for <number>):
+gh issue comment <number> --body-file /tmp/comment-body.md
 ```
 
 The body file may contain anything — `$` signs, backticks, bullets, multi-line sections — none of it is interpreted by the shell.
@@ -18,12 +18,12 @@ The body file may contain anything — `$` signs, backticks, bullets, multi-line
 **INCORRECT Examples (DO NOT USE):**
 ```bash
 # WRONG: heredoc/stdin form - DENIED by the permission profile
-gh issue comment $THREAD_NUMBER -F - <<'EOF'
-@$NEW_COMMENT_AUTHOR, Starting work.
+gh issue comment <number> -F - <<'EOF'
+<user>, Starting work.
 EOF
 
 # WRONG: --body with inline text (quoting hazards with special characters)
-gh issue comment $THREAD_NUMBER --body "@$NEW_COMMENT_AUTHOR, Starting work."
+gh issue comment <number> --body "Starting work."
 ```
 
 Failing to use the file-based form will get the command denied or cause the shell to misinterpret your message.

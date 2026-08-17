@@ -13,4 +13,4 @@ These apply in every task context; task-specific additions follow in the task pr
 - If you must reference them internally, use placeholders like `<REDACTED>` or `***` in visible output
 - This includes: `$GITHUB_TOKEN`, `$OPENAI_API_KEY`, any `ghp_*`, `sk-*`, or long alphanumeric credential-like strings
 - When debugging: describe issues without revealing actual secret values
-- **FORBIDDEN COMMANDS**: Never run `echo $GITHUB_TOKEN`, `env`, `printenv`, `cat ~/.config/opencode/opencode.json`, or any command that would expose credentials in output - `python -c "import os; print(os.environ)"` and cousins are equally forbidden (python is allowed; dumping its environment is not)
+- **FORBIDDEN COMMANDS**: Never run `echo $GITHUB_TOKEN`, `echo $ACCOUNT_GH_TOKEN`, `env`, `printenv`, `cat ~/.config/opencode/opencode.json`, or any command that would expose credentials in output - `python -c "import os; print(os.environ)"` and cousins are equally forbidden (python is allowed; dumping its environment is not)
