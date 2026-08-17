@@ -179,7 +179,10 @@ jobs:
           fi
           author=$(printf '%s' "$comment_json" | jq -r '.user.login')
           association=$(printf '%s' "$comment_json" | jq -r '.author_association')
-          case "$author" in
+          # Case-insensitive bot-loop guard (logins are case-insensitive;
+          # canonical casing follows renames)
+          author_lc=$(printf '%s' "$author" | tr 'A-Z' 'a-z')
+          case "$author_lc" in
             *'[bot]'|mirrobot|mirrobot-agent)
               echo "::notice::Routed comment authored by ${author} (bot/agent); ignoring its identity."
               exit 0
@@ -248,10 +251,16 @@ jobs:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
         run: |
-          pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,headRefOid,files,labels,reviewRequests,baseRefName)
+          set -euo pipefail   # a failed files fetch must be LOUD, not an empty audit scope
+          # REST only (live-observed 2026-08-17): gh pr view goes through
+          # GraphQL, whose reviewRequests/requester.login field demands
+          # user-profile scopes a classic public_repo PAT does not carry -
+          # the run died at this step. Every field below maps onto the REST
+          # endpoints the rest of the pipeline already uses under this token.
+          pr_json=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER")
 
-          echo "head_sha=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_OUTPUT
-          echo "BASE_BRANCH=$(echo "$pr_json" | jq -r .baseRefName)" >> "$GITHUB_ENV"
+          echo "head_sha=$(echo "$pr_json" | jq -r .head.sha)" >> $GITHUB_OUTPUT
+          echo "BASE_BRANCH=$(echo "$pr_json" | jq -r .base.ref)" >> "$GITHUB_ENV"
 
           # SECURITY: pr_title and pr_body are attacker-controlled and may
           # contain newlines (and a literal delimiter line). Multi-line output
@@ -265,7 +274,7 @@ jobs:
           echo "$TITLE_DELIMITER" >> $GITHUB_OUTPUT
           
           # Extract author to shell variable first (can't self-reference step outputs)
-          pr_author=$(echo "$pr_json" | jq -r .author.login)
+          pr_author=$(echo "$pr_json" | jq -r '.user.login')
           echo "pr_author=$pr_author" >> $GITHUB_OUTPUT
           
           pr_body=$(echo "$pr_json" | jq -r '.body // ""')
@@ -274,20 +283,19 @@ jobs:
           echo "$pr_body" >> $GITHUB_OUTPUT
           echo "$BODY_DELIMITER" >> $GITHUB_OUTPUT
           
-          # Changed files as space-separated list
-          changed_files=$(echo "$pr_json" | jq -r '.files[] | .path' | tr '\n' ' ')
+          # Changed files (paginated REST; large PRs span multiple pages)
+          files_json=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          changed_files=$(echo "$files_json" | jq -r '.[]' | tr '\n' ' ')
           echo "changed_files=$changed_files" >> $GITHUB_OUTPUT
-          
-          # Changed files as JSON array
-          files_json=$(echo "$pr_json" | jq -c '[.files[] | .path]')
           echo "files_json=$files_json" >> $GITHUB_OUTPUT
           
           # Labels as JSON array
           labels_json=$(echo "$pr_json" | jq -c '[.labels[] | .name]')
           echo "labels_json=$labels_json" >> $GITHUB_OUTPUT
           
-          # Requested reviewers for mentions
-          reviewers=$(echo "$pr_json" | jq -r '.reviewRequests[]? | .login' | tr '\n' ' ')
+          # Requested reviewers for mentions (REST shape: users[] + teams[];
+          # no .bots key - iterating a missing key errors silently)
+          reviewers=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/requested_reviewers" --jq '[.users[].login, (.teams // [])[].slug as $s | "${{ github.repository_owner }}/\($s)")] | join(" ")' 2>/dev/null || true)
           mentions="@$pr_author"
           if [ -n "$reviewers" ]; then
             for reviewer in $reviewers; do
@@ -319,7 +327,7 @@ jobs:
           latest=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
             --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
               map(select(
-                (.user.login as $u | $bots | index($u)) and
+                ((.user.login // "" | ascii_downcase) as $u | $bots | index($u)) and
                 (.body | contains("<!-- compliance-check-id:"))
               ))
               | last
@@ -549,7 +557,7 @@ jobs:
         run: |
           # Trusted SHA file (see pr-review.yml note): the agent references
           # /tmp/head_sha.txt instead of hand-typing hex SHAs.
-          printf '%s' "$PR_HEAD_SHA" > /tmp/head_sha.txt
+          printf '%s\n' "$PR_HEAD_SHA" > /tmp/head_sha.txt
           # Run-start timestamp: footer verifier attributes comments to THIS
           # run by created_at > RUN_STARTED.
           echo "RUN_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
@@ -706,7 +714,7 @@ jobs:
           # Find the compliance comment just posted by the bot
           latest_comment=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
             --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
-              map(select(.user.login as $u | $bots | index($u)))
+              map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
               | sort_by(.created_at)
               | last
               | {id: .id, body: .body}
@@ -770,7 +778,7 @@ jobs:
           for ((i=1; i<=3; i++)); do
             if latest_comment=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
               --paginate | jq -c --argjson bots "$BOT_NAMES_JSON" --arg runstart "$RUN_STARTED" '
-                map(select(.user.login as $u | $bots | index($u)))
+                map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
                 | map(select(.created_at != null and .created_at > $runstart))
                 | sort_by(.created_at)
                 | last

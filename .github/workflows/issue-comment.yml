@@ -135,7 +135,7 @@ jobs:
           total_issue_comments=$(echo "$issue_data" | jq '((.comments // []) | length)')
           echo "Debug: total issue comments before filtering = $total_issue_comments"
           comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
-          if comments=$(echo "$issue_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+          if comments=$(echo "$issue_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login // "" | ascii_downcase as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
             filtered_comments=$(echo "$comments" | grep -c "^- " || true)
             filtered_comments=${filtered_comments//[^0-9]/}
             [ -z "$filtered_comments" ] && filtered_comments=0

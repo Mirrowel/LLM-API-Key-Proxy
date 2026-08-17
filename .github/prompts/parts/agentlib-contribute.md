@@ -29,5 +29,5 @@ You are implementing a change: fixing, adding, or modifying code. The task is co
 
 ## Boundaries
 
-- **Never push workflow-file changes** (`.github/workflows/`) — GitHub hard-denies them for you. If the task needs one, implement everything else, then propose the workflow change in your report (a suggestion block or patch in the PR description) for maintainers to apply.
+- **Never push workflow-file changes** (`.github/workflows/`) — GitHub denies them for App-token sessions and for account tokens without the `workflow` scope; either way they are denied by policy here. If the task needs one, implement everything else, then propose the workflow change in your report (a suggestion block or patch in the PR description) for maintainers to apply.
 - If a push is rejected with `refusing to allow a GitHub App to create or update workflow`, follow the recovery protocol in this prompt's Contribution Failure Protocol section.

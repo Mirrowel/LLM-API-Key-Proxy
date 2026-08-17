@@ -35,7 +35,7 @@ outputs:
     description: "Which identity mode was activated: 'account' or 'app'."
     value: ${{ steps.resolve_mode.outputs.mode }}
   identity:
-    description: "Human-readable bot identity used this run (login or app slug), for logging."
+    description: "Human-readable bot identity used this run (account login in account mode, the app bot name in app mode), for logging."
     value: ${{ steps.account_token.outputs.login || 'mirrobot-agent[bot]' }}
 
 runs:
@@ -68,14 +68,56 @@ runs:
         set -e
         # Fail-fast validation: a present-but-broken secret must NOT silently
         # fall back to app mode - it needs human attention (rotation).
-        login=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api /user --jq .login) || {
+        # ONE round-trip (--include) yields body (login, id) AND the
+        # X-OAuth-Scopes header, so scope sufficiency is checked here too.
+        resp=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api --include /user) || {
           echo "::error::ACCOUNT_GH_TOKEN is set but invalid (gh api /user failed). Rotate the secret or remove it to fall back to app mode."
           exit 1
         }
-        account_id=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api /user --jq .id)
+        body=$(printf '%s\n' "$resp" | awk 'body {print} /^\r?$/{body=1}')
+        login=$(printf '%s' "$body" | jq -r .login)
+        account_id=$(printf '%s' "$body" | jq -r .id)
+        # __ABSENT__ sentinel distinguishes "header not in response" (non-classic
+        # token) from "header present but empty" (classic token with NO scopes).
+        scopes=$(printf '%s\n' "$resp" | awk '
+          tolower($0) ~ /^x-oauth-scopes:/ {
+            sub(/^[^:]*:[ ]*/, ""); gsub(/\r/, ""); print; found = 1; exit
+          }
+          END { if (!found) print "__ABSENT__" }')
+
         echo "token=$ACCOUNT_TOKEN" >> "$GITHUB_OUTPUT"
         echo "login=$login" >> "$GITHUB_OUTPUT"
         echo "account_id=$account_id" >> "$GITHUB_OUTPUT"
+
+        # Scope contract (classic PAT): public_repo (or repo) required for the
+        # bot's work; `workflow` FORBIDDEN - without that scope GitHub
+        # mechanically rejects .github/workflows pushes, which is the platform
+        # backstop the agent's whole workflow-deny posture relies on.
+        if [ "$scopes" = "__ABSENT__" ]; then
+          echo "::warning::Could not read X-OAuth-Scopes (non-classic token?). Proceeding without scope verification - expected: classic PAT, public_repo only, WITHOUT workflow scope."
+        elif [ -z "$scopes" ]; then
+          echo "::error::ACCOUNT_GH_TOKEN carries NO scopes (X-OAuth-Scopes header is empty) - it cannot operate on the repository. Regenerate with public_repo."
+          exit 1
+        else
+          echo "Token scopes: $scopes"
+          # CRs stripped at extraction; commas normalized to spaces so word
+          # matching is position-independent ("workflow, public_repo" and
+          # "public_repo, workflow" both match; last-position too).
+          scopes_norm=" ${scopes//,/ } "
+          case "$scopes_norm" in
+            *" workflow "*)
+              echo "::error::ACCOUNT_GH_TOKEN has the 'workflow' scope - this removes the platform's workflow-push hard-deny. Regenerate the PAT with public_repo ONLY."
+              exit 1
+              ;;
+          esac
+          case "$scopes_norm" in
+            *" public_repo "*|*" repo "*) : ;;
+            *)
+              echo "::error::ACCOUNT_GH_TOKEN lacks public_repo/repo scope - the token cannot operate on the repository. Regenerate with public_repo."
+              exit 1
+              ;;
+          esac
+        fi
         echo "::notice::Bot identity: account @$login (account-token mode)"
 
     - name: Generate GitHub App Token (app mode)
@@ -104,8 +146,13 @@ runs:
           EMAIL="${ACCOUNT_ID}+${ACCOUNT_LOGIN}@users.noreply.github.com"
           TOKEN="$ACCOUNT_TOKEN"
         else
-          NAME="mirrobot-agent[bot]"
-          EMAIL="${APP_ID}+mirrobot-agent@users.noreply.github.com"
+          # App mode. Display name carries the capitalized branding; commit
+          # attribution rides the numeric ID in the noreply email, so email
+          # casing is cosmetic too. (If the GitHub App is renamed, the API
+          # bot login follows the new casing; repo-side identity matching is
+          # case-insensitive everywhere.)
+          NAME="Mirrobot-Agent[bot]"
+          EMAIL="${APP_ID}+Mirrobot-Agent@users.noreply.github.com"
           TOKEN="$APP_TOKEN"
         fi
         git config --global user.name "$NAME"

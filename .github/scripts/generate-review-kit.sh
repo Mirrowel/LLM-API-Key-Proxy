@@ -33,6 +33,9 @@ if [ -z "$PR" ] || [ -z "$REPO" ] || [ -z "${GH_TOKEN:-}" ]; then
 fi
 case "$PR" in ''|*[!0-9]*) echo "KIT ERROR: PR number must be numeric, got '$PR'"; exit 1;; esac
 
+# Lists are LOWERCASE by convention; every comparison downcases the login
+# side - GitHub logins are case-insensitive and the API returns canonical
+# casing (a rename rewrites history's casing too).
 BOT_NAMES_JSON="${BOT_NAMES_JSON:-[\"mirrobot-agent[bot]\",\"mirrobot\",\"mirrobot-agent\"]}"
 KIT_DIR="/tmp/kit/$PR"
 mkdir -p "$KIT_DIR" /tmp/instructions
@@ -46,7 +49,7 @@ PR_HEAD_SHA=$(printf '%s' "$pr_json" | jq -r .headRefOid)
 PR_BASE=$(printf '%s' "$pr_json" | jq -r '.base.ref')
 PR_AUTHOR=$(printf '%s' "$pr_json" | jq -r '.user.login')
 PR_TITLE=$(printf '%s' "$pr_json" | jq -r .title)
-printf '%s' "$PR_HEAD_SHA" > "$KIT_DIR/head_sha.txt"
+printf '%s\n' "$PR_HEAD_SHA" > "$KIT_DIR/head_sha.txt"
 
 # --- review type: latest review by THIS agent carrying the marker ----------
 # (single retry: GitHub intermittently 500s this endpoint; a failed fetch
@@ -57,9 +60,13 @@ for _attempt in 1 2; do
   sleep 2
 done
 reviews_json="${reviews_json:-[]}"
-LAST_REVIEWED_SHA=$(printf '%s' "$reviews_json" | jq -r \
+# --paginate emits one JSON document PER PAGE; jq -s 'add' merges them into a
+# single array before the pipeline (without it, 30+ review PRs produce one
+# result line per page and the concatenated SHA breaks the diff below).
+LAST_REVIEWED_SHA=$(printf '%s' "$reviews_json" | jq -s -r \
   --argjson bots "$BOT_NAMES_JSON" '
-  map(select(.user.login as $u | $bots | index($u)))
+  add
+  | map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
   | sort_by(.submitted_at)
   | map(.body // "" | scan("last_reviewed_sha:[a-f0-9]+"))
   | flatten
@@ -108,7 +115,12 @@ extract_env_var() { # $1 file, $2 var name -> prints heredoc value
     }
   ' "$1"
 }
-if [ -f /tmp/fetch-pr-discussion.sh ] && [ -f "$KIT_DIR/context.env" ]; then :; elif [ -f /tmp/fetch-pr-discussion.sh ]; then
+# Always refresh: a re-run (e.g. the agent re-running the kit after posting
+# its own review) must see the new discussion state, so any stale context.env
+# from a previous run is discarded first (fetch appends to GITHUB_ENV, so
+# reuse would both duplicate and serve stale review memory).
+if [ -f /tmp/fetch-pr-discussion.sh ]; then
+  rm -f "$KIT_DIR/context.env"
   GITHUB_ENV="$KIT_DIR/context.env" BOT_NAMES_JSON="$BOT_NAMES_JSON" \
     PREVIOUS_BOT_REVIEWS_COUNT="${PREVIOUS_BOT_REVIEWS_COUNT:-1}" \
     bash /tmp/fetch-pr-discussion.sh "$PR" >/dev/null 2>&1 || echo "KIT NOTE: discussion fetch degraded - review memory may be empty"

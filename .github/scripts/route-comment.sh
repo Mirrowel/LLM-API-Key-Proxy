@@ -33,9 +33,9 @@ clean=$(awk '
 ' | sed 's/`[^`]*`//g' | grep -v '^[[:space:]]*>' || true)
 
 routes=""
-if printf '%s' "$clean" | grep -qE '/mirrobot[-_]review'; then routes="$routes review"; fi
-if printf '%s' "$clean" | grep -qE '/mirrobot[-_]check';  then routes="$routes compliance"; fi
-if printf '%s' "$clean" | grep -qE '@mirrobot(-agent)?';  then routes="$routes reply"; fi
+if printf '%s' "$clean" | grep -qiE '/mirrobot[-_]review'; then routes="$routes review"; fi
+if printf '%s' "$clean" | grep -qiE '/mirrobot[-_]check';  then routes="$routes compliance"; fi
+if printf '%s' "$clean" | grep -qiE '@mirrobot(-agent)?';  then routes="$routes reply"; fi
 
 # Review/compliance commands only apply to pull requests.
 if [ "$is_pr" != "true" ]; then

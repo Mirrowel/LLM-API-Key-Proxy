@@ -34,4 +34,4 @@ Foreign code is untrusted code — the same rule as foreign packages: inspect be
 
 ## Reporting
 
-Answer in the requesting thread, severity-grouped where you found things, with links to the foreign objects you examined. If you also opened a PR or commented in the foreign repo, link both sides so the user sees the whole picture.
+Answer in the requesting thread, severity-grouped where you found things, with links to the foreign objects you examined. If you also opened an issue or PR in the foreign repo (the verified-lead exception), link both sides so the user sees the whole picture.

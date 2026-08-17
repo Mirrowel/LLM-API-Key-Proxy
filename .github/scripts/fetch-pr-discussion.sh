@@ -151,7 +151,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     | flatten) as $allc |
   def thread_ok: (.thResolved != true) and (.thOutdated != true);
   def cmt_ok: (.isMinimized != true) and ((.pullRequestReview.isMinimized // false) != true);
-  def agent_cmt: ((.author.login? // "") as $l | $agentbots | index($l)) != null;
+  def agent_cmt: ((.author.login? // "" | ascii_downcase) as $l | $agentbots | index($l)) != null;
   def markers:
     (if .thResolved then " [resolved]" else "" end)
     + (if .thOutdated then " [outdated]" else "" end)
@@ -167,7 +167,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     + (if ($lines | length) > 0 then "Inline comments:\n" + ($lines | join("\n")) + "\n" else "Inline comments: (none)\n" end);
   # THIS agent reviews, newest first
   (($pr.reviews.nodes // []) | sort_by(.submittedAt) | reverse
-    | map(select((.author.login? // "") as $l | $agentbots | index($l)))) as $agent_reviews |
+    | map(select((.author.login? // "" | ascii_downcase) as $l | $agentbots | index($l)))) as $agent_reviews |
   # Section-level clarification: GitHub auto-dismisses APPROVED reviews on new
   # pushes (CHANGES_REQUESTED/COMMENT survive); the state field loses the
   # original verdict. One note per section, only when a DISMISSED review is in it.
@@ -175,8 +175,8 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   # Human/other reviews with correlated active comments (agent reviews excluded)
   (($pr.reviews.nodes // [])
     | map(select(
-        ((.author.login? // "unknown") as $login | $ignored | index($login) | not)
-        and (((.author.login? // "unknown") as $abot | $agentbots | index($abot)) | not)
+        ((.author.login? // "unknown" | ascii_downcase) as $login | $ignored | index($login) | not)
+        and (((.author.login? // "unknown" | ascii_downcase) as $abot | $agentbots | index($abot)) | not)
         and (.isMinimized != true)))) as $other_reviews |
   # ($other_reviews already carries these filters - never duplicate the
   # predicate list; duplicated predicates drift apart on later edits.)
@@ -192,8 +192,8 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
    + (if ($unlinked | length) > 0 then "\nStandalone inline comments:\n" + ($unlinked | join("\n")) + "\n" else "" end)) as $threadreviews |
   ([ $allc[] | select((thread_ok and cmt_ok) | not) ] | length) as $n_filtered |
   {
-    elevated: (([$agent_reviews[0:$count][] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end) + ($agent_reviews[0:$count] | dismissed_note),
-    history: (([$agent_reviews[$count:][] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end) + ($agent_reviews[$count:] | dismissed_note),
+    elevated: ((([$agent_reviews[0:$count][] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end) + ($agent_reviews[0:$count] | dismissed_note)),
+    history: ((([$agent_reviews[$count:][] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end) + ($agent_reviews[$count:] | dismissed_note)),
     threadreviews: ($threadreviews + ($other_reviews | dismissed_note)),
     filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, or minimized comments in active threads). The elevated block bypasses the filter on purpose.</filtering_summary>")
   }

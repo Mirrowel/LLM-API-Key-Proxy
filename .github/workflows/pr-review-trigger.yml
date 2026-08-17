@@ -51,9 +51,13 @@ jobs:
   decide:
     runs-on: ubuntu-latest
     steps:
-      # continue-on-error: a failed status POST (transient API error, fork-SHA
-      # quirk) must NOT suppress the review decision (the signal step below
-      # is the downstream contract, not this step).
+      # continue-on-error + RETRY: the pending status is the merge gate's
+      # heartbeat — losing it to a transient API 503 silently removes the
+      # visible "compliance-check" context (live-observed during a GitHub
+      # outage, 2026-08-17). So: retry the POST with backoff, and only then
+      # give up without failing the run (the signal step below is the
+      # downstream contract, not this step; a suppressed status still leaves
+      # the required-check rule blocking merges as "Expected").
       - name: Post pending compliance status
         if: github.event.pull_request.draft == false
         continue-on-error: true
@@ -71,13 +75,22 @@ jobs:
           else
             DESC='run /mirrobot-check when ready to merge'
           fi
-          gh api \
-            --method POST \
-            -H "Accept: application/vnd.github+json" \
-            "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
-            -f state='pending' \
-            -f context='compliance-check' \
-            -f description="$DESC"
+          for attempt in 1 2 3 4 5; do
+            if gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state='pending' \
+              -f context='compliance-check' \
+              -f description="$DESC"; then
+              echo "pending status posted (attempt $attempt)"
+              exit 0
+            fi
+            echo "status post failed (attempt $attempt) - retrying after backoff"
+            [ "$attempt" -lt 5 ] && sleep $(( attempt * 5 ))
+          done
+          echo "::warning::Could not post pending compliance status after 5 attempts - merge gate falls back to the required-check 'Expected' state."
+          exit 1
 
       - name: Decide whether to review
         # Always exits 0 — a declined review is a normal outcome, not a

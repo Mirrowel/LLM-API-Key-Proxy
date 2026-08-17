@@ -270,7 +270,10 @@ if [ -n "$taint" ]; then
   # Compact alert for the flattened single-line warning: counts + AREAS only
   # (derived from the touched paths); the per-commit file list lives in the
   # details file - nothing enumerated here can be truncated mid-filename.
-  taint_paths=$(git log --name-only --format='@' "${TAINT_BASE}"..HEAD -- .github 2>/dev/null | grep -v '^@' | grep -v '^$' | sort -u)
+  # NOTE: the marker format MUST contain a % placeholder ('@%h', not bare '@'):
+  # a %-less --format value is parsed as a format NAME and fatals with
+  # "invalid --pretty format" (live-observed: n_files/areas silently empty).
+  taint_paths=$(git log --name-only --format='@%h' "${TAINT_BASE}"..HEAD -- .github 2>/dev/null | grep -v '^@' | grep -v '^$' | sort -u)
   n_commits=$(printf '%s\n' "$taint" | grep -c '^- ' || true)
   n_files=$(printf '%s\n' "$taint_paths" | grep -c . || true)
   areas=$(printf '%s\n' "$taint_paths" | awk -F/ '

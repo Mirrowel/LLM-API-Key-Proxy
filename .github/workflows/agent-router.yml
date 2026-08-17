@@ -51,10 +51,14 @@ jobs:
   route:
     # Bot-loop guard: never route comments authored by bots or by the agent
     # itself (its own replies/comments must not re-trigger agents).
+    # NOTE: GitHub Actions expressions have NO case-insensitive compare, so
+    # agent names enumerate known casings (logins are case-insensitive; when
+    # an identity is renamed, add its new casing here).
     if: |
       !endsWith(github.event.comment.user.login, '[bot]') &&
       github.event.comment.user.login != 'mirrobot' &&
-      github.event.comment.user.login != 'mirrobot-agent'
+      github.event.comment.user.login != 'mirrobot-agent' &&
+      github.event.comment.user.login != 'Mirrobot-Agent'
     runs-on: ubuntu-latest
     timeout-minutes: 3
     steps:

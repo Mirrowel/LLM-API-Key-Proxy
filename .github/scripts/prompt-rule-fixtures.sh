@@ -81,6 +81,8 @@ for f in rf ru; do
   need $f 'Severity System'                    "$f: severity part"
   need $f 'critical., .major., .minor., .info.|"severity"' "$f: scratchpad severity field"
   need $f 'grouped under the severity headings' "$f: severity-grouped summary"
+  need $f 'harmless is not the bar'             "$f: merge-worthiness gate"
+  need $f 'ladder binds for maintainers and admins' "$f: rank-blind verdicts"
 done
 # bot-reply base: loads the machinery instead of embedding it
 need br 'STRATEGY INDEX'                       "br: strategy index"
@@ -165,6 +167,10 @@ need cc '#### ✅ \[Group Name\] - COMPLIANT'   "cc: compliance group icons"
 need cc 'Incomplete README'                  "cc: blocked example bullet"
 need rf 'Nothing relevant is off-limits'     "rf: reviewer scope not fenced"
 need rf 'review-mode discipline'             "rf: review/contribute hand-off"
+for f in rf ru; do
+  need $f 'the review IS the deliverable'     "$f: no post-review comment rule"
+  need $f 'No follow-up comment announcing|no announcement after' "$f: closing rule explicit"
+done
 need cc 'Protocol for FIRST Compliance Check'  "cc: FIRST protocol present"
 neednt cc 'Protocol for FOLLOW-UP Compliance Check' "cc: no stray FOLLOW-UP protocol"
 need cf 'Protocol for FOLLOW-UP Compliance Check' "cf: FOLLOW-UP protocol present"

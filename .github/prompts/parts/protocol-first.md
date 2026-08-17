@@ -48,3 +48,5 @@ Before submitting, load the complete scratchpad (`cat /tmp/review_findings.jsonl
 Choose the review event and state your verdict per the **Verdict Levels** section of this prompt, then build and submit using the **Review Submission Flow** section of this prompt - both are shared across every review context this agent runs in.
 
 Your summary shape for a FIRST review: verdict line, **Overall Assessment**, then your findings grouped under the severity headings (🔴 Critical / 🟠 Major / 🟡 Minor / 🔵 Info — omit empty groups), plus **Questions for the Author** (omit when self-reviewing).
+
+**Closing rule:** once the review is submitted, you are DONE posting. No follow-up comment announcing the review — the review is the whole deliverable. If late thoughts genuinely matter, edit your ack comment (or note them in the next follow-up review); a third artifact for one review is noise.
