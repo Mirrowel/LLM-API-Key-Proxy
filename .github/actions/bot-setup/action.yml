@@ -1,13 +1,19 @@
 name: 'Bot Setup'
-description: 'Performs all common setup steps for bot workflows, including token generation, git config, and dependency installation. Agent permissions are owned by the OPENCODE_CONFIG_JSON secret (see permissions.example.json); this action does not inject or export any permission configuration.'
+description: 'Performs all common setup steps for bot workflows, including token selection, git config, and dependency installation. Dual identity mode: uses the bot ACCOUNT token when provided (account mode), falling back to the GitHub App installation token (app mode). Agent permissions are owned by the OPENCODE_CONFIG_JSON secret (see permissions.example.json); this action does not inject or export any permission configuration.'
 
 inputs:
+  account-token:
+    description: 'Optional bot-account PAT. When non-empty, runs in account mode (this token is used directly, validated against /user) and the App credentials below are ignored.'
+    required: false
+    default: ''
   bot-app-id:
-    description: 'The ID of the GitHub App.'
-    required: true
+    description: 'The ID of the GitHub App (app mode only, required when no account token is provided).'
+    required: false
+    default: ''
   bot-private-key:
-    description: 'The private key of the GitHub App.'
-    required: true
+    description: 'The private key of the GitHub App (app mode only, required when no account token is provided).'
+    required: false
+    default: ''
   opencode-api-key:
     description: 'Optional API key to apply to the provider inferred from opencode-model.'
     required: false
@@ -23,14 +29,58 @@ inputs:
 
 outputs:
   token:
-    description: "The generated GitHub App token."
-    value: ${{ steps.generate_token.outputs.token }}
+    description: "The bot token (account PAT in account mode, App installation token in app mode)."
+    value: ${{ steps.account_token.outputs.token || steps.generate_token.outputs.token }}
+  mode:
+    description: "Which identity mode was activated: 'account' or 'app'."
+    value: ${{ steps.resolve_mode.outputs.mode }}
+  identity:
+    description: "Human-readable bot identity used this run (login or app slug), for logging."
+    value: ${{ steps.account_token.outputs.login || 'mirrobot-agent[bot]' }}
 
 runs:
   using: "composite"
   steps:
-    - name: Generate GitHub App Token
+    - name: Resolve token mode
+      id: resolve_mode
+      shell: bash
+      env:
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+        APP_ID: ${{ inputs.bot-app-id }}
+        APP_KEY: ${{ inputs.bot-private-key }}
+      run: |
+        if [ -n "$ACCOUNT_TOKEN" ]; then
+          echo "mode=account" >> "$GITHUB_OUTPUT"
+        elif [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+          echo "mode=app" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::No bot credentials available. Provide ACCOUNT_GH_TOKEN (account mode) or BOT_APP_ID + BOT_PRIVATE_KEY (app mode)."
+          exit 1
+        fi
+
+    - name: Validate account token (account mode)
+      id: account_token
+      if: steps.resolve_mode.outputs.mode == 'account'
+      shell: bash
+      env:
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+      run: |
+        set -e
+        # Fail-fast validation: a present-but-broken secret must NOT silently
+        # fall back to app mode - it needs human attention (rotation).
+        login=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api /user --jq .login) || {
+          echo "::error::ACCOUNT_GH_TOKEN is set but invalid (gh api /user failed). Rotate the secret or remove it to fall back to app mode."
+          exit 1
+        }
+        account_id=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api /user --jq .id)
+        echo "token=$ACCOUNT_TOKEN" >> "$GITHUB_OUTPUT"
+        echo "login=$login" >> "$GITHUB_OUTPUT"
+        echo "account_id=$account_id" >> "$GITHUB_OUTPUT"
+        echo "::notice::Bot identity: account @$login (account-token mode)"
+
+    - name: Generate GitHub App Token (app mode)
       id: generate_token
+      if: steps.resolve_mode.outputs.mode == 'app'
       uses: actions/create-github-app-token@v1
       with:
         app-id: ${{ inputs.bot-app-id }}
@@ -39,11 +89,28 @@ runs:
     - name: Configure Git for Bot
       shell: bash
       env:
-        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        MODE: ${{ steps.resolve_mode.outputs.mode }}
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+        APP_TOKEN: ${{ steps.generate_token.outputs.token }}
+        ACCOUNT_LOGIN: ${{ steps.account_token.outputs.login }}
+        ACCOUNT_ID: ${{ steps.account_token.outputs.account_id }}
+        APP_ID: ${{ inputs.bot-app-id }}
       run: |
-        git config --global user.name "mirrobot-agent[bot]"
-        git config --global user.email "${{ inputs.bot-app-id }}+mirrobot-agent@users.noreply.github.com"
-        git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+        set -e
+        if [ "$MODE" = "account" ]; then
+          # Account mode: commits attribute to the bot account profile via the
+          # ID-prefixed noreply email; display name keeps the [bot] look.
+          NAME="${ACCOUNT_LOGIN}[bot]"
+          EMAIL="${ACCOUNT_ID}+${ACCOUNT_LOGIN}@users.noreply.github.com"
+          TOKEN="$ACCOUNT_TOKEN"
+        else
+          NAME="mirrobot-agent[bot]"
+          EMAIL="${APP_ID}+mirrobot-agent@users.noreply.github.com"
+          TOKEN="$APP_TOKEN"
+        fi
+        git config --global user.name "$NAME"
+        git config --global user.email "$EMAIL"
+        git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
 
     - name: Generate OpenCode Configuration
       shell: bash

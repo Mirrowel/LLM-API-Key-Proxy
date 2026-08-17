@@ -201,6 +201,7 @@ jobs:
         id: setup
         uses: ./.github/actions/bot-setup
         with:
+          account-token: ${{ secrets.ACCOUNT_GH_TOKEN }}
           bot-app-id: ${{ secrets.BOT_APP_ID }}
           bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
