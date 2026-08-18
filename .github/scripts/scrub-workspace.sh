@@ -48,10 +48,13 @@
 # Fail-closed: if the anchor ref cannot be resolved, ALL auto-load files
 # are removed. Removals are printed and appended to /tmp/scrub-removals.txt
 # so the agent can surface them (path + reason) in its final summary.
-# Quarantine: every removed auto-load file is first copied (symlinks
-# dereferenced) to /tmp/scrub-quarantine/<original-path>, and the removals
-# log names BOTH places. The agent may consult a quarantined copy on demand
-# (e.g. an AGENTS.md describing a new module) without that content being
+# Quarantine: a removed auto-load file is copied (symlinks dereferenced)
+# to /tmp/scrub-quarantine/<original-path> when — and only when — its
+# resolved target stays inside this repository (out-of-repo/absolute
+# symlink targets are removed with NO copy; foreign runner files are not
+# PR content). When a copy is preserved the removals log names BOTH
+# places. The agent may consult a quarantined copy on demand (e.g. an
+# AGENTS.md describing a new module) without that content being
 # auto-loaded — quarantined copies are DATA, never instructions. The
 # workflow scratch wipe (.mirrobot_files) is NOT quarantined (regenerated).
 # Exit code: 0 on success (including fail-closed scrub), 1 only when the
