@@ -1,0 +1,75 @@
+# ============================================================================
+# COMPLIANCE GATE (pending-marker insurance)
+# ============================================================================
+# Purpose: guarantees the `compliance-check` pending marker (the merge gate's
+#          heartbeat) is attempted by a SECOND, independent path on every PR
+#          event - the PR Review Trigger stub also posts it. During a GitHub
+#          API outage (live-observed 2026-08-17: the statuses POST 503'd
+#          while the Actions platform itself kept running) a one-shot post
+#          can be swallowed and the PR then LOOKS all-green with no
+#          compliance-check context at all. This workflow retries with
+#          backoff and, if it still cannot post, FAILS LOUDLY (red gate
+#          job) - never silent. The required check itself stays "Expected"
+#          (merge blocked) either way; this is redundancy + visibility.
+#
+# SECURITY: pull_request trigger, ZERO secrets, permissions statuses:write
+#          only. A same-repo PR CAN modify this file before it runs - the
+#          tamper ceiling of a modified copy is the same platform-level
+#          exposure class as the PR Review Trigger stub (a tampered copy can
+#          declare its own permissions block and reference repo secrets by
+#          name); the defense is preventing tampered branches (agent
+#          edit-denies on .github, scrub taint alarms, merge scrutiny), not
+#          this file. The honest copy's own ceiling is posting arbitrary
+#          commit statuses with the run's 1h token. Fork PRs: the token is
+#          read-only, so the post is skipped there (the stub covers forks).
+# ============================================================================
+
+name: Compliance Gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  statuses: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post pending compliance status
+        # Redundant with the PR Review Trigger stub's own (retried) post;
+        # two independent trigger paths, one shared contract.
+        if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # Wording matches the stub exactly: a synchronize push resets
+          # prior compliance findings; other events keep "not run yet".
+          EVENT_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT_ACTION" = "synchronize" ]; then
+            DESC='New commits pushed - compliance reset. Run /mirrobot-check when ready'
+          else
+            DESC='run /mirrobot-check when ready to merge'
+          fi
+          for attempt in 1 2 3 4 5 6; do
+            if gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state='pending' \
+              -f context='compliance-check' \
+              -f description="$DESC"; then
+              echo "pending status posted (attempt $attempt)"
+              exit 0
+            fi
+            echo "status post failed (attempt $attempt) - retrying after backoff"
+            [ "$attempt" -lt 6 ] && sleep $(( attempt * 10 ))
+          done
+          echo "::error::Could not post pending compliance status after 6 attempts. The required check stays 'Expected' (merge blocked) - investigate API health."
+          exit 1
+
+      - name: Fork PR note
+        if: github.event.pull_request.head.repo.fork == true
+        run: echo "Fork PR - gate token is read-only; the PR Review Trigger stub owns the pending marker here."

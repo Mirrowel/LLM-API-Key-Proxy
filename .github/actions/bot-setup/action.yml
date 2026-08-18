@@ -1,13 +1,19 @@
 name: 'Bot Setup'
-description: 'Performs all common setup steps for bot workflows, including token generation, git config, and dependency installation.'
+description: 'Performs all common setup steps for bot workflows, including token selection, git config, and dependency installation. Dual identity mode: uses the bot ACCOUNT token when provided (account mode), falling back to the GitHub App installation token (app mode). Agent permissions are owned by the OPENCODE_CONFIG_JSON secret (see permissions.example.json); this action does not inject or export any permission configuration.'
 
 inputs:
+  account-token:
+    description: 'Optional bot-account PAT. When non-empty, runs in account mode (this token is used directly, validated against /user) and the App credentials below are ignored.'
+    required: false
+    default: ''
   bot-app-id:
-    description: 'The ID of the GitHub App.'
-    required: true
+    description: 'The ID of the GitHub App (app mode only, required when no account token is provided).'
+    required: false
+    default: ''
   bot-private-key:
-    description: 'The private key of the GitHub App.'
-    required: true
+    description: 'The private key of the GitHub App (app mode only, required when no account token is provided).'
+    required: false
+    default: ''
   opencode-api-key:
     description: 'Optional API key to apply to the provider inferred from opencode-model.'
     required: false
@@ -23,14 +29,100 @@ inputs:
 
 outputs:
   token:
-    description: "The generated GitHub App token."
-    value: ${{ steps.generate_token.outputs.token }}
+    description: "The bot token (account PAT in account mode, App installation token in app mode)."
+    value: ${{ steps.account_token.outputs.token || steps.generate_token.outputs.token }}
+  mode:
+    description: "Which identity mode was activated: 'account' or 'app'."
+    value: ${{ steps.resolve_mode.outputs.mode }}
+  identity:
+    description: "Human-readable bot identity used this run (account login in account mode, the app bot name in app mode), for logging."
+    value: ${{ steps.account_token.outputs.login || 'mirrobot-agent[bot]' }}
 
 runs:
   using: "composite"
   steps:
-    - name: Generate GitHub App Token
+    - name: Resolve token mode
+      id: resolve_mode
+      shell: bash
+      env:
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+        APP_ID: ${{ inputs.bot-app-id }}
+        APP_KEY: ${{ inputs.bot-private-key }}
+      run: |
+        if [ -n "$ACCOUNT_TOKEN" ]; then
+          echo "mode=account" >> "$GITHUB_OUTPUT"
+        elif [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+          echo "mode=app" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::No bot credentials available. Provide ACCOUNT_GH_TOKEN (account mode) or BOT_APP_ID + BOT_PRIVATE_KEY (app mode)."
+          exit 1
+        fi
+
+    - name: Validate account token (account mode)
+      id: account_token
+      if: steps.resolve_mode.outputs.mode == 'account'
+      shell: bash
+      env:
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+      run: |
+        set -e
+        # Fail-fast validation: a present-but-broken secret must NOT silently
+        # fall back to app mode - it needs human attention (rotation).
+        # ONE round-trip (--include) yields body (login, id) AND the
+        # X-OAuth-Scopes header, so scope sufficiency is checked here too.
+        resp=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api --include /user) || {
+          echo "::error::ACCOUNT_GH_TOKEN is set but invalid (gh api /user failed). Rotate the secret or remove it to fall back to app mode."
+          exit 1
+        }
+        body=$(printf '%s\n' "$resp" | awk 'body {print} /^\r?$/{body=1}')
+        login=$(printf '%s' "$body" | jq -r .login)
+        account_id=$(printf '%s' "$body" | jq -r .id)
+        # __ABSENT__ sentinel distinguishes "header not in response" (non-classic
+        # token) from "header present but empty" (classic token with NO scopes).
+        scopes=$(printf '%s\n' "$resp" | awk '
+          tolower($0) ~ /^x-oauth-scopes:/ {
+            sub(/^[^:]*:[ ]*/, ""); gsub(/\r/, ""); print; found = 1; exit
+          }
+          END { if (!found) print "__ABSENT__" }')
+
+        echo "token=$ACCOUNT_TOKEN" >> "$GITHUB_OUTPUT"
+        echo "login=$login" >> "$GITHUB_OUTPUT"
+        echo "account_id=$account_id" >> "$GITHUB_OUTPUT"
+
+        # Scope contract (classic PAT): public_repo (or repo) required for the
+        # bot's work; `workflow` FORBIDDEN - without that scope GitHub
+        # mechanically rejects .github/workflows pushes, which is the platform
+        # backstop the agent's whole workflow-deny posture relies on.
+        if [ "$scopes" = "__ABSENT__" ]; then
+          echo "::warning::Could not read X-OAuth-Scopes (non-classic token?). Proceeding without scope verification - expected: classic PAT, public_repo only, WITHOUT workflow scope."
+        elif [ -z "$scopes" ]; then
+          echo "::error::ACCOUNT_GH_TOKEN carries NO scopes (X-OAuth-Scopes header is empty) - it cannot operate on the repository. Regenerate with public_repo."
+          exit 1
+        else
+          echo "Token scopes: $scopes"
+          # CRs stripped at extraction; commas normalized to spaces so word
+          # matching is position-independent ("workflow, public_repo" and
+          # "public_repo, workflow" both match; last-position too).
+          scopes_norm=" ${scopes//,/ } "
+          case "$scopes_norm" in
+            *" workflow "*)
+              echo "::error::ACCOUNT_GH_TOKEN has the 'workflow' scope - this removes the platform's workflow-push hard-deny. Regenerate the PAT with public_repo ONLY."
+              exit 1
+              ;;
+          esac
+          case "$scopes_norm" in
+            *" public_repo "*|*" repo "*) : ;;
+            *)
+              echo "::error::ACCOUNT_GH_TOKEN lacks public_repo/repo scope - the token cannot operate on the repository. Regenerate with public_repo."
+              exit 1
+              ;;
+          esac
+        fi
+        echo "::notice::Bot identity: account @$login (account-token mode)"
+
+    - name: Generate GitHub App Token (app mode)
       id: generate_token
+      if: steps.resolve_mode.outputs.mode == 'app'
       uses: actions/create-github-app-token@v1
       with:
         app-id: ${{ inputs.bot-app-id }}
@@ -39,11 +131,33 @@ runs:
     - name: Configure Git for Bot
       shell: bash
       env:
-        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        MODE: ${{ steps.resolve_mode.outputs.mode }}
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+        APP_TOKEN: ${{ steps.generate_token.outputs.token }}
+        ACCOUNT_LOGIN: ${{ steps.account_token.outputs.login }}
+        ACCOUNT_ID: ${{ steps.account_token.outputs.account_id }}
+        APP_ID: ${{ inputs.bot-app-id }}
       run: |
-        git config --global user.name "mirrobot-agent[bot]"
-        git config --global user.email "${{ inputs.bot-app-id }}+mirrobot-agent@users.noreply.github.com"
-        git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+        set -e
+        if [ "$MODE" = "account" ]; then
+          # Account mode: commits attribute to the bot account profile via the
+          # ID-prefixed noreply email; display name keeps the [bot] look.
+          NAME="${ACCOUNT_LOGIN}[bot]"
+          EMAIL="${ACCOUNT_ID}+${ACCOUNT_LOGIN}@users.noreply.github.com"
+          TOKEN="$ACCOUNT_TOKEN"
+        else
+          # App mode. Display name carries the capitalized branding; commit
+          # attribution rides the numeric ID in the noreply email, so email
+          # casing is cosmetic too. (If the GitHub App is renamed, the API
+          # bot login follows the new casing; repo-side identity matching is
+          # case-insensitive everywhere.)
+          NAME="Mirrobot-Agent[bot]"
+          EMAIL="${APP_ID}+Mirrobot-Agent@users.noreply.github.com"
+          TOKEN="$APP_TOKEN"
+        fi
+        git config --global user.name "$NAME"
+        git config --global user.email "$EMAIL"
+        git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
 
     - name: Generate OpenCode Configuration
       shell: bash
@@ -102,6 +216,27 @@ runs:
         configure_model "$MAIN_MODEL" "model"
         if [ -n "$FAST_MODEL" ]; then
           configure_model "$FAST_MODEL" "small_model"
+        fi
+
+        # NOTE ON PERMISSIONS: the agent permission profile is owned by the
+        # OPENCODE_CONFIG_JSON secret (repository settings), NOT by this action.
+        # Whatever `permission` block the secret supplies lands in
+        # ~/.config/opencode/opencode.json verbatim; no permission injection or
+        # OPENCODE_PERMISSION export happens here. The env var variant would
+        # deep-merge over the config (upstream issue #22292) and override it.
+        # See .github/actions/bot-setup/permissions.example.json for the
+        # recommended profile to paste into the secret.
+        if ! jq -e 'has("permission")' <<< "$CONFIG" >/dev/null 2>&1; then
+          echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste .github/actions/bot-setup/permissions.example.json into the secret."
+        else
+          # Drift check: warn when the secret's permission block differs from
+          # the recommended example (e.g. after the example evolves but the
+          # secret was not refreshed). Comparison is informational only — the
+          # secret always wins; this just makes silent drift visible.
+          if ! diff <(jq -S . <<< "$CONFIG" | jq -S '.permission') \
+                     <(jq -S . "${GITHUB_ACTION_PATH}/permissions.example.json") >/dev/null 2>&1; then
+            echo "::warning::OPENCODE_CONFIG_JSON permission block differs from .github/actions/bot-setup/permissions.example.json. If intentional, update the example to match; otherwise refresh the secret from the example."
+          fi
         fi
 
         # --- FINALIZATION ---
