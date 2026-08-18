@@ -1,0 +1,150 @@
+name: Agent Router
+
+# ============================================================================
+# SINGLE COMMENT-TRIGGER ENTRYPOINT (noise consolidation)
+# ============================================================================
+# Every issue_comment[created] event fired ALL THREE agent workflows, of which
+# at most one proceeded (the rest skipped). This router is now the only
+# comment-triggered workflow: it parses the comment once and dispatches ONLY
+# the matching target workflow(s). Per comment: 3 workflow entries -> 1.
+#
+# Routing rules replicate the targets' former triggers EXACTLY:
+#   - /mirrobot-review or /mirrobot_review  -> PR Review        (PRs only)
+#   - /mirrobot-check  or /mirrobot_check   -> Compliance Check  (PRs only)
+#   - @mirrobot / @mirrobot-agent mention   -> Bot Reply
+#   - compound comments dispatch ALL matches (parallel agents, as before)
+#   - bot-authored comments ([bot] suffix, mirrobot, mirrobot-agent): no route
+#   - trigger words only inside quotes/code fences/inline code: no route
+#
+# Security model:
+#   - issue_comment is default-branch-guaranteed: this file, and everything
+#     it dispatches, always comes from the default branch.
+#   - The ONLY privileges are GITHUB_TOKEN with actions:write (workflow
+#     dispatch) and contents:read (the single sparse default-branch checkout
+#     of the shared routing script). No App key, no LLM key, no PR/fork
+#     checkout, no untrusted code execution: comment text is parsed by
+#     route-comment.sh and never interpolated into shell via ${{ }} (env:
+#     only).
+#   - GITHUB_TOKEN CAN trigger workflow_dispatch (documented GitHub exception
+#     to the token-recursion rule).
+#   - Routing decisions are logged to the run step summary: this run is the
+#     audit trail for "why did/didn't the agent respond".
+#   - Targets re-fetch comment context from the API by id (comment_id input):
+#     author/association/body arrive from GitHub, never from this run's
+#     inputs, so the requester-verification chain is unchanged.
+# ============================================================================
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  actions: write    # dispatch the target agent workflows
+  contents: read    # sparse default-branch checkout of .github/scripts only
+                    # (the shared route-comment.sh; see Checkout routing script)
+
+concurrency:
+  group: agent-router-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    # Bot-loop guard: never route comments authored by bots or by the agent
+    # itself (its own replies/comments must not re-trigger agents).
+    # NOTE: GitHub Actions expressions have NO case-insensitive compare, so
+    # agent names enumerate known casings (logins are case-insensitive; when
+    # an identity is renamed, add its new casing here).
+    if: |
+      !endsWith(github.event.comment.user.login, '[bot]') &&
+      github.event.comment.user.login != 'mirrobot' &&
+      github.event.comment.user.login != 'mirrobot-agent' &&
+      github.event.comment.user.login != 'Mirrobot-Agent'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      # Default-branch checkout for the SHARED routing script ONLY.
+      # issue_comment always executes this workflow from the default branch,
+      # so this tree is trusted-by-construction (same trust level as this
+      # workflow file itself) - NOT the untrusted-PR-code case the security
+      # model prohibits. No PR/fork ref is ever checked out here.
+      - name: Checkout routing script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Parse comment and route
+        env:
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          THREAD_NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request != '' && 'true' || 'false' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # --- Shared decision logic (route-comment.sh): same cleaning and
+          # matching as every former per-workflow guard, from the one file
+          # bot-reply re-validation and the fixture suite also use.
+          ROUTES=$(printf '%s' "$COMMENT_BODY" | bash .github/scripts/route-comment.sh "$IS_PR")
+
+          route_review=false
+          route_compliance=false
+          route_reply=false
+          case " $ROUTES " in
+            *" review "*)     route_review=true ;;
+          esac
+          case " $ROUTES " in
+            *" compliance "*) route_compliance=true ;;
+          esac
+          case " $ROUTES " in
+            *" reply "*)      route_reply=true ;;
+          esac
+
+          # --- Audit trail: this run's summary is the record of the decision.
+          {
+            echo "### Agent Router — comment #$COMMENT_ID on #$THREAD_NUMBER"
+            echo "- Thread is PR: $IS_PR"
+            echo "- Commands found: review=$route_review compliance=$route_compliance mention=$route_reply"
+            echo "- (Words inside quotes/code fences are ignored; bot authors never route.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          dispatched=0
+          failed=0
+          # Each dispatch is isolated: one failing target (renamed workflow
+          # file, API hiccup) must not silently kill the remaining routes for
+          # compound comments - warn, record, keep routing.
+          if [ "$route_review" = "true" ]; then
+            echo "::notice::Routing to PR Review (PR #$THREAD_NUMBER)"
+            if ! gh workflow run pr-review.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f prNumber="$THREAD_NUMBER" -f commentId="$COMMENT_ID" -f source=router; then
+              echo "::warning::Failed to dispatch PR Review for #$THREAD_NUMBER"
+              failed=1
+            fi
+            dispatched=1
+          fi
+          if [ "$route_compliance" = "true" ]; then
+            echo "::notice::Routing to Compliance Check (PR #$THREAD_NUMBER)"
+            if ! gh workflow run compliance-check.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$THREAD_NUMBER" -f commentId="$COMMENT_ID"; then
+              echo "::warning::Failed to dispatch Compliance Check for #$THREAD_NUMBER"
+              failed=1
+            fi
+            dispatched=1
+          fi
+          if [ "$route_reply" = "true" ]; then
+            echo "::notice::Routing to Bot Reply (thread #$THREAD_NUMBER)"
+            if ! gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f commentId="$COMMENT_ID" -f threadNumber="$THREAD_NUMBER"; then
+              echo "::warning::Failed to dispatch Bot Reply for #$THREAD_NUMBER"
+              failed=1
+            fi
+            dispatched=1
+          fi
+
+          if [ "$dispatched" = "0" ]; then
+            echo "::notice::No agent trigger found in comment #$COMMENT_ID; nothing dispatched."
+          elif [ "$failed" = "1" ]; then
+            # A dispatch failure is a REAL failure: fail the router run so the
+            # miss is visible in the Actions tab, not just a warning line.
+            echo "::error::One or more target dispatches failed for comment #$COMMENT_ID"
+            exit 1
+          fi

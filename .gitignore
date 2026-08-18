@@ -14,7 +14,7 @@ eggs/
 .eggs/
 lib/
 lib64/
-parts/
+/parts/
 sdist/
 var/
 wheels/
@@ -142,3 +142,6 @@ tests/*
 !tests/test_session_tracking.py
 !tests/test_selection_engine.py
 docs/ignored/
+
+# locally rendered assembled agent prompts (generated, not source)
+.github/prompts/rendered/

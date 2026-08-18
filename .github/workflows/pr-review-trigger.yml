@@ -1,0 +1,173 @@
+# ============================================================================
+# PR REVIEW TRIGGER (stub)
+# ============================================================================
+# Purpose: restores automatic PR reviews (instant, event-driven) without the
+#          pull_request_target secret-exposure hole that the old PR Review
+#          workflow had.
+#
+# SECURITY MODEL — READ BEFORE EDITING:
+#   pull_request_target executes THIS FILE from the PR's BASE branch. Any
+#   branch can be a base (including bot-created feature branches), so assume
+#   an attacker-influenced copy of this file can run. This workflow is safe
+#   ONLY in its honest form, and the honest copy's ceiling is:
+#     - ZERO secrets referenced (worst case: review-timing control + status
+#       noise with a 1-hour token).
+#   A TAMPERED copy of this file on an attacker-influenced branch is a
+#   platform-level exposure that this design accepts (same exposure the
+#   original status-check-init.yml had): a tampered pull_request_target copy
+#   can declare its own permissions block and reference repo secrets by name.
+#   The defense is preventing tampered branches (agent edit-denies on .github,
+#   scrub taint alarms, merge scrutiny), not this file.
+#   All privileged logic lives in PR Review. The HONEST copy of this stub
+#   dispatches it on the repository DEFAULT branch (--ref), which provides
+#   the same maintained-file guarantee workflow_run did. Note the guarantee
+#   is PARAMETRIC, not structural: a tampered copy of this file can pass
+#   any --ref it wants (e.g. a branch carrying a modified pr-review.yml).
+#   That is ceiling-equivalent to what a tampered pull_request_target copy
+#   can already do (reference repo secrets by name directly) - no NEW
+#   power - but do not read the --ref as a platform-enforced invariant.
+#
+# Decision rules (identical to the original auto-review behavior):
+#   - PR opened (non-draft)            -> review
+#   - PR marked ready for review       -> review
+#   - PR reopened (non-draft)          -> review
+#   - Push/synchronize + 'Agent Monitored' label -> review
+#   - Everything else                  -> no review (EXPECTED outcome: the run
+#     still concludes green — a declined review is not a failure — and the
+#     "Signal review" step stays SKIPPED, dispatching nothing. PR Review is
+#     never triggered at all when no review is wanted.)
+# ============================================================================
+
+name: PR Review Trigger
+
+# Carries the PR number + causing action for log readability only. The
+# PR identity travels as EXPLICIT dispatch inputs to PR Review (prNumber,
+# triggerAction, source=stub) - not via run-name parsing. Declined events
+# dispatch nothing at all, so PR Review is never triggered when no review
+# is wanted (no downstream wake, no wasted runner).
+run-name: 'AutoTrigger PR #${{ github.event.pull_request.number }} (${{ github.event.action }})'
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  statuses: write   # pending compliance-check marker only
+  actions: write    # dispatch pr-review.yml on review-wanted (the signal
+                    # channel). Still ZERO repo secrets - this is the
+                    # ephemeral event token. A tampered copy could always
+                    # declare its own permissions (documented ceiling), so
+                    # the honest copy declaring actions: write adds no new
+                    # tamper power.
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    steps:
+      # continue-on-error + RETRY: the pending status is the merge gate's
+      # heartbeat — losing it to a transient API 503 silently removes the
+      # visible "compliance-check" context (live-observed during a GitHub
+      # outage, 2026-08-17). So: retry the POST with backoff, and only then
+      # give up without failing the run (the signal step below is the
+      # downstream contract, not this step; a suppressed status still leaves
+      # the required-check rule blocking merges as "Expected").
+      - name: Post pending compliance status
+        if: github.event.pull_request.draft == false
+        continue-on-error: true
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          # A synchronize push invalidates prior compliance findings (new
+          # commits = new code to audit - mirrors how a push dismisses stale
+          # reviews). The description says so explicitly; other events keep
+          # the generic "not run yet" wording.
+          EVENT_ACTION: ${{ github.event.action }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT_ACTION" = "synchronize" ]; then
+            DESC='New commits pushed - compliance reset. Run /mirrobot-check when ready'
+          else
+            DESC='run /mirrobot-check when ready to merge'
+          fi
+          for attempt in 1 2 3 4 5; do
+            if gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/$GITHUB_REPOSITORY/statuses/$HEAD_SHA" \
+              -f state='pending' \
+              -f context='compliance-check' \
+              -f description="$DESC"; then
+              echo "pending status posted (attempt $attempt)"
+              exit 0
+            fi
+            echo "status post failed (attempt $attempt) - retrying after backoff"
+            [ "$attempt" -lt 5 ] && sleep $(( attempt * 5 ))
+          done
+          echo "::warning::Could not post pending compliance status after 5 attempts - merge gate falls back to the required-check 'Expected' state."
+          exit 1
+
+      - name: Decide whether to review
+        # Always exits 0 — a declined review is a normal outcome, not a
+        # failure (the run stays green). The decision travels via the step
+        # output; the "Signal review" step below is what PR Review reads.
+        id: decide
+        env:
+          ACTION: ${{ github.event.action }}
+          DRAFT: ${{ github.event.pull_request.draft }}
+          LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
+        run: |
+          review=false
+          if [ "$DRAFT" != "true" ]; then
+            case "$ACTION" in
+              opened|ready_for_review|reopened)
+                review=true
+                ;;
+              synchronize)
+                # Only re-review labeled PRs on push (original auto rule)
+                if printf '%s' "$LABELS_JSON" | jq -e 'map(.name) | index("Agent Monitored")' >/dev/null; then
+                  review=true
+                fi
+                ;;
+            esac
+          fi
+
+          if [ "$review" = true ]; then
+            echo "Review requested for $ACTION event."
+            echo "review_wanted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No review for $ACTION event (draft, or no 'Agent Monitored' label)."
+            echo "review_wanted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Signal review
+        # DOWNSTREAM CONTRACT: dispatches PR Review directly (GITHUB_TOKEN
+        # CAN trigger workflow_dispatch - documented GitHub exception, same
+        # live-proven mechanism agent-router.yml uses). Runs only when a
+        # review is wanted; a skipped conclusion means "no review" and
+        # NOTHING downstream runs - PR Review is simply never triggered.
+        # The dispatch targets the repository DEFAULT branch, so the
+        # workflow definition executed is the maintained one (same
+        # guarantee workflow_run used to provide). Retries absorb transient
+        # API errors; if all attempts fail the step FAILS LOUDLY - a lost
+        # review is a real failure worth a red run, not a silent skip.
+        if: steps.decide.outputs.review_wanted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          for attempt in 1 2 3; do
+            if gh workflow run pr-review.yml \
+              --repo "$GITHUB_REPOSITORY" \
+              --ref "$DEFAULT_BRANCH" \
+              -f prNumber="$PR_NUMBER" \
+              -f triggerAction="$ACTION" \
+              -f source=stub; then
+              echo "review dispatched for PR #$PR_NUMBER ($ACTION) on $DEFAULT_BRANCH (attempt $attempt)"
+              exit 0
+            fi
+            echo "dispatch failed (attempt $attempt) - retrying after backoff"
+            [ "$attempt" -lt 3 ] && sleep $(( attempt * 5 ))
+          done
+          echo "::error::Could not dispatch PR Review for PR #$PR_NUMBER after 3 attempts."
+          exit 1
