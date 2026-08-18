@@ -117,7 +117,7 @@ jobs:
           # compound comments - warn, record, keep routing.
           if [ "$route_review" = "true" ]; then
             echo "::notice::Routing to PR Review (PR #$THREAD_NUMBER)"
-            if ! gh workflow run pr-review.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f prNumber="$THREAD_NUMBER" -f commentId="$COMMENT_ID"; then
+            if ! gh workflow run pr-review.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f prNumber="$THREAD_NUMBER" -f commentId="$COMMENT_ID" -f source=router; then
               echo "::warning::Failed to dispatch PR Review for #$THREAD_NUMBER"
               failed=1
             fi

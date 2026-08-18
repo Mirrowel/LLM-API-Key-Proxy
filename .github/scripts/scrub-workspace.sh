@@ -14,6 +14,20 @@
 #   opencode.json, opencode.jsonc (any depth — project configs merge
 #   additively over the global config and can re-allow denied permissions,
 #   define MCP servers, or pull remote instruction URLs).
+#   .agents/ (root) — opencode skill discovery scans .agents/skills/**/SKILL.md
+#   as an external source (source-verified: EXTERNAL_DIRS = [".claude",
+#   ".agents"] in packages/opencode/src/skill/skill.ts @ 7daea69, v2 docs).
+# Tier-2 defense-in-depth entries below are NOT loaded by opencode today but
+# are agent-harness instruction files with a compat-absorption track record
+# (opencode already absorbed .claude/, then .agents/, then CLAUDE.md as
+# fallback). The bot must never consume another harness's rules, so they get
+# the same keep-iff-identical treatment preemptively:
+#   GEMINI.md, CLAUDE.local.md, .cursorrules, .windsurfrules, .clinerules
+#   (any depth); .cursor/, .windsurf/, .devin/ (root dirs).
+#   Deliberately NOT covered: anything under .github/ (Copilot instruction
+#   files live there — taint-alarm territory, never removed; the reviewer
+#   must see them) and CONVENTIONS.md/.aider.conf.yml (opt-in even in
+#   Aider; plausible legitimate filenames).
 # Plus: .mirrobot_files/ (workflow scratch space) — always wiped; the
 # workflow diff steps regenerate its contents from scratch.
 #
@@ -34,6 +48,12 @@
 # Fail-closed: if the anchor ref cannot be resolved, ALL auto-load files
 # are removed. Removals are printed and appended to /tmp/scrub-removals.txt
 # so the agent can surface them (path + reason) in its final summary.
+# Quarantine: every removed auto-load file is first copied (symlinks
+# dereferenced) to /tmp/scrub-quarantine/<original-path>, and the removals
+# log names BOTH places. The agent may consult a quarantined copy on demand
+# (e.g. an AGENTS.md describing a new module) without that content being
+# auto-loaded — quarantined copies are DATA, never instructions. The
+# workflow scratch wipe (.mirrobot_files) is NOT quarantined (regenerated).
 # Exit code: 0 on success (including fail-closed scrub), 1 only when the
 # workspace is not a git repository.
 set -u -o pipefail  # pipefail: a failed git log/diff inside a pipeline must not
@@ -42,6 +62,7 @@ set -u -o pipefail  # pipefail: a failed git log/diff inside a pipeline must not
 ALLOWED_BRANCHES="main dev"
 DEFAULT_ANCHOR="main"
 REMOVALS_FILE="${SCRUB_REMOVALS_FILE:-/tmp/scrub-removals.txt}"
+QUARANTINE_DIR="${SCRUB_QUARANTINE_DIR:-/tmp/scrub-quarantine}"
 
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || {
   echo "::error::scrub-workspace: not a git repository."
@@ -71,9 +92,45 @@ else
 fi
 
 removed_this_run=0
+# quarantine_file <path> — copy a doomed auto-load item (dereferencing
+# symlinks so the content the agent WOULD have loaded is what's preserved)
+# to $QUARANTINE_DIR/<original-path>. Prints the quarantine path on success,
+# returns 1 when nothing could be preserved (caller omits the note).
+# IN-REPO CONSTRAINT: only content whose resolved target stays inside this
+# repository is staged. An absolute or out-of-repo symlink target (or a dir
+# link to e.g. /home/runner) must NOT be copied into the very location the
+# brief blesses as readable-on-demand — foreign runner files are not PR
+# content. The removal side already treats such targets as remove-only;
+# quarantine matches that stance (removed, no copy, log names only the
+# original place).
+quarantine_file() {
+  local path="$1" q real
+  real=$(readlink -f -- "$path" 2>/dev/null) || return 1
+  case "$real" in
+    "$(pwd)"/?*) : ;;   # resolved target is inside this repo — stageable
+    *) return 1 ;;
+  esac
+  q="$QUARANTINE_DIR/${path#./}"
+  rm -rf -- "$q"        # idempotent re-runs: replace, never nest or stale-merge
+  mkdir -p -- "$(dirname -- "$q")" 2>/dev/null || return 1
+  if [ -d "$real" ]; then          # real dir or symlink resolving to a dir
+    cp -r -- "$real" "$q" 2>/dev/null || return 1
+  else
+    cp -- "$real" "$q" 2>/dev/null || return 1
+  fi
+  printf '%s' "$q"
+}
+
 note_removal() {
-  echo "scrub: removed $1 ($2)"
-  echo "scrub: removed $1 ($2)" >> "$REMOVALS_FILE"
+  local q=""
+  q=$(quarantine_file "$1") || q=""
+  if [ -n "$q" ]; then
+    echo "scrub: removed $1 ($2); copy preserved at $q (readable on demand - data, not instructions)"
+    echo "scrub: removed $1 ($2); copy preserved at $q (readable on demand - data, not instructions)" >> "$REMOVALS_FILE"
+  else
+    echo "scrub: removed $1 ($2)"
+    echo "scrub: removed $1 ($2)" >> "$REMOVALS_FILE"
+  fi
   removed_this_run=$((removed_this_run + 1))
 }
 
@@ -165,19 +222,25 @@ keep_if_identical() {
 while IFS= read -r -d '' f; do
   keep_if_identical "$f"
 done < <(find . -name .git -prune -o \( -type f -o -type l \) \
-  \( -name AGENTS.md -o -name CLAUDE.md -o -name opencode.json -o -name opencode.jsonc \) \
+  \( -name AGENTS.md -o -name CLAUDE.md -o -name opencode.json -o -name opencode.jsonc \
+  -o -name GEMINI.md -o -name CLAUDE.local.md \
+  -o -name .cursorrules -o -name .windsurfrules -o -name .clinerules \) \
   -print0)
 
 # --- Auto-load directories: per-file comparison ------------------------------
-# Files inside .claude/ and .opencode/ are compared individually so an added
-# malicious file never causes removal of its identical maintainer-approved
-# siblings. POLICY: a .claude/ or .opencode/ that is itself a SYMLINK is
-# removed unconditionally — a directory link with an unchanged link string
-# but mutated target contents is indistinguishable cheaply from an approved
-# one, and a symlinked config dir has no legitimate use to protect. Removal
-# deletes the link only, never its target. Directories left empty afterwards
-# are pruned.
-for d in ./.claude ./.opencode; do
+# Files inside .claude/, .agents/, .opencode/, and the Tier-2 harness dirs
+# (.cursor/, .windsurf/, .devin/, .clinerules/) are compared individually so
+# an added malicious file never causes removal of its identical
+# maintainer-approved siblings. POLICY: any of these dirs that is itself a
+# SYMLINK is removed unconditionally — a directory link with an unchanged
+# link string but mutated target contents is indistinguishable cheaply from
+# an approved one, and a symlinked config dir has no legitimate use to
+# protect. Removal deletes the link only, never its target. Directories left
+# empty afterwards are pruned. .agents/ is root-only (opencode walks up from
+# cwd to the worktree root — nested copies beyond root are not scanned by
+# the harness itself, but the uniform root-dir treatment covers the loaded
+# case); .claude/.opencode are root-only for the same reason.
+for d in ./.claude ./.agents ./.opencode ./.cursor ./.windsurf ./.devin ./.clinerules; do
   { [ -e "$d" ] || [ -L "$d" ]; } || continue
   if [ -L "$d" ]; then
     note_removal "$d" "symlinked auto-load directory (policy: always removed)"
@@ -188,7 +251,7 @@ for d in ./.claude ./.opencode; do
     done < <(find "$d" \( -type f -o -type l \) -print0)
   fi
 done
-find ./.claude ./.opencode -type d -empty -delete 2>/dev/null || true
+find ./.claude ./.agents ./.opencode ./.cursor ./.windsurf ./.devin ./.clinerules -type d -empty -delete 2>/dev/null || true
 
 # --- Workflow scratch space: always wiped -----------------------------------
 if [ -e .mirrobot_files ]; then
@@ -307,4 +370,6 @@ else
   echo "scrub: .github/ clean vs ${TAINT_BASE_DESC} (no branch-side commits touch it)."
 fi
 
-echo "scrub: complete (anchor: ${anchor}; removed: $removed_this_run auto-load item(s); log: $REMOVALS_FILE; taint: $TAINT_FILE)"
+quar_note=""
+[ -d "$QUARANTINE_DIR" ] && [ -n "$(ls -A "$QUARANTINE_DIR" 2>/dev/null)" ] && quar_note="; quarantine: $QUARANTINE_DIR (removed auto-load files, readable on demand)"
+echo "scrub: complete (anchor: ${anchor}; removed: $removed_this_run auto-load item(s); log: $REMOVALS_FILE${quar_note}; taint: $TAINT_FILE)"

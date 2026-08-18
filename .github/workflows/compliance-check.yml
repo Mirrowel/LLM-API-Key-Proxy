@@ -148,6 +148,24 @@ jobs:
 
     steps:
       # ========================================================================
+      # FAST EYES (account mode, routed comments only) - see pr-review.yml
+      # ========================================================================
+      - name: Fast eyes on trigger (account mode)
+        id: fast_eyes
+        if: github.event_name == 'workflow_dispatch' && inputs.commentId != '' && secrets.ACCOUNT_GH_TOKEN != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          COMMENT_ID: ${{ inputs.commentId }}
+        run: |
+          if gh api --method POST -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" -f content=eyes; then
+            echo "posted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "posted=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ========================================================================
       # ROUTED-COMMENT RESOLUTION STEP (dispatch runs carrying a commentId only)
       # ========================================================================
       # Validates that trigger words are in actual content (not in quotes/code)
@@ -650,7 +668,7 @@ jobs:
         # for manual runs. Comment targets transition to rocket/confused on
         # session end; PR targets keep eyes by design.
         continue-on-error: true
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.fast_eyes.outputs.posted != 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}

@@ -168,5 +168,8 @@
   },
   "external_directory": "allow",
   "webfetch": "deny",
-  "websearch": "allow"
+  "websearch": "allow",
+  "skill": {
+    "*": "deny"
+  }
 }

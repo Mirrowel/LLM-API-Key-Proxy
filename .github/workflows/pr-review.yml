@@ -1,63 +1,66 @@
 name: PR Review
 
 # SECURITY MODEL:
-#   This workflow runs ONLY from the default branch: its triggers are limited
-#   to workflow_dispatch (manual or agent-router-routed) and workflow_run -
-#   event types GitHub
-#   guarantees to execute with the default branch's workflow file, local
-#   actions, and prompts. pull_request* triggers are BANNED here: they would
-#   execute a PR's base-branch copy of this file (with secrets in scope for
-#   same-repo branches), letting any pushed branch redefine how the agent
-#   runs. Automatic reviews instead arrive via the completion of the
-#   PR Review Trigger stub (pr-review-trigger.yml), which holds zero secrets
-#   and is safe to run from any base branch.
+#   Runs arrive as workflow_dispatch only (router / stub / manual). The
+#   honest dispatchers target --ref <default-branch>, so the workflow file,
+#   local actions, and prompts executed are the maintained ones - a
+#   PARAMETRIC guarantee (the ref is an argument a tampered dispatcher
+#   could change; ceiling-equivalent to that dispatcher's other powers).
+#   pull_request* triggers are BANNED here: they would execute a PR's
+#   base-branch copy of this file (with secrets in scope for same-repo
+#   branches), letting any pushed branch redefine how the agent runs.
+#   Automatic reviews arrive as stub DISPATCHES (pr-review-trigger.yml
+#   decides and dispatches only on review-wanted - declined events never
+#   trigger this workflow at all), which holds zero secrets and is safe to
+#   run from any base branch.
 
 concurrency:
   # ONE group per PR across ALL trigger paths, so auto and comment/manual
   # reviews of the same PR serialize (a manual review requested mid-auto-run
   # waits; both then render correct FIRST/FOLLOW-UP types instead of racing
-  # on stale review state). Resolution order: dispatch input -> the stub
-  # run's pull_requests[0] (populated for same-repo PRs; empty for forks) ->
-  # head_branch (per-PR-branch fallback, mainly forks) -> run_id (last
-  # resort: degrades to no cross-path serialization rather than wrongly
-  # blocking unrelated runs). cancel-in-progress stays false: reviews queue.
-  group: ${{ github.workflow }}-${{ inputs.prNumber || github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.head_branch || github.run_id }}
+  # on stale review state). Dispatch input always carries the PR number now
+  # (router and stub both pass prNumber); run_id is the last resort for a
+  # malformed dispatch (degrades to no cross-path serialization rather than
+  # wrongly blocking unrelated runs). cancel-in-progress stays false:
+  # reviews queue.
+  group: ${{ github.workflow }}-${{ inputs.prNumber || github.run_id }}
   cancel-in-progress: false
 
 on:
   workflow_dispatch:
     inputs:
       prNumber:
-        description: 'The number of the PR to review manually'
+        description: 'The number of the PR to review'
         required: true
         type: string
       commentId:
-        description: 'Id of the comment that requested the review (set by agent-router; empty for manual runs)'
+        description: 'Id of the comment that requested the review (set by agent-router; empty for auto/manual runs)'
         required: false
         type: string
-  # AUTOMATIC: fired by the PR Review Trigger stub (zero-secrets decision
-  # workflow). The PR number arrives via the stub's run name.
-  workflow_run:
-    workflows: ["PR Review Trigger"]
-    types: [completed]
+      triggerAction:
+        description: 'Causing PR event for auto runs (set by the PR Review Trigger stub: opened/synchronize/ready_for_review/reopened)'
+        required: false
+        type: string
+      source:
+        description: 'Who dispatched this run: "stub" (auto), "router" (routed comment), or empty (manual)'
+        required: false
+        type: string
 
 jobs:
   review-pr:
-    # Comment-triggered runs arrive exclusively via agent-router.yml dispatch
-    # (the router owns the bot-loop guard and trigger-word validation); this
-    # workflow's own triggers are manual/routed dispatch and the auto stub.
-    if: |
-      github.event_name == 'workflow_dispatch' ||
-      github.event_name == 'workflow_run'
+    # All runs arrive as workflow_dispatch: routed comments via
+    # agent-router.yml (which owns the bot-loop guard and trigger-word
+    # validation), automatic reviews via the PR Review Trigger stub
+    # (which dispatches only on review-wanted), and manual dispatch.
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pull-requests: write
-      actions: read         # resolve_auto: verify the trigger stub's job outcome
 
     env:
-      # For workflow_run triggers, PR_NUMBER is exported by the resolve_auto
-      # step (parsed from the stub's run name) — pull_requests[] is unreliable.
+      # Every run is a dispatch carrying prNumber explicitly (router, stub,
+      # or manual) - no event-payload parsing needed.
       PR_NUMBER: ${{ inputs.prNumber }}
       MAINTAINED_BASE_BRANCHES: 'main dev'
       BOT_NAMES_JSON: '["mirrobot", "mirrobot-agent", "mirrobot-agent[bot]"]'
@@ -72,6 +75,30 @@ jobs:
       THREAD_COMMENT_FETCH_LIMIT: '10'
 
     steps:
+      # ========================================================================
+      # FAST EYES (account mode, routed comments only)
+      # ========================================================================
+      # The "bot listened" signal should land within seconds, not after the
+      # full setup chain (checkout + bot-setup token mint + deps = ~30s). In
+      # account mode the token IS the secret - no minting, no checkout
+      # needed - so the eyes posts as the job's very first action. Skipped
+      # in app mode; the regular react step after bot-setup then owns it.
+      # Failure never blocks the run (cosmetic signal, continue-on-error).
+      - name: Fast eyes on trigger (account mode)
+        id: fast_eyes
+        if: github.event_name == 'workflow_dispatch' && inputs.commentId != '' && secrets.ACCOUNT_GH_TOKEN != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          COMMENT_ID: ${{ inputs.commentId }}
+        run: |
+          if gh api --method POST -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" -f content=eyes; then
+            echo "posted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "posted=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # ========================================================================
       # ROUTED-COMMENT RESOLUTION STEP (dispatch runs carrying a commentId only)
       # ========================================================================
@@ -127,57 +154,43 @@ jobs:
           } >> "$GITHUB_ENV"
 
       # ========================================================================
-      # AUTO-TRIGGER RESOLUTION (workflow_run events only)
+      # AUTO CONTEXT (stub-dispatched runs: source=stub, no commentId)
       # ========================================================================
-      # The PR Review Trigger stub names its run "AutoTrigger PR #N" - the only
-      # reliable PR identity channel for workflow_run (pull_requests[] is
-      # empty for fork PRs). The stub's "Signal review" STEP conclusion is
-      # then verified: success = review wanted; skipped = declined (a normal,
-      # green-run outcome); anything else = no review, fail-safe.
-      - name: Resolve auto-triggered review (workflow_run)
-        id: resolve_auto
-        if: github.event_name == 'workflow_run'
+      # The stub already made the review decision and dispatched this run
+      # with explicit inputs (prNumber, triggerAction) - no run-name
+      # parsing, no jobs-API verification needed (the dispatch IS the
+      # decision: declined events never trigger this workflow). What auto
+      # runs still lack is requester identity: fetch the PR author so the
+      # requester-context fallback works. Step outputs (not GITHUB_ENV) so
+      # they are usable in later steps' with: expressions.
+      - name: Resolve auto context (stub dispatch)
+        id: auto_ctx
+        if: inputs.source == 'stub' && inputs.commentId == ''
         env:
-          TRIGGER_RUN_NAME: ${{ github.event.workflow_run.name }}
-          TRIGGER_RUN_ID: ${{ github.event.workflow_run.id }}
+          PR_NUMBER: ${{ inputs.prNumber }}
+          TRIGGER_ACTION: ${{ inputs.triggerAction }}
           GH_TOKEN: ${{ github.token }}
         run: |
-          pr_number=$(printf '%s' "$TRIGGER_RUN_NAME" | sed -n 's/.*#\([0-9][0-9]*\).*/\1/p')
-          if [ -z "$pr_number" ]; then
-            echo "::notice::Triggering run name '$TRIGGER_RUN_NAME' carries no PR number; skipping."
-            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # The stub's "Signal review" STEP conclusion is the contract:
-          # success = review wanted; skipped = declined (a normal, green-run
-          # outcome — the stub always exits 0 on decline); anything else =
-          # treat as no review. A skipped step can never read as success.
-          stub_signal=$(gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$TRIGGER_RUN_ID/jobs" \
-            --jq '[.jobs[] | select(.name == "decide") | .steps[] | select(.name == "Signal review")][0].conclusion // "unknown"' 2>/dev/null || echo "unknown")
-          if [ "$stub_signal" != "success" ]; then
-            echo "::notice::Trigger stub's signal step concluded '$stub_signal' (not success); no review wanted."
-            echo "should_proceed=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # Fetch the PR author so the requester context works for auto runs
-          # (the workflow_run payload carries no PR data). Step outputs (not
-          # GITHUB_ENV) so they are usable in later steps' with: expressions.
-          pr_author_login=$(gh api "/repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq '.user.login // ""' 2>/dev/null || echo "")
-          pr_author_association=$(gh api "/repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq '.author_association // ""' 2>/dev/null || echo "")
-          echo "auto_pr_author=$pr_author_login" >> "$GITHUB_OUTPUT"
-          echo "auto_pr_association=$pr_author_association" >> "$GITHUB_OUTPUT"
-
-          echo "Auto-review of PR #$pr_number confirmed."
-          echo "should_proceed=true" >> "$GITHUB_OUTPUT"
-          echo "PR_NUMBER=$pr_number" >> "$GITHUB_ENV"
-          # Trigger-message block for auto runs (no comment exists). The stub
-          # run name carries the causing action, e.g. "(synchronize)".
-          echo "TRIGGER_MESSAGE=Automatically triggered by PR activity (stub run: $TRIGGER_RUN_NAME) - no human comment requested this; the PR event itself did." >> "$GITHUB_ENV"
+          # triggerAction validation: in the honest chain this is the
+          # platform enum (on: types), but as a dispatch input it is an
+          # arbitrary string (write-access actor or tampered copy). A value
+          # with newlines must never reach the GITHUB_ENV echo below (the
+          # routed-comment path guards the same class with a random
+          # delimiter). Enum-check: anything unexpected degrades to the
+          # generic wording, never the raw input.
+          case "$TRIGGER_ACTION" in
+            opened|synchronize|ready_for_review|reopened) safe_action="$TRIGGER_ACTION" ;;
+            *) safe_action="unknown event" ;;
+          esac
+          pr_author_login=$(gh api "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.user.login // ""' 2>/dev/null || echo "")
+          pr_author_association=$(gh api "/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.author_association // ""' 2>/dev/null || echo "")
+          echo "pr_author=$pr_author_login" >> "$GITHUB_OUTPUT"
+          echo "pr_association=$pr_author_association" >> "$GITHUB_OUTPUT"
+          # Trigger-message block for auto runs (no comment exists).
+          echo "TRIGGER_MESSAGE=Automatically triggered by PR activity (${safe_action}) - no human comment requested this; the PR event itself did." >> "$GITHUB_ENV"
 
       - name: Checkout repository
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v4
         with:
           persist-credentials: false  # no credentials in .git/config (public repo: anonymous fetches still work)
@@ -191,16 +204,16 @@ jobs:
       # review; this only informs the agent's judgment.
       - name: Build requester context
         id: requester
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/requester-context
         with:
-          login: ${{ env.RESOLVED_COMMENT_AUTHOR || steps.resolve_auto.outputs.auto_pr_author || github.actor }}
-          association: ${{ env.RESOLVED_ASSOCIATION || steps.resolve_auto.outputs.auto_pr_association }}
+          login: ${{ env.RESOLVED_COMMENT_AUTHOR || steps.auto_ctx.outputs.pr_author || github.actor }}
+          association: ${{ env.RESOLVED_ASSOCIATION || steps.auto_ctx.outputs.pr_association }}
           trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
           trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
 
       - name: Bot Setup
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: setup
         uses: ./.github/actions/bot-setup
         with:
@@ -213,7 +226,7 @@ jobs:
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
 
       - name: Clear pending bot review
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
@@ -246,9 +259,10 @@ jobs:
         # the triggering COMMENT when routed from one; eyes on the PR itself
         # for auto-triggered and manual runs. Comments later transition to
         # rocket (success) / confused (failure); PR/issue targets keep eyes
-        # by design. Cosmetic: never aborts the run.
+        # by design. Cosmetic: never aborts the run. Skipped when fast-eyes
+        # (account mode) already posted - same login, same lifecycle.
         continue-on-error: true
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: (github.event_name == 'workflow_dispatch') && steps.fast_eyes.outputs.posted != 'true'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
@@ -263,7 +277,7 @@ jobs:
         # Metadata only (title/body/files/labels/linked issues/xrefs). The PR
         # DISCUSSION (comments, reviews, inline comments - the three-block
         # separation) is built by the shared fetch-pr-discussion.sh step next.
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: pr_meta
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -352,7 +366,7 @@ jobs:
         # markers), keeps older agent reviews filtered, and correlates all
         # remaining reviews with their inline comments in THREAD_CONTEXT.
         # Runs from the default-branch checkout - never PR-controlled code.
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -365,7 +379,7 @@ jobs:
           fi
 
       - name: Determine Review Type and Last Reviewed SHA
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         id: review_type
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
@@ -446,14 +460,15 @@ jobs:
       # actions/checkout cannot write outside the workspace, so a PR can never
       # overwrite these copies.
       - name: Set trigger message default (manual dispatch)
-        # Runs only for manual dispatches with no routed comment; routed and
-        # auto runs already exported TRIGGER_MESSAGE in their resolve steps.
-        if: github.event_name == 'workflow_dispatch' && inputs.commentId == ''
+        # Runs only for MANUAL dispatches with no routed comment; routed and
+        # auto (stub) runs already exported TRIGGER_MESSAGE in their resolve
+        # steps - do not overwrite theirs.
+        if: github.event_name == 'workflow_dispatch' && inputs.commentId == '' && inputs.source != 'stub'
         run: |
           echo "TRIGGER_MESSAGE=Manual dispatch by ${GITHUB_ACTOR} - no specific comment; review the current PR state." >> "$GITHUB_ENV"
 
       - name: Save trusted artifacts (prompt parts + scrub script)
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         run: |
           cp .github/prompts/security-brief.md /tmp/security-brief.md
           # Prompt assembly system: parts + manifests + assembler travel together
@@ -466,18 +481,17 @@ jobs:
           bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout PR head
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           APP_TOKEN_INPUT: ${{ steps.setup.outputs.token }}
         run: |
           set -euo pipefail
-          # FORK-PR SUPPORT: actions/checkout refuses fork-PR code under
-          # workflow_run events ("Refusing to check out fork pull request
-          # code from a 'workflow_run' workflow") - its blunt guard against
-          # untrusted code in a privileged context. This workflow's
-          # architecture replaces that guard: the workflow file, actions,
-          # prompts, and scrub script all come from the default branch, and
-          # PR code is untrusted DATA - nothing in this workflow executes it
+          # FORK-PR SUPPORT: actions/checkout used to refuse fork-PR code
+          # under workflow_run events - a blunt guard against untrusted
+          # code in a privileged context. This workflow's architecture
+          # replaces that guard: the workflow file, actions, prompts, and
+          # scrub script all come from the default branch, and PR code is
+          # untrusted DATA - nothing in this workflow executes it
           # before the workspace scrub; the agent operates under the
           # permission profile. So we fetch the PR head explicitly instead
           # of routing through actions/checkout. GitHub grafts every open
@@ -495,14 +509,14 @@ jobs:
       # branches (anchor: PR base when maintained, else main — the script
       # self-enforces the allowlist) BEFORE any agent work on the tree.
       - name: Scrub workspace
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         run: bash /tmp/scrub-workspace.sh --anchor "${BASE_BRANCH}"
 
       # Factual trust context for the security brief: PRs targeting maintained
       # branches vs everything else, plus the scrub's .github taint alarm.
       # Runs AFTER the scrub so /tmp/scrub-taint.txt exists.
       - name: Build trust context
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
@@ -525,7 +539,7 @@ jobs:
           fi
 
       - name: Generate PR Diff for First Review
-        if: (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true') && steps.review_type.outputs.is_first_review == 'true'
+        if: (github.event_name == 'workflow_dispatch') && steps.review_type.outputs.is_first_review == 'true'
         id: first_review_diff
         # SECURITY: BASE_BRANCH (a PR-controlled branch name, which may contain
         # quotes) reaches this script ONLY via the env: block below — never via
@@ -583,7 +597,7 @@ jobs:
           BASE_BRANCH: ${{ env.BASE_BRANCH }}
 
       - name: Generate Incremental Diff
-        if: (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true') && steps.review_type.outputs.is_first_review == 'false'
+        if: (github.event_name == 'workflow_dispatch') && steps.review_type.outputs.is_first_review == 'false'
         id: incremental_diff
         env:
           LAST_REVIEWED_SHA_INPUT: ${{ steps.review_type.outputs.last_reviewed_sha }}
@@ -653,7 +667,7 @@ jobs:
 
 
       - name: Assemble Review Prompt
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           REVIEW_TYPE: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST' || 'FOLLOW-UP' }}
           PR_AUTHOR: ${{ env.PR_AUTHOR }}
@@ -686,7 +700,7 @@ jobs:
           echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
 
       - name: Review PR with OpenCode
-        if: github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true'
+        if: github.event_name == 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           # Agent permissions are owned by the OPENCODE_CONFIG_JSON secret
@@ -707,7 +721,7 @@ jobs:
         # Comment targets: eyes -> rocket. PR/issue targets keep eyes by
         # design (a rocket on the PR itself could read as endorsing it).
         continue-on-error: true
-        if: success() && (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true') && inputs.commentId != ''
+        if: success() && (github.event_name == 'workflow_dispatch') && inputs.commentId != ''
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
@@ -716,14 +730,14 @@ jobs:
       - name: Lifecycle reaction (session failure)
         # Comment targets: eyes -> confused. PR/issue targets keep eyes.
         continue-on-error: true
-        if: failure() && (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true') && inputs.commentId != ''
+        if: failure() && (github.event_name == 'workflow_dispatch') && inputs.commentId != ''
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
         run: bash .github/scripts/react.sh failure comment "$ROUTED_COMMENT_ID"
 
       - name: Verify AI Review Footers
-        if: always() && (github.event_name == 'workflow_dispatch' || steps.resolve_auto.outputs.should_proceed == 'true')
+        if: always() && (github.event_name == 'workflow_dispatch')
         # No continue-on-error: repair-path failures must FAIL this step
         # loudly (the no-candidate path above exits 0 softly). A swallowed
         # repair failure would leave the repo believing footers are hardened.

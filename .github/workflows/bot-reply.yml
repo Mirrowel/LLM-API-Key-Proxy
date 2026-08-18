@@ -151,6 +151,25 @@ jobs:
           } >> "$GITHUB_ENV"
           echo "should_proceed=true" >> "$GITHUB_OUTPUT"
 
+      - name: Fast eyes on trigger (account mode)
+        # Same rationale as pr-review's fast-eyes: account-mode eyes within
+        # seconds of the mention, before checkout/setup. Only fires once the
+        # validate gate passed (mention confirmed in actual content). The
+        # regular react step below is the app-mode fallback.
+        id: fast_eyes
+        if: steps.validate.outputs.should_proceed == 'true' && inputs.commentId != '' && secrets.ACCOUNT_GH_TOKEN != ''
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          COMMENT_ID: ${{ inputs.commentId }}
+        run: |
+          if gh api --method POST -H "Accept: application/vnd.github+json" \
+            "/repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" -f content=eyes; then
+            echo "posted=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "posted=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
         if: steps.validate.outputs.should_proceed == 'true'
         uses: actions/checkout@v4
@@ -186,7 +205,8 @@ jobs:
       - name: Add reaction to comment (lifecycle start)
         # Eyes on the mention comment via the shared lifecycle script; the
         # session-success/failure steps below transition it to rocket/confused.
-        if: steps.validate.outputs.should_proceed == 'true'
+        # Skipped when fast-eyes (account mode) already posted.
+        if: steps.validate.outputs.should_proceed == 'true' && steps.fast_eyes.outputs.posted != 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
