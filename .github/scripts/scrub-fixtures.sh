@@ -86,6 +86,11 @@ run_scrub() { # branch -> ALARM|INFO|CLEAN
 # ---- taint matrix ----------------------------------------------------------
 check "syntax scrub-workspace" OK "$(bash -n "$SCRUB" && echo OK)"
 check "syntax fetch-roster"    OK "$(bash -n "$SCRIPT_DIR/fetch-roster.sh" && echo OK)"
+check "syntax fetch-pr-discussion" OK "$(bash -n "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo OK)"
+check "discussion: ellipsis hardcode removed" no "$(grep -q ellipsis "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "discussion: minimized filter on agent reviews" yes "$(grep -q "isMinimized != true)))) as \$agent_reviews" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "discussion: noise patterns baked" yes "$(grep -q "rate limited by coderabbit" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "discussion: jq pattern binding (. as \$p)" yes "$(grep -q ". as \$p | select" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
 check "stale-base docs branch -> INFO (informed, not alarmed)"  INFO  "$(run_scrub stale)"
 check "direct .github modify -> ALARM"                          ALARM "$(run_scrub evil)"
 check "modify+revert identical tree -> ALARM"                   ALARM "$(run_scrub revert-hide)"

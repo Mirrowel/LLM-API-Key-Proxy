@@ -131,7 +131,7 @@ When documenting issues, be EXTREMELY detailed — future compliance checks will
 ```
 ❌ BLOCKED: README.md missing documentation for new provider
 **Issue**: The README Features section (lines 20-50) lists supported providers but does not mention
-the newly added "ProviderX" that was implemented in src/rotator_library/providers/providerx.py.
+the newly added "ProviderX" that was implemented in src/providers/providerx.py.
 This will leave users unaware that they can use this provider.
 **Current State**: Provider implemented in code but not documented in Features or Quick Start
 **Required Fix**: Add ProviderX to the Features list and include setup instructions in the documentation
