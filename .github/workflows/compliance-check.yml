@@ -413,9 +413,10 @@ jobs:
           cp -r .github/prompts/manifests /tmp/manifests
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
+          cp .github/scripts/share-filter.sh /tmp/share-filter.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           cp .github/scripts/react.sh /tmp/react.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/share-filter.sh
           bash /tmp/assemble-prompt.sh --verify
 
       # NOW it's safe to checkout the PR code (untrusted)
@@ -705,9 +706,34 @@ jobs:
           # Optional public-account token for verified-lead actions abroad
           # (scope-of-action rules). Absent secret => empty => unavailable.
           ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          # Share-link encryption (pub key from secret; private key stays
+          # with the admin - see decrypt_share_link.py). Context fields are
+          # public metadata that identify WHICH compliance run this is.
+          SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
+          SHARE_CTX_THREAD: "PR #${{ inputs.pr_number }}"
+          SHARE_CTX_HEAD: ${{ steps.pr_info.outputs.head_sha }}
+          SHARE_CTX_DETAIL: compliance check (${{ env.REVIEW_TYPE }})
+        run: |
+          set -o pipefail
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          opencode run --share - < "$TMP_DIR/assembled_prompt.txt" | bash /tmp/share-filter.sh
+
+      - name: Share link summary
+        if: always()
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
+          if [ -s "$TMP_DIR/share-link.enc" ]; then
+            {
+              echo "### Mirrobot share link (encrypted)"
+              echo
+              echo '```'
+              cat "$TMP_DIR/share-link.enc"
+              echo '```'
+              cat "$TMP_DIR/share-link.ctx" 2>/dev/null || true
+              echo
+              echo "Decrypt locally: \`python decrypt_share_link.py\` and paste the block above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Lifecycle reaction (session success)
         continue-on-error: true
