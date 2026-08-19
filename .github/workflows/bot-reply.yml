@@ -677,7 +677,7 @@ jobs:
           # with the admin - see decrypt_share_link.py). Context fields are
           # public metadata identifying which session this is.
           SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
-          SHARE_CTX_THREAD: ${{ steps.context.outputs.IS_PR == 'true' && format('PR #{0}', env.THREAD_NUMBER) || format('Issue #{0}', env.THREAD_NUMBER) }}
+          SHARE_CTX_THREAD: "${{ steps.context.outputs.IS_PR == 'true' && format('PR #{0}', env.THREAD_NUMBER) || format('Issue #{0}', env.THREAD_NUMBER) }}"
           SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA }}
           SHARE_CTX_DETAIL: agent reply
         run: |
