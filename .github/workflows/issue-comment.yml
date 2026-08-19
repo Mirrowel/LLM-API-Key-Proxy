@@ -84,7 +84,8 @@ jobs:
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh
+          cp .github/scripts/react.sh /tmp/react.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh
           bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout repository
@@ -195,7 +196,7 @@ jobs:
         continue-on-error: true
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-        run: bash .github/scripts/react.sh start issue "$ISSUE_NUMBER"
+        run: bash /tmp/react.sh start issue "$ISSUE_NUMBER"
 
       - name: Analyze issue and suggest resolution
         env:

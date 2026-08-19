@@ -415,7 +415,8 @@ jobs:
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh
+          cp .github/scripts/react.sh /tmp/react.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh
           bash /tmp/assemble-prompt.sh --verify
 
       # NOW it's safe to checkout the PR code (untrusted)
@@ -683,9 +684,9 @@ jobs:
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
         run: |
           if [ -n "$ROUTED_COMMENT_ID" ]; then
-            bash .github/scripts/react.sh start comment "$ROUTED_COMMENT_ID"
+            bash /tmp/react.sh start comment "$ROUTED_COMMENT_ID"
           else
-            bash .github/scripts/react.sh start issue "$PR_NUMBER"
+            bash /tmp/react.sh start issue "$PR_NUMBER"
           fi
 
       # The AI will analyze the PR using multiple turns (5-20+ expected)
@@ -711,7 +712,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
-        run: bash .github/scripts/react.sh success comment "$ROUTED_COMMENT_ID"
+        run: bash /tmp/react.sh success comment "$ROUTED_COMMENT_ID"
 
       - name: Lifecycle reaction (session failure)
         continue-on-error: true
@@ -719,7 +720,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           ROUTED_COMMENT_ID: ${{ inputs.commentId }}
-        run: bash .github/scripts/react.sh failure comment "$ROUTED_COMMENT_ID"
+        run: bash /tmp/react.sh failure comment "$ROUTED_COMMENT_ID"
 
       # ======================================================================
       # PHASE 6: POST-PROCESSING (OPTIONAL)

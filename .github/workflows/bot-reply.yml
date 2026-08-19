@@ -220,6 +220,10 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
+        # Workspace copy is SAFE here: this step runs on the default-branch
+        # checkout BEFORE the PR-head checkout (the /tmp copy is not saved
+        # yet). Never move this step below the PR checkout — past it, the
+        # workspace script is PR-controlled content.
         run: bash .github/scripts/react.sh start comment "$COMMENT_ID"
 
       - name: Gather Full Thread Context
@@ -259,7 +263,13 @@ jobs:
             # Review / Compliance Check) is built by the shared
             # fetch-pr-discussion.sh, which also exports PREVIOUS_BOT_REVIEWS
             # and AGENT_REVIEW_HISTORY (your own earlier reviews on this PR).
-            pr_json=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
+            # GraphQL note (live-verified 2026-08-17, account mode, PR #33 lab
+          # battery): these gh pr view fields run green under a classic
+          # public_repo PAT. The known-bad field is reviewRequests/…
+          # requester.login — it demands user-profile scopes the PAT lacks
+          # (see compliance-check.yml pr_info for the REST pattern if a
+          # field ever needs migrating). Do NOT add reviewRequests here.
+          pr_json=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
             timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$THREAD_NUMBER/timeline")
 
             echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
@@ -445,9 +455,10 @@ jobs:
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
+          cp .github/scripts/react.sh /tmp/react.sh
           cp .github/scripts/fetch-pr-discussion.sh /tmp/fetch-pr-discussion.sh
           cp .github/scripts/generate-review-kit.sh /tmp/generate-review-kit.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/fetch-pr-discussion.sh /tmp/generate-review-kit.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/fetch-pr-discussion.sh /tmp/generate-review-kit.sh /tmp/react.sh
           bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout PR head
@@ -649,7 +660,7 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
-        run: bash .github/scripts/react.sh success comment "$COMMENT_ID"
+        run: bash /tmp/react.sh success comment "$COMMENT_ID"
 
       - name: Lifecycle reaction (session failure)
         # Mention comment: eyes -> confused on failure.
@@ -658,4 +669,4 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           COMMENT_ID: ${{ env.RESOLVED_COMMENT_ID }}
-        run: bash .github/scripts/react.sh failure comment "$COMMENT_ID"
+        run: bash /tmp/react.sh failure comment "$COMMENT_ID"
