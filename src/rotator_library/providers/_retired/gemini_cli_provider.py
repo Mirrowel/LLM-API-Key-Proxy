@@ -10,11 +10,12 @@ import logging
 import time
 import asyncio
 from typing import List, Dict, Any, AsyncGenerator, Union, Optional, Tuple
-from .provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
+from ..provider_interface import ProviderInterface, QuotaGroupMap, UsageResetConfigDef
 from .gemini_auth_base import GeminiAuthBase
-from .provider_cache import ProviderCache
-from .utilities.gemini_cli_quota_tracker import GeminiCliQuotaTracker
-from .utilities.gemini_shared_utils import (
+from ..provider_cache import ProviderCache
+from ...field_cache import FieldCacheInjection, FieldCacheRule
+from .gemini_cli_quota_tracker import GeminiCliQuotaTracker
+from .gemini_shared_utils import (
     env_bool,
     env_int,
     inline_schema_refs,
@@ -33,16 +34,16 @@ from .utilities.gemini_shared_utils import (
     TIER_PRIORITIES,
     DEFAULT_TIER_PRIORITY,
 )
-from ..transaction_logger import ProviderLogger
-from .utilities.gemini_tool_handler import GeminiToolHandler
-from .utilities.gemini_credential_manager import GeminiCredentialManager
-from ..model_definitions import ModelDefinitions
-from ..timeout_config import TimeoutConfig
-from ..utils.paths import get_cache_dir
-from ..session_tracking import SessionTrackingHints
+from ...transaction_logger import ProviderLogger
+from .gemini_tool_handler import GeminiToolHandler
+from .gemini_credential_manager import GeminiCredentialManager
+from ...model_definitions import ModelDefinitions
+from ...timeout_config import TimeoutConfig
+from ...utils.paths import get_cache_dir
+from ...session_tracking import SessionTrackingHints
 import litellm
 from litellm.exceptions import RateLimitError
-from ..error_handler import extract_retry_after_from_body
+from ...error_handler import extract_retry_after_from_body
 import os
 from pathlib import Path
 import uuid
@@ -156,6 +157,24 @@ class GeminiCliProvider(
     # Provider name for env var lookups (QUOTA_GROUPS_GEMINI_CLI_*)
     provider_env_name: str = "gemini_cli"
 
+    # Native protocol declarations for the Phase 5 opt-in execution seam. The
+    # existing custom Gemini CLI execution path remains active; these metadata
+    # hooks let future native routing reuse the Gemini protocol and field-cache
+    # engine without rewriting this provider first.
+    protocol_name: str = "gemini"
+    adapter_names: tuple[str, ...] = ()
+    field_cache_rules = (
+        FieldCacheRule(
+            name="gemini_cli_thought_signature",
+            source="response",
+            path="candidates.*.content.parts.*.thoughtSignature",
+            mode="all",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="metadata.thoughtSignatures", as_list=True),
+            metadata={"purpose": "mirror existing Gemini CLI thoughtSignature preservation in the native cache seam"},
+        ),
+    )
+
     # Tier name -> priority mapping (from centralized tier utilities)
     # Lower numbers = higher priority (ULTRA=1 > PRO=2 > FREE=3)
     tier_priorities = TIER_PRIORITIES
@@ -174,6 +193,12 @@ class GeminiCliProvider(
             field_name="models",
         ),
     }
+
+    # retrieveUserQuota can report an exhausted bucket without resetTime when a
+    # project/account has no entitlement for that model group. Treat that as a
+    # scoped fallback cooldown instead of repeatedly retrying and logging errors.
+    default_no_reset_exhaustion_policy = "cooldown"
+    default_no_reset_exhaustion_cooldown_seconds = 24 * 60 * 60
 
     # Model quota groups - models that share quota/cooldown timing
     # Verified 2026-01-07 via quota verification tests

@@ -3,12 +3,19 @@
 
 """RequestContext construction for RotatingClient public request methods."""
 
-import time
 import inspect
+import time
+from copy import deepcopy
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..core.types import RequestContext
+from ..protocols import ProtocolContext, get_protocol
+from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
+from ..routing.types import RouteTarget, RoutingDecision
+from ..session_tracking import SessionTrackingHints
 from ..transaction_logger import TransactionLogger
+from .scopes import derive_session_isolation_key
+from .protocol_selection import require_same_protocol_stream
 
 
 class RequestContextBuilder:
@@ -35,13 +42,35 @@ class RequestContextBuilder:
         self._get_provider_instance = get_provider_instance
 
     @staticmethod
-    def _pop_scope_kwargs(kwargs: Dict[str, Any]) -> tuple[Optional[str], Any, Any, bool]:
+    def _pop_scope_kwargs(kwargs: Dict[str, Any]) -> tuple[Optional[str], Any, Any, bool, Any]:
         classifier = kwargs.pop("classifier", None)
         request_api_keys = kwargs.pop("api_keys", None)
         request_providers = kwargs.pop("providers", None)
         private = bool(kwargs.pop("private", False))
+        session_tracking_hints = kwargs.pop("_session_tracking_hints", None)
         kwargs.pop("model_filters", None)
-        return classifier, request_api_keys, request_providers, private
+        return classifier, request_api_keys, request_providers, private, session_tracking_hints
+
+    @staticmethod
+    def _session_isolation_key(
+        classifier: Optional[str],
+        request_api_keys: Any,
+        request_providers: Any,
+        private: bool,
+    ) -> str:
+        """Return a provider-independent caller/credential isolation key.
+
+        Ad hoc credentials and provider overrides are hashed as one bundle so
+        secrets never enter logs or persistence. Named classifiers intentionally
+        own one authoritative domain across their providers and credential changes.
+        """
+
+        return derive_session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
+        )
 
     @staticmethod
     def _provider_from_model(model: str) -> str:
@@ -51,11 +80,53 @@ class RequestContextBuilder:
     def _raise_no_provider(model: str) -> None:
         raise ValueError(f"Invalid model format or no credentials for provider: {model}")
 
+    def _resolve_routing_decision(self, model: str) -> Optional[RoutingDecision]:
+        """Resolve env-configured fallback routing, if any applies."""
+
+        config = load_routing_config_from_env()
+        if not config.fallback_groups and not config.model_routes:
+            return None
+        try:
+            decision = FallbackResolver(config).resolve(model)
+            if decision.reason == "direct_provider_model" and model.lower() not in config.model_routes:
+                return None
+            return decision
+        except RoutingConfigError:
+            if "/" in model:
+                return None
+            raise
+
+    @staticmethod
+    def _with_request_scope(target: RouteTarget, scope: Dict[str, Any]) -> RouteTarget:
+        """Attach per-provider request scope to a route target without secrets in traces."""
+
+        metadata = dict(target.metadata)
+        metadata["request_scope"] = {
+            "credentials": list(scope["credentials"]),
+            "usage_manager_key": scope["usage_manager_key"],
+            "provider_config": scope["provider_config"],
+            "credential_secrets": dict(scope["credential_secrets"]),
+        }
+        return RouteTarget(
+            provider=target.provider,
+            model=target.model,
+            name=target.name,
+            protocol=target.protocol,
+            execution=target.execution,
+            priority=target.priority,
+            weight=target.weight,
+            conditions=dict(target.conditions),
+            metadata=metadata,
+        )
+
     async def _get_session_hints(
         self,
         provider: str,
         model: str,
         kwargs: Dict[str, Any],
+        *,
+        unified_request: Any = None,
+        input_protocol: str = "openai_chat",
     ) -> Any:
         """Ask the provider for optional session evidence before routing.
 
@@ -71,7 +142,31 @@ class RequestContextBuilder:
         if not hook:
             return None
         try:
-            result = hook(kwargs, model=model)
+            provider_request = kwargs
+            if unified_request is not None:
+                provider_protocol_name = plugin.get_protocol_name(model) if hasattr(plugin, "get_protocol_name") else "openai_chat"
+                provider_protocol = get_protocol(provider_protocol_name)
+                native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else model
+                provider_view = deepcopy(unified_request)
+                provider_view.model = native_model
+                provider_request = provider_protocol.build_request(
+                    provider_view,
+                    ProtocolContext(
+                        input_protocol=input_protocol,
+                        provider_protocol=provider_protocol.name,
+                        output_protocol=input_protocol,
+                        source_protocol=input_protocol,
+                        target_protocol=provider_protocol.name,
+                        source_provider=None,
+                        target_provider=provider,
+                        provider=provider,
+                        model=native_model,
+                    ),
+                )
+                operation = plugin.get_native_operation(native_model, None, stream=bool(provider_view.stream)) if hasattr(plugin, "get_native_operation") else "generate"
+                if hasattr(plugin, "prepare_native_request"):
+                    provider_request = plugin.prepare_native_request(provider_request, native_model, operation)
+            result = hook(provider_request, model=model)
             if inspect.isawaitable(result):
                 result = await result
             return result
@@ -88,17 +183,91 @@ class RequestContextBuilder:
             )
             return None
 
+    @staticmethod
+    def _merge_session_hints(*hints: Any) -> Any:
+        """Merge proxy-internal and provider session evidence.
+
+        Internal hints are removed from request kwargs before provider execution.
+        They let services such as Responses expose stable continuation IDs to the
+        centralized tracker without adding provider-visible payload fields.
+        """
+
+        merged = SessionTrackingHints()
+        seen = False
+        for index, hint in enumerate(hints):
+            if not hint:
+                continue
+            allow_global = index == 0 and isinstance(hint, SessionTrackingHints)
+            if isinstance(hint, dict):
+                hint = SessionTrackingHints(
+                    strong_anchors=list(hint.get("strong_anchors") or []),
+                    medium_anchors=list(hint.get("medium_anchors") or []),
+                    weak_anchors=list(hint.get("weak_anchors") or []),
+                    affinity_key=hint.get("affinity_key"),
+                    session_scope=hint.get("session_scope"),
+                )
+            if not isinstance(hint, SessionTrackingHints):
+                continue
+            seen = True
+            merged.strong_anchors.extend(hint.strong_anchors)
+            merged.medium_anchors.extend(hint.medium_anchors)
+            merged.weak_anchors.extend(hint.weak_anchors)
+            if allow_global:
+                merged.global_strong_anchors.extend(hint.global_strong_anchors)
+                merged.global_medium_anchors.extend(hint.global_medium_anchors)
+                merged.global_weak_anchors.extend(hint.global_weak_anchors)
+            if not merged.affinity_key and hint.affinity_key:
+                merged.affinity_key = hint.affinity_key
+            if not merged.session_scope and hint.session_scope:
+                merged.session_scope = hint.session_scope
+        return merged if seen else None
+
     async def build_completion_context(
         self,
         request: Optional[Any],
         pre_request_callback: Optional[Callable],
         kwargs: Dict[str, Any],
     ) -> RequestContext:
-        classifier, request_api_keys, request_providers, private = self._pop_scope_kwargs(
+        classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        disable_provider_continuation = bool(kwargs.pop("_disable_provider_continuation", False))
+        requested_input_protocol = str(kwargs.pop("_input_protocol", "openai_chat") or "openai_chat")
+        raw_output_protocol = kwargs.pop("_output_protocol", None)
+        output_protocol_explicit = raw_output_protocol not in (None, "")
+        requested_output_protocol = str(raw_output_protocol or requested_input_protocol)
+        input_protocol = get_protocol(requested_input_protocol)
+        output_protocol = get_protocol(requested_output_protocol)
+        protocol_request = deepcopy(kwargs)
+        protocol_context = ProtocolContext(
+            source_protocol=input_protocol.name,
+            target_protocol=input_protocol.name,
+            input_protocol=input_protocol.name,
+            output_protocol=output_protocol.name,
+        )
+        unified_request = input_protocol.parse_request(protocol_request, protocol_context)
+        if input_protocol.name != "openai_chat":
+            kwargs = get_protocol("openai_chat").build_request(
+                unified_request,
+                ProtocolContext(
+                    source_protocol=input_protocol.name,
+                    target_protocol="openai_chat",
+                    input_protocol=input_protocol.name,
+                    provider_protocol="openai_chat",
+                    output_protocol=output_protocol.name,
+                ),
+            )
+        session_isolation_key = self._session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
+        )
         model = kwargs.get("model", "")
-        provider = self._provider_from_model(model)
+        routing_decision = self._resolve_routing_decision(model)
+        routing_targets = routing_decision.targets if routing_decision else None
+        provider = routing_targets[0].provider if routing_targets else self._provider_from_model(model)
         if not provider:
             self._raise_no_provider(model)
 
@@ -112,9 +281,34 @@ class RequestContextBuilder:
         if not scope["credentials"]:
             self._raise_no_provider(model)
 
-        parent_log_dir = kwargs.pop("_parent_log_dir", None)
-        resolved_model = self._model_resolver.resolve_model_id(model, provider)
+        if routing_targets:
+            scoped_targets = []
+            for index, target in enumerate(routing_targets):
+                target_scope = scope if index == 0 else await self._resolve_scope_for_provider(
+                    target.provider,
+                    classifier,
+                    request_api_keys,
+                    request_providers,
+                    private,
+                )
+                if not target_scope["credentials"]:
+                    self._raise_no_provider(target.prefixed_model)
+                scoped_targets.append(self._with_request_scope(target, target_scope))
+            routing_targets = tuple(scoped_targets)
+
+        resolved_model = self._model_resolver.resolve_model_id(routing_targets[0].prefixed_model if routing_targets else model, provider)
         kwargs["model"] = resolved_model
+        if not output_protocol_explicit and self._get_provider_instance:
+            plugin = self._get_provider_instance(provider)
+            default_output = (
+                plugin.get_default_output_protocol(resolved_model)
+                if plugin and hasattr(plugin, "get_default_output_protocol")
+                else None
+            )
+            if default_output:
+                output_protocol = get_protocol(default_output)
+        if unified_request.stream:
+            require_same_protocol_stream(input_protocol.name, output_protocol.name)
 
         transaction_logger = None
         if self._get_enable_request_logging():
@@ -130,9 +324,25 @@ class RequestContextBuilder:
             kwargs,
             provider=provider,
             model=resolved_model,
-            scope_key=scope["usage_manager_key"],
-            hints=await self._get_session_hints(provider, resolved_model, kwargs),
+            scope_key=session_isolation_key,
+            hints=self._merge_session_hints(
+                internal_session_hints,
+                await self._get_session_hints(
+                    provider,
+                    resolved_model,
+                    kwargs,
+                    unified_request=unified_request,
+                    input_protocol=input_protocol.name,
+                ),
+            ),
+            _trusted_isolation_key=True,
         )
+        if transaction_logger:
+            transaction_logger.set_trace_context(
+                session_id=session.session_id,
+                scope_key=scope["usage_manager_key"],
+                classifier=scope["classifier"],
+            )
 
         return RequestContext(
             model=resolved_model,
@@ -144,9 +354,8 @@ class RequestContextBuilder:
             session_id=session.session_id,
             session_affinity_key=session.affinity_key,
             session_tracker=self._session_tracker,
-            session_possible_compaction=session.possible_compaction,
-            session_lineage_parent_id=session.lineage_parent_session_id,
             session_tracking_namespace=session.tracking_namespace,
+            session_isolation_key=session_isolation_key,
             request=request,
             pre_request_callback=pre_request_callback,
             transaction_logger=transaction_logger,
@@ -154,6 +363,15 @@ class RequestContextBuilder:
             provider_config=scope["provider_config"],
             credential_secrets=scope["credential_secrets"],
             classifier=scope["classifier"],
+            routing_targets=routing_targets,
+            routing_group_name=routing_decision.group_name if routing_decision else None,
+            input_protocol_name=input_protocol.name,
+            output_protocol_name=output_protocol.name,
+            protocol_request=protocol_request,
+            unified_request=unified_request,
+            input_provider=provider,
+            disable_provider_continuation=disable_provider_continuation,
+            routing_group=routing_decision.group if routing_decision else None,
         )
 
     async def build_embedding_context(
@@ -162,8 +380,14 @@ class RequestContextBuilder:
         pre_request_callback: Optional[Callable],
         kwargs: Dict[str, Any],
     ) -> RequestContext:
-        classifier, request_api_keys, request_providers, private = self._pop_scope_kwargs(
+        classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
+        )
+        session_isolation_key = self._session_isolation_key(
+            classifier,
+            request_api_keys,
+            request_providers,
+            private,
         )
         model = kwargs.get("model", "")
         provider = self._provider_from_model(model)
@@ -184,8 +408,12 @@ class RequestContextBuilder:
             kwargs,
             provider=provider,
             model=model,
-            scope_key=scope["usage_manager_key"],
-            hints=await self._get_session_hints(provider, model, kwargs),
+            scope_key=session_isolation_key,
+            hints=self._merge_session_hints(
+                internal_session_hints,
+                await self._get_session_hints(provider, model, kwargs),
+            ),
+            _trusted_isolation_key=True,
         )
 
         return RequestContext(
@@ -198,9 +426,8 @@ class RequestContextBuilder:
             session_id=session.session_id,
             session_affinity_key=session.affinity_key,
             session_tracker=self._session_tracker,
-            session_possible_compaction=session.possible_compaction,
-            session_lineage_parent_id=session.lineage_parent_session_id,
             session_tracking_namespace=session.tracking_namespace,
+            session_isolation_key=session_isolation_key,
             request=request,
             pre_request_callback=pre_request_callback,
             usage_manager_key=scope["usage_manager_key"],

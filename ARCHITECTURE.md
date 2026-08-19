@@ -15,7 +15,7 @@
 ## Layers
 
 **Proxy Application Layer:**
-- Purpose: Expose OpenAI- and Anthropic-compatible HTTP endpoints, handle auth, logging, TUI
+- Purpose: Expose OpenAI Chat Completions, OpenAI Responses, and Anthropic-compatible HTTP endpoints, handle auth, logging, TUI
 - Location: `src/proxy_app/`
 - Contains: FastAPI app, route handlers, Pydantic request/response models, launcher TUI, quota viewer
 - Depends on: `rotator_library`, `litellm`, `fastapi`, `uvicorn`
@@ -49,6 +49,13 @@
 - Depends on: `rotator_library.core`
 - Used by: Client layer's `AnthropicHandler`, proxy routes `/v1/messages`, `/v1/messages/count_tokens`
 
+**Responses API Layer:**
+- Purpose: OpenAI Responses API compatibility — create, store, retrieve, and stream response objects with `previous_response_id` continuation
+- Location: `src/rotator_library/responses/`
+- Contains: `ResponsesService` (orchestrator + `ResponsesServiceError`), `ResponsesBridge` (Responses ↔ chat-completions translation via `ResponsesProtocol`), `ResponsesStore` protocol with `InMemoryResponsesStore` / `ProviderCacheResponsesStore` backends and `create_configured_responses_store` factory, `ResponsesSSEFormatter` / `ResponsesWebSocketFormatter` / `ResponsesStreamEvent` (streaming), `StoredResponse` / `ResponsesStoreSettings` / `generate_response_id` (types)
+- Depends on: `rotator_library.protocols`, `rotator_library.streaming`, `rotator_library.usage` (costs/accounting), `rotator_library.client` via injected `RotatingClient`
+- Used by: Proxy routes `/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/input_items`
+
 **Core Types & Config Layer:**
 - Purpose: Shared type definitions, constants, error classification, config defaults
 - Location: `src/rotator_library/core/`, `src/rotator_library/config/`
@@ -77,6 +84,17 @@
 4. Response is translated back to Anthropic format — `src/rotator_library/anthropic_compat/translator.py`
 5. For streaming, `anthropic_streaming_wrapper` wraps the SSE stream — `src/rotator_library/anthropic_compat/streaming.py`
 
+**Responses API Request:**
+
+1. Client sends POST to `/v1/responses` (streaming or non-streaming) — `src/proxy_app/main.py`
+2. `ResponsesService.create_response()` / `stream_response()` parses the payload via `ResponsesProtocol` — `src/rotator_library/responses/service.py`
+3. `previous_response_id` resolves the parent `StoredResponse` and its lineage from the scoped `ResponsesStore` for continuation — `src/rotator_library/responses/service.py`, `src/rotator_library/responses/store.py`
+4. `ResponsesBridge.to_chat_kwargs()` translates the Responses payload into chat-completions kwargs and emits session-tracking hints — `src/rotator_library/responses/bridge.py`
+5. Execution flows through `RotatingClient.acompletion()`, reusing the standard retry/rotation/session-tracking path — `src/rotator_library/client/rotating_client.py`
+6. `ResponsesBridge.from_chat_response()` shapes the chat result back into Responses format; usage is recorded via `extract_usage_record` and cost via `CostCalculator` — `src/rotator_library/responses/bridge.py`, `src/rotator_library/usage/`
+7. When `store` is true, a `StoredResponse` is persisted scoped by the session isolation key for later retrieval and continuation — `src/rotator_library/responses/store.py`
+8. Streaming requests emit Responses SSE events (`response.created`, `response.output_item.added`, `response.output_text.delta`, `response.output_item.done`, `response.completed`) from the chat SSE stream via `ResponsesSSEFormatter` — `src/rotator_library/responses/streaming.py`
+
 **Provider Discovery:**
 
 1. `providers/__init__.py` scans all `*_provider.py` files in `src/rotator_library/providers/`
@@ -89,12 +107,12 @@
 1. `RequestContextBuilder` calls `provider.get_session_tracking_hints()` to collect provider-specific evidence — `src/rotator_library/client/request_builder.py`
 2. `SessionTracker.infer_session()` builds scoped anchors from explicit IDs, message content, tool-call IDs, and provider hints — `src/rotator_library/session_tracking.py`
 3. System/developer prompts are excluded from continuity anchors to prevent harness-level system prompts from cross-binding independent sessions
-4. Compaction probe anchors are built separately (`_build_compaction_probe_anchors()`) from large early messages or explicit summarization markers; these identify lineage parents but are not stored on the new child session
+4. Compaction probe anchors are built separately (`_build_compaction_probe_anchors()`) from early user/system/developer messages only (assistant, tool, and function-result history is never probed); these identify lineage parents but are not stored on the new child session
 5. Normal anchors suppress compaction probe indexes to avoid double-counting summary text as continuity evidence
 6. Anchors are namespaced by scope/provider/model so sticky evidence never leaks between credential pools
 7. `_best_match()` scores anchor overlap against live sessions with comprehensive tiebreaker (score, strong matches, medium matches, group diversity, response matches, last_seen, session_id); confidence is `strong` (any strong match), `probable` (diverse medium evidence), `weak`, or `none`
-8. `_is_compaction_parent_match()` requires response anchor overlap for size-only probes (noisy) or any score > 0 for explicit marker probes
-9. Compaction lineage is tracked via `lineage_parent_session_id` on `SessionInference` but does not force sticky continuation
+8. `_evaluate_compaction()` requires structural replacement of more than half the parent's high-water request history (`_retained_history_ratio()` below `_COMPACTION_MAX_RETAINED_HISTORY_RATIO`); unmarked summaries must additionally overlap at least two distinct response events (`_MIN_UNMARKED_RESPONSE_GROUPS`) plus a retained request group, while explicit marker probes qualify on any score > 0
+9. Compaction lineage is tracked via `lineage_parent_session_id` on `SessionInference` but does not force sticky continuation of the parent; exact resends of a validated compacted payload reuse the already-created child session via opaque `compaction_replay` anchors (`_find_compaction_replay()` / `_compaction_replay_anchor()`), and changing non-probe history invalidates the replay key; post-compaction requests that retain the validated compacted base context but extend or alter the tail continue the child via `compaction_context` anchors (`_find_compaction_context()` / `_compaction_context_anchor()`) minted only from probe groups that matched parent response evidence; authoritative identity (trusted explicit IDs or provider affinity, via `_is_authoritative_identity_anchor()`) takes precedence over replay/context bindings and suppresses unrelated compaction lineage
 10. Returns `SessionInference` with `session_id`, `affinity_key` (deterministic first-pick hint), confidence, and namespace
 
 **Credential Selection:**
@@ -132,8 +150,8 @@
 - Purpose: TTL-based session inference using scoped, compounding evidence anchors with confidence scoring
 - Location: `src/rotator_library/session_tracking.py`
 - Pattern: Evidence accumulator with thread-safe anchor store (`threading.RLock` for state, separate `threading.Lock` for save I/O), namespace isolation, schema-versioned JSON persistence via `ResilientStateWriter`
-- Key types: `SessionAnchor` (evidence with strength/source/group), `SessionTrackingHints` (provider evidence), `SessionInference` (result with confidence + affinity + lineage), `_MatchCandidate` (scored candidate with `last_seen` tiebreaker)
-- Key methods: `infer_session()`, `record_response()`, `flush()`, `_build_compaction_probe_anchors()`, `_is_compaction_parent_match()`, `_prepare_save_locked()`, `_write_save_job()`
+- Key types: `SessionAnchor` (evidence with strength/source/group), `SessionTrackingHints` (provider evidence), `SessionInference` (result with confidence + affinity + lineage), `_MatchCandidate` (scored candidate with `response_groups`/`request_groups`/`matched_probe_groups` tracking and `last_seen` tiebreaker), `_CompactionDecision` (validated parent lineage with retained-history ratio and `context_probe_groups`)
+- Key methods: `infer_session()`, `record_response()`, `flush()`, `_build_compaction_probe_anchors()`, `_evaluate_compaction()`, `_find_compaction_replay()`, `_find_compaction_context()`, `_compaction_replay_anchor()`, `_compaction_context_anchor()`, `_is_authoritative_identity_anchor()`, `_compaction_marker_probe_groups()`, `_log_inference_decision()`, `_retained_history_ratio()`, `_prepare_save_locked()`, `_write_save_job()`
 - Save I/O: Dirty generation counter (`_dirty_generation`) decouples state mutations from disk writes; `_prepare_save_locked()` snapshots under state lock, `_write_save_job()` writes under separate I/O lock to avoid blocking inference
 
 ## Entry Points
@@ -164,6 +182,7 @@
 
 - Error classification: `src/rotator_library/core/errors.py` — `classify_error()`, `should_rotate_on_error()`, `should_retry_same_key()`
 - Error handler with cooldown parsing: `src/rotator_library/error_handler.py` — parses retry-after headers, duration strings, sets provider cooldowns
+- No-reset quota exhaustion: Authoritative quota APIs that report an exhausted bucket with no reset timestamp (e.g., account lacks model-group entitlement) are handled by `UsageManager._handle_no_reset_quota_exhaustion()` in `src/rotator_library/usage/manager.py` — policy `warn_only` | `cooldown` | `disable_scope` from `ProviderUsageConfig.no_reset_exhaustion_policy` applies a scoped fallback cooldown instead of repeated retries
 - Streaming errors: `StreamedAPIError` raised mid-stream to trigger credential rotation
 - Credential reauth: `CredentialNeedsReauthError` triggers background OAuth refresh
 
@@ -173,8 +192,8 @@
 
 **Caching:** Provider instances are singletons via `SingletonABCMeta`. Provider-level HTTP caching via `provider_cache.py`. Model info cached by `ModelInfoService` with async refresh.
 
-**Storage:** JSON file persistence for usage data (`usage/usage_*.json`), OAuth credentials in `oauth_creds/`, transaction logs in `logs/transactions/`. Session state persisted to JSON via `ResilientStateWriter` when disk persistence is enabled. Config via `.env` files and environment variables.
+**Storage:** JSON file persistence for usage data (`usage/usage_*.json`), OAuth credentials in `oauth_creds/`, transaction logs in `logs/transactions/` written by `TransactionLogger` (`src/rotator_library/transaction_logger.py`) with per-request directories containing client/provider I/O and a JSON-safe payload converter (`_make_json_safe`) for Pydantic/dataclass/timestamp objects. Session state persisted to JSON via `ResilientStateWriter` when disk persistence is enabled. Config via `.env` files and environment variables.
 
 **Background Tasks:** `BackgroundRefresher` manages periodic OAuth token refresh (default 10 min) and provider-specific background jobs (quota refresh, etc.) with independent timers.
 
-**Session Tracking:** Thread-safe with two-lock design (`threading.RLock` for anchor store, `threading.Lock` for save I/O), scoped by usage scope/provider/model. Anchor strength levels: `strong` (tool IDs, provider affinity), `medium` (message content hashes, response anchors), `weak` (first-user text, untrusted explicit IDs). System/developer prompts excluded from continuity anchors. Compaction detection uses separate probe anchors (`_build_compaction_probe_anchors()`) with response-anchor validation for size-only probes; lineage tracked via `lineage_parent_session_id` without forcing sticky continuation. Persistence uses schema-versioned JSON (`_PERSISTENCE_SCHEMA_VERSION`) with generation-based write deduplication. Configurable via `TRUSTED_SESSION_ID_FIELDS` env var and per-provider `SESSION_STICKY_*` env vars.
+**Session Tracking:** Thread-safe with two-lock design (`threading.RLock` for anchor store, `threading.Lock` for save I/O), scoped by usage scope/provider/model. Anchor strength levels: `strong` (trusted explicit IDs, provider affinity keys, response global IDs), `medium` (message content hashes, response anchors), `weak` (first-user text, raw tool-call IDs, untrusted explicit IDs). System/developer prompts excluded from continuity anchors. Compaction detection uses separate probe anchors (`_build_compaction_probe_anchors()`) restricted to early user/system/developer messages and requires structural replacement of more than half the parent's high-water request history via `_evaluate_compaction()`; unmarked summaries must additionally overlap at least two distinct response events plus a retained request group; authoritative identity (trusted explicit or provider, via `_is_authoritative_identity_anchor()`) suppresses unrelated compaction lineage; exact resends of a validated compacted payload reuse the child session via opaque `compaction_replay` anchors while changed-tail continuations bind via `compaction_context` anchors (`_find_compaction_context()`) minted only from probe groups that matched parent response evidence. Lineage tracked via `lineage_parent_session_id` without forcing sticky continuation of the parent. Trimming and TTL pruning evict weak/ordinary evidence before replay/context identity (`_anchor_eviction_key()` ranks `compaction_context` and `compaction_replay` sources above ordinary anchors) with deterministic value tie-breaking, and late responses cannot resurrect an expired session; session namespaces are immutable — `_refresh_and_bridge()` rejects namespace drift and `record_response()` normalizes fallback callbacks to the session's original namespace. Streaming response identity is recorded only after an explicit provider completion signal (`_sse_has_completion_signal()`: usage-backed final chunk, `finish_reason` paired with usage, or `[DONE]`). Persistence uses schema-versioned JSON (`_PERSISTENCE_SCHEMA_VERSION`) with generation-based write deduplication, dirty state retained on failed writes for retry, stale delayed generations rejected, and anchor ownership rebuilt on load (rejecting malformed containers, non-finite timestamps, expired sessions, orphan anchors, namespace mismatches, invalid strengths, and unsupported schemas); rebuilt sessions are flagged `loaded_from_persistence` for lineage diagnostics. Configurable via `TRUSTED_SESSION_ID_FIELDS` env var, per-provider `SESSION_STICKY_*` env vars, and `SESSION_PERSISTENCE_ENABLED` / `SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS` env vars on `RotatingClient`; every inference emits a temporary warning-level `Session tracker decision` line (`_log_inference_decision()`) with action, session IDs, namespace, confidence, score, persistence origin, and compaction evidence.

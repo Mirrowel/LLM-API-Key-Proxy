@@ -500,6 +500,8 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `SESSION_STICKY_ENTRY_TTL_SECONDS[_<PROVIDER>]` | TTL for in-memory session-to-credential sticky entries |
 | `SESSION_STICKY_MAX_ENTRIES[_<PROVIDER>]` | Max in-memory sequential sticky entries before LRU pruning |
 | `TRUSTED_SESSION_ID_FIELDS` | Comma-separated explicit request ID fields to trust as strong evidence; unset by default |
+| `SESSION_PERSISTENCE_ENABLED` | Persist content-free session lineage across proxy restarts (`false` by default) |
+| `SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS` | Session-state write throttle; use `0` for immediate manual testing (default: `5`) |
 | `OVERRIDE_TEMPERATURE_ZERO` | `remove` or `set` to prevent tool hallucination |
 | `GEMINI_CLI_QUOTA_REFRESH_INTERVAL` | Quota baseline refresh interval in seconds (default: 300) |
 
@@ -577,20 +579,44 @@ ROTATION_MODE_OPENAI=balanced
 
 ### Session Stickiness
 
-Sequential mode can keep related chat requests on the same credential when the session tracker has enough scoped evidence. Tracking is provider/model/scope-bound, so classifier/private credential pools do not share sticky sessions.
+Sequential mode can keep related chat requests on the same credential when the
+session tracker has enough evidence. The logical session ID follows a conversation
+across providers and models inside one caller/credential domain. Public traffic,
+each named classifier, and every ad hoc private credential bundle remain strictly
+isolated. Credential bindings are still independent per provider/model, so one
+global session can use different sticky credentials on different providers.
+Raw tool-call IDs remain weak because clients may reuse counters such as
+`call_1`. A call becomes medium evidence only when the request contains a
+matching tool result; the event identity hashes the ID, function name, and
+canonical arguments. One closed event plus an independent message group, or two
+distinct closed events, can therefore continue a sparse agentic session.
 
 ```env
 # Wait up to 15s for a session-bound credential if it is only busy by concurrency.
 SESSION_STICKY_WAIT_SECONDS=15
 SESSION_STICKY_WAIT_SECONDS_GEMINI_CLI=15
 
-# Bound the in-memory sticky session cache.
-SESSION_STICKY_ENTRY_TTL_SECONDS=3600
+# Expire each provider/model binding after five idle minutes. Provider-specific
+# overrides win; set a provider TTL to 0 to disable its sticky bindings.
+SESSION_STICKY_ENTRY_TTL_SECONDS=300
+SESSION_STICKY_ENTRY_TTL_SECONDS_DEEPSEEK=300
 SESSION_STICKY_MAX_ENTRIES=10000
 
 # Optional and conservative: only set this if your clients send stable IDs.
 TRUSTED_SESSION_ID_FIELDS="conversation_id,thread_id"
+
+# Optional restart persistence, disabled by default. This stores content-free
+# logical lineage only; credential bindings remain in memory.
+SESSION_PERSISTENCE_ENABLED=true
+SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=5
 ```
+
+Scoped Responses API creation returns a response-specific
+`X-Proxy-Session-Domain` access capability. Present that header when retrieving,
+deleting, listing input items, or creating a `previous_response_id` continuation
+for that non-public response. Only the capability hash is stored; knowing a
+classifier label or deterministic domain hash is insufficient. Responses storage
+and lineage remain keyed internally by both the domain and response ID.
 
 ### Priority Multipliers
 

@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import time
+from copy import deepcopy
 from typing import (
     Any,
     AsyncGenerator,
@@ -47,6 +48,8 @@ from ..core.errors import (
     StreamedAPIError,
     ClassifiedError,
     RequestErrorAccumulator,
+    StructuredAPIResponseError,
+    structured_api_response_error,
     classify_error,
     should_rotate_on_error,
     should_retry_same_key,
@@ -62,17 +65,37 @@ from ..core.constants import (
 from ..request_sanitizer import sanitize_request_payload
 from ..transaction_logger import TransactionLogger
 from ..failure_logger import log_failure
+from ..retry_policy import FailureHistory, decide_provider_cooldown, provider_cooldown_env
+from ..routing import FallbackPolicy, clone_context_for_target
+from ..routing.policy import normalize_route_error_type
+from ..routing.types import RouteTarget
+from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
+from ..protocols import ProtocolContext, UnifiedStreamEvent, get_protocol
+from ..protocols.streaming import convert_protocol_stream, format_canonical_stream_event
+from ..native_provider.streaming import provider_supports_native_streaming as native_provider_supports_streaming
+from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
+from ..transform_trace import REDACTED
+from ..usage.accounting import UsageRecord, extract_usage_record
+from ..usage.costs import CostBreakdown, CostCalculator
 
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
 from .streaming import StreamingHandler
-from .stream_retry_policy import can_retry_stream_after_error
+from ..streaming.policy import can_retry_stream_after_error, is_stream_heartbeat_or_comment, is_visible_stream_output
 
 if TYPE_CHECKING:
     from ..usage import UsageManager
 
 lib_logger = logging.getLogger("rotator_library")
+
+
+class RoutingExecutionError(RuntimeError):
+    """Internal error used when a routed target cannot use its requested mode."""
+
+    def __init__(self, message: str, error_type: str = "configuration_error") -> None:
+        super().__init__(message)
+        self.error_type = error_type
 
 
 class RequestExecutor:
@@ -100,6 +123,7 @@ class RequestExecutor:
         litellm_provider_params: Optional[Dict[str, Any]] = None,
         litellm_logger_fn: Optional[Any] = None,
         provider_instances: Optional[Dict[str, Any]] = None,
+        experimental_config: Optional[Any] = None,
     ):
         """
         Initialize RequestExecutor.
@@ -134,8 +158,11 @@ class RequestExecutor:
         self._abort_on_callback_error = abort_on_callback_error
         self._litellm_provider_params = litellm_provider_params or {}
         self._litellm_logger_fn = litellm_logger_fn
+        self._experimental_config = experimental_config
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
         self._streaming_handler = StreamingHandler()
+        self._native_executor = NativeProviderExecutor()
+        self._failure_history = FailureHistory()
 
     def _get_transient_retry_delay(self) -> float:
         """Small jittered delay used before transient retries and rotations."""
@@ -192,14 +219,17 @@ class RequestExecutor:
                     self._plugin_instances[provider] = plugin_class
             else:
                 return None
-        return self._plugin_instances[provider]
+        instance = self._plugin_instances[provider]
+        if self._experimental_config is not None and hasattr(instance, "bind_runtime_config"):
+            instance.bind_runtime_config(self._experimental_config)
+        return instance
 
     def _has_tier_support(self, provider: str) -> bool:
         """
         Check if provider has tier/priority configuration.
 
         Providers with tier support define tier_priorities mapping
-        (e.g., GeminiCli, NanoGpt).
+        (e.g., NanoGpt).
 
         Args:
             provider: Provider name
@@ -358,6 +388,9 @@ class RequestExecutor:
         model: str,
         cred: str,
         context: "RequestContext",
+        *,
+        credential_id: Optional[str] = None,
+        native_execution: bool = False,
     ) -> Dict[str, Any]:
         """
         Prepare request kwargs with transforms, sanitization, and provider params.
@@ -371,6 +404,19 @@ class RequestExecutor:
         Returns:
             Prepared kwargs dict for the LiteLLM call
         """
+        if native_execution:
+            kwargs = deepcopy(context.kwargs)
+            self._log_executor_trace(
+                context,
+                "native_callback_compatibility_view",
+                kwargs,
+                direction="request",
+                stage="client",
+                credential_id=credential_id,
+                metadata={"provider": provider, "model": model},
+            )
+            return kwargs
+
         # Apply transforms
         kwargs = await self._transforms.apply(
             provider,
@@ -378,17 +424,58 @@ class RequestExecutor:
             cred,
             context.kwargs.copy(),
             provider_config_override=context.provider_config,
+            transaction_logger=context.transaction_logger,
+            credential_id=credential_id,
+            transport="sse" if context.streaming else "http",
+            trace_metadata={
+                "session_id": context.session_id,
+                "scope_key": context.usage_manager_key,
+                "classifier": context.classifier,
+            },
         )
 
-        # Sanitize request payload
+        # Sanitize request payload. Some provider compatibility fields are
+        # intentionally removed here, so record it as its own transform pass.
+        before_sanitize = deepcopy(kwargs) if context.transaction_logger else None
         kwargs = sanitize_request_payload(kwargs, model)
+        self._log_executor_trace(
+            context,
+            "after_request_sanitization",
+            kwargs,
+            direction="request",
+            stage="client",
+            credential_id=credential_id,
+            changed_from_previous=(before_sanitize != kwargs) if before_sanitize is not None else None,
+            metadata={"provider": provider, "model": model},
+        )
 
         # Apply provider-specific LiteLLM params
+        before_params = deepcopy(kwargs) if context.transaction_logger else None
         self._apply_litellm_provider_params(provider, kwargs)
+        self._log_executor_trace(
+            context,
+            "after_litellm_provider_params",
+            kwargs,
+            direction="request",
+            stage="client",
+            credential_id=credential_id,
+            changed_from_previous=(before_params != kwargs) if before_params is not None else None,
+            metadata={"provider": provider, "model": model},
+        )
 
         # Add transaction context for provider logging
         if context.transaction_logger:
             kwargs["transaction_context"] = context.transaction_logger.get_context()
+            self._log_executor_trace(
+                context,
+                "after_transaction_context_attached",
+                kwargs,
+                direction="request",
+                stage="client",
+                credential_id=credential_id,
+                changed_from_previous=True,
+                metadata={"provider": provider, "model": model},
+            )
 
         return kwargs
 
@@ -472,11 +559,320 @@ class RequestExecutor:
         """
         if context.pre_request_callback:
             try:
+                before = deepcopy(kwargs) if context.transaction_logger else None
                 await context.pre_request_callback(context.request, kwargs)
+                if before is not None and before != kwargs:
+                    self._log_executor_trace(
+                        context,
+                        "after_pre_request_callback",
+                        kwargs,
+                        direction="request",
+                        stage="client",
+                        changed_from_previous=True,
+                        snapshot=True,
+                    )
             except Exception as e:
                 if self._abort_on_callback_error:
                     raise PreRequestCallbackError(str(e)) from e
                 lib_logger.warning(f"Pre-request callback failed: {e}")
+
+    async def _execute_provider_request(
+        self,
+        provider: str,
+        model: str,
+        plugin: Any,
+        credential_secret: str,
+        credential_id: str,
+        kwargs: Dict[str, Any],
+        context: RequestContext,
+    ) -> Any:
+        """Execute one provider request using routed execution-mode rules."""
+
+        target = _current_route_target(context)
+        execution = target.execution if target else "auto"
+        self._log_executor_trace(
+            context,
+            "pre_provider_execution_request",
+            kwargs,
+            direction="request",
+            stage="provider",
+            credential_id=credential_id,
+            metadata={"execution": execution, "provider": provider, "model": model},
+        )
+        if execution == "litellm_fallback":
+            self._log_routing_trace(
+                context,
+                "routing_litellm_fallback",
+                _target_trace(target) if target else {"provider": provider, "model": model},
+            )
+            response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+            _raise_for_structured_response_error(response)
+            return self._format_execution_response(response, "openai_chat", context)
+
+        if execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
+            if not plugin or not plugin.has_custom_logic():
+                raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
+            kwargs["credential_identifier"] = credential_secret
+            self._log_executor_trace(
+                context,
+                "provider_execution_request",
+                kwargs,
+                direction="request",
+                stage="provider",
+                credential_id=credential_id,
+                metadata={"execution": "custom", "provider": provider, "model": model},
+            )
+            response = await plugin.acompletion(self._http_client, **kwargs)
+            _raise_for_structured_response_error(response)
+            return self._format_execution_response(response, "openai_chat", context)
+
+        if execution == "native" or (execution == "auto" and _should_use_native_protocol(plugin, model, target, kwargs, stream=False, execution=execution)):
+            native_context, native_request = self._build_native_provider_context(
+                provider,
+                model,
+                plugin,
+                credential_secret,
+                credential_id,
+                context,
+                target,
+                raw_request=kwargs,
+                return_request=True,
+            )
+            self._log_routing_trace(
+                context,
+                "routing_native_execution_selected",
+                _target_trace(target) if target else {"provider": provider, "model": model},
+                metadata={"protocol": native_context.protocol_name, "operation": native_context.operation},
+            )
+            return await self._get_native_executor().execute(native_request, native_context, NativeHTTPTransport(self._http_client))
+
+        response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
+        _raise_for_structured_response_error(response)
+        return self._format_execution_response(response, "openai_chat", context)
+
+    def _get_native_executor(self) -> NativeProviderExecutor:
+        """Return the shared native executor for process-local field-cache state."""
+
+        native_executor = getattr(self, "_native_executor", None)
+        if native_executor is None:
+            native_executor = NativeProviderExecutor()
+            self._native_executor = native_executor
+        return native_executor
+
+    async def _execute_litellm_request(
+        self,
+        kwargs: Dict[str, Any],
+        credential_secret: str,
+        *,
+        context: Optional[RequestContext] = None,
+        credential_id: Optional[str] = None,
+    ) -> Any:
+        """Execute the existing LiteLLM request path."""
+
+        kwargs["api_key"] = credential_secret
+        self._apply_litellm_logger(kwargs)
+        kwargs.pop("transaction_context", None)
+        if context:
+            self._log_executor_trace(
+                context,
+                "provider_execution_request",
+                kwargs,
+                direction="request",
+                stage="provider",
+                credential_id=credential_id,
+                metadata={"execution": "litellm", "provider": context.provider, "model": context.model},
+            )
+        return await litellm.acompletion(**kwargs)
+
+    @staticmethod
+    def _format_execution_response(
+        response: Any,
+        source_protocol_name: str,
+        context: RequestContext,
+    ) -> Any:
+        """Format a non-native execution result into the selected client protocol."""
+
+        output_protocol = get_protocol(context.output_protocol_name)
+        source_protocol = get_protocol(source_protocol_name)
+        if output_protocol.name == source_protocol.name:
+            return response
+        if isinstance(response, dict):
+            payload = deepcopy(response)
+        elif hasattr(response, "model_dump"):
+            payload = response.model_dump()
+        elif hasattr(response, "dict"):
+            payload = response.dict()
+        else:
+            payload = dict(response)
+        protocol_context = ProtocolContext(
+            provider=context.provider,
+            model=context.model,
+            source_protocol=source_protocol.name,
+            target_protocol=output_protocol.name,
+            input_protocol=context.input_protocol_name,
+            provider_protocol=source_protocol.name,
+            output_protocol=output_protocol.name,
+            source_provider=context.provider,
+            session_id=context.session_id,
+            transport="http",
+        )
+        unified_response = source_protocol.parse_response(payload, protocol_context)
+        unified_response.model = context.model
+        return output_protocol.format_response(unified_response, protocol_context)
+
+    def _build_native_provider_context(
+        self,
+        provider: str,
+        model: str,
+        plugin: Any,
+        credential_secret: str,
+        credential_id: str,
+        context: RequestContext,
+        target: Optional[RouteTarget],
+        raw_request: Optional[Dict[str, Any]] = None,
+        transport: str = "http",
+        stream: bool = False,
+        return_request: bool = False,
+    ) -> NativeProviderContext | tuple[NativeProviderContext, Dict[str, Any]]:
+        """Build native provider context from provider declarations."""
+
+        if not plugin:
+            raise RoutingExecutionError(f"Provider {provider} has no plugin for native execution")
+        protocol_name = _provider_native_protocol(plugin, model, target)
+        if not protocol_name:
+            raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
+        public_model = model
+        native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
+        operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+        if hasattr(plugin, "supports_native_operation") and not plugin.supports_native_operation(native_model, operation):
+            raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
+        try:
+            endpoint = plugin.get_native_endpoint(model=native_model, operation=operation)
+            headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
+        except NotImplementedError as exc:
+            raise RoutingExecutionError(str(exc)) from exc
+        native_context = NativeProviderContext(
+            provider=provider,
+            model=native_model,
+            protocol_name=protocol_name,
+            endpoint=endpoint,
+            operation=operation,
+            input_protocol_name=context.input_protocol_name,
+            # The operational stream handler consumes canonical Chat SSE. The
+            # selected client protocol is applied once after timeout/retry/usage
+            # and completion-gated session handling.
+            output_protocol_name="openai_chat" if stream else context.output_protocol_name,
+            headers=headers,
+            credential_id=credential_id,
+            session_id=context.session_id,
+            scope_key=context.usage_manager_key,
+            classifier=context.classifier,
+            transport=transport,
+            adapter_names=tuple(plugin.get_adapter_names(native_model) if hasattr(plugin, "get_adapter_names") else ()),
+            adapter_config=dict(plugin.get_adapter_config(native_model) if hasattr(plugin, "get_adapter_config") else {}),
+            field_cache_rules=_merged_field_cache_rules(
+                provider,
+                public_model,
+                plugin,
+                config=getattr(self, "_experimental_config", None),
+            ),
+            transaction_logger=context.transaction_logger,
+            metadata={
+                "public_model": public_model,
+                "input_provider": context.input_provider,
+                "disable_provider_continuation": context.disable_provider_continuation,
+            },
+            request_preparer=plugin.prepare_native_request if hasattr(plugin, "prepare_native_request") else None,
+            request_validator=plugin.validate_request if hasattr(plugin, "validate_request") else None,
+        )
+        if return_request:
+            if context.unified_request is None:
+                raise RoutingExecutionError("Native execution requires a canonical request")
+            return native_context, self._canonical_request_for_native(context, raw_request or {})
+        return native_context
+
+    @staticmethod
+    def _canonical_request_for_native(
+        context: RequestContext,
+        request_payload: Dict[str, Any],
+    ) -> Any:
+        """Overlay protocol-safe attempt mutations onto the canonical request.
+
+        Existing transforms and callbacks operate on the Chat execution view.
+        Only canonical fields changed relative to that view are overlaid, so
+        source-native semantics that Chat cannot represent remain intact.
+        """
+
+        canonical_request = deepcopy(context.unified_request)
+        chat_protocol = get_protocol("openai_chat")
+        baseline = chat_protocol.parse_request(context.kwargs)
+        attempted = chat_protocol.parse_request(request_payload)
+        original_instructions = [message for message in canonical_request.messages if message.role in {"system", "developer"}]
+        original_conversation = [message for message in canonical_request.messages if message.role not in {"system", "developer"}]
+        baseline_instructions = [message for message in baseline.messages if message.role in {"system", "developer"}]
+        baseline_conversation = [message for message in baseline.messages if message.role not in {"system", "developer"}]
+        attempted_instructions = [message for message in attempted.messages if message.role in {"system", "developer"}]
+        attempted_conversation = [message for message in attempted.messages if message.role not in {"system", "developer"}]
+        if baseline_conversation != attempted_conversation:
+            original_conversation = _merge_canonical_sequence(
+                original_conversation,
+                baseline_conversation,
+                attempted_conversation,
+                _merge_canonical_message,
+                lambda message: (message.role, message.tool_call_id, message.name),
+            )
+        if baseline_instructions != attempted_instructions:
+            if canonical_request.system and not original_instructions:
+                baseline_blocks = [block for message in baseline_instructions for block in message.content]
+                attempted_blocks = [block for message in attempted_instructions for block in message.content]
+                canonical_request.system = _merge_canonical_sequence(
+                    canonical_request.system,
+                    baseline_blocks,
+                    attempted_blocks,
+                    _merge_canonical_content_block,
+                    lambda block: block.type,
+                )
+            else:
+                original_instructions = _merge_canonical_sequence(
+                    original_instructions,
+                    baseline_instructions,
+                    attempted_instructions,
+                    _merge_canonical_message,
+                    lambda message: (message.role, message.tool_call_id, message.name),
+                )
+        canonical_request.messages = original_instructions + original_conversation
+        if baseline.tools != attempted.tools:
+            canonical_request.tools = _merge_canonical_sequence(
+                canonical_request.tools,
+                baseline.tools,
+                attempted.tools,
+                _merge_canonical_tool,
+                lambda tool: (tool.type, tool.name),
+            )
+        for field_name in ("stream", "modalities"):
+            if getattr(baseline, field_name) != getattr(attempted, field_name):
+                setattr(canonical_request, field_name, deepcopy(getattr(attempted, field_name)))
+        metadata_keys = set(baseline.metadata) | set(attempted.metadata)
+        for key in metadata_keys:
+            if baseline.metadata.get(key) == attempted.metadata.get(key):
+                continue
+            if key in attempted.metadata:
+                canonical_request.metadata[key] = deepcopy(attempted.metadata[key])
+            else:
+                canonical_request.metadata.pop(key, None)
+        if baseline.response_format != attempted.response_format:
+            canonical_request.response_format = deepcopy(attempted.response_format)
+        generation_keys = set(baseline.generation_params) | set(attempted.generation_params)
+        for key in generation_keys:
+            baseline_value = baseline.generation_params.get(key)
+            attempted_value = attempted.generation_params.get(key)
+            if baseline_value == attempted_value:
+                continue
+            if key in attempted.generation_params:
+                canonical_request.generation_params[key] = deepcopy(attempted_value)
+            else:
+                canonical_request.generation_params.pop(key, None)
+        return canonical_request
 
     async def execute(
         self,
@@ -493,10 +889,324 @@ class RequestExecutor:
         Returns:
             Response object or async generator for streaming
         """
+        if context.streaming and context.routing_targets:
+            return self._execute_streaming_with_fallback(context)
         if context.streaming:
             return self._execute_streaming(context)
+        elif context.routing_targets:
+            return await self._execute_non_streaming_with_fallback(context)
         else:
             return await self._execute_non_streaming(context)
+
+    async def _execute_non_streaming_with_fallback(self, context: RequestContext) -> Any:
+        """Execute an ordered non-streaming fallback target chain.
+
+        The normal single-target path remains `_execute_non_streaming()`. This
+        wrapper only runs when request building has populated `routing_targets`,
+        preserving existing behavior for all current requests.
+        """
+
+        targets = tuple(context.routing_targets or ())
+        if not targets:
+            return await self._execute_non_streaming(context)
+        policy = FallbackPolicy()
+        last_failure: Any = None
+        target_failures: List[Dict[str, Any]] = []
+        self._log_routing_trace(
+            context,
+            "routing_decision",
+            {"requested_model": context.model, "target_count": len(targets)},
+            metadata={"group": context.routing_group_name, "targets": [_target_trace(target) for target in targets]},
+        )
+        for index, target in enumerate(targets):
+            attempt_started_at = time.monotonic()
+            target_context = clone_context_for_target(
+                context,
+                target,
+                target_index=index,
+                credentials=_target_scope_value(target, "credentials", context.credentials),
+                usage_manager_key=_target_scope_value(target, "usage_manager_key", target.provider),
+                provider_config=_target_scope_value(target, "provider_config", context.provider_config),
+                credential_secrets=_target_scope_value(target, "credential_secrets", context.credential_secrets),
+            )
+            self._log_routing_trace(
+                context,
+                "routing_target_attempt_started",
+                _target_trace(target),
+                metadata={"target_index": index, "group": context.routing_group_name},
+            )
+            try:
+                result = await self._execute_non_streaming(target_context)
+            except Exception as exc:
+                last_failure = exc
+                error_type = _route_error_type(exc, target.provider)
+                self._log_routing_trace(
+                    context,
+                    "routing_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
+                )
+                target_failures.append(_target_failure_summary(target, error_type))
+                fallback_allowed = index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                if not fallback_allowed:
+                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
+                    if isinstance(exc, StructuredAPIResponseError):
+                        exc.response = _with_fallback_summary(
+                            deepcopy(exc.response),
+                            target_failures,
+                            context.routing_attempt_history,
+                        )
+                    raise
+                self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
+                continue
+
+            error_type = _route_error_type_from_response(result)
+            if error_type:
+                last_failure = result
+                self._log_routing_trace(
+                    context,
+                    "routing_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type},
+                )
+                target_failures.append(_target_failure_summary(target, error_type, status_code=_route_status_code_from_response(result)))
+                fallback_allowed = index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, status_code=_route_status_code_from_response(result), fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                if fallback_allowed:
+                    self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
+                    continue
+                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
+                return _with_fallback_summary(result, target_failures, context.routing_attempt_history)
+
+            self._log_routing_trace(
+                context,
+                "routing_target_attempt_succeeded",
+                _target_trace(target),
+                metadata={"target_index": index},
+            )
+            _append_routing_attempt_history(context, target, index, success=True, duration_ms=_elapsed_ms(attempt_started_at))
+            return result
+
+        if isinstance(last_failure, Exception):
+            raise last_failure
+        return last_failure
+
+    async def _execute_streaming_with_fallback(self, context: RequestContext) -> AsyncGenerator[str, None]:
+        """Execute streaming fallback targets with pre-output-only failover."""
+
+        targets = tuple(context.routing_targets or ())
+        if not targets:
+            async for chunk in self._execute_streaming(context):
+                yield chunk
+            return
+        policy = FallbackPolicy()
+        target_failures: List[Dict[str, Any]] = []
+        self._log_routing_trace(
+            context,
+            "routing_decision",
+            {"requested_model": context.model, "target_count": len(targets), "stream": True},
+            metadata={"group": context.routing_group_name, "streaming_policy": _group_streaming_policy(context.routing_group), "targets": [_target_trace(target) for target in targets]},
+        )
+        for index, target in enumerate(targets):
+            attempt_started_at = time.monotonic()
+            emitted_output = False
+            pending_chunks: List[str] = []
+            terminal_error_type: Optional[str] = None
+            target_context = clone_context_for_target(
+                context,
+                target,
+                target_index=index,
+                credentials=_target_scope_value(target, "credentials", context.credentials),
+                usage_manager_key=_target_scope_value(target, "usage_manager_key", target.provider),
+                provider_config=_target_scope_value(target, "provider_config", context.provider_config),
+                credential_secrets=_target_scope_value(target, "credential_secrets", context.credential_secrets),
+            )
+            self._log_routing_trace(
+                context,
+                "routing_stream_target_attempt_started",
+                _target_trace(target),
+                metadata={"target_index": index, "group": context.routing_group_name},
+            )
+            try:
+                async for chunk in self._execute_streaming(target_context):
+                    if is_stream_heartbeat_or_comment(chunk):
+                        yield chunk
+                        continue
+                    chunk_error_type = _stream_chunk_error_type(chunk)
+                    if chunk_error_type and not emitted_output:
+                        terminal_error_type = chunk_error_type
+                        pending_chunks.append(chunk)
+                        continue
+                    if _stream_chunk_is_visible_output(chunk):
+                        for pending in pending_chunks:
+                            yield pending
+                        pending_chunks.clear()
+                        emitted_output = True
+                        yield chunk
+                        continue
+                    pending_chunks.append(chunk)
+                if terminal_error_type and not emitted_output:
+                    error_type = terminal_error_type
+                    self._log_routing_trace(
+                        context,
+                        "routing_stream_target_attempt_failed",
+                        _target_trace(target),
+                        metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output, "terminal_error_frame": True},
+                    )
+                    target_failures.append(_target_failure_summary(target, error_type))
+                    fallback_allowed = index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False)
+                    _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, emitted_output=emitted_output, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                    if fallback_allowed:
+                        self._log_routing_trace(
+                            context,
+                            "routing_fallback_selected",
+                            _target_trace(targets[index + 1]),
+                            metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type, "stream": True},
+                        )
+                        continue
+                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "stream": True, "streaming_policy": _group_streaming_policy(context.routing_group), "fallback_targets": target_failures})
+                    for pending in pending_chunks:
+                        yield pending
+                    return
+                for pending in pending_chunks:
+                    yield pending
+                self._log_routing_trace(
+                    context,
+                    "routing_stream_target_attempt_succeeded",
+                    _target_trace(target),
+                    metadata={"target_index": index, "emitted_output": emitted_output},
+                )
+                _append_routing_attempt_history(context, target, index, success=True, emitted_output=emitted_output, duration_ms=_elapsed_ms(attempt_started_at))
+                return
+            except Exception as exc:
+                error_type = _route_error_type(exc, target.provider)
+                self._log_routing_trace(
+                    context,
+                    "routing_stream_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type, "emitted_output": emitted_output},
+                )
+                target_failures.append(_target_failure_summary(target, error_type))
+                fallback_allowed = (not emitted_output) and index < len(targets) - 1 and _streaming_policy_allows_fallback(context.routing_group) and policy.should_fallback(error_type, group=context.routing_group, stream=True, emitted_output=False)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, emitted_output=emitted_output, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                if emitted_output:
+                    self._log_routing_trace(
+                        context,
+                        "routing_stream_fallback_blocked_after_output",
+                        _target_trace(target),
+                        metadata={"target_index": index, "error_type": error_type},
+                    )
+                    raise
+                if fallback_allowed:
+                    self._log_routing_trace(
+                        context,
+                        "routing_fallback_selected",
+                        _target_trace(targets[index + 1]),
+                        metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type, "stream": True},
+                    )
+                    continue
+                self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "stream": True, "streaming_policy": _group_streaming_policy(context.routing_group), "fallback_targets": target_failures})
+                raise
+
+    @staticmethod
+    def _log_routing_trace(context: RequestContext, pass_name: str, data: Any, *, metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Record routing trace entries without affecting request execution."""
+
+        if not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            pass_name,
+            data,
+            direction="metadata",
+            stage="routing",
+            metadata=metadata or {},
+            snapshot=False,
+        )
+
+    @staticmethod
+    def _log_executor_trace(
+        context: RequestContext,
+        pass_name: str,
+        data: Any,
+        *,
+        direction: str,
+        stage: str,
+        credential_id: Optional[str] = None,
+        changed_from_previous: Optional[bool] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        snapshot: bool = True,
+    ) -> None:
+        """Record live executor trace boundaries without affecting requests."""
+
+        if not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            pass_name,
+            data,
+            direction=direction,
+            stage=stage,
+            credential_id=credential_id,
+            transport="sse" if context.streaming else "http",
+            changed_from_previous=changed_from_previous,
+            metadata={
+                "provider": context.provider,
+                "model": context.model,
+                "session_id": context.session_id,
+                "scope_key": context.usage_manager_key,
+                "classifier": context.classifier,
+                **(metadata or {}),
+            },
+            snapshot=snapshot,
+        )
+
+    def _terminal_stream_error_lines(
+        self,
+        context: RequestContext,
+        error_data: Dict[str, Any],
+        *,
+        protocol_context: Optional[ProtocolContext] = None,
+    ) -> Tuple[str, ...]:
+        """Return executor-created terminal SSE lines and trace them first."""
+
+        output_protocol = getattr(context, "output_protocol_name", None) or "openai_chat"
+        input_protocol = getattr(context, "input_protocol_name", None) or "openai_chat"
+        protocol_context = protocol_context or ProtocolContext(
+                provider=context.provider,
+                model=context.model,
+                source_protocol="openai_chat",
+                target_protocol=output_protocol,
+                input_protocol=input_protocol,
+                output_protocol=output_protocol,
+                request_id=getattr(context, "request_id", None),
+                session_id=context.session_id,
+                transport="sse",
+            )
+        error = error_data.get("error", error_data)
+        lines = tuple(
+            format_canonical_stream_event(
+                UnifiedStreamEvent(type="error", error=error),
+                output_protocol,
+                protocol_context,
+            )
+        )
+        self._log_executor_trace(
+            context,
+            "stream_error_event",
+            error_data,
+            direction="stream",
+            stage="client",
+            snapshot=False,
+        )
+        self._log_executor_trace(
+            context,
+            "stream_done_event",
+            {"frames": lines},
+            direction="stream",
+            stage="final",
+            snapshot=False,
+        )
+        return lines
 
     async def _prepare_execution(
         self,
@@ -516,8 +1226,9 @@ class RequestExecutor:
         quota_group = usage_manager.get_model_quota_group(model)
 
         await self._ensure_initialized(usage_manager, context, filter_result)
-        await self._validate_request(provider, model, context.kwargs)
-
+        plugin = self._get_plugin_instance(provider)
+        if not _attempt_uses_native_protocol(plugin, model, context):
+            await self._validate_request(provider, model, context.kwargs)
         if not credentials:
             raise NoAvailableKeysError(f"No compatible credentials for model {model}")
 
@@ -569,7 +1280,7 @@ class RequestExecutor:
                 break
 
             # Wait for provider cooldown
-            await self._wait_for_cooldown(provider, deadline)
+            await self._wait_for_cooldown(provider, deadline, model=model, context=context)
 
             # Acquire credential using context manager
             try:
@@ -598,21 +1309,32 @@ class RequestExecutor:
                     self._log_acquired_credential(
                         cred, model, state, quota_group, availability, usage_manager
                     )
+                    plugin = self._get_plugin_instance(provider)
+                    native_execution = _attempt_uses_native_protocol(plugin, model, context)
 
                     try:
                         # Prepare request kwargs
                         kwargs = await self._prepare_request_kwargs(
-                            provider, model, cred, context
+                            provider,
+                            model,
+                            cred,
+                            context,
+                            credential_id=cred_context.stable_id,
+                            native_execution=native_execution,
                         )
 
                         # Log transformed request if it differs from original
                         if context.transaction_logger:
                             context.transaction_logger.log_transformed_request(
-                                kwargs, context.kwargs
+                                kwargs,
+                                context.kwargs,
+                                credential_id=cred_context.stable_id,
+                                metadata={
+                                    "session_id": context.session_id,
+                                    "scope_key": context.usage_manager_key,
+                                    "classifier": context.classifier,
+                                },
                             )
-
-                        # Get provider plugin
-                        plugin = self._get_plugin_instance(provider)
 
                         # Execute request with retries
                         for attempt in range(self._max_retries):
@@ -624,31 +1346,42 @@ class RequestExecutor:
                                 # Pre-request callback
                                 await self._run_pre_request_callback(context, kwargs)
 
-                                # Make the API call
-                                if plugin and plugin.has_custom_logic():
-                                    kwargs["credential_identifier"] = credential_secret
-                                    response = await plugin.acompletion(
-                                        self._http_client, **kwargs
-                                    )
-                                else:
-                                    # Standard LiteLLM call
-                                    kwargs["api_key"] = credential_secret
-                                    self._apply_litellm_logger(kwargs)
-                                    # Remove internal context before litellm call
-                                    kwargs.pop("transaction_context", None)
-                                    response = await litellm.acompletion(**kwargs)
+                                response = await self._execute_provider_request(
+                                    provider,
+                                    model,
+                                    plugin,
+                                    credential_secret,
+                                    cred_context.stable_id,
+                                    kwargs,
+                                    context,
+                                )
+                                trace_response = _redact_context_field_cache_paths(
+                                    response,
+                                    context,
+                                    "response",
+                                    plugin,
+                                    config=getattr(self, "_experimental_config", None),
+                                )
+                                self._log_executor_trace(
+                                    context,
+                                    "raw_provider_response",
+                                    trace_response,
+                                    direction="response",
+                                    stage="provider",
+                                    credential_id=cred_context.stable_id,
+                                    metadata={"provider": provider, "model": model},
+                                )
 
                                 # Success! Extract token usage if available
-                                (
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    prompt_tokens_cached,
-                                    prompt_tokens_cache_write,
-                                    thinking_tokens,
-                                ) = self._extract_usage_tokens(response)
-                                approx_cost = self._calculate_cost(
-                                    provider, model, response
+                                usage_record, cost_breakdown = self._account_for_response_usage(
+                                    provider, model, response, context
                                 )
+                                prompt_tokens = usage_record.prompt_tokens_for_mark_success
+                                completion_tokens = usage_record.completion_tokens
+                                prompt_tokens_cached = usage_record.cache_read_tokens
+                                prompt_tokens_cache_write = usage_record.cache_write_tokens
+                                thinking_tokens = usage_record.reasoning_tokens
+                                approx_cost = cost_breakdown.total_cost
                                 response_headers = self._extract_response_headers(
                                     response
                                 )
@@ -663,30 +1396,63 @@ class RequestExecutor:
                                     approx_cost=approx_cost,
                                     response_headers=response_headers,
                                 )
+                                self._clear_failure_history_on_success(provider, model)
                                 self._record_session_response(context, response)
 
                                 lib_logger.info(
                                     f"Recorded usage from response object for key {mask_credential(cred)}"
                                 )
 
-                                # Log response if transaction logging enabled
+                                normalized_response = self._normalize_response_usage(response, model)
+                                trace_normalized_response = _redact_context_field_cache_paths(
+                                    normalized_response,
+                                    context,
+                                    "response",
+                                    plugin,
+                                    config=getattr(self, "_experimental_config", None),
+                                )
+                                self._log_executor_trace(
+                                    context,
+                                    "post_usage_normalization_response",
+                                    trace_normalized_response,
+                                    direction="response",
+                                    stage="final",
+                                    credential_id=cred_context.stable_id,
+                                    metadata={"provider": provider, "model": model},
+                                )
+                                # Legacy response.json and final_client_response must
+                                # reflect the same post-normalization payload returned
+                                # to the caller, not the pre-accounting SDK object.
                                 if context.transaction_logger:
                                     try:
-                                        response_data = (
-                                            response.model_dump()
-                                            if hasattr(response, "model_dump")
-                                            else response
-                                        )
-                                        context.transaction_logger.log_response(
-                                            response_data
-                                        )
+                                        context.transaction_logger.log_response(trace_normalized_response)
                                     except Exception as log_err:
                                         lib_logger.debug(
                                             f"Failed to log response: {log_err}"
                                         )
+                                return normalized_response
 
-                                return self._normalize_response_usage(response, model)
-
+                            except RoutingExecutionError as e:
+                                if e.error_type == "configuration_error":
+                                    raise
+                                last_exception = e
+                                action = await self._handle_error_with_context(
+                                    e,
+                                    cred_context,
+                                    model,
+                                    provider,
+                                    attempt,
+                                    error_accumulator,
+                                    retry_state,
+                                    request_headers,
+                                    context,
+                                )
+                                if action == ErrorAction.RETRY_SAME:
+                                    continue
+                                elif action == ErrorAction.ROTATE:
+                                    break
+                                else:
+                                    raise
                             except Exception as e:
                                 last_exception = e
                                 action = await self._handle_error_with_context(
@@ -698,6 +1464,7 @@ class RequestExecutor:
                                     error_accumulator,
                                     retry_state,
                                     request_headers,
+                                    context,
                                 )
 
                                 if action == ErrorAction.RETRY_SAME:
@@ -709,6 +1476,9 @@ class RequestExecutor:
 
                     except PreRequestCallbackError:
                         raise
+                    except RoutingExecutionError as exc:
+                        if exc.error_type == "configuration_error":
+                            raise
                     except Exception:
                         # Let context manager handle cleanup
                         pass
@@ -718,11 +1488,19 @@ class RequestExecutor:
 
         # All credentials exhausted
         error_accumulator.timeout_occurred = time.time() >= deadline
+        if isinstance(last_exception, StructuredAPIResponseError):
+            raise last_exception
         if last_exception and not error_accumulator.has_errors():
             raise last_exception
 
-        # Return error response
-        return error_accumulator.build_client_error_response()
+        error_response = error_accumulator.build_client_error_response()
+        error_type = str(error_response.get("error", {}).get("type") or "proxy_all_credentials_exhausted")
+        raise StructuredAPIResponseError(
+            str(error_response.get("error", {}).get("message") or "All credentials exhausted"),
+            error_type=error_type,
+            status_code=504 if error_accumulator.timeout_occurred else 503,
+            response=error_response,
+        )
 
     async def _execute_streaming(
         self,
@@ -742,6 +1520,7 @@ class RequestExecutor:
         provider = context.provider
         model = context.model
         deadline = context.deadline
+        client_protocol_context: Optional[ProtocolContext] = None
 
         try:
             (
@@ -758,8 +1537,8 @@ class RequestExecutor:
                     "type": "proxy_error",
                 }
             }
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            for line in self._terminal_stream_error_lines(context, error_data):
+                yield line
             return
 
         error_accumulator = RequestErrorAccumulator()
@@ -768,6 +1547,7 @@ class RequestExecutor:
 
         retry_state = RetryState()
         last_exception: Optional[Exception] = None
+        last_stream_error_payload: Optional[Dict[str, Any]] = None
 
         try:
             while time.time() < deadline:
@@ -785,7 +1565,7 @@ class RequestExecutor:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
-                await self._wait_for_cooldown(provider, deadline)
+                await self._wait_for_cooldown(provider, deadline, model=model, context=context)
 
                 # Acquire credential using context manager
                 try:
@@ -814,27 +1594,39 @@ class RequestExecutor:
                         self._log_acquired_credential(
                             cred, model, state, quota_group, availability, usage_manager
                         )
+                        plugin = self._get_plugin_instance(provider)
+                        native_execution = _attempt_uses_native_protocol(plugin, model, context)
 
                         try:
                             # Prepare request kwargs
                             kwargs = await self._prepare_request_kwargs(
-                                provider, model, cred, context
+                                provider,
+                                model,
+                                cred,
+                                context,
+                                credential_id=cred_context.stable_id,
+                                native_execution=native_execution,
                             )
 
                             # Log transformed request if it differs from original
                             if context.transaction_logger:
                                 context.transaction_logger.log_transformed_request(
-                                    kwargs, context.kwargs
+                                    kwargs,
+                                    context.kwargs,
+                                    credential_id=cred_context.stable_id,
+                                    metadata={
+                                        "session_id": context.session_id,
+                                        "scope_key": context.usage_manager_key,
+                                        "classifier": context.classifier,
+                                    },
                                 )
 
                             # Add stream usage metadata for active providers.
-                            if "stream_options" not in kwargs:
+                            if not native_execution and "stream_options" not in kwargs:
                                 kwargs["stream_options"] = {}
-                            if "include_usage" not in kwargs["stream_options"]:
+                            if not native_execution and "include_usage" not in kwargs["stream_options"]:
                                 kwargs["stream_options"]["include_usage"] = True
 
-                            # Get provider plugin
-                            plugin = self._get_plugin_instance(provider)
                             skip_cost_calculation = bool(
                                 plugin
                                 and getattr(plugin, "skip_cost_calculation", False)
@@ -843,6 +1635,7 @@ class RequestExecutor:
                             # Execute request with retries
                             for attempt in range(self._max_retries):
                                 last_streamed_chunk: Optional[str] = None
+                                stream_visible_output_emitted = False
 
                                 try:
                                     lib_logger.info(
@@ -853,20 +1646,94 @@ class RequestExecutor:
                                     await self._run_pre_request_callback(
                                         context, kwargs
                                     )
+                                    target = _current_route_target(context)
+                                    execution = target.execution if target else "auto"
+                                    stream_provider_protocol = "openai_chat"
 
-                                    # Make the API call
-                                    if plugin and plugin.has_custom_logic():
+                                    # Make the API call. Keep execution-mode precedence aligned with
+                                    # the non-streaming path: explicit LiteLLM wins, explicit custom
+                                    # requires custom logic, explicit native fails closed, and auto
+                                    # prefers custom before native streaming.
+                                    if execution == "litellm_fallback":
+                                        kwargs["api_key"] = credential_secret
+                                        kwargs["stream"] = True
+                                        self._apply_litellm_logger(kwargs)
+                                        kwargs.pop("transaction_context", None)
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "litellm_stream", "provider": provider, "model": model},
+                                        )
+                                        stream = await litellm.acompletion(**kwargs)
+                                    elif execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
+                                        if not plugin or not plugin.has_custom_logic():
+                                            raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
                                         kwargs["credential_identifier"] = credential_secret
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "custom_stream", "provider": provider, "model": model},
+                                        )
                                         stream = await plugin.acompletion(
                                             self._http_client, **kwargs
                                         )
+                                    elif _should_use_native_streaming(plugin, model, target, execution, provider):
+                                        native_context, native_request = self._build_native_provider_context(
+                                            provider,
+                                            model,
+                                            plugin,
+                                            credential_secret,
+                                            cred_context.stable_id,
+                                            context,
+                                            target,
+                                            raw_request=kwargs,
+                                            transport="sse",
+                                            stream=True,
+                                            return_request=True,
+                                        )
+                                        self._log_routing_trace(
+                                            context,
+                                            "routing_native_stream_execution_selected",
+                                            _target_trace(target) if target else {"provider": provider, "model": model},
+                                            metadata={"protocol": native_context.protocol_name, "operation": native_context.operation},
+                                        )
+                                        stream = self._get_native_executor().stream(native_request, native_context, NativeHTTPTransport(self._http_client))
+                                        stream_provider_protocol = native_context.protocol_name
                                     else:
                                         kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
                                         # Remove internal context before litellm call
                                         kwargs.pop("transaction_context", None)
+                                        self._log_executor_trace(
+                                            context,
+                                            "provider_execution_request",
+                                            kwargs,
+                                            direction="request",
+                                            stage="provider",
+                                            credential_id=cred_context.stable_id,
+                                            metadata={"execution": "litellm_stream", "provider": provider, "model": model},
+                                        )
                                         stream = await litellm.acompletion(**kwargs)
+
+                                    self._log_executor_trace(
+                                        context,
+                                        "provider_stream_opened",
+                                        {"stream_type": f"{type(stream).__module__}.{type(stream).__name__}"},
+                                        direction="response",
+                                        stage="provider",
+                                        credential_id=cred_context.stable_id,
+                                        metadata={"provider": provider, "model": model},
+                                        snapshot=False,
+                                    )
 
                                     # Hand off to streaming handler with cred_context
                                     # The handler will call mark_success on completion
@@ -880,6 +1747,31 @@ class RequestExecutor:
                                         response_callback=lambda response: self._record_session_response(
                                             context, response
                                         ),
+                                        success_callback=lambda: self._clear_failure_history_on_success(provider, model),
+                                        transaction_logger=context.transaction_logger,
+                                    )
+                                    if client_protocol_context is None:
+                                        client_protocol_context = ProtocolContext(
+                                            provider=provider,
+                                            model=model,
+                                            source_protocol="openai_chat",
+                                            target_protocol=context.output_protocol_name,
+                                            input_protocol=context.input_protocol_name,
+                                            provider_protocol=stream_provider_protocol,
+                                            output_protocol=context.output_protocol_name,
+                                            source_provider=provider,
+                                            target_provider=None,
+                                            provider_state_compatible=False,
+                                            request_id=getattr(context, "request_id", None),
+                                            session_id=context.session_id,
+                                            credential_stable_id=cred_context.stable_id,
+                                            transport="sse",
+                                        )
+                                    client_stream = convert_protocol_stream(
+                                        base_stream,
+                                        source_protocol=get_protocol("openai_chat"),
+                                        output_protocol=get_protocol(context.output_protocol_name),
+                                        context=client_protocol_context,
                                     )
 
                                     lib_logger.info(
@@ -892,15 +1784,23 @@ class RequestExecutor:
                                         async for (
                                             chunk
                                         ) in self._transaction_logging_stream_wrapper(
-                                            base_stream,
+                                            client_stream,
                                             context.transaction_logger,
                                             context.kwargs,
+                                            context=context,
+                                            plugin=plugin,
                                         ):
-                                            last_streamed_chunk = chunk
+                                            if not is_stream_heartbeat_or_comment(chunk):
+                                                last_streamed_chunk = chunk
+                                            if _stream_chunk_is_visible_output(chunk):
+                                                stream_visible_output_emitted = True
                                             yield chunk
                                     else:
-                                        async for chunk in base_stream:
-                                            last_streamed_chunk = chunk
+                                        async for chunk in client_stream:
+                                            if not is_stream_heartbeat_or_comment(chunk):
+                                                last_streamed_chunk = chunk
+                                            if _stream_chunk_is_visible_output(chunk):
+                                                stream_visible_output_emitted = True
                                             yield chunk
                                     return
 
@@ -908,6 +1808,12 @@ class RequestExecutor:
                                     last_exception = e
                                     original = getattr(e, "data", e)
                                     classified = classify_error(original, provider)
+                                    last_stream_error_payload = _streamed_error_payload(e, classified)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
+                                    ):
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=original)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -934,8 +1840,8 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            yield f"data: {json.dumps(error_data)}\n\n"
-                                            yield "data: [DONE]\n\n"
+                                            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                                yield line
                                             return
                                     else:
                                         retry_state.reset_quota_failures()
@@ -944,19 +1850,11 @@ class RequestExecutor:
                                         cred_context.mark_failure(classified)
                                         raise
 
-                                    if not can_retry_stream_after_error(
-                                        last_streamed_chunk,
-                                        self._stream_retry_on_reasoning_only_enabled(),
-                                    ):
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
-                                        error_data = {
-                                            "error": {
-                                                "message": "Upstream stream failed after output began",
-                                                "type": classified.error_type,
-                                            }
-                                        }
-                                        yield f"data: {json.dumps(error_data)}\n\n"
-                                        yield "data: [DONE]\n\n"
+                                        error_data = _streamed_error_payload(e, classified)
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                            yield line
                                         return
 
                                     small_cooldown_threshold = int(
@@ -993,6 +1891,11 @@ class RequestExecutor:
                                 except (RateLimitError, httpx.HTTPStatusError) as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
+                                    ):
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1019,8 +1922,8 @@ class RequestExecutor:
                                                     "type": "quota_exhausted",
                                                 }
                                             }
-                                            yield f"data: {json.dumps(error_data)}\n\n"
-                                            yield "data: [DONE]\n\n"
+                                            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                                yield line
                                             return
                                     else:
                                         retry_state.reset_quota_failures()
@@ -1028,6 +1931,13 @@ class RequestExecutor:
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
+
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                            yield line
+                                        return
 
                                     # Check for small cooldown - retry same key instead of rotating
                                     small_cooldown_threshold = int(
@@ -1068,6 +1978,11 @@ class RequestExecutor:
                                 ) as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
+                                    ):
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1075,6 +1990,13 @@ class RequestExecutor:
                                         error=e,
                                         request_headers=request_headers,
                                     )
+
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                            yield line
+                                        return
 
                                     if attempt >= self._max_retries - 1:
                                         error_accumulator.record_error(
@@ -1101,9 +2023,35 @@ class RequestExecutor:
 
                                     continue  # Retry
 
+                                except RoutingExecutionError as e:
+                                    if e.error_type == "configuration_error":
+                                        raise
+                                    last_exception = e
+                                    classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(last_streamed_chunk, emitted_output=stream_visible_output_emitted):
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
+                                    log_failure(api_key=cred, model=model, attempt=attempt + 1, error=e, request_headers=request_headers)
+                                    error_accumulator.record_error(cred, classified, str(e)[:150])
+                                    if not should_rotate_on_error(classified):
+                                        cred_context.mark_failure(classified)
+                                        raise
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                            yield line
+                                        return
+                                    cred_context.mark_failure(classified)
+                                    break
+
                                 except Exception as e:
                                     last_exception = e
                                     classified = classify_error(e, provider)
+                                    if _can_start_stream_provider_cooldown(
+                                        last_streamed_chunk,
+                                        emitted_output=stream_visible_output_emitted,
+                                    ):
+                                        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=e)
                                     log_failure(
                                         api_key=cred,
                                         model=model,
@@ -1118,6 +2066,13 @@ class RequestExecutor:
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
                                         raise
+
+                                    if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
+                                        cred_context.mark_failure(classified)
+                                        error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
+                                        for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                                            yield line
+                                        return
 
                                     small_cooldown_threshold = int(
                                         os.environ.get(
@@ -1152,6 +2107,9 @@ class RequestExecutor:
 
                         except PreRequestCallbackError:
                             raise
+                        except RoutingExecutionError as exc:
+                            if exc.error_type == "configuration_error":
+                                raise
                         except Exception:
                             # Let context manager handle cleanup
                             pass
@@ -1162,20 +2120,23 @@ class RequestExecutor:
             # All credentials exhausted or timeout
             error_accumulator.timeout_occurred = time.time() >= deadline
             error_data = error_accumulator.build_client_error_response()
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            if last_stream_error_payload:
+                _merge_stream_error_details(error_data, last_stream_error_payload)
+            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                yield line
 
         except NoAvailableKeysError as e:
             lib_logger.error(f"No keys available: {e}")
             error_data = {"error": {"message": str(e), "type": "proxy_busy"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                yield line
 
         except Exception as e:
             lib_logger.error(f"Unhandled exception in streaming: {e}", exc_info=True)
-            error_data = {"error": {"message": str(e), "type": "proxy_internal_error"}}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            classified = classify_error(e, context.provider)
+            error_data = {"error": {"message": "Streaming request failed", "type": classified.error_type, "details": {"status_code": classified.status_code}}}
+            for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
+                yield line
 
     def _apply_litellm_provider_params(
         self, provider: str, kwargs: Dict[str, Any]
@@ -1209,9 +2170,12 @@ class RequestExecutor:
         self,
         provider: str,
         deadline: float,
+        *,
+        model: Optional[str] = None,
+        context: Optional[RequestContext] = None,
     ) -> None:
         """
-        Wait for provider-level cooldown to end.
+        Wait for provider/model cooldown to end.
 
         Args:
             provider: Provider name
@@ -1220,15 +2184,31 @@ class RequestExecutor:
         if not self._cooldown:
             return
 
-        remaining = await self._cooldown.get_remaining_cooldown(provider)
+        if hasattr(self._cooldown, "get_max_remaining"):
+            remaining = await self._cooldown.get_max_remaining(provider, model=model)
+        else:
+            remaining = await self._cooldown.get_remaining_cooldown(provider)
         if remaining > 0:
             budget = deadline - time.time()
             if remaining > budget:
                 lib_logger.warning(
                     f"Provider {provider} cooldown ({remaining:.1f}s) exceeds budget ({budget:.1f}s)"
                 )
-                return  # Will fail on no keys available
+                self._log_provider_cooldown_trace(
+                    context,
+                    "cooldown_wait_exceeds_budget",
+                    provider,
+                    ClassifiedError(error_type="rate_limit", original_exception=RuntimeError("cooldown exceeds budget"), retry_after=int(remaining)),
+                    int(remaining),
+                    "cooldown_exceeds_budget",
+                    model=model,
+                )
+                raise RoutingExecutionError(
+                    f"Provider {provider} cooldown exceeds request budget",
+                    error_type="rate_limit",
+                )
             lib_logger.info(f"Waiting {remaining:.1f}s for {provider} cooldown")
+            self._log_cooldown_wait_trace(context, provider, model, remaining)
             await asyncio.sleep(remaining)
 
     async def _handle_error_with_context(
@@ -1241,6 +2221,7 @@ class RequestExecutor:
         error_accumulator: RequestErrorAccumulator,
         retry_state: RetryState,
         request_headers: Dict[str, Any],
+        context: Optional[RequestContext] = None,
     ) -> str:
         """
         Handle an error and determine next action.
@@ -1289,6 +2270,8 @@ class RequestExecutor:
             cred_context.mark_failure(classified)
             return ErrorAction.FAIL
 
+        await self._maybe_start_provider_cooldown(provider, classified, context=context, model=model, original_error=error)
+
         # Check if should retry same key (including small cooldown auto-retry)
         small_cooldown_threshold = int(
             os.environ.get(
@@ -1334,6 +2317,135 @@ class RequestExecutor:
         )
         return ErrorAction.ROTATE
 
+    async def _maybe_start_provider_cooldown(
+        self,
+        provider: str,
+        classified: ClassifiedError,
+        *,
+        context: Optional[RequestContext],
+        model: Optional[str] = None,
+        original_error: Any = None,
+    ) -> None:
+        """Start provider-wide cooldown for large provider-level throttles.
+
+        This is intentionally conservative: small retry-after values stay on the
+        same credential path, and quota cooldown is disabled by default because
+        most quota errors are per credential or account.
+        """
+
+        if not self._cooldown:
+            return
+        small_cooldown_threshold = int(
+            os.environ.get(
+                "SMALL_COOLDOWN_RETRY_THRESHOLD", DEFAULT_SMALL_COOLDOWN_RETRY_THRESHOLD
+            )
+        )
+        min_seconds, default_seconds, cooldown_on_quota = provider_cooldown_env()
+        decision = decide_provider_cooldown(
+            classified,
+            small_cooldown_threshold=small_cooldown_threshold,
+            provider_cooldown_min_seconds=min_seconds,
+            default_duration=default_seconds,
+            cooldown_on_quota=cooldown_on_quota,
+            provider=provider,
+            model=model,
+            original_error=original_error,
+            failure_history=getattr(self, "_failure_history", None),
+        )
+        if not decision.should_start:
+            if decision.reason == "transient_backoff_threshold_not_met" and classified.error_type in {"server_error", "api_connection"}:
+                history = getattr(self, "_failure_history", None)
+                if history is not None:
+                    history.record(provider=provider, model=decision.model, error_type=classified.error_type, scope=decision.scope, duration=0, reason=decision.reason)
+            self._log_provider_cooldown_trace(
+                context,
+                "provider_cooldown_skipped",
+                provider,
+                classified,
+                decision.duration,
+                decision.reason,
+                scope=decision.scope,
+                model=decision.model,
+                backoff_level=decision.backoff_level,
+            )
+            return
+        try:
+            if hasattr(self._cooldown, "start_scoped_cooldown"):
+                await self._cooldown.start_scoped_cooldown(provider, decision.duration, model=decision.model, scope=decision.scope, reason=decision.reason)
+            else:
+                await self._cooldown.start_cooldown(provider, decision.duration)
+            history = getattr(self, "_failure_history", None)
+            if history is not None:
+                history.record(provider=provider, model=decision.model, error_type=classified.error_type, scope=decision.scope, duration=decision.duration, reason=decision.reason)
+            self._log_provider_cooldown_trace(
+                context,
+                "provider_cooldown_started",
+                provider,
+                classified,
+                decision.duration,
+                decision.reason,
+                scope=decision.scope,
+                model=decision.model,
+                backoff_level=decision.backoff_level,
+            )
+        except Exception as exc:
+            lib_logger.debug("Failed to start provider cooldown for %s: %s", provider, exc)
+
+    def _clear_failure_history_on_success(self, provider: str, model: Optional[str]) -> None:
+        """Clear transient failure history after a successful provider/model call."""
+
+        history = getattr(self, "_failure_history", None)
+        if history is not None and hasattr(history, "clear"):
+            history.clear(provider=provider, model=model)
+
+    @staticmethod
+    def _log_provider_cooldown_trace(
+        context: Optional[RequestContext],
+        pass_name: str,
+        provider: str,
+        classified: ClassifiedError,
+        duration: int,
+        reason: str,
+        *,
+        scope: str = "provider",
+        model: Optional[str] = None,
+        backoff_level: int = 0,
+    ) -> None:
+        if not context or not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            pass_name,
+            {"provider": provider, "model": model, "scope": scope, "error_type": classified.error_type, "duration": duration},
+            direction="metadata",
+            stage="retry",
+            metadata={
+                "provider": provider,
+                "duration": duration,
+                "scope": scope,
+                "model": model,
+                "backoff_level": backoff_level,
+                "error_type": classified.error_type,
+                "retry_after_present": classified.retry_after is not None,
+                "reason": reason,
+            },
+            snapshot=False,
+        )
+
+    @staticmethod
+    def _log_cooldown_wait_trace(context: Optional[RequestContext], provider: str, model: Optional[str], remaining: float) -> None:
+        """Trace cooldown waits without exposing credentials or payloads."""
+
+        if not context or not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            "cooldown_wait",
+            {"provider": provider, "model": model, "remaining": remaining},
+            direction="metadata",
+            stage="retry",
+            metadata={"provider": provider, "model": model, "remaining": remaining},
+            snapshot=False,
+        )
+
     def _record_session_response(self, context: RequestContext, response: Any) -> None:
         """Let the tracker learn anchors emitted by a successful response.
 
@@ -1348,7 +2460,7 @@ class RequestExecutor:
                 context.session_id,
                 provider=context.provider,
                 model=context.model,
-                scope_key=context.usage_manager_key,
+                scope_key=context.session_isolation_key,
                 tracking_namespace=context.session_tracking_namespace,
                 response=response,
             )
@@ -1377,8 +2489,10 @@ class RequestExecutor:
         provider: str,
         model: str,
         kwargs: Dict[str, Any],
+        *,
+        plugin: Any = None,
     ) -> None:
-        plugin = self._get_plugin_instance(provider)
+        plugin = plugin or self._get_plugin_instance(provider)
         if not plugin or not hasattr(plugin, "validate_request"):
             return
 
@@ -1390,60 +2504,52 @@ class RequestExecutor:
         if isinstance(result, str):
             raise ValueError(result)
 
-    def _extract_usage_tokens(self, response: Any) -> tuple[int, int, int, int, int]:
-        prompt_tokens = 0
-        completion_tokens = 0
-        cached_tokens = 0
-        cache_write_tokens = 0
-        thinking_tokens = 0
+    def _account_for_response_usage(
+        self,
+        provider: str,
+        model: str,
+        response: Any,
+        context: RequestContext,
+    ) -> tuple[UsageRecord, CostBreakdown]:
+        """Normalize usage and advisory cost for one successful response."""
 
-        if hasattr(response, "usage") and response.usage:
-            prompt_tokens = getattr(response.usage, "prompt_tokens", 0) or 0
-            completion_tokens = getattr(response.usage, "completion_tokens", 0) or 0
+        usage_record = extract_usage_record(
+            response,
+            provider=provider,
+            model=model,
+            source="executor_response",
+        )
+        plugin = self._get_plugin_instance(provider)
+        cost_breakdown = CostCalculator(provider_plugin=plugin).calculate(
+            usage_record,
+            model=model,
+            response=response,
+        )
+        self._trace_usage_accounting(context, usage_record, cost_breakdown)
+        return usage_record, cost_breakdown
 
-            prompt_details = getattr(response.usage, "prompt_tokens_details", None)
-            if prompt_details:
-                if isinstance(prompt_details, dict):
-                    cached_tokens = prompt_details.get("cached_tokens", 0) or 0
-                    cache_write_tokens = (
-                        prompt_details.get("cache_creation_tokens", 0) or 0
-                    )
-                else:
-                    cached_tokens = getattr(prompt_details, "cached_tokens", 0) or 0
-                    cache_write_tokens = (
-                        getattr(prompt_details, "cache_creation_tokens", 0) or 0
-                    )
+    @staticmethod
+    def _trace_usage_accounting(
+        context: RequestContext,
+        usage_record: UsageRecord,
+        cost_breakdown: CostBreakdown,
+    ) -> None:
+        """Record normalized usage/cost trace data without affecting requests."""
 
-            completion_details = getattr(
-                response.usage, "completion_tokens_details", None
-            )
-            if completion_details:
-                if isinstance(completion_details, dict):
-                    thinking_tokens = completion_details.get("reasoning_tokens", 0) or 0
-                else:
-                    thinking_tokens = (
-                        getattr(completion_details, "reasoning_tokens", 0) or 0
-                    )
-
-            cache_read_tokens = getattr(response.usage, "cache_read_tokens", None)
-            if cache_read_tokens is not None:
-                cached_tokens = cache_read_tokens or 0
-            cache_creation_tokens = getattr(
-                response.usage, "cache_creation_tokens", None
-            )
-            if cache_creation_tokens is not None:
-                cache_write_tokens = cache_creation_tokens or 0
-
-            if thinking_tokens and completion_tokens >= thinking_tokens:
-                completion_tokens = completion_tokens - thinking_tokens
-
-        uncached_prompt = max(0, prompt_tokens - cached_tokens)
-        return (
-            uncached_prompt,
-            completion_tokens,
-            cached_tokens,
-            cache_write_tokens,
-            thinking_tokens,
+        if not context.transaction_logger:
+            return
+        context.transaction_logger.log_transform_pass(
+            "usage_accounting_summary",
+            {"usage": usage_record.to_dict(), "cost": cost_breakdown.to_dict()},
+            direction="metadata",
+            stage="final",
+            metadata={
+                "provider": usage_record.provider,
+                "model": usage_record.model,
+                "source": usage_record.source,
+                "pricing_source": cost_breakdown.pricing_source,
+            },
+            snapshot=False,
         )
 
     @staticmethod
@@ -1453,39 +2559,22 @@ class RequestExecutor:
 
         Delegates to normalize_usage_for_response which handles both
         dicts (streaming) and pydantic objects (non-streaming).
-        Internal tracking values from _extract_usage_tokens are unaffected.
+        Internal tracking values from UsageRecord accounting are unaffected.
         """
-        if hasattr(response, "usage") and response.usage:
+        if isinstance(response, dict):
+            normalize_usage_for_response(response.get("usage"), model)
+        elif hasattr(response, "usage") and response.usage:
             normalize_usage_for_response(response.usage, model)
         return response
-
-    def _calculate_cost(self, provider: str, model: str, response: Any) -> float:
-        plugin = self._get_plugin_instance(provider)
-        if plugin and getattr(plugin, "skip_cost_calculation", False):
-            return 0.0
-
-        try:
-            if isinstance(response, litellm.EmbeddingResponse):
-                model_info = litellm.get_model_info(model)
-                input_cost = model_info.get("input_cost_per_token")
-                if input_cost:
-                    return (response.usage.prompt_tokens or 0) * input_cost
-                return 0.0
-
-            cost = litellm.completion_cost(
-                completion_response=response,
-                model=model,
-            )
-            return float(cost) if cost is not None else 0.0
-        except Exception as exc:
-            lib_logger.debug(f"Cost calculation failed for {model}: {exc}")
-            return 0.0
 
     async def _transaction_logging_stream_wrapper(
         self,
         stream: AsyncGenerator[str, None],
         transaction_logger: TransactionLogger,
         request_kwargs: Dict[str, Any],
+        *,
+        context: Optional[RequestContext] = None,
+        plugin: Any = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a stream to log chunks and final response to TransactionLogger.
@@ -1503,6 +2592,29 @@ class RequestExecutor:
         chunks = []
 
         async for sse_line in stream:
+            trace_sse_line = _redact_stream_sse_for_trace(
+                sse_line,
+                context,
+                plugin,
+                config=getattr(self, "_experimental_config", None),
+            )
+            transaction_logger.log_transform_pass(
+                "raw_stream_chunk",
+                trace_sse_line,
+                direction="stream",
+                stage="client",
+                transport="sse",
+                snapshot=False,
+            )
+            if sse_line.startswith("data: [DONE]"):
+                transaction_logger.log_transform_pass(
+                    "stream_done_event",
+                    {"raw": trace_sse_line},
+                    direction="stream",
+                    stage="final",
+                    transport="sse",
+                    snapshot=False,
+                )
             yield sse_line
 
             # Parse and accumulate for final logging
@@ -1514,7 +2626,23 @@ class RequestExecutor:
                     if content:
                         chunk_data = json.loads(content)
                         chunks.append(chunk_data)
-                        transaction_logger.log_stream_chunk(chunk_data)
+                        trace_chunk_data = _redact_context_field_cache_paths(
+                            chunk_data,
+                            context,
+                            "stream",
+                            plugin,
+                            config=getattr(self, "_experimental_config", None),
+                        ) if context else chunk_data
+                        transaction_logger.log_stream_chunk(trace_chunk_data)
+                        if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
+                            transaction_logger.log_transform_pass(
+                                "stream_error_event",
+                                trace_chunk_data,
+                                direction="stream",
+                                stage="client",
+                                transport="sse",
+                                snapshot=False,
+                            )
                 except json.JSONDecodeError:
                     lib_logger.debug(
                         f"Failed to parse chunk for logging: {sse_line[:100]}"
@@ -1524,8 +2652,819 @@ class RequestExecutor:
         if chunks:
             try:
                 final_response = TransactionLogger.assemble_streaming_response(chunks)
-                transaction_logger.log_response(final_response)
+                trace_final_response = _redact_context_field_cache_paths(
+                    final_response,
+                    context,
+                    "stream",
+                    plugin,
+                    config=getattr(self, "_experimental_config", None),
+                ) if context else final_response
+                transaction_logger.log_transform_pass(
+                    "assembled_stream_response",
+                    trace_final_response,
+                    direction="response",
+                    stage="client",
+                    transport="sse",
+                )
+                transaction_logger.log_response(trace_final_response)
             except Exception as e:
                 lib_logger.debug(
                     f"Failed to assemble/log final streaming response: {e}"
                 )
+
+
+def _target_trace(target: RouteTarget) -> Dict[str, Any]:
+    """Return non-secret route target metadata for transaction traces."""
+
+    return {
+        "name": target.name,
+        "provider": target.provider,
+        "model": target.prefixed_model,
+        "execution": target.execution,
+        "protocol": target.protocol,
+    }
+
+
+def _merge_canonical_sequence(
+    original: list[Any],
+    baseline: list[Any],
+    attempted: list[Any],
+    merge_item: Any,
+    identity: Any,
+) -> list[Any]:
+    """Apply Chat-view edits while retaining source-native item metadata."""
+
+    if len(original) == len(baseline) == len(attempted):
+        return [
+            deepcopy(source) if before == after else merge_item(source, before, after)
+            for source, before, after in zip(original, baseline, attempted)
+        ]
+    merged: list[Any] = []
+    unused = set(range(min(len(original), len(baseline))))
+    for index, after in enumerate(attempted):
+        exact = next((position for position in unused if baseline[position] == after), None)
+        if exact is not None:
+            merged.append(deepcopy(original[exact]))
+            unused.remove(exact)
+            continue
+        if index in unused and identity(baseline[index]) == identity(after):
+            merged.append(merge_item(original[index], baseline[index], after))
+            unused.remove(index)
+            continue
+        merged.append(_without_source_artifacts(after))
+    return merged
+
+
+def _merge_canonical_message(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original.role != baseline.role or baseline.role != attempted.role:
+        return _without_source_artifacts(attempted)
+    merged = deepcopy(original)
+    for field_name in ("role", "name", "tool_call_id"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+    if baseline.content != attempted.content:
+        merged.content = _merge_canonical_sequence(
+            original.content,
+            baseline.content,
+            attempted.content,
+            _merge_canonical_content_block,
+            lambda block: block.type,
+        )
+    if baseline.tool_calls != attempted.tool_calls:
+        merged.tool_calls = _merge_canonical_sequence(
+            original.tool_calls,
+            baseline.tool_calls,
+            attempted.tool_calls,
+            _merge_canonical_tool_call,
+            lambda call: (call.type, call.id, call.name),
+        )
+    if baseline.reasoning != attempted.reasoning:
+        merged.reasoning = deepcopy(attempted.reasoning)
+    return merged
+
+
+def _merge_canonical_content_block(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original.type != baseline.type or baseline.type != attempted.type:
+        return _without_source_artifacts(attempted)
+    merged = deepcopy(original)
+    for field_name in ("type", "text", "source"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+    if baseline.tool_call != attempted.tool_call:
+        merged.tool_call = (
+            _merge_canonical_tool_call(original.tool_call, baseline.tool_call, attempted.tool_call)
+            if original.tool_call and baseline.tool_call and attempted.tool_call
+            else deepcopy(attempted.tool_call)
+        )
+    if baseline.tool_result != attempted.tool_result:
+        merged.tool_result = deepcopy(attempted.tool_result)
+    if baseline.reasoning != attempted.reasoning:
+        merged.reasoning = deepcopy(attempted.reasoning)
+    return merged
+
+
+def _merge_canonical_tool_call(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original is None or baseline is None or attempted is None:
+        return deepcopy(attempted)
+    merged = deepcopy(original)
+    changed = False
+    for field_name in ("type", "id", "name", "arguments", "index"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+            changed = True
+    if changed:
+        merged.raw = None
+        merged.extra = {}
+    return merged
+
+
+def _merge_canonical_tool(original: Any, baseline: Any, attempted: Any) -> Any:
+    if original.type != baseline.type or baseline.type != attempted.type:
+        return _without_source_artifacts(attempted)
+    merged = deepcopy(original)
+    for field_name in ("type", "name", "description", "input_schema"):
+        if getattr(baseline, field_name) != getattr(attempted, field_name):
+            setattr(merged, field_name, deepcopy(getattr(attempted, field_name)))
+    return merged
+
+
+def _without_source_artifacts(value: Any) -> Any:
+    """Copy a callback-created canonical value without Chat wire fragments."""
+
+    copied = deepcopy(value)
+    if hasattr(copied, "raw"):
+        copied.raw = None
+    if hasattr(copied, "extra"):
+        copied.extra = {}
+    if hasattr(copied, "content") and isinstance(copied.content, list):
+        copied.content = [_without_source_artifacts(item) for item in copied.content]
+    if hasattr(copied, "tool_calls") and isinstance(copied.tool_calls, list):
+        copied.tool_calls = [_without_source_artifacts(item) for item in copied.tool_calls]
+    return copied
+
+
+def _current_route_target(context: RequestContext) -> Optional[RouteTarget]:
+    """Return the currently selected route target from context metadata."""
+
+    targets = tuple(context.routing_targets or ())
+    if not targets:
+        return None
+    if context.routing_target_index < 0 or context.routing_target_index >= len(targets):
+        return None
+    return targets[context.routing_target_index]
+
+
+def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget]) -> Optional[str]:
+    """Resolve native protocol from target override or provider declaration."""
+
+    if target and target.protocol:
+        return target.protocol
+    if plugin and hasattr(plugin, "get_protocol_name"):
+        return plugin.get_protocol_name(model)
+    return None
+
+
+def _should_use_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], kwargs: Dict[str, Any], *, stream: bool, execution: str) -> bool:
+    """Return whether auto routing should use provider-native execution."""
+
+    protocol_name = _provider_native_protocol(plugin, model, target)
+    if not plugin or not protocol_name:
+        return False
+    native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
+    operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+    hook = getattr(plugin, "should_use_native_protocol", None)
+    if callable(hook):
+        return bool(hook(model=native_model, operation=operation, stream=stream, execution=execution))
+    support = getattr(plugin, "supports_native_operation", None)
+    return bool(support(native_model, operation) if callable(support) else True)
+
+
+def _strip_provider_prefix(model: str) -> str:
+    """Return model without the proxy-facing provider prefix."""
+
+    return model.split("/", 1)[1] if "/" in model else model
+
+
+def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
+    """Return whether a provider declares native streaming support."""
+
+    support = getattr(plugin, "supports_native_streaming", None)
+    if not callable(support):
+        return False
+    operation = "chat"
+    resolver = getattr(plugin, "get_native_operation", None)
+    if callable(resolver):
+        try:
+            operation = resolver(model, None, stream=True)
+        except TypeError:
+            try:
+                operation = resolver(model)
+            except Exception:
+                return False
+        except Exception:
+            return False
+    return native_provider_supports_streaming(plugin, model=model, operation=operation)
+
+
+def _should_use_native_streaming(plugin: Any, model: str, target: Optional[RouteTarget], execution: str, provider: str) -> bool:
+    """Return whether streaming may use the native executor.
+
+    Explicit `@native` routing is still constrained by provider capability.
+    Falling through to native streaming when a provider has not opted in is unsafe
+    because the generic stream wrapper currently expects LiteLLM-shaped chunks.
+    """
+
+    if execution == "native":
+        if _provider_supports_native_streaming(plugin, model):
+            return True
+        raise RoutingExecutionError(
+            f"Provider {provider} does not support native streaming for {model}",
+            error_type="configuration_error",
+        )
+    if execution != "auto" or not plugin:
+        return False
+    if not _should_use_native_protocol(plugin, model, target, {"model": model, "stream": True}, stream=True, execution=execution):
+        return False
+    return _provider_supports_native_streaming(plugin, model)
+
+
+def _redact_context_field_cache_paths(
+    payload: Any,
+    context: RequestContext,
+    direction: str,
+    plugin: Any,
+    *,
+    config: Any = None,
+) -> Any:
+    """Redact configured field-cache paths before executor-level traces.
+
+    Native provider execution already redacts its internal trace passes. The
+    client executor also logs returned responses, so it must apply the same
+    rule-aware redaction there without mutating the client-facing response.
+    """
+
+    if direction not in {"response", "stream"} or not plugin or not _provider_native_protocol(plugin, context.model, _current_route_target(context)):
+        return payload
+    try:
+        rules = _merged_field_cache_rules(
+            context.provider,
+            context.model,
+            plugin,
+            config=config,
+        )
+    except RoutingExecutionError:
+        raise
+    except Exception:
+        return payload
+    if not rules:
+        return payload
+    redacted = deepcopy(payload)
+    for rule in rules:
+        if direction == "response" and getattr(rule, "source", None) not in {"response", "unified_response"}:
+            continue
+        if direction == "stream" and getattr(rule, "source", None) not in {"stream_event", "unified_stream_event", "response", "unified_response"}:
+            continue
+        for path in _trace_redaction_paths((rule.path,), direction=direction):
+            try:
+                tokens = parse_path(path)
+                _redact_trace_path(redacted, tokens)
+                _redact_trace_leaf_key(redacted, tokens)
+            except (FieldCachePathError, TypeError, ValueError):
+                continue
+    return redacted
+
+
+def _trace_redaction_paths(paths: tuple[str, ...] | list[str], *, direction: str) -> list[str]:
+    """Return configured paths plus raw-stream envelope fallbacks for traces."""
+
+    expanded: list[str] = []
+    for path in paths:
+        expanded.append(path)
+        if direction == "stream" and path.startswith("raw."):
+            expanded.append(path[4:])
+    return expanded
+
+
+def _redact_stream_sse_for_trace(
+    sse_line: str,
+    context: Optional[RequestContext],
+    plugin: Any,
+    *,
+    config: Any = None,
+) -> str:
+    """Return a trace-only SSE line with configured native cache paths redacted."""
+
+    if not context or not isinstance(sse_line, str) or not sse_line.startswith("data: ") or sse_line.startswith("data: [DONE]"):
+        return sse_line
+    try:
+        payload = json.loads(sse_line[6:].strip())
+    except json.JSONDecodeError:
+        return sse_line
+    redacted = _redact_context_field_cache_paths(
+        payload,
+        context,
+        "stream",
+        plugin,
+        config=config,
+    )
+    if redacted is payload:
+        return sse_line
+    return f"data: {json.dumps(redacted, separators=(',', ':'))}\n\n"
+
+
+def _redact_trace_path(value: Any, tokens: tuple[PathToken, ...]) -> None:
+    if not tokens:
+        return
+    token = tokens[0]
+    rest = tokens[1:]
+    if token.kind == "key":
+        if isinstance(value, dict) and token.value in value:
+            if rest:
+                _redact_trace_path(value[token.value], rest)
+            else:
+                value[token.value] = REDACTED
+        return
+    if token.kind == "index":
+        if isinstance(value, list) and value:
+            index = int(token.value)
+            if -len(value) <= index < len(value):
+                if rest:
+                    _redact_trace_path(value[index], rest)
+                else:
+                    value[index] = REDACTED
+        return
+    if token.kind == "wildcard":
+        if isinstance(value, dict):
+            for key in list(value.keys()):
+                if rest:
+                    _redact_trace_path(value[key], rest)
+                else:
+                    value[key] = REDACTED
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                if rest:
+                    _redact_trace_path(item, rest)
+                else:
+                    value[index] = REDACTED
+
+
+def _redact_trace_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
+    """Redact terminal configured cache keys across duplicated trace envelopes."""
+
+    leaf = next((token.value for token in reversed(tokens) if token.kind == "key"), None)
+    if not leaf:
+        return
+    if isinstance(value, dict):
+        for key, item in list(value.items()):
+            if key == leaf:
+                value[key] = REDACTED
+            else:
+                _redact_trace_leaf_key(item, tokens)
+    elif isinstance(value, list):
+        for item in value:
+            _redact_trace_leaf_key(item, tokens)
+
+
+def _merged_field_cache_rules(
+    provider: str,
+    model: str,
+    plugin: Any,
+    *,
+    config: Any = None,
+) -> tuple[Any, ...]:
+    """Merge provider-declared and JSON-configured field-cache rules.
+
+    Provider declarations are the safe default. Optional JSON config can add or
+    replace rules by name so operators can tune protocol-state preservation per
+    provider/model without editing provider code. The import is local to keep the
+    experimental config layer out of executor module initialization.
+    """
+
+    declared = list(plugin.get_field_cache_rules(model) if plugin and hasattr(plugin, "get_field_cache_rules") else ())
+    try:
+        from ..config.experimental import load_experimental_config, parse_field_cache_rules
+
+        configured = list(
+            parse_field_cache_rules(
+                config if config is not None else load_experimental_config(),
+                provider,
+                model,
+            )
+        )
+    except Exception as exc:
+        raise RoutingExecutionError(f"Invalid field-cache configuration for {provider}/{model}", error_type="configuration_error") from exc
+    if not configured:
+        return tuple(declared)
+    merged: dict[str, Any] = {getattr(rule, "name", str(index)): rule for index, rule in enumerate(declared)}
+    order = [getattr(rule, "name", str(index)) for index, rule in enumerate(declared)]
+    for rule in configured:
+        name = getattr(rule, "name", "")
+        if name and name not in merged:
+            order.append(name)
+        if name:
+            declared_rule = merged.get(name)
+            if declared_rule is not None and not _safe_field_cache_override(
+                declared_rule,
+                rule,
+            ):
+                raise RoutingExecutionError(
+                    f"Configured field-cache rule {name!r} cannot weaken provider state isolation or injection behavior",
+                    error_type="configuration_error",
+                )
+            merged[name] = rule
+    return tuple(merged[name] for name in order if name in merged)
+
+
+def _safe_field_cache_override(declared: Any, configured: Any) -> bool:
+    """Allow extraction tuning only when provider-state behavior is unchanged."""
+
+    behavior_keys = (
+        "provider_continuation",
+        "tool_call_id_path",
+        "tool_container_path",
+        "tool_value_path",
+        "inject_tool_call_id_path",
+        "turn_container_path",
+        "turn_role_path",
+        "turn_value_path",
+    )
+    return (
+        getattr(configured, "cache_key", None) == getattr(declared, "cache_key", None)
+        and getattr(configured, "mode", None) == getattr(declared, "mode", None)
+        and getattr(configured, "scope", None) == getattr(declared, "scope", None)
+        and getattr(configured, "ttl_seconds", None) == getattr(declared, "ttl_seconds", None)
+        and getattr(configured, "allow_missing_session", None) == getattr(declared, "allow_missing_session", None)
+        and getattr(configured, "max_values", None) == getattr(declared, "max_values", None)
+        and getattr(configured, "max_bytes", None) == getattr(declared, "max_bytes", None)
+        and getattr(configured, "inject", None) == getattr(declared, "inject", None)
+        and all(
+            (getattr(configured, "metadata", {}) or {}).get(key)
+            == (getattr(declared, "metadata", {}) or {}).get(key)
+            for key in behavior_keys
+        )
+    )
+
+
+def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:
+    """Read request-scope metadata attached by routing resolution."""
+
+    scope = target.metadata.get("request_scope") if isinstance(target.metadata, dict) else None
+    if isinstance(scope, dict) and key in scope:
+        return scope[key]
+    return default
+
+
+def _route_error_type(error: BaseException, provider: Optional[str] = None) -> str:
+    """Map an exception to a fallback-policy error type."""
+
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, StructuredAPIResponseError):
+        response_type = _route_error_type_from_response(error.response)
+        if response_type:
+            return response_type
+    explicit = getattr(error, "error_type", None)
+    if explicit:
+        return normalize_route_error_type(str(explicit))
+    classified = classify_error(error, provider)
+    return normalize_route_error_type(classified.error_type)
+
+
+def _route_error_type_from_response(response: Any) -> Optional[str]:
+    """Infer retryability from the proxy's structured error response."""
+
+    if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
+        return None
+    error = response["error"]
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    candidates = _structured_error_candidates(error, details)
+    hard_stop = _first_route_error_candidate(candidates, _HARD_STOP_ROUTE_ERRORS)
+    if hard_stop:
+        return hard_stop
+    retryable = _first_route_error_candidate(candidates, _RETRYABLE_ROUTE_ERRORS)
+    if retryable:
+        return retryable
+    normal_summary = str(details.get("normal_error_summary", "")).lower()
+    if any(token in normal_summary for token in ("authentication", "forbidden", "invalid_request", "context_window", "credential_reauth", "configuration_error")):
+        return _summary_hard_stop_type(normal_summary)
+    if any(token in normal_summary for token in ("rate_limit", "quota", "capacity")):
+        return "quota_exceeded" if "quota" in normal_summary else "rate_limit"
+    if any(token in normal_summary for token in ("server_error", "api_connection", "transient")):
+        return "api_connection" if "api_connection" in normal_summary else "server_error"
+    error_type = normalize_route_error_type(str(error.get("type", "")))
+    if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
+        return "rate_limit"
+    return None
+
+
+def _attempt_uses_native_protocol(plugin: Any, model: str, context: RequestContext) -> bool:
+    """Predict execution mode before attempt-specific request preparation."""
+
+    target = _current_route_target(context)
+    execution = target.execution if target else "auto"
+    if execution in {"custom", "litellm_fallback"}:
+        return False
+    if execution == "auto" and plugin and getattr(plugin, "has_custom_logic", lambda: False)():
+        return False
+    if context.streaming:
+        return _should_use_native_streaming(plugin, model, target, execution, context.provider)
+    return execution == "native" or _should_use_native_protocol(
+        plugin,
+        model,
+        target,
+        context.kwargs,
+        stream=context.streaming,
+        execution=execution,
+    )
+
+
+def _raise_for_structured_response_error(response: Any) -> None:
+    """Prevent structured errors from being formatted as empty successes."""
+
+    error = structured_api_response_error(response)
+    if error:
+        raise error
+
+
+def _route_status_code_from_response(response: Any) -> Optional[int]:
+    """Return a structured status code without reading raw provider text."""
+
+    if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
+        return None
+    error = response["error"]
+    details = error.get("details") if isinstance(error.get("details"), dict) else {}
+    for candidate in (details.get("status_code"), details.get("status"), error.get("status_code"), error.get("status"), error.get("code")):
+        try:
+            return int(candidate)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _target_failure_summary(target: RouteTarget, error_type: str, *, status_code: Optional[int] = None) -> Dict[str, Any]:
+    """Return a client-safe fallback target failure summary."""
+
+    summary = {
+        "target": target.name,
+        "provider": target.provider,
+        "model": target.prefixed_model,
+        "execution": target.execution,
+        "error_type": normalize_route_error_type(error_type),
+        # Provider error text can contain raw upstream payload fragments or
+        # credential-like identifiers. Keep the cross-target summary structural;
+        # detailed per-credential errors remain in the existing sanitized error
+        # accumulator.
+        "message": "",
+    }
+    if status_code is not None:
+        summary["status_code"] = status_code
+    return summary
+
+
+def _append_routing_attempt_history(
+    context: RequestContext,
+    target: RouteTarget,
+    target_index: int,
+    *,
+    success: bool,
+    error_type: Optional[str] = None,
+    status_code: Optional[int] = None,
+    emitted_output: Optional[bool] = None,
+    fallback_allowed: Optional[bool] = None,
+    duration_ms: Optional[int] = None,
+) -> None:
+    """Append sanitized live fallback-attempt metadata to the request context."""
+
+    entry: Dict[str, Any] = {
+        "target_index": target_index,
+        "target": target.name,
+        "provider": target.provider,
+        "model": target.prefixed_model,
+        "execution": target.execution,
+        "success": success,
+    }
+    if error_type is not None:
+        entry["error_type"] = normalize_route_error_type(error_type)
+    if status_code is not None:
+        entry["status_code"] = status_code
+    if emitted_output is not None:
+        entry["emitted_output"] = bool(emitted_output)
+    if fallback_allowed is not None:
+        entry["fallback_allowed"] = bool(fallback_allowed)
+    if duration_ms is not None:
+        entry["duration_ms"] = max(0, duration_ms)
+    context.routing_attempt_history.append(entry)
+
+
+def _elapsed_ms(started_at: float) -> int:
+    return int((time.monotonic() - started_at) * 1000)
+
+
+def _group_streaming_policy(group: Any) -> str:
+    """Return the active streaming fallback policy for trace and decisions."""
+
+    return str(getattr(group, "streaming_policy", "pre_output_only") or "pre_output_only")
+
+
+def _streaming_policy_allows_fallback(group: Any) -> bool:
+    """Return whether a group permits pre-output streaming fallback."""
+
+    return _group_streaming_policy(group) != "never"
+
+
+_HARD_STOP_ROUTE_ERRORS = {
+    "authentication",
+    "forbidden",
+    "invalid_request",
+    "context_window_exceeded",
+    "credential_reauth_needed",
+    "pre_request_callback_error",
+    "cancelled",
+    "configuration_error",
+}
+_RETRYABLE_ROUTE_ERRORS = {"rate_limit", "quota_exceeded", "server_error", "api_connection", "unsupported_operation"}
+
+
+def _structured_error_candidates(error: Dict[str, Any], details: Dict[str, Any]) -> List[str]:
+    """Return normalized structured error hints before reading free-form text."""
+
+    values: List[Any] = [
+        error.get("type"),
+        error.get("code"),
+        error.get("status"),
+        details.get("classification"),
+        details.get("error_type"),
+        details.get("status"),
+    ]
+    for abnormal in details.get("abnormal_errors") or []:
+        if isinstance(abnormal, dict):
+            values.append(abnormal.get("error_type"))
+            values.append(abnormal.get("status_code"))
+    status_code = _route_status_code_from_response({"error": error})
+    if status_code == 400:
+        values.append("invalid_request")
+    elif status_code == 401:
+        values.append("authentication")
+    elif status_code == 403:
+        values.append("forbidden")
+    elif status_code == 429:
+        values.append("rate_limit")
+    elif status_code is not None and status_code >= 500:
+        values.append("server_error")
+    return [normalize_route_error_type(str(value)) for value in values if value not in (None, "")]
+
+
+def _first_route_error_candidate(candidates: List[str], allowed: set[str]) -> Optional[str]:
+    """Return the first structured candidate in an allowed policy set."""
+
+    for candidate in candidates:
+        if candidate in allowed:
+            return candidate
+    return None
+
+
+def _summary_hard_stop_type(summary: str) -> str:
+    """Map legacy summary text to a hard-stop category without using raw text."""
+
+    if "credential_reauth" in summary:
+        return "credential_reauth_needed"
+    if "context_window" in summary:
+        return "context_window_exceeded"
+    if "configuration_error" in summary or "config" in summary:
+        return "configuration_error"
+    if "forbidden" in summary:
+        return "forbidden"
+    if "authentication" in summary:
+        return "authentication"
+    return "invalid_request"
+
+
+def _with_fallback_summary(response: Any, target_failures: List[Dict[str, Any]], attempt_history: Optional[List[Dict[str, Any]]] = None) -> Any:
+    """Attach fallback target summaries to a structured error response."""
+
+    if not target_failures or not isinstance(response, dict) or not isinstance(response.get("error"), dict):
+        return response
+    details = response["error"].setdefault("details", {})
+    if isinstance(details, dict):
+        details["fallback_targets"] = list(target_failures)
+        if attempt_history:
+            details["routing_attempt_history"] = list(attempt_history)
+    return response
+
+
+def _stream_chunk_is_visible_output(chunk: str) -> bool:
+    """Return whether a stream chunk should block cross-target fallback.
+
+    Only client-visible model output should lock the route. Empty frames, DONE
+    sentinels, and structured error frames are not considered visible output, so
+    a provider that fails before producing content can still fall through to the
+    next ordered target.
+    """
+
+    return is_visible_stream_output(chunk)
+
+
+def _stream_chunk_error_type(chunk: str) -> Optional[str]:
+    """Return a route error type for terminal stream error frames.
+
+    Per-target stream executors can emit a structured error SSE and `[DONE]`
+    instead of raising. Fallback wrappers must treat those frames as target
+    failures before visible output, while still forwarding them if no fallback is
+    available.
+    """
+
+    payload = _stream_chunk_payload(chunk)
+    if not isinstance(payload, dict):
+        return None
+    event_type = normalize_route_error_type(str(payload.get("event_type") or payload.get("type") or ""))
+    if event_type == "error":
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        return _route_error_type_from_response({"error": error}) or "server_error"
+    if event_type == "response.failed":
+        response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+        error = payload.get("error") if isinstance(payload.get("error"), dict) else response.get("error") if isinstance(response.get("error"), dict) else {"type": "server_error"}
+        return _route_error_type_from_response({"error": error}) or "server_error"
+    if isinstance(payload.get("error"), dict):
+        return _route_error_type_from_response({"error": payload["error"]}) or "server_error"
+    return None
+
+
+def _stream_chunk_payload(chunk: str) -> Optional[Dict[str, Any]]:
+    """Parse a minimal SSE payload for routing decisions only."""
+
+    text = str(chunk or "").strip()
+    if not text:
+        return None
+    event_type = None
+    data_lines: List[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith(":"):
+            continue
+        if stripped.startswith("event:"):
+            event_type = stripped[6:].strip()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if not data_lines:
+        return {"event_type": event_type} if event_type else None
+    data = "\n".join(data_lines).strip()
+    if not data or data == "[DONE]":
+        return None
+    try:
+        parsed = json.loads(data)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    if event_type and "event_type" not in parsed:
+        parsed["event_type"] = event_type
+    return parsed
+
+
+def _can_start_stream_provider_cooldown(last_streamed_chunk: Optional[str], *, emitted_output: bool = False) -> bool:
+    """Return whether a streaming failure occurred before visible output."""
+
+    if emitted_output:
+        return False
+    return last_streamed_chunk is None or not _stream_chunk_is_visible_output(last_streamed_chunk)
+
+
+def _can_retry_stream_after_error(last_streamed_chunk: Optional[str], allow_reasoning_only_retry: bool, *, emitted_output: bool = False) -> bool:
+    """Return whether a stream can retry/rotate without duplicating output."""
+
+    if emitted_output:
+        return False
+    return can_retry_stream_after_error(last_streamed_chunk, allow_reasoning_only_retry)
+
+
+def _streamed_error_payload(error: StreamedAPIError, classified: Any) -> Dict[str, Any]:
+    """Return a terminal stream error while preserving structured timeout data."""
+
+    data = getattr(error, "data", None)
+    if isinstance(data, dict) and isinstance(data.get("error"), dict):
+        source = data["error"]
+        return {
+            "error": {
+                "message": source.get("message") or "Upstream stream failed after output began",
+                "type": source.get("type") or classified.error_type,
+                "details": source.get("details") or {"status_code": classified.status_code},
+            }
+        }
+    return {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type, "details": {"status_code": classified.status_code}}}
+
+
+def _merge_stream_error_details(error_data: Dict[str, Any], stream_error: Dict[str, Any]) -> None:
+    """Preserve structured stream timeout metadata in aggregate stream errors."""
+
+    target = error_data.get("error") if isinstance(error_data, dict) else None
+    source = stream_error.get("error") if isinstance(stream_error, dict) else None
+    if not isinstance(target, dict) or not isinstance(source, dict):
+        return
+    details = source.get("details")
+    if not isinstance(details, dict) or "timeout_type" not in details:
+        return
+    merged = dict(target.get("details") or {}) if isinstance(target.get("details"), dict) else {}
+    merged.update(details)
+    target["details"] = merged
+    target["type"] = source.get("type") or target.get("type")

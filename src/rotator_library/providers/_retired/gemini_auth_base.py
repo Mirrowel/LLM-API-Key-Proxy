@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, List
 import httpx
 
 from .google_oauth_base import GoogleOAuthBase
-from .utilities.gemini_shared_utils import (
+from .gemini_shared_utils import (
     CODE_ASSIST_ENDPOINT,
     GEMINI_CLI_UA_VERSION,
     GEMINI_CLI_NODE_CLIENT_VERSION,

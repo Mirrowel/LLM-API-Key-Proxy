@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
-from .base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
+from ..utilities.base_quota_tracker import BaseQuotaTracker, QUOTA_DISCOVERY_DELAY_SECONDS
 
 if TYPE_CHECKING:
     from ...usage import UsageManager

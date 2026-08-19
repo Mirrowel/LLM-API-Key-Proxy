@@ -23,6 +23,23 @@ from litellm.exceptions import (
 
 lib_logger = logging.getLogger("rotator_library")
 
+_CONTEXT_WINDOW_ERROR_PATTERNS = (
+    "context_length",
+    "context length",
+    "max_tokens",
+    "token limit",
+    "context window",
+    "too many tokens",
+    "too long",
+)
+
+
+def is_context_window_error_text(value: Any) -> bool:
+    """Return whether provider text describes an oversized context request."""
+
+    normalized = str(value or "").lower()
+    return any(pattern in normalized for pattern in _CONTEXT_WINDOW_ERROR_PATTERNS)
+
 
 def _parse_duration_string(duration_str: str) -> Optional[int]:
     """
@@ -90,7 +107,7 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
     Extract the retry-after time from an API error response body.
 
     Handles various error formats including:
-    - Gemini CLI: "Your quota will reset after 39s."
+    - Provider text: "Your quota will reset after 39s."
     - Google RPC: "quota will reset after 156h14m36s"
     - Generic: "quota will reset after 120s", "retry after 60s"
 
@@ -167,7 +184,7 @@ class EmptyResponseError(Exception):
     Treated as a transient server-side issue (503 equivalent).
 
     Attributes:
-        provider: The provider name (e.g., "gemini_cli")
+        provider: The provider name (e.g., "openai")
         model: The model that was requested
         message: Human-readable message about the error
     """
@@ -193,7 +210,7 @@ class TransientQuotaError(Exception):
     Treated as a transient server-side issue (503 equivalent), same as EmptyResponseError.
 
     Attributes:
-        provider: The provider name (e.g., "gemini_cli")
+        provider: The provider name (e.g., "openai")
         model: The model that was requested
         message: Human-readable message about the error
     """
@@ -680,6 +697,25 @@ def get_retry_after(error: Exception) -> Optional[int]:
             except (ValueError, TypeError):
                 pass
 
+    # Structured native errors retain decoded bodies and headers without needing
+    # to expose transport objects to protocol formatters.
+    structured_response = getattr(error, "response", None)
+    if isinstance(structured_response, dict):
+        try:
+            result = _extract_retry_from_json_body(json.dumps(structured_response))
+            if result is not None:
+                return result
+        except (TypeError, ValueError):
+            pass
+    structured_headers = getattr(error, "headers", None)
+    if isinstance(structured_headers, dict):
+        retry_header = structured_headers.get("retry-after") or structured_headers.get("Retry-After")
+        if retry_header is not None:
+            try:
+                return max(0, int(retry_header))
+            except (TypeError, ValueError):
+                pass
+
     # 1. Try to parse JSON from the error string representation
     # Some exceptions embed JSON in their string representation
     error_str = str(error)
@@ -759,12 +795,26 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
     if isinstance(e, dict):
         payload = e.get("error", e)
         if isinstance(payload, dict):
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
             code = payload.get("code")
+            status_value = payload.get("status_code") or payload.get("status") or details.get("status_code") or details.get("status") or code
             status = str(payload.get("status", "")).upper()
             try:
-                status_code = int(code) if code is not None else None
+                status_code = int(status_value) if status_value is not None else None
             except (TypeError, ValueError):
                 status_code = None
+            structured_type = _classify_structured_error_text(payload, details)
+            if status_code == 400:
+                return ClassifiedError(error_type=structured_type or "invalid_request", original_exception=e, status_code=status_code)
+            if status_code == 401:
+                return ClassifiedError(error_type="authentication", original_exception=e, status_code=status_code)
+            if status_code == 403:
+                return ClassifiedError(error_type="forbidden", original_exception=e, status_code=status_code)
+            if status_code == 429:
+                body = str(payload).lower()
+                return ClassifiedError(error_type="quota_exceeded" if "quota" in body or "resource_exhausted" in body else "rate_limit", original_exception=e, status_code=status_code)
+            if structured_type:
+                return ClassifiedError(error_type=structured_type, original_exception=e, status_code=status_code)
             if (status_code is not None and status_code >= 500) or status in {
                 "INTERNAL",
                 "UNAVAILABLE",
@@ -774,6 +824,15 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                     original_exception=e,
                     status_code=status_code or 503,
                 )
+
+    explicit_error_type = getattr(e, "error_type", None)
+    if explicit_error_type:
+        return ClassifiedError(
+            error_type=str(explicit_error_type).strip().lower().replace("-", "_").replace(" ", "_"),
+            original_exception=e,
+            status_code=getattr(e, "status_code", None),
+            retry_after=get_retry_after(e),
+        )
 
     error_text = str(e)
     error_type_name = type(e).__name__
@@ -904,27 +963,12 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             )
         if status_code == 400:
             # Check for context window / token limit errors with more specific patterns
-            if any(
-                pattern in error_body
-                for pattern in [
-                    "context_length",
-                    "max_tokens",
-                    "token limit",
-                    "context window",
-                    "too many tokens",
-                    "too long",
-                ]
-            ):
+            if is_context_window_error_text(error_body):
                 return ClassifiedError(
                     error_type="context_window_exceeded",
                     original_exception=e,
                     status_code=status_code,
                 )
-            return ClassifiedError(
-                error_type="invalid_request",
-                original_exception=e,
-                status_code=status_code,
-            )
             return ClassifiedError(
                 error_type="invalid_request",
                 original_exception=e,
@@ -1073,6 +1117,13 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             status_code=status_code or 503,
         )
 
+    if "model_capacity_exhausted" in error_text.lower() or "model capacity" in error_text.lower() or "capacity exhausted" in error_text.lower():
+        return ClassifiedError(
+            error_type="server_error",
+            original_exception=e,
+            status_code=status_code or 503,
+        )
+
     # Fallback for any other unclassified errors
     return ClassifiedError(
         error_type="unknown", original_exception=e, status_code=status_code
@@ -1082,6 +1133,34 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 def is_rate_limit_error(e: Exception) -> bool:
     """Checks if the exception is a rate limit error."""
     return isinstance(e, RateLimitError)
+
+
+def _classify_structured_error_text(payload: dict, details: dict) -> Optional[str]:
+    """Classify structured error type/code/status text without raw messages."""
+
+    values = [payload.get("type"), payload.get("code"), payload.get("status"), details.get("error_type"), details.get("classification"), details.get("status")]
+    normalized = {str(value).strip().lower().replace("-", "_").replace(" ", "_") for value in values if value not in (None, "")}
+    if normalized & {"authentication", "auth", "unauthorized", "invalid_api_key"}:
+        return "authentication"
+    if normalized & {"forbidden", "permission_denied", "access_denied"}:
+        return "forbidden"
+    if normalized & {"context_window_exceeded", "context_length", "context_length_exceeded", "too_many_tokens"}:
+        return "context_window_exceeded"
+    if normalized & {"invalid_request", "bad_request", "validation", "invalid_argument"}:
+        return "invalid_request"
+    if normalized & {"credential_reauth_needed"}:
+        return "credential_reauth_needed"
+    if normalized & {"configuration_error", "config", "configuration"}:
+        return "configuration_error"
+    if normalized & {"rate_limit", "rate_limited", "too_many_requests"}:
+        return "rate_limit"
+    if normalized & {"quota_exceeded", "resource_exhausted", "quota"}:
+        return "quota_exceeded"
+    if normalized & {"server_error", "internal", "unavailable"}:
+        return "server_error"
+    if normalized & {"api_connection", "network", "connection"}:
+        return "api_connection"
+    return None
 
 
 def is_server_error(e: Exception) -> bool:

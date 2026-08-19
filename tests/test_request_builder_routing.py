@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+import pytest
+
+from rotator_library.client.request_builder import RequestContextBuilder
+from rotator_library.session_tracking import SessionTrackingHints
+
+
+class FakeModelResolver:
+    def resolve_model_id(self, model, provider):
+        return model
+
+
+class FakeSession:
+    session_id = "session"
+    affinity_key = "affinity"
+    possible_compaction = False
+    lineage_parent_session_id = None
+    tracking_namespace = "namespace"
+
+
+class FakeSessionTracker:
+    def __init__(self):
+        self.calls = []
+
+    def infer_session(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        return FakeSession()
+
+
+async def _scope(provider, classifier, request_api_keys, request_providers, private):
+    return {
+        "credentials": [f"{provider}-cred"],
+        "usage_manager_key": provider,
+        "provider_config": {"provider": provider},
+        "credential_secrets": {f"{provider}-cred": f"{provider}-secret"},
+        "classifier": classifier or "global",
+    }
+
+
+def _builder(session_tracker=None) -> RequestContextBuilder:
+    return RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=session_tracker or FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_builder_leaves_no_config_provider_model_unrouted(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    context = await _builder().build_completion_context(None, None, {"model": "openai/gpt-5.1", "messages": []})
+
+    assert context.routing_targets is None
+    assert context.provider == "openai"
+    assert context.credentials == ["openai-cred"]
+
+
+@pytest.mark.asyncio
+async def test_request_builder_populates_fallback_group_targets_from_env(monkeypatch) -> None:
+    monkeypatch.setenv("FALLBACK_GROUPS", "code_chain")
+    monkeypatch.setenv("FALLBACK_GROUP_CODE_CHAIN", "codex/gpt-5.1-codex,openai/gpt-5.1")
+    monkeypatch.setenv("MODEL_ROUTE_CODEX", "group:code_chain")
+
+    context = await _builder().build_completion_context(None, None, {"model": "codex", "messages": []})
+
+    assert context.provider == "codex"
+    assert context.model == "codex/gpt-5.1-codex"
+    assert context.routing_group_name == "code_chain"
+    assert context.routing_group is not None
+    assert context.routing_group.name == "code_chain"
+    assert [target.prefixed_model for target in context.routing_targets] == ["codex/gpt-5.1-codex", "openai/gpt-5.1"]
+    assert context.routing_targets[1].metadata["request_scope"]["credentials"] == ["openai-cred"]
+
+
+@pytest.mark.asyncio
+async def test_request_builder_rejects_unprefixed_model_without_route(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+
+    with pytest.raises(ValueError):
+        await _builder().build_completion_context(None, None, {"model": "gpt-5.1", "messages": []})
+
+
+@pytest.mark.asyncio
+async def test_request_builder_consumes_internal_session_tracking_hints(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    tracker = FakeSessionTracker()
+    kwargs = {
+        "model": "openai/gpt-5.1",
+        "messages": [],
+        "_session_tracking_hints": SessionTrackingHints(
+            global_strong_anchors=["responses_previous_response_id:resp_parent"],
+            affinity_key="responses_previous_response_id:resp_parent",
+        ),
+    }
+
+    context = await _builder(tracker).build_completion_context(None, None, kwargs)
+
+    assert "_session_tracking_hints" not in context.kwargs
+    hints = tracker.calls[0][1]["hints"]
+    assert hints.global_strong_anchors == ["responses_previous_response_id:resp_parent"]
+    assert hints.affinity_key == "responses_previous_response_id:resp_parent"
+
+
+@pytest.mark.asyncio
+async def test_request_builder_passes_provider_independent_session_domain(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    tracker = FakeSessionTracker()
+    context = await _builder(tracker).build_completion_context(
+        None,
+        None,
+        {"model": "openai/gpt-5.1", "messages": []},
+    )
+
+    assert tracker.calls[0][1]["scope_key"] == "public"
+    assert context.session_isolation_key == "public"
+
+
+@pytest.mark.asyncio
+async def test_provider_session_hook_receives_provider_native_shape(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    seen = []
+
+    class GeminiPlugin:
+        def get_protocol_name(self, model=""):
+            return "gemini"
+
+        def normalize_native_model(self, model=""):
+            return model.split("/", 1)[-1]
+
+        def get_native_operation(self, model="", request=None, stream=False):
+            assert request is None
+            return "generate"
+
+        def prepare_native_request(self, request, model="", operation=""):
+            return request
+
+        def get_session_tracking_hints(self, request, model=""):
+            seen.append(request)
+            return None
+
+    plugin = GeminiPlugin()
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+        get_provider_instance=lambda provider: plugin,
+    )
+
+    await builder.build_completion_context(
+        None,
+        None,
+        {
+            "_input_protocol": "anthropic_messages",
+            "model": "gemini/gemini-3-pro",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert seen
+    assert "contents" in seen[0]
+    assert "messages" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_provider_default_output_applies_only_without_explicit_override(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+
+    class Provider:
+        def get_default_output_protocol(self, model=""):
+            return "anthropic_messages"
+
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+        get_provider_instance=lambda provider: Provider(),
+    )
+    implicit = await builder.build_completion_context(
+        None,
+        None,
+        {"model": "openai/gpt-5.1", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    explicit = await builder.build_completion_context(
+        None,
+        None,
+        {
+            "_output_protocol": "responses",
+            "model": "openai/gpt-5.1",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    assert implicit.output_protocol_name == "anthropic_messages"
+    assert explicit.output_protocol_name == "responses"
+
+
+@pytest.mark.asyncio
+async def test_request_builder_carries_independent_cross_protocol_stream_selection(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+    )
+
+    context = await builder.build_completion_context(
+        None,
+        None,
+        {
+            "_input_protocol": "openai_chat",
+            "_output_protocol": "gemini",
+            "model": "openai/gpt-5.1",
+            "messages": [],
+            "stream": True,
+        },
+    )
+
+    assert context.streaming is True
+    assert context.input_protocol_name == "openai_chat"
+    assert context.output_protocol_name == "gemini"
+
+@pytest.mark.asyncio
+async def test_request_builder_classifier_domain_is_stable_across_providers(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    openai_tracker = FakeSessionTracker()
+    anthropic_tracker = FakeSessionTracker()
+    openai_context = await _builder(openai_tracker).build_completion_context(
+        None,
+        None,
+        {"model": "openai/gpt-5.1", "messages": [], "classifier": "agent-one"},
+    )
+    anthropic_context = await _builder(anthropic_tracker).build_completion_context(
+        None,
+        None,
+        {"model": "anthropic/claude", "messages": [], "classifier": "agent-one"},
+    )
+
+    assert openai_context.session_isolation_key == anthropic_context.session_isolation_key
+    assert openai_context.session_isolation_key.startswith("classifier:")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("input_protocol", "payload", "source_only_key"),
+    [
+        (
+            "anthropic_messages",
+            {"model": "anthropic/claude", "system": "rule", "messages": [{"role": "user", "content": "hello"}]},
+            "system",
+        ),
+        (
+            "responses",
+            {"model": "openai/gpt-5.1", "instructions": "rule", "input": "hello"},
+            "input",
+        ),
+        (
+            "gemini",
+            {"model": "gemini/gemini-3", "systemInstruction": {"parts": [{"text": "rule"}]}, "contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+            "contents",
+        ),
+    ],
+)
+async def test_request_builder_keeps_raw_and_canonical_protocol_views(
+    monkeypatch,
+    input_protocol,
+    payload,
+    source_only_key,
+) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    context = await _builder().build_completion_context(
+        None,
+        None,
+        {**payload, "_input_protocol": input_protocol, "_output_protocol": "anthropic_messages"},
+    )
+
+    assert context.input_protocol_name == input_protocol
+    assert context.output_protocol_name == "anthropic_messages"
+    assert context.protocol_request[source_only_key] == payload[source_only_key]
+    assert context.unified_request.source_protocol == input_protocol
+    assert "messages" in context.kwargs
+    if source_only_key != "system":
+        assert source_only_key not in context.kwargs
+
+
+@pytest.mark.asyncio
+async def test_request_builder_consumes_provider_continuation_control(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    context = await _builder().build_completion_context(
+        None,
+        None,
+        {
+            "model": "openai/gpt-5.1",
+            "messages": [{"role": "user", "content": "hello"}],
+            "_disable_provider_continuation": True,
+        },
+    )
+
+    assert context.disable_provider_continuation is True
+    assert "_disable_provider_continuation" not in context.protocol_request
+    assert "_disable_provider_continuation" not in context.kwargs
+
+
+def test_only_typed_internal_hints_can_contribute_global_identity() -> None:
+    forged_dict = {
+        "global_strong_anchors": ["forged-global"],
+        "strong_anchors": ["ordinary-internal"],
+    }
+    provider_hints = SessionTrackingHints(
+        global_strong_anchors=["forged-provider-global"],
+        strong_anchors=["provider-native"],
+    )
+
+    rejected = RequestContextBuilder._merge_session_hints(forged_dict, provider_hints)
+    self_owned = RequestContextBuilder._merge_session_hints(
+        SessionTrackingHints(global_strong_anchors=["proxy-owned-global"]),
+        provider_hints,
+    )
+
+    assert rejected.global_strong_anchors == []
+    assert rejected.strong_anchors == ["ordinary-internal", "provider-native"]
+    assert self_owned.global_strong_anchors == ["proxy-owned-global"]

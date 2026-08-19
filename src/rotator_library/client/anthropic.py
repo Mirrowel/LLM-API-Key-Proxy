@@ -61,9 +61,9 @@ class AnthropicHandler:
         """
         Handle Anthropic Messages API requests.
 
-        This method accepts requests in Anthropic's format, translates them to
-        OpenAI format internally, processes them through the existing acompletion
-        method, and returns responses in Anthropic's format.
+        Non-streaming requests use the shared canonical protocol runtime.
+        Streaming temporarily retains the established Chat wrapper until the
+        canonical stream-lifecycle phase is enabled.
 
         Args:
             request: An AnthropicMessagesRequest object
@@ -94,9 +94,68 @@ class AnthropicHandler:
                 request.model_dump(exclude_none=True),
                 filename="anthropic_request.json",
             )
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_raw_request",
+                request.model_dump(exclude_none=True),
+                direction="request",
+                stage="client",
+            )
 
-        # Translate Anthropic request to OpenAI format
+        anthropic_request = request.model_dump(exclude_none=True)
+
+        if hasattr(self._client, "agenerate"):
+            selected_output = (
+                self._client.resolve_output_protocol(
+                    anthropic_request,
+                    input_protocol="anthropic_messages",
+                    request=raw_request,
+                )
+                if hasattr(self._client, "resolve_output_protocol")
+                else "anthropic_messages"
+            )
+            response = await self._client.agenerate(
+                anthropic_request,
+                input_protocol="anthropic_messages",
+                output_protocol=selected_output,
+                request=raw_request,
+                pre_request_callback=pre_request_callback,
+                _parent_log_dir=anthropic_logger.log_dir if anthropic_logger and anthropic_logger.log_dir else None,
+            )
+            if request.stream:
+                return response
+            anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+            if selected_output != "anthropic_messages":
+                return anthropic_response
+            anthropic_response["id"] = request_id
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_native_protocol_response",
+                anthropic_response,
+                direction="response",
+                stage="final",
+            )
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_final_response",
+                anthropic_response,
+                direction="response",
+                stage="final",
+            )
+            if anthropic_logger:
+                anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
+            return anthropic_response
+
+        # Compatibility fallback for external facades that have not implemented
+        # the protocol-aware agenerate entry point.
         openai_request = translate_anthropic_request(request)
+        _trace_anthropic(
+            anthropic_logger,
+            "anthropic_to_openai_request",
+            openai_request,
+            direction="request",
+            stage="adapter",
+        )
 
         # Pass parent log directory to acompletion for nested logging
         if anthropic_logger and anthropic_logger.log_dir:
@@ -138,8 +197,22 @@ class AnthropicHandler:
                 if hasattr(response, "model_dump")
                 else dict(response)
             )
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_openai_response",
+                openai_response,
+                direction="response",
+                stage="provider",
+            )
             anthropic_response = openai_to_anthropic_response(
                 openai_response, original_model
+            )
+            _trace_anthropic(
+                anthropic_logger,
+                "openai_to_anthropic_response",
+                anthropic_response,
+                direction="response",
+                stage="adapter",
             )
 
             # Override the ID with our request ID
@@ -150,6 +223,13 @@ class AnthropicHandler:
                 anthropic_logger.log_response(
                     anthropic_response,
                     filename="anthropic_response.json",
+                )
+                _trace_anthropic(
+                    anthropic_logger,
+                    "anthropic_final_response",
+                    anthropic_response,
+                    direction="response",
+                    stage="final",
                 )
 
             return anthropic_response
@@ -201,3 +281,26 @@ class AnthropicHandler:
         total_tokens = message_tokens + tool_tokens
 
         return {"input_tokens": total_tokens}
+
+
+def _trace_anthropic(
+    logger: Optional[TransactionLogger],
+    pass_name: str,
+    payload: Any,
+    *,
+    direction: str,
+    stage: str,
+    transport: Optional[str] = None,
+) -> None:
+    """Emit an Anthropic compatibility transform trace when logging is enabled."""
+
+    if not logger:
+        return
+    logger.log_transform_pass(
+        pass_name,
+        payload,
+        direction=direction,
+        stage=stage,
+        protocol="anthropic_messages",
+        transport=transport,
+    )

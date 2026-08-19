@@ -81,7 +81,6 @@ NATIVE_PROVIDER_PRIORITY = [
 #
 PROVIDER_ALIASES = {
     "nvidia_nim": ["nvidia"],
-    "gemini_cli": ["google"],
     "gemini": ["google"],
 }
 
@@ -1115,7 +1114,6 @@ class ModelRegistry:
 
         Examples:
             nvidia_nim/mistralai/model -> nvidia/mistralai/model
-            gemini_cli/gemini-2.5-flash -> google/gemini-2.5-flash
             gemini/gemini-2.5-pro -> google/gemini-2.5-pro
         """
         parts = model_id.split("/")

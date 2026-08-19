@@ -66,11 +66,76 @@ async def anthropic_streaming_wrapper(
     accumulated_text = ""  # Track accumulated text for logging
     accumulated_thinking = ""  # Track accumulated thinking for logging
     stop_reason_final = "end_turn"  # Track final stop reason for logging
+    upstream_closed = False
+    stream_iterator = openai_stream.__aiter__()
+
+    def trace_frame(pass_name: str, frame: str, payload: Any | None = None) -> str:
+        """Trace one Anthropic stream conversion frame and return it for yield."""
+
+        if transaction_logger:
+            transaction_logger.log_transform_pass(
+                pass_name,
+                payload if payload is not None else frame,
+                direction="stream",
+                stage="adapter",
+                protocol="anthropic_messages",
+                transport="sse",
+                snapshot=False,
+            )
+        return frame
+
+    async def close_upstream(reason: str) -> None:
+        """Close the wrapped OpenAI stream when Anthropic streaming stops early."""
+
+        nonlocal upstream_closed
+        if upstream_closed:
+            return
+        upstream_closed = True
+        for candidate in (stream_iterator, openai_stream):
+            close = getattr(candidate, "aclose", None)
+            if callable(close):
+                await close()
+                break
+            sync_close = getattr(candidate, "close", None)
+            if callable(sync_close):
+                sync_close()
+                break
+        if transaction_logger:
+            transaction_logger.log_transform_pass(
+                "anthropic_stream_upstream_closed",
+                {"reason": reason},
+                direction="stream",
+                stage="adapter",
+                protocol="anthropic_messages",
+                transport="sse",
+                snapshot=False,
+            )
 
     try:
-        async for chunk_str in openai_stream:
+        async for chunk_str in stream_iterator:
+            if transaction_logger:
+                transaction_logger.log_transform_pass(
+                    "anthropic_stream_source_chunk",
+                    chunk_str,
+                    direction="stream",
+                    stage="provider",
+                    protocol="openai_chat",
+                    transport="sse",
+                    snapshot=False,
+                )
             # Check for client disconnection if callback provided
             if is_disconnected is not None and await is_disconnected():
+                if transaction_logger:
+                    transaction_logger.log_transform_pass(
+                        "anthropic_stream_disconnected",
+                        {"reason": "client_disconnected"},
+                        direction="stream",
+                        stage="adapter",
+                        protocol="anthropic_messages",
+                        transport="sse",
+                        snapshot=False,
+                    )
+                await close_upstream("client_disconnected")
                 break
 
             if not chunk_str.strip() or not chunk_str.startswith("data:"):
@@ -103,25 +168,25 @@ async def anthropic_streaming_wrapper(
                             "usage": usage_dict,
                         },
                     }
-                    yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                    yield trace_frame("anthropic_stream_message_start", f"event: message_start\ndata: {json.dumps(message_start)}\n\n", message_start)
                     message_started = True
 
                 # Close any open thinking block
                 if thinking_block_started:
-                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                    yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n')
                     current_block_index += 1
                     thinking_block_started = False
 
                 # Close any open text block
                 if content_block_started:
-                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                    yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n')
                     current_block_index += 1
                     content_block_started = False
 
                 # Close all open tool_use blocks
                 for tc_index in sorted(tool_block_indices.keys()):
                     block_idx = tool_block_indices[tc_index]
-                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {block_idx}}}\n\n'
+                    yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {block_idx}}}\n\n')
 
                 # Determine stop_reason based on whether we had tool calls
                 stop_reason = "tool_use" if tool_calls_by_index else "end_turn"
@@ -134,10 +199,10 @@ async def anthropic_streaming_wrapper(
                     final_usage["cache_creation_input_tokens"] = 0
 
                 # Send message_delta with final info
-                yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "{stop_reason}", "stop_sequence": null}}, "usage": {json.dumps(final_usage)}}}\n\n'
+                yield trace_frame("anthropic_stream_message_delta", f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "{stop_reason}", "stop_sequence": null}}, "usage": {json.dumps(final_usage)}}}\n\n')
 
                 # Send message_stop
-                yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+                yield trace_frame("anthropic_stream_message_stop", 'event: message_stop\ndata: {"type": "message_stop"}\n\n')
 
                 # Log final Anthropic response if logger provided
                 if transaction_logger:
@@ -242,7 +307,7 @@ async def anthropic_streaming_wrapper(
                         "usage": usage_dict,
                     },
                 }
-                yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+                yield trace_frame("anthropic_stream_message_start", f"event: message_start\ndata: {json.dumps(message_start)}\n\n", message_start)
                 message_started = True
 
             choices = chunk.get("choices") or []
@@ -261,7 +326,7 @@ async def anthropic_streaming_wrapper(
                         "index": current_block_index,
                         "content_block": {"type": "thinking", "thinking": ""},
                     }
-                    yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                    yield trace_frame("anthropic_stream_content_block_start", f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n", block_start)
                     thinking_block_started = True
 
                 # Send thinking delta
@@ -270,7 +335,7 @@ async def anthropic_streaming_wrapper(
                     "index": current_block_index,
                     "delta": {"type": "thinking_delta", "thinking": reasoning_content},
                 }
-                yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+                yield trace_frame("anthropic_stream_content_delta", f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n", block_delta)
                 # Accumulate thinking for logging
                 accumulated_thinking += reasoning_content
 
@@ -279,7 +344,7 @@ async def anthropic_streaming_wrapper(
             if content:
                 # If we were in a thinking block, close it first
                 if thinking_block_started and not content_block_started:
-                    yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                    yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n')
                     current_block_index += 1
                     thinking_block_started = False
 
@@ -290,7 +355,7 @@ async def anthropic_streaming_wrapper(
                         "index": current_block_index,
                         "content_block": {"type": "text", "text": ""},
                     }
-                    yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                    yield trace_frame("anthropic_stream_content_block_start", f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n", block_start)
                     content_block_started = True
 
                 # Send content delta
@@ -299,7 +364,7 @@ async def anthropic_streaming_wrapper(
                     "index": current_block_index,
                     "delta": {"type": "text_delta", "text": content},
                 }
-                yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+                yield trace_frame("anthropic_stream_content_delta", f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n", block_delta)
                 # Accumulate text for logging
                 accumulated_text += content
 
@@ -312,13 +377,13 @@ async def anthropic_streaming_wrapper(
                 if tc_index not in tool_calls_by_index:
                     # Close previous thinking block if open
                     if thinking_block_started:
-                        yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                        yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n')
                         current_block_index += 1
                         thinking_block_started = False
 
                     # Close previous text block if open
                     if content_block_started:
-                        yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+                        yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n')
                         current_block_index += 1
                         content_block_started = False
 
@@ -341,7 +406,7 @@ async def anthropic_streaming_wrapper(
                             "input": {},
                         },
                     }
-                    yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+                    yield trace_frame("anthropic_stream_content_block_start", f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n", block_start)
                     # Increment for the next block
                     current_block_index += 1
 
@@ -361,7 +426,7 @@ async def anthropic_streaming_wrapper(
                             "partial_json": func["arguments"],
                         },
                     }
-                    yield f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n"
+                    yield trace_frame("anthropic_stream_content_delta", f"event: content_block_delta\ndata: {json.dumps(block_delta)}\n\n", block_delta)
 
             # Note: We intentionally ignore finish_reason here.
             # Block closing is handled when we receive [DONE] to avoid
@@ -369,6 +434,15 @@ async def anthropic_streaming_wrapper(
 
     except Exception as e:
         logger.error(f"Error in Anthropic streaming wrapper: {e}")
+        if transaction_logger:
+            transaction_logger.log_transform_error(
+                "anthropic_stream_transform",
+                e,
+                payload={"request_id": request_id, "model": original_model},
+                stage="adapter",
+                protocol="anthropic_messages",
+                transport="sse",
+            )
 
         # If we haven't sent message_start yet, send it now so the client can display the error
         # Claude Code and other clients may ignore events that come before message_start
@@ -395,7 +469,7 @@ async def anthropic_streaming_wrapper(
                     "usage": usage_dict,
                 },
             }
-            yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
+            yield trace_frame("anthropic_stream_message_start", f"event: message_start\ndata: {json.dumps(message_start)}\n\n", message_start)
 
         # Send the error as a text content block so it's visible to the user
         error_message = f"Error: {str(e)}"
@@ -404,16 +478,16 @@ async def anthropic_streaming_wrapper(
             "index": current_block_index,
             "content_block": {"type": "text", "text": ""},
         }
-        yield f"event: content_block_start\ndata: {json.dumps(error_block_start)}\n\n"
+        yield trace_frame("anthropic_stream_content_block_start", f"event: content_block_start\ndata: {json.dumps(error_block_start)}\n\n", error_block_start)
 
         error_block_delta = {
             "type": "content_block_delta",
             "index": current_block_index,
             "delta": {"type": "text_delta", "text": error_message},
         }
-        yield f"event: content_block_delta\ndata: {json.dumps(error_block_delta)}\n\n"
+        yield trace_frame("anthropic_stream_content_delta", f"event: content_block_delta\ndata: {json.dumps(error_block_delta)}\n\n", error_block_delta)
 
-        yield f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n'
+        yield trace_frame("anthropic_stream_content_block_stop", f'event: content_block_stop\ndata: {{"type": "content_block_stop", "index": {current_block_index}}}\n\n')
 
         # Build final usage with cached tokens
         final_usage = {"output_tokens": 0}
@@ -422,12 +496,15 @@ async def anthropic_streaming_wrapper(
             final_usage["cache_creation_input_tokens"] = 0
 
         # Send message_delta and message_stop to properly close the stream
-        yield f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "end_turn", "stop_sequence": null}}, "usage": {json.dumps(final_usage)}}}\n\n'
-        yield 'event: message_stop\ndata: {"type": "message_stop"}\n\n'
+        yield trace_frame("anthropic_stream_message_delta", f'event: message_delta\ndata: {{"type": "message_delta", "delta": {{"stop_reason": "end_turn", "stop_sequence": null}}, "usage": {json.dumps(final_usage)}}}\n\n')
+        yield trace_frame("anthropic_stream_message_stop", 'event: message_stop\ndata: {"type": "message_stop"}\n\n')
 
         # Also send the formal error event for clients that handle it
         error_event = {
             "type": "error",
             "error": {"type": "api_error", "message": str(e)},
         }
-        yield f"event: error\ndata: {json.dumps(error_event)}\n\n"
+        yield trace_frame("anthropic_stream_error", f"event: error\ndata: {json.dumps(error_event)}\n\n", error_event)
+    finally:
+        if not upstream_closed:
+            await close_upstream("wrapper_exit")

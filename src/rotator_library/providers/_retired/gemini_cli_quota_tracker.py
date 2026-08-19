@@ -35,7 +35,7 @@ from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
-from .base_quota_tracker import BaseQuotaTracker
+from ..utilities.base_quota_tracker import BaseQuotaTracker
 from .gemini_shared_utils import (
     CODE_ASSIST_ENDPOINT,
     GEMINI_CLI_UA_VERSION,
@@ -484,6 +484,10 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                         # Reset time parsing failed; leave reset_timestamp as None
                         pass
 
+                exhaustion_reason = None
+                if is_exhausted and reset_timestamp is None:
+                    exhaustion_reason = "no_reset_time"
+
                 buckets_data.append(
                     {
                         "model_id": bucket.get("modelId"),
@@ -493,6 +497,7 @@ class GeminiCliQuotaTracker(BaseQuotaTracker):
                         "reset_timestamp": reset_timestamp,
                         "token_type": bucket.get("tokenType"),
                         "is_exhausted": is_exhausted,
+                        "exhaustion_reason": exhaustion_reason,
                     }
                 )
 

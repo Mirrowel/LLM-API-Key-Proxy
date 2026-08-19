@@ -135,7 +135,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # TIER CONFIGURATION - Override in subclass
     # =========================================================================
 
-    # Provider name for env var lookups (e.g., "gemini_cli")
+    # Provider name for env var lookups (e.g., "openai")
     # Used for: QUOTA_GROUPS_{provider_env_name}_{GROUP}
     provider_env_name: str = ""
 
@@ -270,6 +270,15 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]
     ] = {}
 
+    # Native protocol/adapter declarations introduced for the experimental
+    # protocol stack. Defaults are intentionally no-op so existing providers keep
+    # the LiteLLM-backed execution path until they opt into native protocols.
+    protocol_name: Optional[str] = None
+    default_output_protocol: Optional[str] = None
+    adapter_names: Tuple[str, ...] = ()
+    field_cache_rules: Tuple[Any, ...] = ()
+    native_streaming_supported: bool = False
+
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -301,16 +310,192 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """Return provider-specific evidence for core session tracking.
 
         Providers can expose stable native markers, custom request structure, or
-        a preferred affinity key before credential selection. The return value is
-        intentionally evidence-only: providers must not select credentials or
-        mutate sticky state. Core routing merges these hints with generic anchors
-        and applies the same confidence policy for every provider.
+        a preferred affinity key before credential selection. Native evidence is
+        provider-qualified and may use ``SessionTrackingHints.session_scope`` for
+        model/family partitioning without fragmenting the global logical session.
+        The return value is intentionally evidence-only: providers must not select
+        credentials or mutate sticky state. Core routing merges these hints with
+        generic anchors and applies the same confidence policy for every provider.
 
         Expansion path: providers that know their upstream cache/session scope can
         return a richer ``SessionTrackingHints`` object from
         ``rotator_library.session_tracking``. Returning ``None`` keeps the generic
         OpenAI-compatible tracker behavior.
         """
+        return None
+
+    def get_protocol_name(self, model: str = "") -> Optional[str]:
+        """Return the native protocol adapter name this provider prefers.
+
+        Providers may override this method when protocol choice varies by model.
+        Returning ``None`` keeps the current fallback execution behavior. Later
+        provider phases will use this as the bridge from provider declarations to
+        native protocol parsing/building.
+        """
+
+        configured = self._get_runtime_config(model).protocol_name
+        return configured or self.protocol_name
+
+    def get_default_output_protocol(self, model: str = "") -> Optional[str]:
+        """Return the integration output protocol selected for this provider."""
+
+        configured = self._get_runtime_config(model).default_output_protocol
+        return configured or self.default_output_protocol
+
+    def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
+        """Return ordered adapter names for this provider/model.
+
+        The order is significant and is preserved by the adapter chain runner.
+        Providers can override this for model-specific quirks without mutating the
+        global adapter registry.
+        """
+
+        configured = self._get_runtime_config(model).adapter_names
+        return tuple(configured) if configured is not None else tuple(self.adapter_names)
+
+    def get_adapter_config(self, model: str = "") -> Dict[str, Dict[str, Any]]:
+        """Return adapter-specific config keyed by adapter name.
+
+        Config is intentionally a plain dict so custom providers can define it in
+        env/JSON later without importing adapter classes. Phase 10 will add formal
+        config loading and validation.
+        """
+
+        return dict(self._get_runtime_config(model).adapter_config)
+
+    def get_field_cache_rules(self, model: str = "") -> Tuple[Any, ...]:
+        """Return field-cache rules for provider-specific protocol state.
+
+        Rules preserve provider state such as reasoning content, thought
+        signatures, prompt cache keys, provider session IDs, and response IDs.
+        They are not a replacement for ``SessionTracker``; session tracking still
+        decides continuity and credential affinity.
+        """
+
+        configured = self._get_runtime_config(model).field_cache_rules
+        return tuple(self.field_cache_rules) + tuple(configured)
+
+    def supports_native_streaming(self, model: str = "", operation: str = "chat") -> bool:
+        """Return whether this provider explicitly supports native streaming.
+
+        The default is intentionally false. Phase 8 keeps live streaming
+        conservative: providers must opt in before routed streaming can use the
+        native stream executor instead of current custom/LiteLLM behavior.
+        """
+
+        configured = self._get_runtime_config(model).native_streaming_supported
+        if configured is None:
+            return self.native_streaming_supported
+        return bool(configured and self.supports_native_operation(model, operation))
+
+    def _get_runtime_config(self, model: str = "") -> Any:
+        """Return optional JSON runtime config for this provider.
+
+        The helper keeps config loading lazy so provider imports do not depend on
+        the experimental config layer during startup discovery.
+        """
+
+        from ..config.experimental import get_provider_runtime_config
+
+        return get_provider_runtime_config(
+            self._provider_config_key(),
+            model,
+            config=getattr(self, "_runtime_config_snapshot", None),
+        )
+
+    def bind_runtime_config(self, config: Any) -> None:
+        """Bind the immutable process-start configuration used by this instance."""
+
+        existing = getattr(self, "_runtime_config_snapshot", None)
+        if existing is not None and existing != config:
+            raise RuntimeError(
+                f"Provider singleton {self._provider_config_key()!r} is already bound to a different startup configuration"
+            )
+        self._runtime_config_snapshot = config
+
+    def _provider_config_key(self) -> str:
+        """Return the JSON providers-section key for this provider."""
+
+        if self.provider_env_name:
+            return self.provider_env_name.lower()
+        name = self.__class__.__name__
+        if name.endswith("Provider"):
+            name = name[: -len("Provider")]
+        return name.lower()
+
+    def supports_native_operation(self, model: str = "", operation: str = "chat") -> bool:
+        """Return whether this provider supports a native operation."""
+
+        protocol_name = self.get_protocol_name(model)
+        if not protocol_name:
+            return False
+        try:
+            from ..protocols import get_protocol
+
+            return get_protocol(protocol_name).supports_operation(operation)
+        except Exception:
+            return False
+
+    def should_use_native_protocol(self, model: str = "", operation: str = "chat", *, stream: bool = False, execution: str = "auto") -> bool:
+        """Return whether routing should use this provider's native protocol."""
+
+        if stream and not self.supports_native_streaming(model, operation):
+            return False
+        return bool(self.get_protocol_name(model) and self.supports_native_operation(model, operation))
+
+    def get_native_operation(self, model: str = "", request: Optional[Dict[str, Any]] = None, stream: bool = False) -> str:
+        """Return the provider-native operation for a request.
+
+        Providers that expose native protocols often use operation names that are
+        not simply ``chat``: Anthropic-compatible providers use ``messages``,
+        Responses providers use ``responses``, and Gemini-style providers use a
+        generate operation. The default stays ``chat`` so existing OpenAI-chat
+        providers remain compatible unless they opt in to something richer.
+        """
+
+        return "chat"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        """Return the upstream endpoint for a native operation."""
+
+        raise NotImplementedError(f"{self.__class__.__name__} does not define a native endpoint")
+
+    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
+        """Return non-payload HTTP headers for native requests."""
+
+        raise NotImplementedError(f"{self.__class__.__name__} does not define native headers")
+
+    def normalize_native_model(self, model: str) -> str:
+        """Return the upstream model name for native provider calls.
+
+        The proxy-facing model commonly includes a provider prefix such as
+        ``provider/model``. Native upstream APIs usually expect only ``model``.
+        Providers may override this for aliases, but stripping the first prefix
+        is the safe default for native execution.
+        """
+
+        return model.split("/", 1)[1] if "/" in model else model
+
+    def prepare_native_request(self, request: Dict[str, Any], model: str = "", operation: str = "") -> Dict[str, Any]:
+        """Return a provider-adjusted native request payload.
+
+        The declared provider protocol has already built a valid native payload
+        before this hook runs. Implementations may add provider envelopes,
+        aliases, or required defaults, but must never translate a client protocol.
+        Credentials remain in ``get_native_headers()`` so payload traces never
+        mix request data with secrets.
+        """
+
+        return dict(request)
+
+    def get_model_pricing(self, model: str = "") -> Optional[Any]:
+        """Return optional local pricing metadata for advisory cost tracking.
+
+        Providers can return `usage.costs.ModelPricing` or a compatible dict.
+        The default is `None`, which lets cost accounting safely fall back to
+        LiteLLM model metadata or report pricing as unavailable.
+        """
+
         return None
 
     async def acompletion(
@@ -411,9 +596,8 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             Minimum required priority level or None if no restrictions
 
         Example:
-            For Gemini CLI:
-            - gemini-3-*: requires priority 1 (paid tier only)
-            - gemini-2.5-*: no restriction (None)
+            A provider may restrict high-capability models to priority 1
+            credentials while allowing lower-cost models for all priorities.
         """
         return None
 
@@ -459,7 +643,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         then falls back to the class's default_rotation_mode.
 
         Args:
-            provider_name: The provider name (e.g., "gemini_cli")
+            provider_name: The provider name (e.g., "openai")
 
         Returns:
             "balanced" or "sequential"
@@ -623,12 +807,16 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Env format: QUOTA_GROUPS_{PROVIDER}_{GROUP}="model1,model2"
         Set empty string to disable a default group.
         """
-        if not self.provider_env_name or not self.model_quota_groups:
-            return self.model_quota_groups
+        configured_groups = self._get_runtime_config().model_quota_groups or {}
+        base_groups: QuotaGroupMap = {group: list(models) for group, models in self.model_quota_groups.items()}
+        for group, models in configured_groups.items():
+            base_groups[group] = list(models)
+        if not self.provider_env_name:
+            return base_groups
 
         result: QuotaGroupMap = {}
 
-        for group_name, default_models in self.model_quota_groups.items():
+        for group_name, default_models in base_groups.items():
             env_key = (
                 f"QUOTA_GROUPS_{self.provider_env_name.upper()}_{group_name.upper()}"
             )

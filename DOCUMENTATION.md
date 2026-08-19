@@ -977,31 +977,120 @@ ROTATION_MODE_OPENAI=balanced
 
 # Optional sequential session-stickiness controls
 SESSION_STICKY_WAIT_SECONDS=15
-SESSION_STICKY_ENTRY_TTL_SECONDS=3600
+SESSION_STICKY_ENTRY_TTL_SECONDS=300
 SESSION_STICKY_MAX_ENTRIES=10000
 ```
 
 #### Session Stickiness
 
 Sequential routing uses scoped session evidence to keep related chat requests on
-the same credential where possible. Evidence is always bound to the resolved
-credential scope, provider, and model/session scope, so classifier/private scopes
-do not share sticky sessions. Explicit request IDs are weak by default because
-some clients generate random IDs per request; set `TRUSTED_SESSION_ID_FIELDS` only
-when the client-provided fields are known stable.
+the same credential where possible. Logical session IDs and generic conversation
+evidence cross providers and models inside one caller/credential domain. Public,
+named-classifier, and ad hoc private credential-bundle domains never share
+anchors, trusted IDs, compaction lineage, replay bindings, usage managers, or
+Responses storage. Provider-native anchors remain qualified by provider and the
+provider's optional `session_scope`.
+
+Credential affinity is separate from logical lineage. Sticky entries remain
+independent per provider/model and expire after that provider's idle TTL. Activity
+on Anthropic therefore cannot refresh a DeepSeek binding in the same global
+session. The default is 300 seconds; providers may declare
+`default_session_sticky_entry_ttl_seconds`, per-provider environment overrides
+win, and a TTL of `0` disables sticky bindings for that provider.
+
+Explicit request IDs are weak by default because some clients generate random IDs
+per request; set `TRUSTED_SESSION_ID_FIELDS` only when the fields are stable.
 
 Provider plugins may implement `get_session_tracking_hints()` to contribute
-provider-specific anchors or a provider session scope. The hook supplies evidence
-only; credential selection remains centralized in the rotator.
+provider-qualified anchors, affinity, or a native session scope. Proxy-owned
+global hints such as Responses IDs use a separate internal-only channel, so a
+provider cannot promote its opaque ID into another provider's identity domain.
 
-Compaction lineage detection is intentionally conservative telemetry. It can use
-summary-like or unusually large early messages in any role as temporary parent
-lookup evidence, but those probe-only anchors are not stored on the child session
-and do not force sticky continuation.
+Session inference persistence is opt-in for the proxy process:
+
+```env
+SESSION_PERSISTENCE_ENABLED=true
+SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=5.0
+```
+
+Set the flush interval to `0` for immediate writes during manual restart testing.
+After restart, a continued lineage warning reports `origin=persisted`; schema-3
+state is written to `session_stickiness.json` under the proxy data directory.
+External IDs are hashed, file/session/string/source bounds are enforced on load,
+and schema-2 provider/model-scoped state is rejected rather than merged. Only
+logical lineage is persisted; credential bindings remain in memory.
+
+Compaction lineage detection is intentionally conservative. A candidate must be
+an early user/system/developer message and must replace more than half of the
+matched parent's high-water request history. Replacing a minority of history,
+including turns in the middle, remains ordinary continuity. Assistant/tool
+history is never treated as a size-only compaction probe.
+
+Explicit summary markers still require matching parent evidence and structural
+replacement. Unmarked summaries additionally require overlap with at least two
+distinct completed response events and request-side parent evidence, so output
+aggregation prompts cannot become compaction merely by quoting responses.
+Probe-only summary anchors are not stored as ordinary continuity. An opaque
+replay anchor identifies an exact resend, while context anchors derived only from
+probe messages that actually matched response evidence keep changed or extended
+tails on the validated child. Shared system/user harness probes therefore cannot
+become child bindings by position alone. Strong trusted explicit or provider
+identity takes precedence over replay/context bindings. Raw tool-call IDs remain
+supporting evidence rather than authoritative identity because clients may reuse
+counter-like or deterministic IDs across independent conversations.
+
+Agentic tool structure compounds conservatively. An assistant call is paired
+one-to-one with a later `tool`/`function` result carrying the same
+`tool_call_id`. The closed event contributes one medium evidence group keyed by
+a content-free hash of the ID, function name, and canonicalized arguments. Raw,
+unpaired, duplicated, or nameless calls remain weak; a previously closed event
+cannot promote an unpaired copy in a later request. One closed event plus an
+independent medium message group, or two distinct closed events, reaches the
+normal probable-confidence boundary. Tool events support ordinary continuity
+but never become compaction probes.
+
+Fallback routing preserves the global session domain but clears provider-native
+affinity before selecting a different provider/model. Response recording remains
+in the original caller domain.
+
+Scoped Responses storage uses `(session_domain, response_id)` ownership. Creation
+returns a response-specific `X-Proxy-Session-Domain` capability; non-public GET,
+DELETE, input-items, and `previous_response_id` continuation requests must return
+that opaque header. The token contains the lookup domain plus a random nonce, and
+only its hash is stored, so a deterministic classifier/domain hash cannot be used
+to forge access. Continuation validates the parent capability and every stored
+ancestor's domain. Credential/provider routing containers are omitted from stored
+requests and transform traces.
+
+Legacy public ProviderCache entries are migrated on first exact ID/scope match.
+Pre-capability private entries intentionally reject their old deterministic domain
+header because accepting it would restore forgeable access; those records expire
+under the configured Responses store TTL.
+
+Only completed responses contribute response-derived identity. Streaming text is
+recorded after an explicit provider completion signal, not from clean iterator
+EOF alone, because some transports surface truncation as normal EOF.
+Streamed tool calls reconstruct function-name and argument fragments by provider
+choice index and tool index. Incremental fragments and cumulative snapshots are
+both accepted before the same structural event hashing is applied.
+
+During the current session-tracking validation period, every inference emits a
+warning-level `Session tracker decision` line. `action` is one of `new`,
+`continue`, `compaction_child`, `compaction_continue`, `compaction_replay`, or
+`untracked`. The line includes the selected `session_id`, any
+accepted `matched_session_id`, rejected best `candidate_session_id`, and
+`parent_session_id`, plus tracking namespace, confidence, score, persistence
+origin, and compaction evidence. `origin=persisted` confirms
+that the selected session was restored from `session_stickiness.json`. These
+diagnostics are intentionally warnings for terminal testing and are expected to
+move to debug level after validation.
 
 When optional session persistence is enabled, `session_stickiness.json` is
-schema-versioned. Upgrades that change the schema intentionally ignore older
-session-stickiness files and rebuild in-memory state instead of attempting an
+schema-versioned. Schema 2 persists hashed high-water history profiles, scoped
+anchor provenance, response-event groups, and compaction replay/context bindings; raw
+message content is never stored. Loading rebuilds ownership from validated anchor
+records and ignores malformed, expired, orphaned, cross-namespace, or unsupported
+state. Upgrades intentionally ignore older schemas instead of attempting an
 unsafe migration.
 
 #### Per-Model Quota Tracking

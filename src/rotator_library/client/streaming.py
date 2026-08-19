@@ -13,22 +13,36 @@ Handles:
 - Client disconnect handling
 """
 
+import asyncio
 import codecs
+import contextlib
 import json
 import logging
 import re
+import time
+from copy import deepcopy
+from dataclasses import replace
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, TYPE_CHECKING
-
-import litellm
 
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..core.types import ProcessedChunk
 from ..core.utils import normalize_usage_for_response
+from ..streaming import StreamEvent, StreamMonitor, stream_event_from_sse_chunk
+from ..streaming.transport import SSEStreamFormatter
+from ..usage.accounting import UsageRecord, extract_usage_record
+from ..usage.costs import CostBreakdown, CostCalculator
 
 if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
 
 lib_logger = logging.getLogger("rotator_library")
+
+_MIXED_REASONING_CONTENT_MODELS = frozenset(
+    {
+        "google/diffusiongemma-26b-a4b-it",
+        "nvidia_nim/google/diffusiongemma-26b-a4b-it",
+    }
+)
 
 
 class StreamingHandler:
@@ -50,6 +64,8 @@ class StreamingHandler:
         cred_context: Optional["CredentialContext"] = None,
         skip_cost_calculation: bool = False,
         response_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        success_callback: Optional[Callable[[], None]] = None,
+        transaction_logger: Optional[Any] = None,
     ) -> AsyncGenerator[str, None]:
         """
         Wrap a LiteLLM stream with error handling and usage tracking.
@@ -70,6 +86,7 @@ class StreamingHandler:
             SSE-formatted strings: "data: {...}\\n\\n"
         """
         stream_completed = False
+        response_identity_complete = False
         error_buffer = StreamBuffer()  # Use StreamBuffer for JSON reassembly
         accumulated_finish_reason: Optional[str] = None
         has_tool_calls = False
@@ -79,11 +96,60 @@ class StreamingHandler:
         prompt_tokens_uncached = 0
         completion_tokens = 0
         thinking_tokens = 0
+        usage_record = UsageRecord(source="stream")
         assistant_parts: List[str] = []
         tool_call_ids: List[str] = []
+        tool_call_events: Dict[tuple[int, int], Dict[str, str]] = {}
+        monitor = StreamMonitor(clock=time.monotonic)
+        from ..config.experimental import get_stream_runtime_settings
+
+        stream_settings = get_stream_runtime_settings()
+        formatter = SSEStreamFormatter()
+        split_mixed_reasoning_content = (
+            model.lower() in _MIXED_REASONING_CONTENT_MODELS
+        )
+        upstream_closed = False
+        stream_cancelled = False
+        last_heartbeat_at = monitor.metrics.started_at
+        lifecycle_logger = transaction_logger
+        self._log_stream_lifecycle(
+            lifecycle_logger,
+            "stream_started",
+            monitor,
+            StreamEvent("started", protocol="openai_chat"),
+        )
 
         # Use manual iteration to allow continue after partial JSON errors
         stream_iterator = stream.__aiter__()
+
+        async def close_upstream(reason: str, *, force: bool = False) -> None:
+            """Best-effort close for upstream async streams.
+
+            Client disconnects and timeout failures should not leave provider
+            HTTP streams running in the background. Close failures are logged as
+            lifecycle metadata only and never replace the original stream error.
+            """
+
+            nonlocal upstream_closed
+            if upstream_closed or (not force and not stream_settings.cancel_upstream_on_disconnect):
+                return
+            upstream_closed = True
+            for candidate in (stream_iterator, stream):
+                try:
+                    closer = getattr(candidate, "aclose", None)
+                    if closer:
+                        await closer()
+                        self._log_stream_lifecycle(lifecycle_logger, "stream_upstream_cancelled", monitor, StreamEvent("cancelled", protocol="openai_chat", data={"reason": reason}))
+                        return
+                    closer = getattr(candidate, "close", None)
+                    if closer:
+                        closer()
+                        self._log_stream_lifecycle(lifecycle_logger, "stream_upstream_cancelled", monitor, StreamEvent("cancelled", protocol="openai_chat", data={"reason": reason}))
+                        return
+                except Exception as exc:
+                    lib_logger.debug("Failed to close upstream stream: %s", exc)
+                    self._log_stream_lifecycle(lifecycle_logger, "stream_upstream_close_failed", monitor, StreamEvent("error", protocol="openai_chat", data={"reason": reason, "error_type": type(exc).__name__}))
+                    return
 
         try:
             while True:
@@ -95,23 +161,96 @@ class StreamingHandler:
                         )
                         break
 
-                    chunk = await stream_iterator.__anext__()
+                    next_task = asyncio.create_task(stream_iterator.__anext__())
+                    try:
+                        while True:
+                            wait_seconds = _next_stream_wait_seconds(monitor, stream_settings, last_heartbeat_at)
+                            wait_tasks = {next_task}
+                            disconnect_task = None
+                            if request is not None:
+                                disconnect_task = asyncio.create_task(request.is_disconnected())
+                                wait_tasks.add(disconnect_task)
+                            done, _ = await asyncio.wait(wait_tasks, timeout=wait_seconds)
+                            if disconnect_task is not None:
+                                if disconnect_task in done and disconnect_task.result():
+                                    stream_cancelled = True
+                                    next_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                                        await next_task
+                                    await close_upstream("client_disconnect")
+                                    return
+                                if not disconnect_task.done():
+                                    disconnect_task.cancel()
+                                    with contextlib.suppress(asyncio.CancelledError):
+                                        await disconnect_task
+                            if next_task in done:
+                                chunk = next_task.result()
+                                break
+
+                            timeout_error = _stream_timeout_error(monitor, stream_settings)
+                            if timeout_error:
+                                next_task.cancel()
+                                with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                                    await next_task
+                                await close_upstream(timeout_error[0], force=True)
+                                self._log_stream_lifecycle(lifecycle_logger, timeout_error[2], monitor, StreamEvent("error", protocol="openai_chat", data={"error": timeout_error[1]}))
+                                raise StreamedAPIError(timeout_error[1]["message"], data={"error": timeout_error[1]})
+
+                            if _heartbeat_due(monitor, stream_settings, last_heartbeat_at):
+                                heartbeat = formatter.format_heartbeat()
+                                last_heartbeat_at = time.monotonic()
+                                self._log_stream_lifecycle(lifecycle_logger, "stream_heartbeat", monitor, StreamEvent("heartbeat", protocol="openai_chat", visible_output=False))
+                                yield heartbeat
+                    except Exception:
+                        if not next_task.done():
+                            next_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
+                                await next_task
+                        raise
+
+                    raw_event = StreamEvent(
+                        "raw_chunk",
+                        protocol="openai_chat",
+                        raw=chunk,
+                        data={"chunk_index": monitor.metrics.chunk_count + 1},
+                    )
+                    if monitor.metrics.first_byte_at is None:
+                        self._log_stream_lifecycle(
+                            lifecycle_logger,
+                            "stream_first_byte",
+                            monitor,
+                            raw_event,
+                        )
 
                     # Clear error buffer on successful chunk receipt
                     error_buffer.reset()
 
                     # Process chunk
+                    cost_event_record = _usage_record_from_sse_cost_chunk(chunk, model=model)
                     processed = self._process_chunk(
                         chunk,
                         accumulated_finish_reason,
                         has_tool_calls,
                         model,
                     )
-                    self._collect_session_response_anchors(
-                        processed.sse_string,
-                        assistant_parts,
-                        tool_call_ids,
+                    if cost_event_record.provider_reported_cost is not None:
+                        usage_record = _merge_usage_cost(usage_record, cost_event_record)
+                    if not processed.sse_string:
+                        stream_completed = True
+                        response_identity_complete = True
+                        break
+                    output_frames = (
+                        self._split_mixed_reasoning_content_frames(
+                            processed.sse_string
+                        )
+                        if split_mixed_reasoning_content
+                        else [processed.sse_string]
                     )
+                    if processed.finish_reason or any(
+                        self._sse_has_completion_signal(frame)
+                        for frame in output_frames
+                    ):
+                        response_identity_complete = True
 
                     # Update tracking state
                     if processed.has_tool_calls:
@@ -121,54 +260,42 @@ class StreamingHandler:
                         # Only update if not already tool_calls (highest priority)
                         accumulated_finish_reason = processed.finish_reason
                     if processed.usage and isinstance(processed.usage, dict):
-                        # Extract token counts from final chunk
-                        prompt_tokens = processed.usage.get("prompt_tokens", 0)
-                        completion_tokens = processed.usage.get("completion_tokens", 0)
-                        prompt_details = processed.usage.get("prompt_tokens_details")
-                        if prompt_details:
-                            if isinstance(prompt_details, dict):
-                                prompt_tokens_cached = (
-                                    prompt_details.get("cached_tokens", 0) or 0
-                                )
-                                prompt_tokens_cache_write = (
-                                    prompt_details.get("cache_creation_tokens", 0) or 0
-                                )
-                            else:
-                                prompt_tokens_cached = (
-                                    getattr(prompt_details, "cached_tokens", 0) or 0
-                                )
-                                prompt_tokens_cache_write = (
-                                    getattr(prompt_details, "cache_creation_tokens", 0)
-                                    or 0
-                                )
-                        completion_details = processed.usage.get(
-                            "completion_tokens_details"
+                        next_usage_record = extract_usage_record(
+                            processed.usage,
+                            model=model,
+                            source="stream_final_chunk",
                         )
-                        if completion_details:
-                            if isinstance(completion_details, dict):
-                                thinking_tokens = (
-                                    completion_details.get("reasoning_tokens", 0) or 0
-                                )
-                            else:
-                                thinking_tokens = (
-                                    getattr(completion_details, "reasoning_tokens", 0)
-                                    or 0
-                                )
-                        if processed.usage.get("cache_read_tokens") is not None:
-                            prompt_tokens_cached = (
-                                processed.usage.get("cache_read_tokens") or 0
-                            )
-                        if processed.usage.get("cache_creation_tokens") is not None:
-                            prompt_tokens_cache_write = (
-                                processed.usage.get("cache_creation_tokens") or 0
-                            )
-                        if thinking_tokens and completion_tokens >= thinking_tokens:
-                            completion_tokens = completion_tokens - thinking_tokens
-                        prompt_tokens_uncached = max(
-                            0, prompt_tokens - prompt_tokens_cached
-                        )
+                        if next_usage_record.provider_reported_cost is None and usage_record.provider_reported_cost is not None:
+                            next_usage_record = _merge_usage_cost(next_usage_record, usage_record)
+                        usage_record = next_usage_record
+                        prompt_tokens = usage_record.input_tokens + usage_record.cache_read_tokens
+                        completion_tokens = usage_record.completion_tokens
+                        thinking_tokens = usage_record.reasoning_tokens
+                        prompt_tokens_cached = usage_record.cache_read_tokens
+                        prompt_tokens_cache_write = usage_record.cache_write_tokens
+                        prompt_tokens_uncached = usage_record.prompt_tokens_for_mark_success
 
-                    yield processed.sse_string
+                    for frame in output_frames:
+                        self._collect_session_response_anchors(
+                            frame,
+                            assistant_parts,
+                            tool_call_ids,
+                            tool_call_events,
+                        )
+                        event = stream_event_from_sse_chunk(frame)
+                        first_visible = (
+                            event.visible_output
+                            and monitor.metrics.first_visible_output_at is None
+                        )
+                        monitor.record_event(event)
+                        if first_visible:
+                            self._log_stream_lifecycle(
+                                lifecycle_logger,
+                                "stream_first_visible_output",
+                                monitor,
+                                event,
+                            )
+                        yield frame
 
                 except StopAsyncIteration:
                     # Stream ended normally
@@ -221,37 +348,60 @@ class StreamingHandler:
                         )
 
                     # Not a JSON-related error, re-raise
+                    monitor.metrics.error_count += 1
+                    await close_upstream("stream_exception", force=True)
                     raise
 
         except StreamedAPIError:
             # Re-raise for retry loop
+            await close_upstream("streamed_api_error", force=True)
+            raise
+
+        except asyncio.CancelledError:
+            stream_cancelled = True
+            monitor.cancel()
+            self._log_stream_lifecycle(
+                lifecycle_logger,
+                "stream_cancelled",
+                monitor,
+                StreamEvent("cancelled", protocol="openai_chat", data={"reason": "task_cancelled"}),
+            )
+            await close_upstream("task_cancelled", force=True)
             raise
 
         finally:
             # Record usage if stream completed
             if stream_completed:
                 if cred_context:
-                    approx_cost = 0.0
-                    if not skip_cost_calculation:
-                        approx_cost = self._calculate_stream_cost(
-                            model,
-                            prompt_tokens_uncached + prompt_tokens_cached,
-                            completion_tokens + thinking_tokens,
-                        )
+                    cost_breakdown = self._calculate_stream_cost_breakdown(
+                        model,
+                        usage_record,
+                        skip_cost_calculation=skip_cost_calculation,
+                    )
+                    self._log_stream_usage_accounting(
+                        transaction_logger,
+                        usage_record,
+                        cost_breakdown,
+                    )
                     cred_context.mark_success(
                         prompt_tokens=prompt_tokens_uncached,
                         completion_tokens=completion_tokens,
                         thinking_tokens=thinking_tokens,
                         prompt_tokens_cache_read=prompt_tokens_cached,
                         prompt_tokens_cache_write=prompt_tokens_cache_write,
-                        approx_cost=approx_cost,
+                        approx_cost=cost_breakdown.total_cost,
                     )
+                if success_callback:
+                    success_callback()
 
-                if response_callback and (assistant_parts or tool_call_ids):
-                    # Intentionally only record response anchors after a complete
-                    # stream. Partial/aborted streams can contain text the client
-                    # never accepted, so using them for identity would over-bind
-                    # failed or disconnected sessions.
+                if (
+                    response_callback
+                    and response_identity_complete
+                    and (assistant_parts or tool_call_ids)
+                ):
+                    # A clean iterator EOF is not enough identity evidence: some
+                    # transports surface upstream truncation as normal EOF. Require
+                    # a provider completion signal before recording response anchors.
                     response_callback(
                         {
                             "choices": [
@@ -259,23 +409,77 @@ class StreamingHandler:
                                     "message": {
                                         "role": "assistant",
                                         "content": "".join(assistant_parts),
-                                        "tool_calls": [
-                                            {"id": call_id} for call_id in tool_call_ids
-                                        ],
+                                        "tool_calls": self._assembled_tool_calls(
+                                            tool_call_ids,
+                                            tool_call_events,
+                                        ),
                                     }
                                 }
                             ]
                         }
                     )
 
+                monitor.complete()
+                self._log_stream_lifecycle(
+                    lifecycle_logger,
+                    "stream_completed",
+                    monitor,
+                    StreamEvent("completed", protocol="openai_chat"),
+                )
+                self._log_stream_lifecycle(
+                    lifecycle_logger,
+                    "stream_metrics_final",
+                    monitor,
+                    StreamEvent("metadata", protocol="openai_chat"),
+                )
+
                 # Yield [DONE] for completed streams
                 yield "data: [DONE]\n\n"
+
+            elif request and await request.is_disconnected():
+                stream_cancelled = True
+                monitor.cancel()
+                self._log_stream_lifecycle(
+                    lifecycle_logger,
+                    "stream_cancelled",
+                    monitor,
+                    StreamEvent("cancelled", protocol="openai_chat"),
+                )
+                await close_upstream("client_disconnect")
+            elif stream_cancelled:
+                await close_upstream("stream_cancelled", force=True)
+
+    @staticmethod
+    def _log_stream_lifecycle(
+        transaction_logger: Optional[Any],
+        pass_name: str,
+        monitor: StreamMonitor,
+        event: StreamEvent,
+    ) -> None:
+        """Emit stream lifecycle metrics without affecting stream delivery."""
+
+        if not transaction_logger:
+            return
+        try:
+            transaction_logger.log_transform_pass(
+                pass_name,
+                {"event": event.to_dict(), "metrics": monitor.metrics.to_dict()},
+                direction="stream",
+                stage="client",
+                protocol=event.protocol,
+                transport="sse",
+                metadata={"event_type": event.event_type},
+                snapshot=False,
+            )
+        except Exception as exc:
+            lib_logger.debug("Stream lifecycle trace failed: %s", exc)
 
     def _collect_session_response_anchors(
         self,
         sse_string: str,
         assistant_parts: List[str],
         tool_call_ids: List[str],
+        tool_call_events: Optional[Dict[tuple[int, int], Dict[str, str]]] = None,
     ) -> None:
         """Collect lightweight response evidence for session tracking.
 
@@ -283,24 +487,213 @@ class StreamingHandler:
         chunks. We keep a synthetic assistant message so the core tracker can use
         the same response-anchor path as non-streaming responses.
         """
-        if not sse_string.startswith("data: "):
-            return
-        payload = sse_string[6:].strip()
-        if not payload or payload == "[DONE]":
-            return
+        for payload in self._sse_data_payloads(sse_string):
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            choices = data.get("choices") or []
+            if not isinstance(choices, list):
+                continue
+            for choice_position, choice in enumerate(choices):
+                if not isinstance(choice, dict):
+                    continue
+                choice_index = choice.get("index", choice_position)
+                try:
+                    stable_choice_index = int(choice_index)
+                except (TypeError, ValueError):
+                    stable_choice_index = choice_position
+                delta = choice.get("delta") or {}
+                if not isinstance(delta, dict):
+                    continue
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    assistant_parts.append(content)
+                tool_calls = delta.get("tool_calls") or []
+                if not isinstance(tool_calls, list):
+                    continue
+                for position, tool_call in enumerate(tool_calls):
+                    call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
+                    if call_id and str(call_id) not in tool_call_ids:
+                        tool_call_ids.append(str(call_id))
+                    if tool_call_events is None or not isinstance(tool_call, dict):
+                        continue
+                    index = tool_call.get("index", position)
+                    try:
+                        event_index = int(index)
+                    except (TypeError, ValueError):
+                        event_index = position
+                    event = tool_call_events.setdefault(
+                        (stable_choice_index, event_index),
+                        {},
+                    )
+                    if call_id:
+                        event["id"] = str(call_id)
+                    function = tool_call.get("function")
+                    if not isinstance(function, dict):
+                        continue
+                    if function.get("name"):
+                        event["name"] = str(function["name"])
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str) and arguments:
+                        event["arguments"] = self._merge_streamed_tool_arguments(
+                            event.get("arguments", ""),
+                            arguments,
+                        )
+
+    @staticmethod
+    def _assembled_tool_calls(
+        tool_call_ids: List[str],
+        tool_call_events: Dict[tuple[int, int], Dict[str, str]],
+    ) -> List[Dict[str, Any]]:
+        """Return reconstructed tool calls for response-derived session evidence."""
+
+        calls: List[Dict[str, Any]] = []
+        emitted_ids: set[str] = set()
+        for index in sorted(tool_call_events):
+            event = tool_call_events[index]
+            call_id = event.get("id")
+            if not call_id:
+                continue
+            call: Dict[str, Any] = {"id": call_id}
+            if event.get("name"):
+                call["function"] = {
+                    "name": event["name"],
+                    "arguments": event.get("arguments", ""),
+                }
+            calls.append(call)
+            emitted_ids.add(call_id)
+        calls.extend(
+            {"id": call_id}
+            for call_id in tool_call_ids
+            if call_id not in emitted_ids
+        )
+        return calls
+
+    @staticmethod
+    def _merge_streamed_tool_arguments(current: str, incoming: str) -> str:
+        """Accept both incremental fragments and cumulative argument snapshots."""
+
+        if not current:
+            return incoming
+        if incoming.startswith(current):
+            return incoming
+        if current.startswith(incoming):
+            return current
+        return current + incoming
+
+    def _sse_has_completion_signal(self, sse_string: str) -> bool:
+        """Return whether an SSE frame explicitly marks response completion."""
+
+        for payload in self._sse_data_payloads(sse_string):
+            if payload == "[DONE]":
+                return True
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            choices = data.get("choices") or []
+            if not isinstance(choices, list):
+                continue
+            has_finish_reason = any(
+                isinstance(choice, dict) and choice.get("finish_reason") is not None
+                for choice in choices
+            )
+            usage = data.get("usage")
+            has_meaningful_usage = isinstance(usage, dict) and any(
+                isinstance(value, (int, float)) and value > 0
+                for value in usage.values()
+            )
+            if isinstance(usage, dict) and (has_finish_reason or has_meaningful_usage):
+                return True
+        return False
+
+    @staticmethod
+    def _sse_data_payloads(sse_string: str) -> List[str]:
+        """Extract SSE data payloads from plain or event-prefixed frames."""
+
+        payloads: List[str] = []
+        for frame in re.split(r"\r?\n\r?\n", sse_string):
+            data_lines = []
+            for line in frame.splitlines():
+                if line.startswith("data:"):
+                    data_lines.append(line[5:].lstrip())
+            if data_lines:
+                payloads.append("\n".join(data_lines).strip())
+        return payloads
+
+    def _split_mixed_reasoning_content_frames(
+        self,
+        sse_string: str,
+    ) -> List[str]:
+        """Separate reasoning and final text that share one OpenAI delta.
+
+        DiffusionGemma can end reasoning and begin answer text in the same
+        chunk. Several OpenAI-compatible clients treat a delta as one state or
+        the other and discard its content when reasoning is also present.
+        Fast checks keep normal stream chunks out of the JSON parsing path.
+        """
+        if (
+            '"reasoning_content"' not in sse_string
+            or '"content"' not in sse_string
+        ):
+            return [sse_string]
+        if '"content": null' in sse_string or '"content":null' in sse_string:
+            return [sse_string]
+
+        payloads = self._sse_data_payloads(sse_string)
+        if len(payloads) != 1:
+            return [sse_string]
+
         try:
-            data = json.loads(payload)
+            payload = json.loads(payloads[0])
         except json.JSONDecodeError:
-            return
-        for choice in data.get("choices") or []:
-            delta = choice.get("delta") or {}
-            content = delta.get("content")
-            if content:
-                assistant_parts.append(str(content))
-            for tool_call in delta.get("tool_calls") or []:
-                call_id = tool_call.get("id") if isinstance(tool_call, dict) else None
-                if call_id:
-                    tool_call_ids.append(str(call_id))
+            return [sse_string]
+        if not isinstance(payload, dict):
+            return [sse_string]
+
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1:
+            return [sse_string]
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return [sse_string]
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            return [sse_string]
+
+        content = delta.get("content")
+        reasoning_fields = [
+            field
+            for field in ("reasoning_content", "reasoning")
+            if isinstance(delta.get(field), str) and delta[field]
+        ]
+        if not isinstance(content, str) or not content or not reasoning_fields:
+            return [sse_string]
+
+        reasoning_payload = deepcopy(payload)
+        reasoning_choice = reasoning_payload["choices"][0]
+        reasoning_delta = reasoning_choice["delta"]
+        for field in ("content", "tool_calls", "function_call", "audio", "refusal"):
+            reasoning_delta.pop(field, None)
+        reasoning_choice["finish_reason"] = None
+        reasoning_payload.pop("usage", None)
+
+        content_payload = deepcopy(payload)
+        content_delta = content_payload["choices"][0]["delta"]
+        for field in reasoning_fields:
+            content_delta.pop(field, None)
+
+        return [
+            f"data: {json.dumps(reasoning_payload)}\n\n",
+            f"data: {json.dumps(content_payload)}\n\n",
+        ]
 
     def _process_chunk(
         self,
@@ -325,6 +718,19 @@ class StreamingHandler:
             ProcessedChunk with SSE string and metadata
         """
         # Convert chunk to dict
+        if isinstance(chunk, str):
+            stripped = chunk.strip()
+            if stripped == "[DONE]" or stripped == "data: [DONE]":
+                return ProcessedChunk(sse_string="", finish_reason="stop")
+            if stripped.startswith("data:") or stripped.startswith("event:") or stripped.startswith(":"):
+                error = self._in_band_error_payload(chunk)
+                if error is not None:
+                    raise StreamedAPIError(
+                        str(error.get("message") or error.get("type") or "Provider stream failed"),
+                        data={"error": error},
+                    )
+                usage = _usage_from_sse_string(chunk)
+                return ProcessedChunk(sse_string=chunk if chunk.endswith("\n\n") else f"{chunk}\n\n", usage=usage)
         if hasattr(chunk, "model_dump"):
             chunk_dict = chunk.model_dump()
         elif hasattr(chunk, "dict"):
@@ -332,8 +738,16 @@ class StreamingHandler:
         else:
             chunk_dict = chunk
 
-        # Extract metadata before modifying
-        usage = chunk_dict.get("usage")
+        error = self._in_band_error_payload(chunk_dict)
+        if error is not None:
+            raise StreamedAPIError(
+                str(error.get("message") or error.get("type") or "Provider stream failed"),
+                data={"error": error},
+            )
+
+        # Extract metadata before modifying. Providers can report cost as a
+        # sibling of `usage`, so keep those fields attached for normalization.
+        usage = _usage_from_chunk_dict(chunk_dict)
         finish_reason = None
         chunk_has_tool_calls = False
 
@@ -350,7 +764,7 @@ class StreamingHandler:
 
             # Detect final chunk using multiple signals:
             # 1. Primary: has usage with any meaningful token count > 0
-            # 2. Secondary: has usage (even empty) + source has finish_reason (Fallback case)
+            # 2. Secondary: has usage (even empty) + source has finish_reason
             has_meaningful_usage = (
                 usage
                 and isinstance(usage, dict)
@@ -387,7 +801,7 @@ class StreamingHandler:
                 # INTERMEDIATE CHUNK: Never emit finish_reason
                 choice["finish_reason"] = None
 
-        usage = chunk_dict.get("usage")
+        usage = _usage_from_chunk_dict(chunk_dict)
         if isinstance(usage, dict):
             normalize_usage_for_response(usage, model)
 
@@ -397,6 +811,46 @@ class StreamingHandler:
             finish_reason=finish_reason,
             has_tool_calls=chunk_has_tool_calls,
         )
+
+    @classmethod
+    def _in_band_error_payload(cls, chunk: Any) -> Optional[Dict[str, Any]]:
+        """Return a structured provider error embedded in a stream frame."""
+
+        event_name = None
+        payload = chunk
+        if isinstance(chunk, str):
+            event_names = [line[6:].strip() for line in chunk.splitlines() if line.startswith("event:")]
+            event_name = event_names[-1] if event_names else None
+            data_payloads = cls._sse_data_payloads(chunk)
+            if not data_payloads:
+                return None
+            try:
+                payload = json.loads(data_payloads[-1])
+            except json.JSONDecodeError:
+                if event_name == "error":
+                    return {"type": "upstream_error", "message": data_payloads[-1]}
+                return None
+        if not isinstance(payload, dict):
+            return None
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return deepcopy(error)
+        if error is not None:
+            return {"type": "upstream_error", "message": str(error)}
+        event_type = str(event_name or payload.get("event_type") or payload.get("type") or "")
+        if event_type == "response.failed":
+            response = payload.get("response") if isinstance(payload.get("response"), dict) else {}
+            nested = response.get("error")
+            if isinstance(nested, dict):
+                return deepcopy(nested)
+        if event_type in {"error", "response.error"}:
+            result = deepcopy(payload)
+            result.pop("event_type", None)
+            if result.get("type") in {None, "error", "response.error"}:
+                result["type"] = str(result.get("error_type") or "upstream_error")
+            result.setdefault("message", "Provider stream failed")
+            return result
+        return None
 
     def _try_extract_error(
         self,
@@ -446,25 +900,214 @@ class StreamingHandler:
 
         return None
 
-    def _calculate_stream_cost(
+    def _calculate_stream_cost_breakdown(
         self,
         model: str,
-        prompt_tokens: int,
-        completion_tokens: int,
-    ) -> float:
+        usage_record: UsageRecord,
+        *,
+        skip_cost_calculation: bool,
+    ) -> CostBreakdown:
+        """Calculate advisory stream cost through the shared cost helper."""
+
+        if skip_cost_calculation:
+            return CostBreakdown(pricing_source="skipped")
+        return CostCalculator().calculate(usage_record, model=model)
+
+    @staticmethod
+    def _log_stream_usage_accounting(
+        transaction_logger: Optional[Any],
+        usage_record: UsageRecord,
+        cost_breakdown: CostBreakdown,
+    ) -> None:
+        """Trace normalized stream usage without affecting stream delivery."""
+
+        if not transaction_logger:
+            return
+        transaction_logger.log_transform_pass(
+            "usage_accounting_summary",
+            {"usage": usage_record.to_dict(), "cost": cost_breakdown.to_dict()},
+            direction="metadata",
+            stage="final",
+            transport="sse",
+            metadata={
+                "source": usage_record.source,
+                "pricing_source": cost_breakdown.pricing_source,
+            },
+            snapshot=False,
+        )
+
+
+def _next_stream_wait_seconds(
+    monitor: StreamMonitor,
+    settings: Any,
+    last_heartbeat_at: float,
+) -> Optional[float]:
+    """Return the next active stream policy deadline.
+
+    A pending upstream `__anext__()` task is not cancelled for heartbeats. The
+    handler waits until the nearest policy deadline, emits heartbeat metadata if
+    needed, and keeps waiting on the same upstream task.
+    """
+
+    candidates: list[float] = []
+    now = time.monotonic()
+    if settings.heartbeat_seconds:
+        candidates.append(max(0.0, last_heartbeat_at + settings.heartbeat_seconds - now))
+    if settings.ttfb_timeout_seconds and monitor.metrics.first_byte_at is None:
+        candidates.append(max(0.0, monitor.metrics.started_at + settings.ttfb_timeout_seconds - now))
+    if settings.stall_timeout_seconds and monitor.metrics.first_byte_at is not None:
+        last_chunk_at = monitor.metrics.last_chunk_at or monitor.metrics.first_byte_at
+        candidates.append(max(0.0, last_chunk_at + settings.stall_timeout_seconds - now))
+    return min(candidates) if candidates else None
+
+
+def _heartbeat_due(monitor: StreamMonitor, settings: Any, last_heartbeat_at: float) -> bool:
+    """Return whether a heartbeat should be emitted while upstream is idle."""
+
+    if not settings.heartbeat_seconds:
+        return False
+    return time.monotonic() - last_heartbeat_at >= settings.heartbeat_seconds
+
+
+def _stream_timeout_error(monitor: StreamMonitor, settings: Any) -> Optional[tuple[str, dict[str, Any], str]]:
+    """Return a structured stream timeout error when a configured deadline expires."""
+
+    now = time.monotonic()
+    if settings.ttfb_timeout_seconds and monitor.metrics.first_byte_at is None:
+        if now - monitor.metrics.started_at >= settings.ttfb_timeout_seconds:
+            return (
+                "ttfb_timeout",
+                {
+                    "message": "Stream timed out before first byte",
+                    "type": "api_connection",
+                    "details": {"timeout_type": "ttfb", "timeout_seconds": settings.ttfb_timeout_seconds},
+                },
+                "stream_ttfb_timeout",
+            )
+    if settings.stall_timeout_seconds and monitor.metrics.first_byte_at is not None:
+        last_chunk_at = monitor.metrics.last_chunk_at or monitor.metrics.first_byte_at
+        if now - last_chunk_at >= settings.stall_timeout_seconds:
+            return (
+                "stall_timeout",
+                {
+                    "message": "Stream stalled while waiting for provider data",
+                    "type": "api_connection",
+                    "details": {"timeout_type": "stall", "timeout_seconds": settings.stall_timeout_seconds},
+                },
+                "stream_stall_timeout",
+            )
+    return None
+
+
+def _usage_from_sse_string(chunk: str) -> Optional[dict[str, Any]]:
+    """Extract usage from already formatted SSE chunks when native streams pass through."""
+
+    text = chunk.strip()
+    data_lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if not data_lines:
+        return None
+    payload = "\n".join(data_lines).strip()
+    if not payload or payload == "[DONE]":
+        return None
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    merged = dict(usage)
+    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+        if key in data and key not in merged:
+            merged[key] = data[key]
+    return merged
+
+
+def _usage_from_chunk_dict(chunk: Any) -> Optional[dict[str, Any]]:
+    """Return dict chunk usage with top-level provider cost siblings."""
+
+    if not isinstance(chunk, dict):
+        return None
+    usage = chunk.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    merged = dict(usage)
+    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
+        if key in chunk and key not in merged:
+            merged[key] = chunk[key]
+    return merged
+
+
+def _usage_record_from_sse_cost_chunk(chunk: Any, *, model: str) -> UsageRecord:
+    """Extract provider-reported stream cost from SSE comments/events."""
+
+    if not isinstance(chunk, str):
+        return UsageRecord(source="stream_cost_event", model=model)
+    cost_payload = _sse_cost_payload(chunk)
+    if cost_payload is None:
+        return UsageRecord(source="stream_cost_event", model=model)
+    if isinstance(cost_payload, (int, float, str)):
+        cost_payload = {"provider_reported_cost": cost_payload, "source": "sse_cost"}
+    if not isinstance(cost_payload, dict):
+        return UsageRecord(source="stream_cost_event", model=model)
+    return extract_usage_record(
+        {"usage": {"provider_reported_cost": cost_payload.get("provider_reported_cost", cost_payload.get("request_cost_usd", cost_payload.get("total_cost", cost_payload.get("cost", cost_payload.get("estimated_cost"))))), "currency": cost_payload.get("currency", "USD"), "cost_details": cost_payload}},
+        model=model,
+        source="stream_cost_event",
+    )
+
+
+def _sse_cost_payload(chunk: str) -> Any:
+    """Parse `: cost ...` comments and `event: cost` frames."""
+
+    event_type: Optional[str] = None
+    data_lines: list[str] = []
+    for line in chunk.strip().splitlines():
+        stripped = line.strip()
+        if stripped.startswith(":"):
+            comment = stripped[1:].strip()
+            if comment.startswith("cost"):
+                return _parse_cost_text(comment[4:].strip())
+            continue
+        if stripped.startswith("event:"):
+            event_type = stripped[6:].strip()
+            continue
+        if stripped.startswith("data:"):
+            data_lines.append(stripped[5:].strip())
+    if event_type == "cost" and data_lines:
+        return _parse_cost_text("\n".join(data_lines).strip())
+    return None
+
+
+def _parse_cost_text(text: str) -> Any:
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
         try:
-            model_info = litellm.get_model_info(model)
-            input_cost = model_info.get("input_cost_per_token")
-            output_cost = model_info.get("output_cost_per_token")
-            total_cost = 0.0
-            if input_cost:
-                total_cost += prompt_tokens * input_cost
-            if output_cost:
-                total_cost += completion_tokens * output_cost
-            return total_cost
-        except Exception as exc:
-            lib_logger.debug(f"Stream cost calculation failed for {model}: {exc}")
-            return 0.0
+            return float(text)
+        except ValueError:
+            return None
+
+
+def _merge_usage_cost(base: UsageRecord, cost_record: UsageRecord) -> UsageRecord:
+    """Copy provider-reported cost onto an existing normalized usage record."""
+
+    if cost_record.provider_reported_cost is None:
+        return base
+    return replace(
+        base,
+        provider_reported_cost=cost_record.provider_reported_cost,
+        cost_currency=cost_record.cost_currency,
+        cost_source=cost_record.cost_source,
+    )
 
 
 class StreamBuffer:

@@ -14,9 +14,7 @@ from typing import (
     Callable,
     Dict,
     List,
-    Literal,
     Optional,
-    Set,
     Tuple,
     Union,
 )
@@ -79,9 +77,8 @@ class RequestContext:
     session_id: Optional[str] = None
     session_affinity_key: Optional[str] = None
     session_tracker: Optional[Any] = None
-    session_possible_compaction: bool = False
-    session_lineage_parent_id: Optional[str] = None
     session_tracking_namespace: Optional[str] = None
+    session_isolation_key: Optional[str] = None
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
     transaction_logger: Optional[Any] = None
@@ -89,6 +86,17 @@ class RequestContext:
     provider_config: Optional[Dict[str, Any]] = None
     credential_secrets: Dict[str, str] = field(default_factory=dict)
     classifier: Optional[str] = None
+    routing_targets: Optional[Any] = None
+    routing_group_name: Optional[str] = None
+    routing_group: Optional[Any] = None
+    routing_target_index: int = 0
+    routing_attempt_history: List[Dict[str, Any]] = field(default_factory=list)
+    input_protocol_name: str = "openai_chat"
+    output_protocol_name: str = "openai_chat"
+    protocol_request: Dict[str, Any] = field(default_factory=dict)
+    unified_request: Optional[Any] = None
+    input_provider: Optional[str] = None
+    disable_provider_continuation: bool = False
 
 
 @dataclass

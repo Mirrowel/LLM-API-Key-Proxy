@@ -4,7 +4,6 @@
 import httpx
 import logging
 from typing import List, Dict, Any
-import litellm
 from .provider_interface import ProviderInterface
 
 lib_logger = logging.getLogger("rotator_library")
@@ -54,6 +53,9 @@ class NvidiaProvider(ProviderInterface):
     KIMI_K2_MODEL_PATTERNS = [
         "kimi-k2.",
     ]
+    DIFFUSION_GEMMA_MODEL_EXACT = [
+        "google/diffusiongemma-26b-a4b-it",
+    ]
 
     V4_EFFORT_MAP = {
         "low": "high",
@@ -61,7 +63,7 @@ class NvidiaProvider(ProviderInterface):
         "high": "max",
         "max": "max",
     }
-    DISABLE_VALUES = {"none", "disable", "off"}
+    DISABLE_VALUES = {"none", "disable", "disabled", "off"}
 
     def _is_v3_deepseek(self, model_name: str) -> bool:
         if model_name in self.V3_MODEL_EXACT:
@@ -77,14 +79,18 @@ class NvidiaProvider(ProviderInterface):
     def _is_kimi_k2(self, model_name: str) -> bool:
         return any(p in model_name for p in self.KIMI_K2_MODEL_PATTERNS)
 
+    def _is_diffusion_gemma(self, model_name: str) -> bool:
+        return model_name in self.DIFFUSION_GEMMA_MODEL_EXACT
+
     def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
         """
-        Configures thinking and reasoning_effort for DeepSeek and Mistral models on NVIDIA.
+        Configures thinking and reasoning_effort for supported NVIDIA models.
 
         DeepSeek V3.x: only thinking=True/False in chat_template_kwargs.
         DeepSeek V4: thinking + mapped reasoning_effort (high/max).
         Mistral: reasoning_effort="high" via extra_body (LiteLLM drops unsupported top-level params).
-        Incoming reasoning_effort of none/disable/off disables thinking/effort.
+        DiffusionGemma: enable_thinking=True/False in top-level chat_template_kwargs.
+        Incoming reasoning_effort of none/disable/disabled/off disables thinking/effort.
         """
         model_name = model.split("/", 1)[1] if "/" in model else model
 
@@ -92,8 +98,15 @@ class NvidiaProvider(ProviderInterface):
         is_v4 = self._is_v4_deepseek(model_name)
         is_mistral = self._is_mistral_reasoning(model_name)
         is_kimi = self._is_kimi_k2(model_name)
+        is_diffusion_gemma = self._is_diffusion_gemma(model_name)
 
-        if not is_v3 and not is_v4 and not is_mistral and not is_kimi:
+        if (
+            not is_v3
+            and not is_v4
+            and not is_mistral
+            and not is_kimi
+            and not is_diffusion_gemma
+        ):
             return
 
         reasoning_effort = payload.get("reasoning_effort")
@@ -102,6 +115,19 @@ class NvidiaProvider(ProviderInterface):
             isinstance(reasoning_effort, str)
             and reasoning_effort.lower() in self.DISABLE_VALUES
         )
+
+        if is_diffusion_gemma:
+            payload.pop("reasoning_effort", None)
+            template_kwargs = payload.get("chat_template_kwargs")
+            if not isinstance(template_kwargs, dict):
+                template_kwargs = {}
+                payload["chat_template_kwargs"] = template_kwargs
+            template_kwargs["enable_thinking"] = not is_disabled
+            lib_logger.info(
+                f"NVIDIA: DiffusionGemma '{model_name}' — "
+                f"enable_thinking={not is_disabled}"
+            )
+            return
 
         if is_kimi:
             payload.pop("reasoning_effort", None)
@@ -135,6 +161,7 @@ class NvidiaProvider(ProviderInterface):
         kwargs = payload["extra_body"]["chat_template_kwargs"]
 
         if is_disabled:
+            payload.pop("reasoning_effort", None)
             kwargs["thinking"] = False
             lib_logger.info(
                 f"NVIDIA: DeepSeek '{model_name}' — thinking DISABLED "

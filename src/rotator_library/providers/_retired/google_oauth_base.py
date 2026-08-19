@@ -22,10 +22,10 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.markup import escape as rich_escape
 
-from ..utils.headless_detection import is_headless_environment
-from ..utils.reauth_coordinator import get_reauth_coordinator
-from ..utils.resilient_io import safe_write_json
-from ..error_handler import CredentialNeedsReauthError
+from ...utils.headless_detection import is_headless_environment
+from ...utils.reauth_coordinator import get_reauth_coordinator
+from ...utils.resilient_io import safe_write_json
+from ...error_handler import CredentialNeedsReauthError
 
 lib_logger = logging.getLogger("rotator_library")
 
