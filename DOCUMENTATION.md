@@ -1145,7 +1145,31 @@ TIMEOUT_POOL=120
 
 The library handles provider idiosyncrasies through specialized "Provider" classes in `src/rotator_library/providers/`.
 
-### 3.1. Gemini CLI (`gemini_cli_provider.py`)
+### 3.1. MiniMax (`minimax_provider.py`)
+
+The MiniMax provider exposes the built-in `MiniMax-M3` and `MiniMax-M2.7`
+models while preserving additional models returned by the provider's model
+discovery endpoint. Native model metadata includes context limits, pricing,
+input modalities, tool use, and interleaved thinking for the
+`/v1/models` and cost APIs.
+
+Configure the upstream region and protocol with these environment variables:
+
+```env
+MINIMAX_API_REGION="global_en"  # or cn_zh
+MINIMAX_API_PROTOCOL="openai"   # or anthropic
+
+MINIMAX_GLOBAL_OPENAI_BASE_URL="https://api.minimax.io/v1"
+MINIMAX_GLOBAL_ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic"
+MINIMAX_CN_OPENAI_BASE_URL="https://api.minimaxi.com/v1"
+MINIMAX_CN_ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic"
+```
+
+Anthropic-compatible base URLs must end with `/anthropic`. The adapter passes
+that base to the compatibility client, which appends `/v1/messages` for the
+Messages API request.
+
+### 3.2. Gemini CLI (`gemini_cli_provider.py`)
 
 The `GeminiCliProvider` is the most complex implementation, mimicking the Google Cloud Code extension.
 
@@ -1492,4 +1516,3 @@ The GUI modifies the same environment variables that the `RotatingClient` reads:
 3. **Proxy applies rules** → `get_available_models()` filters based on rules
 
 **Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
-
