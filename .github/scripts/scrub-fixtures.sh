@@ -157,6 +157,9 @@ check "review: auto context keyed on source=stub input"      yes "$(grep -q "inp
 for wf in pr-review bot-reply compliance-check issue-comment; do
   WFF="$SCRIPT_DIR/../workflows/$wf.yml"
   check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  # opencode prints the share link on STDERR (TUI/status channel): the
+  # merge is load-bearing - without 2>&1 the link bypasses the filter.
+  check "share: $wf merges stderr into filter"      yes "$(grep -q 'opencode run --share.*2>&1 | bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   check "share: $wf passes SHARE_LINK_PUBKEY env"  yes "$(grep -q 'SHARE_LINK_PUBKEY: \${{ secrets.SHARE_LINK_PUBKEY }}' "$WFF" && echo yes || echo no)"
   check "share: $wf copies filter to /tmp"         yes "$(grep -q 'cp .github/scripts/share-filter.sh /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   check "share: $wf has summary step"              yes "$(grep -q 'Share link summary' "$WFF" && echo yes || echo no)"

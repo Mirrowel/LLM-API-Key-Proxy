@@ -693,7 +693,7 @@ jobs:
             fi
             VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY'
             # Prepend the security brief (with the verified requester and trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh bot-reply | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share - | bash /tmp/share-filter.sh
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh bot-reply | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
 
       - name: Share link summary
         if: always()
