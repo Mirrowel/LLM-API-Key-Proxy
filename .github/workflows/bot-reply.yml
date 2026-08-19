@@ -483,11 +483,12 @@ jobs:
           cp -r .github/prompts/manifests /tmp/manifests
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
+          cp .github/scripts/share-filter.sh /tmp/share-filter.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           cp .github/scripts/react.sh /tmp/react.sh
           cp .github/scripts/fetch-pr-discussion.sh /tmp/fetch-pr-discussion.sh
           cp .github/scripts/generate-review-kit.sh /tmp/generate-review-kit.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/fetch-pr-discussion.sh /tmp/generate-review-kit.sh /tmp/react.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/fetch-pr-discussion.sh /tmp/generate-review-kit.sh /tmp/react.sh /tmp/share-filter.sh
           bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout PR head
@@ -672,7 +673,15 @@ jobs:
           # Optional public-account token for verified-lead actions abroad
           # (scope-of-action rules). Absent secret => empty => unavailable.
           ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          # Share-link encryption (pub key from secret; private key stays
+          # with the admin - see decrypt_share_link.py). Context fields are
+          # public metadata identifying which session this is.
+          SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
+          SHARE_CTX_THREAD: ${{ steps.context.outputs.IS_PR == 'true' && format('PR #{0}', env.THREAD_NUMBER) || format('Issue #{0}', env.THREAD_NUMBER) }}
+          SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA }}
+          SHARE_CTX_DETAIL: agent reply
         run: |
+            set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
             if [ "$IS_PR" = "true" ]; then
               FULL_DIFF_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
@@ -684,7 +693,24 @@ jobs:
             fi
             VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY'
             # Prepend the security brief (with the verified requester and trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh bot-reply | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share -
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh bot-reply | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share - | bash /tmp/share-filter.sh
+
+      - name: Share link summary
+        if: always()
+        run: |
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          if [ -s "$TMP_DIR/share-link.enc" ]; then
+            {
+              echo "### Mirrobot share link (encrypted)"
+              echo
+              echo '```'
+              cat "$TMP_DIR/share-link.enc"
+              echo '```'
+              cat "$TMP_DIR/share-link.ctx" 2>/dev/null || true
+              echo
+              echo "Decrypt locally: \`python decrypt_share_link.py\` and paste the block above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Lifecycle reaction (session success)
         # Mention comment: eyes -> rocket on completed reply.

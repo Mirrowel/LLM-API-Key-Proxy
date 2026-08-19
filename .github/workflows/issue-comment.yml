@@ -88,9 +88,10 @@ jobs:
           cp -r .github/prompts/manifests /tmp/manifests
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
+          cp .github/scripts/share-filter.sh /tmp/share-filter.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           cp .github/scripts/react.sh /tmp/react.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/share-filter.sh
           bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout repository
@@ -218,8 +219,31 @@ jobs:
           # Optional public-account token for verified-lead actions abroad
           # (scope-of-action rules). Absent secret => empty => unavailable.
           ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          # Share-link encryption (pub key from secret; private key stays
+          # with the admin - see decrypt_share_link.py).
+          SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
+          SHARE_CTX_THREAD: "Issue #${{ env.ISSUE_NUMBER }}"
+          SHARE_CTX_DETAIL: issue triage
         run: |
+            set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
             VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}'
             # Prepend the security brief (with the verified requester + trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share -
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share - | bash /tmp/share-filter.sh
+
+      - name: Share link summary
+        if: always()
+        run: |
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          if [ -s "$TMP_DIR/share-link.enc" ]; then
+            {
+              echo "### Mirrobot share link (encrypted)"
+              echo
+              echo '```'
+              cat "$TMP_DIR/share-link.enc"
+              echo '```'
+              cat "$TMP_DIR/share-link.ctx" 2>/dev/null || true
+              echo
+              echo "Decrypt locally: \`python decrypt_share_link.py\` and paste the block above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

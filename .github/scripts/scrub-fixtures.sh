@@ -149,6 +149,20 @@ check "stub: label gate + decide/signal steps intact"        yes "$(grep -c "Age
 check "review: NO workflow_run listener (dispatch only)"     no  "$(grep -q 'workflow_run:' "$PRWF" && echo yes || echo no)"
 check "review: auto context keyed on source=stub input"      yes "$(grep -q "inputs.source == 'stub'" "$PRWF" && echo yes || echo no)"
 
+# ---- share-link filter contract (drift tripwire) ---------------------------
+# Every opencode --share invocation MUST pipe through the trusted /tmp copy
+# of share-filter.sh (raw share URLs must never reach the public log), every
+# agent step must pass the SHARE_LINK_PUBKEY secret, and the summary step
+# must exist to surface the encrypted block on the run page.
+for wf in pr-review bot-reply compliance-check issue-comment; do
+  WFF="$SCRIPT_DIR/../workflows/$wf.yml"
+  check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  check "share: $wf passes SHARE_LINK_PUBKEY env"  yes "$(grep -q 'SHARE_LINK_PUBKEY: \${{ secrets.SHARE_LINK_PUBKEY }}' "$WFF" && echo yes || echo no)"
+  check "share: $wf copies filter to /tmp"         yes "$(grep -q 'cp .github/scripts/share-filter.sh /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  check "share: $wf has summary step"              yes "$(grep -q 'Share link summary' "$WFF" && echo yes || echo no)"
+  check "share: $wf step sets pipefail"            yes "$(grep -B15 'opencode run --share' "$WFF" | grep -q 'set -o pipefail' && echo yes || echo no)"
+done
+
 # ---- channel hygiene -------------------------------------------------------
 git checkout -q --detach origin/evil; rm -f /tmp/scrub-taint.txt; bash "$SCRUB" --anchor main >/dev/null 2>&1
 flat=$(tr '\n' ' ' < /tmp/scrub-taint.txt | tr -s ' ' | cut -c1-600)
