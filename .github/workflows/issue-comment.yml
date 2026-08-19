@@ -24,7 +24,12 @@ jobs:
       # If triggered by 'issues', it uses github.event.issue.number.
       # If triggered by 'workflow_dispatch', it uses the number you provided in the form.
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
-      IGNORE_BOT_NAMES_JSON: '["ellipsis-dev"]'
+      # Noise filtering for thread context (see fetch-pr-discussion.sh):
+      # CONTEXT_IGNORE_AUTHORS - comma logins dropped outright (repo variable)
+      # CONTEXT_FILTER_PATTERNS_JSON - JSON array of body regexes dropping
+      #   matching posts; unset = baked AI-reviewer noise defaults
+      CONTEXT_IGNORE_AUTHORS: ${{ vars.CONTEXT_IGNORE_AUTHORS || '' }}
+      CONTEXT_FILTER_PATTERNS_JSON: ${{ vars.CONTEXT_FILTER_PATTERNS_JSON || '' }}
 
     steps:
 
@@ -136,7 +141,7 @@ jobs:
           total_issue_comments=$(echo "$issue_data" | jq '((.comments // []) | length)')
           echo "Debug: total issue comments before filtering = $total_issue_comments"
           comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
-          if comments=$(echo "$issue_data" | jq -r --argjson ignored "$IGNORE_BOT_NAMES_JSON" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login // "" | ascii_downcase as $login | $ignored | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+          if comments=$(echo "$issue_data" | jq -r --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login // "" | ascii_downcase) as $login | ($ignore_authors | split(",") | map(select(length > 0)) | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
             filtered_comments=$(echo "$comments" | grep -c "^- " || true)
             filtered_comments=${filtered_comments//[^0-9]/}
             [ -z "$filtered_comments" ] && filtered_comments=0
