@@ -24,7 +24,7 @@ on:
 # superseded mention's content is still in the thread history and the next
 # run on that thread sees it.
 concurrency:
-  group: bot-reply-${{ inputs.threadNumber }}
+  group: bot-reply-${{ inputs.threadNumber || github.run_id }}
   cancel-in-progress: false
 
 jobs:
@@ -51,6 +51,15 @@ jobs:
       # How many of THIS agent's newest PR reviews to elevate into the
       # dedicated context block (same machinery as PR Review). Default 1.
       PREVIOUS_BOT_REVIEWS_COUNT: ${{ vars.PREVIOUS_BOT_REVIEWS_COUNT || '1' }}
+
+      # secrets.* is not evaluable in step-level if: conditionals - the
+      # push-path validation of dispatch-only workflows (actions/runner#4001
+      # phantom runs) rejects the file with "Unrecognized named-value:
+      # (secrets)". Deriving the boolean here (job env, where secrets IS
+      # valid) and branching on env.X in step ifs is the sanctioned pattern.
+      # NOTE: a later step writing ACCOUNT_TOKEN_SET to $GITHUB_ENV would
+      # override this - do not do that.
+      ACCOUNT_TOKEN_SET: ${{ secrets.ACCOUNT_GH_TOKEN != '' }}
 
     steps:
       # Sparse default-branch checkout for the SHARED routing script, so the
@@ -157,7 +166,7 @@ jobs:
         # validate gate passed (mention confirmed in actual content). The
         # regular react step below is the app-mode fallback.
         id: fast_eyes
-        if: steps.validate.outputs.should_proceed == 'true' && inputs.commentId != '' && secrets.ACCOUNT_GH_TOKEN != ''
+        if: steps.validate.outputs.should_proceed == 'true' && inputs.commentId != '' && env.ACCOUNT_TOKEN_SET == 'true'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
