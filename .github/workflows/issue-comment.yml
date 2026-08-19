@@ -229,7 +229,7 @@ jobs:
             # Only substitute the variables we intend; leave example $vars and secrets intact
             VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}'
             # Prepend the security brief (with the verified requester + trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share - | bash /tmp/share-filter.sh
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
 
       - name: Share link summary
         if: always()

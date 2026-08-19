@@ -716,7 +716,7 @@ jobs:
         run: |
           set -o pipefail
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          opencode run --share - < "$TMP_DIR/assembled_prompt.txt" | bash /tmp/share-filter.sh
+          opencode run --share - < "$TMP_DIR/assembled_prompt.txt" 2>&1 | bash /tmp/share-filter.sh
 
       - name: Share link summary
         if: always()
