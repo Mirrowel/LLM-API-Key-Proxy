@@ -519,7 +519,8 @@ jobs:
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           cp .github/scripts/react.sh /tmp/react.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh
+          cp .github/scripts/share-filter.sh /tmp/share-filter.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/share-filter.sh
           bash /tmp/assemble-prompt.sh --verify
 
       - name: Checkout PR head
@@ -759,9 +760,34 @@ jobs:
           # Optional public-account token for verified-lead actions abroad
           # (scope-of-action rules). Absent secret => empty => unavailable.
           ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          # Share-link encryption (pub key from secret; private key stays
+          # with the admin - see decrypt_share_link.py). Context fields are
+          # public metadata that identify WHICH review session this is.
+          SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
+          SHARE_CTX_THREAD: "PR #${{ inputs.prNumber || env.PR_NUMBER }}"
+          SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA }}
+          SHARE_CTX_DETAIL: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST review' || format('FOLLOW-UP (last reviewed {0})', env.LAST_REVIEWED_SHA) }}
+        run: |
+          set -o pipefail
+          TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          opencode run --share - < "$TMP_DIR/assembled_prompt.txt" | bash /tmp/share-filter.sh
+
+      - name: Share link summary
+        if: always()
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          opencode run --share - < "$TMP_DIR/assembled_prompt.txt"
+          if [ -s "$TMP_DIR/share-link.enc" ]; then
+            {
+              echo "### Mirrobot share link (encrypted)"
+              echo
+              echo '```'
+              cat "$TMP_DIR/share-link.enc"
+              echo '```'
+              cat "$TMP_DIR/share-link.ctx" 2>/dev/null || true
+              echo
+              echo "Decrypt locally: \`python decrypt_share_link.py\` and paste the block above."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Lifecycle reaction (session success)
         # Comment targets: eyes -> rocket. PR/issue targets keep eyes by
