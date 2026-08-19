@@ -766,7 +766,7 @@ jobs:
           SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
           SHARE_CTX_THREAD: "PR #${{ inputs.prNumber || env.PR_NUMBER }}"
           SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA }}
-          SHARE_CTX_DETAIL: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST review' || format('FOLLOW-UP (last reviewed {0})', env.LAST_REVIEWED_SHA) }}
+          SHARE_CTX_DETAIL: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST review' || format('FOLLOW-UP (last reviewed {0})', steps.review_type.outputs.last_reviewed_sha) }}
         run: |
           set -o pipefail
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
