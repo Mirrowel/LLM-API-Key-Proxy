@@ -113,6 +113,23 @@ need br 'wording varies by token type'     "br: recovery grep is wording-agnosti
 need br 'failure report'                       "br: fatal-error reporting duty"
 need br 'second and final'                     "br: single-recovery limit"
 
+# ---- workflow contracts (grep the raw workflow files) ----
+for w in .github/workflows/bot-reply.yml .github/workflows/pr-review.yml .github/workflows/compliance-check.yml; do
+  if grep -q '\["mirrobot",' "$w" 2>/dev/null && grep -q 'BOT_NAMES_JSON' "$w"; then
+    echo "FAIL: $w: BOT_NAMES_JSON contains bare mirrobot (name != identity)"; FAILED=1
+  fi
+  grep -q 'mirrobot-agent\[bot\]' "$w" || { echo "FAIL: $w: BOT_NAMES_JSON missing app identity"; FAILED=1; }
+done
+for w in .github/workflows/bot-reply.yml .github/workflows/pr-review.yml .github/workflows/compliance-check.yml .github/workflows/issue-comment.yml; do
+  grep -q 'CONTEXT_IGNORE_AUTHORS' "$w" || { echo "FAIL: $w: CONTEXT_IGNORE_AUTHORS unwired"; FAILED=1; }
+  grep -q 'CONTEXT_FILTER_PATTERNS_JSON' "$w" || { echo "FAIL: $w: CONTEXT_FILTER_PATTERNS_JSON unwired"; FAILED=1; }
+  grep -q 'ellipsis' "$w" && { echo "FAIL: $w: hardcoded ellipsis survives"; FAILED=1; }
+done
+grep -q 'head -1 /tmp/scrub-taint.txt' .github/workflows/pr-review.yml || { echo 'FAIL: pr-review taint summary not head -1'; FAILED=1; }
+grep -q 'head -1 /tmp/scrub-taint.txt' .github/workflows/compliance-check.yml || { echo 'FAIL: compliance taint summary not head -1'; FAILED=1; }
+grep -q 'head -1 /tmp/scrub-taint.txt' .github/workflows/bot-reply.yml || { echo 'FAIL: bot-reply taint summary not head -1'; FAILED=1; }
+grep -q 'cut -c1-600' .github/workflows/*.yml && { echo 'FAIL: flatten-cut taint pattern survives'; FAILED=1; }
+
 # ---- mode-specific ----
 need cc 'compliance'                           "cc: compliance mission"
 need cc 'file group'                           "cc: file groups wiring"
@@ -120,6 +137,14 @@ need cc 'template'                             "cc: report template wiring"
 need ic 'Initial Analysis Report'              "ic: analysis output shape"
 need ic 'thanks'                               "ic: acknowledgment duty"
 
+# ---- context noise filtering + identity (2026-08 rework) ----
+for f in rf ru cc cf; do
+  need $f 'Other AI reviewers'                   "$f: AI-reviewer input-not-authority stance"
+  need $f 'never authority'                      "$f: never defer clause"
+  need $f 'noise posts .rate-limit.skip notices.' "$f: filtering explained"
+done
+need ru 'your NAME, not an identity'           "ru: name-vs-identity rule"
+need br 'your name, not an identity'           "br: name-vs-identity rule"
 # ---- severity universal + inline format (agent trait, every mode) ----
 for f in rf ru br ic cc cf; do
   need $f 'Severity System'                      "$f: severity part present"

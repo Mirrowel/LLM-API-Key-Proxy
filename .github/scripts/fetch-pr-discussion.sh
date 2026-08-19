@@ -5,8 +5,9 @@
 # PR Review and Compliance Check (identical machinery, identical semantics):
 #   1. PREVIOUS_BOT_REVIEWS  - newest N reviews by THIS agent (BOT_NAMES_JSON,
 #      NOT bots in general) with ALL their inline comments, bypassing the
-#      resolved/outdated/hidden filter (markers shown instead - the latest
-#      review deserves the full picture).
+#      resolved/outdated filter (markers shown instead - the latest review
+#      deserves the full picture). Minimized (hidden) content is the ONE
+#      exception: hidden stays hidden everywhere, own content included.
 #   2. AGENT_REVIEW_HISTORY  - older reviews by this agent, fully filtered
 #      (resolved/outdated/hidden threads and comments omitted to save context).
 #   3. THREAD_CONTEXT        - everything else: issue comments (bot's
@@ -14,15 +15,30 @@
 #      reviews with their inline comments CORRELATED under each review
 #      (filtered), plus the filtering summary.
 #
+# NOISE FILTERING (other-people content only; never the agent's own blocks):
+#   CONTEXT_IGNORE_AUTHORS   - comma-separated logins whose posts are dropped
+#                              outright (repo variable). Default: empty.
+#   CONTEXT_FILTER_PATTERNS_JSON - JSON array of regex snippets (repo
+#                              variable). Any case-insensitive match on a
+#                              post's body drops that post. JSON array means
+#                              patterns may contain commas/semicolons/pipes;
+#                              backslashes double as JSON escapes ("\\.").
+#                              Setting the variable REPLACES the baked-in
+#                              defaults (defaults: known AI-reviewer noise -
+#                              rate-limit notices, review-skipped/Too-many-
+#                              files posts, greptile status channel). Malformed
+#                              JSON falls back to defaults with a warning.
+#
 # Contract:
 #   $1      : PR number
-#   env in  : GH_TOKEN, GITHUB_REPOSITORY, BOT_NAMES_JSON, IGNORE_BOT_NAMES_JSON,
-#             COMMENT_FETCH_LIMIT, REVIEW_FETCH_LIMIT, REVIEW_THREAD_FETCH_LIMIT,
+#   env in  : GH_TOKEN, GITHUB_REPOSITORY, BOT_NAMES_JSON, COMMENT_FETCH_LIMIT,
+#             REVIEW_FETCH_LIMIT, REVIEW_THREAD_FETCH_LIMIT,
 #             THREAD_COMMENT_FETCH_LIMIT, PREVIOUS_BOT_REVIEWS_COUNT (default 1),
 #             EXCLUDE_COMMENT_IDS (optional comma-separated databaseIds to drop
 #             from THREAD_CONTEXT - used to dedup elevated injections),
 #             PREFIX_TEXT (optional text prepended verbatim to THREAD_CONTEXT -
-#             callers use it for PR metadata/body framing)
+#             callers use it for PR metadata/body framing),
+#             CONTEXT_IGNORE_AUTHORS (optional), CONTEXT_FILTER_PATTERNS_JSON (optional)
 #   env out : appends THREAD_CONTEXT / PREVIOUS_BOT_REVIEWS / AGENT_REVIEW_HISTORY
 #             to $GITHUB_ENV with unguessable random delimiters; THREAD_CONTEXT
 #             ends with a one-line filtering summary
@@ -42,8 +58,7 @@ PR_NUMBER="${1:?usage: fetch-pr-discussion.sh <pr_number>}"
 : "${GH_TOKEN:?}"
 : "${GITHUB_REPOSITORY:?}"
 
-BOT_NAMES_JSON="${BOT_NAMES_JSON:-[\"mirrobot\", \"mirrobot-agent\", \"mirrobot-agent[bot]\"]}"
-IGNORE_BOT_NAMES_JSON="${IGNORE_BOT_NAMES_JSON:-[\"ellipsis-dev\"]}"
+BOT_NAMES_JSON="${BOT_NAMES_JSON:-[\"mirrobot-agent\", \"mirrobot-agent[bot]\"]}"
 COMMENT_FETCH_LIMIT="${COMMENT_FETCH_LIMIT:-20}"
 REVIEW_FETCH_LIMIT="${REVIEW_FETCH_LIMIT:-30}"
 REVIEW_THREAD_FETCH_LIMIT="${REVIEW_THREAD_FETCH_LIMIT:-30}"
@@ -51,6 +66,23 @@ THREAD_COMMENT_FETCH_LIMIT="${THREAD_COMMENT_FETCH_LIMIT:-10}"
 ELEVATED_COUNT="${PREVIOUS_BOT_REVIEWS_COUNT:-1}"
 EXCLUDE_COMMENT_IDS="${EXCLUDE_COMMENT_IDS:-}"
 PREFIX_TEXT="${PREFIX_TEXT:-}"
+
+# Noise-filter configuration (repo variables; see header).
+CONTEXT_IGNORE_AUTHORS="${CONTEXT_IGNORE_AUTHORS:-}"
+# Baked defaults: the demonstrated noise classes of AI reviewers (coderabbit
+# rate-limit/skip posts, greptile status/skip posts). Substantive reviews -
+# walkthroughs, overviews, inline findings - NEVER match these.
+DEFAULT_FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","<!-- greptile-status -->","Too many files changed for review"]'
+if [ -n "${CONTEXT_FILTER_PATTERNS_JSON:-}" ]; then
+  if printf '%s' "$CONTEXT_FILTER_PATTERNS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    FILTER_PATTERNS_JSON="$CONTEXT_FILTER_PATTERNS_JSON"
+  else
+    echo "::warning::CONTEXT_FILTER_PATTERNS_JSON is not a valid JSON array; using built-in defaults."
+    FILTER_PATTERNS_JSON="$DEFAULT_FILTER_PATTERNS_JSON"
+  fi
+else
+  FILTER_PATTERNS_JSON="$DEFAULT_FILTER_PATTERNS_JSON"
+fi
 
 repo_owner="${GITHUB_REPOSITORY%/*}"
 repo_name="${GITHUB_REPOSITORY#*/}"
@@ -125,13 +157,17 @@ fi
 
 # ---- Thread context: issue comments (filtered, optional id exclusion) ----
 thread_context=$(printf '%s' "$discussion_data" | jq -r \
-  --argjson ignored "$IGNORE_BOT_NAMES_JSON" \
+  --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
+  --argjson patterns "$FILTER_PATTERNS_JSON" \
   --arg exclude_ids "$EXCLUDE_COMMENT_IDS" '
+  ($ignore_authors | split(",") | map(select(length > 0))) as $ignored |
+  def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
   (.data.repository.pullRequest.comments.nodes // [])
   | map(select(
       (.isMinimized != true)
-      and (((.author.login? // "unknown") as $login | $ignored | index($login)) | not)
+      and (((.author.login? // "unknown") | ascii_downcase) as $login | $ignored | index($login) | not)
       and (((.databaseId | tostring) as $id | ($exclude_ids | split(",") | map(select(length > 0)) | index($id)) | not))
+      and (noisy | not)
     ))
   | if length > 0 then
       map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n")
@@ -143,8 +179,11 @@ thread_context=$(printf '%s' "$discussion_data" | jq -r \
 # ---- Reviews + correlated inline comments (three-block separation) ----
 if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   --argjson agentbots "$BOT_NAMES_JSON" \
-  --argjson ignored "$IGNORE_BOT_NAMES_JSON" \
+  --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
+  --argjson patterns "$FILTER_PATTERNS_JSON" \
   --argjson count "$ELEVATED_COUNT" '
+  ($ignore_authors | split(",") | map(select(length > 0))) as $ignored |
+  def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
   (.data.repository.pullRequest) as $pr |
   (($pr.reviewThreads.nodes // [])
     | map(. as $th | (.comments.nodes // []) | map(. + {thResolved: ($th.isResolved == true), thOutdated: ($th.isOutdated == true)}))
@@ -165,9 +204,11 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     "## " + (.submittedAt // "N/A") + " - " + (.state // "UNKNOWN") + " - " + (.author.login? // "unknown") + " <" + (.url // "") + ">\n"
     + ((.body // "(No summary comment)") | tostring) + "\n"
     + (if ($lines | length) > 0 then "Inline comments:\n" + ($lines | join("\n")) + "\n" else "Inline comments: (none)\n" end);
-  # THIS agent reviews, newest first
+  # (agent-reviews selection note: minimized stays hidden for the agent own
+  # reviews too - hidden is hidden from ANYONE; only resolved/outdated
+  # markers are bypassed, in the elevated block, on purpose)
   (($pr.reviews.nodes // []) | sort_by(.submittedAt) | reverse
-    | map(select((.author.login? // "" | ascii_downcase) as $l | $agentbots | index($l)))) as $agent_reviews |
+    | map(select(((.author.login? // "" | ascii_downcase) as $l | $agentbots | index($l)) and (.isMinimized != true)))) as $agent_reviews |
   # Section-level clarification: GitHub auto-dismisses APPROVED reviews on new
   # pushes (CHANGES_REQUESTED/COMMENT survive); the state field loses the
   # original verdict. One note per section, only when a DISMISSED review is in it.
@@ -175,19 +216,21 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   # Human/other reviews with correlated active comments (agent reviews excluded)
   (($pr.reviews.nodes // [])
     | map(select(
-        ((.author.login? // "unknown" | ascii_downcase) as $login | $ignored | index($login) | not)
+        (((.author.login? // "unknown" | ascii_downcase) as $login | $ignored | index($login)) | not)
         and (((.author.login? // "unknown" | ascii_downcase) as $abot | $agentbots | index($abot)) | not)
-        and (.isMinimized != true)))) as $other_reviews |
+        and (.isMinimized != true)
+        and (noisy | not)))) as $other_reviews |
   # ($other_reviews already carries these filters - never duplicate the
   # predicate list; duplicated predicates drift apart on later edits.)
   [ $other_reviews[]?
     | . as $r
     | [ ($allc | map(select((.pullRequestReview.databaseId? // null) == $r.databaseId)) | .[] | fmt_c_kept) ] as $lines
     | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + " - " + (.state // "UNKNOWN") + " <" + (.url // "") + ">\n"
+      + ((.body // "") | tostring | if length > 0 then "  " + . + "\n" else "" end)
       + (if ($lines | length) > 0 then "  Inline comments:\n" + ($lines | map("  " + .) | join("\n")) + "\n" else "  (no active inline comments)\n" end)
   ] | join("") as $othertext |
   # Standalone (unlinked) active comments not by this agent
-  [ ($allc | .[] | select((.pullRequestReview == null) and thread_ok and cmt_ok and (agent_cmt | not)) | fmt_c) ] as $unlinked |
+  [ ($allc | .[] | select((.pullRequestReview == null) and thread_ok and cmt_ok and (agent_cmt | not))) | fmt_c ] as $unlinked |
   ((if ($othertext | length) > 0 then $othertext else "No formal reviews." end)
    + (if ($unlinked | length) > 0 then "\nStandalone inline comments:\n" + ($unlinked | join("\n")) + "\n" else "" end)) as $threadreviews |
   ([ $allc[] | select((thread_ok and cmt_ok) | not) ] | length) as $n_filtered |
@@ -195,7 +238,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     elevated: ((([$agent_reviews[0:$count][] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end) + ($agent_reviews[0:$count] | dismissed_note)),
     history: ((([$agent_reviews[$count:][] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end) + ($agent_reviews[$count:] | dismissed_note)),
     threadreviews: ($threadreviews + ($other_reviews | dismissed_note)),
-    filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, or minimized comments in active threads). The elevated block bypasses the filter on purpose.</filtering_summary>")
+    filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, or minimized comments in active threads); hidden (minimized) content excluded everywhere, own reviews included; AI-reviewer noise posts (rate-limit/skip notices) and ignored authors dropped. The elevated block bypasses only the resolved/outdated filter, on purpose.</filtering_summary>")
   }
 '); then
   echo "::warning::Discussion block formatting failed for PR #$PR_NUMBER"
