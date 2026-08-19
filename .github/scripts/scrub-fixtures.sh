@@ -160,6 +160,11 @@ for wf in pr-review bot-reply compliance-check issue-comment; do
   # opencode prints the share link on STDERR (TUI/status channel): the
   # merge is load-bearing - without 2>&1 the link bypasses the filter.
   check "share: $wf merges stderr into filter"      yes "$(grep -q 'opencode run --share.*2>&1 | bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  # "PR #{0}" inside an UNQUOTED scalar truncates the value at the YAML
+  # comment marker (" #") - the workflow file goes invalid and every push
+  # red-Xes with 0 jobs (live-caught on bot-reply). Values carrying # in
+  # expressions must be quoted.
+  check "share: $wf SHARE_CTX values quoted (hash trap)" no "$(grep -E 'SHARE_CTX_[A-Z]+: [^\"'\"']' "$WFF" | grep -q '\$\{{' && echo yes || echo no)"
   check "share: $wf passes SHARE_LINK_PUBKEY env"  yes "$(grep -q 'SHARE_LINK_PUBKEY: \${{ secrets.SHARE_LINK_PUBKEY }}' "$WFF" && echo yes || echo no)"
   check "share: $wf copies filter to /tmp"         yes "$(grep -q 'cp .github/scripts/share-filter.sh /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   check "share: $wf has summary step"              yes "$(grep -q 'Share link summary' "$WFF" && echo yes || echo no)"
