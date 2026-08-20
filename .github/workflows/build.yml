@@ -1,5 +1,12 @@
 name: Build and Release Executable
 
+# TODO(definitive-release-workflow): Keep this release workflow aligned with
+# opencode-agent-variants where practical. The intended shared shape is:
+# centralized config, branch/channel release policy, generated release notes,
+# author resolution, community contributor detection, and project-specific
+# packaging steps. Do not extract into a separate shared workflow unless more
+# projects need it; keep the two workflows readable sibling implementations.
+
 # ╔═══════════════════════════════════════════════════════════════════════════════════════╗
 # ║                              CONFIGURATION SECTION                                     ║
 # ║  Edit the values below to customize build triggers, release contents, and behavior.   ║
@@ -107,8 +114,10 @@ on:
     paths:
       - 'src/proxy_app/**'       # Main application source code
       - 'src/rotator_library/**' # Key rotation library
-      - '.github/workflows/build.yml'  # This workflow file
-      - 'cliff.toml'             # Changelog configuration
+
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
 
 # ════════════════════════════════════════════════════════════════════════════════════════════
 #                                         JOBS
@@ -234,6 +243,21 @@ jobs:
         BRANCH_NAME=${{ github.ref_name }}
         DATE_STAMP_NEW=$(date +'%Y%m%d')
         DATE_STAMP_OLD=$(date +'%Y.%m.%d')
+
+        EXISTING_TAG=$(gh release list --repo "${{ github.repository }}" --limit 1000 --json tagName,targetCommitish \
+          --jq ".[] | select(.tagName | startswith(\"$BRANCH_NAME/build-\")) | select(.targetCommitish == \"${{ github.sha }}\") | .tagName" \
+          | head -n 1)
+
+        if [ -n "$EXISTING_TAG" ]; then
+          echo "Release already exists for this commit: $EXISTING_TAG"
+          echo "release_title=Build ($BRANCH_NAME): ${EXISTING_TAG#*/build-}" >> $GITHUB_OUTPUT
+          echo "release_tag=$EXISTING_TAG" >> $GITHUB_OUTPUT
+          echo "archive_version_part=${EXISTING_TAG%%/*}-${EXISTING_TAG#*/build-}" >> $GITHUB_OUTPUT
+          echo "version=${EXISTING_TAG#*/build-}" >> $GITHUB_OUTPUT
+          echo "timestamp=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+          echo "should_release=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
         
         # Find the number of releases already created today for this branch, matching either old or new format.
         # We use grep -E for an OR condition and wrap it to prevent failures when no matches are found.
@@ -251,14 +275,17 @@ jobs:
         echo "archive_version_part=$BRANCH_NAME-$VERSION" >> $GITHUB_OUTPUT
         echo "version=$VERSION" >> $GITHUB_OUTPUT
         echo "timestamp=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
+        echo "should_release=true" >> $GITHUB_OUTPUT
 
     - name: Download build artifacts
+      if: steps.version.outputs.should_release == 'true'
       uses: actions/download-artifact@v4
       with:
         path: release-assets
         pattern: proxy-app-build-*-${{ steps.get_sha.outputs.sha }}
 
     - name: Archive release files
+      if: steps.version.outputs.should_release == 'true'
       id: archive
       shell: bash
       run: |
@@ -321,6 +348,7 @@ jobs:
         echo "ASSET_PATHS=$ASSET_PATHS" >> $GITHUB_OUTPUT
 
     - name: Install git-cliff
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -338,6 +366,7 @@ jobs:
         sudo mv git-cliff-*/git-cliff /usr/local/bin/
 
     - name: Prepare git-cliff config
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       run: |
         # Inject the GitHub repo URL into your template
@@ -346,6 +375,7 @@ jobs:
         head -20 .github/cliff.toml
 
     - name: Generate Changelog
+      if: steps.version.outputs.should_release == 'true'
       id: changelog
       shell: bash
       env:
@@ -474,6 +504,7 @@ jobs:
         fi
 
     - name: Resolve GitHub Usernames in Changelog
+      if: steps.version.outputs.should_release == 'true'
       id: resolve_usernames
       shell: bash
       env:
@@ -652,39 +683,55 @@ jobs:
         if [ -n "$PREV_TAG" ]; then
           echo "🔍 Layer PR: Generating Community Contributions section..."
           
-          # Get all merge commits in the range
-          MERGE_COMMITS=$(git log "$PREV_TAG".."$CURRENT_SHA" --oneline --grep="Merge pull request" 2>/dev/null || true)
-          
-          if [ -n "$MERGE_COMMITS" ]; then
+          OWNER="${{ github.repository_owner }}"
+          REPO_NAME="${{ github.event.repository.name }}"
+          PR_NUMBERS=""
+
+          # Layer PR-1: parse PR numbers from commit subjects. This keeps the old
+          # merge-commit behavior and also catches squash commits that include #123.
+          SUBJECT_PRS=$(git log "$PREV_TAG".."$CURRENT_SHA" --format='%s' 2>/dev/null | grep -oE 'Merge pull request #[0-9]+|#[0-9]+' | grep -oE '[0-9]+' || true)
+          PR_NUMBERS=$(printf '%s\n%s\n' "$PR_NUMBERS" "$SUBJECT_PRS")
+
+          # Layer PR-2: GraphQL associatedPullRequests catches squash/rebase flows
+          # even when the commit subject does not include a PR number.
+          COMMIT_SHAS=$(git rev-list "$PREV_TAG".."$CURRENT_SHA" 2>/dev/null || true)
+          while read -r SHA; do
+            if [ -z "$SHA" ]; then
+              continue
+            fi
+            ASSOCIATED_PRS=$(gh api graphql \
+              -f owner="$OWNER" \
+              -f name="$REPO_NAME" \
+              -f oid="$SHA" \
+              -f query='query($owner:String!, $name:String!, $oid:GitObjectID!) { repository(owner:$owner, name:$name) { object(oid:$oid) { ... on Commit { associatedPullRequests(first: 10) { nodes { number } } } } } }' \
+              --jq '.data.repository.object.associatedPullRequests.nodes[].number' 2>/dev/null || true)
+            PR_NUMBERS=$(printf '%s\n%s\n' "$PR_NUMBERS" "$ASSOCIATED_PRS")
+          done <<< "$COMMIT_SHAS"
+
+          PR_NUMBERS=$(printf '%s\n' "$PR_NUMBERS" | grep -E '^[0-9]+$' | sort -n | uniq || true)
+
+          if [ -n "$PR_NUMBERS" ]; then
             PR_SECTION=""
-            
-            while IFS= read -r commit_line; do
-              if [ -n "$commit_line" ]; then
-                # Extract PR number from "Merge pull request #XX from ..."
-                PR_NUM=$(echo "$commit_line" | grep -oE '#[0-9]+' | head -1 | tr -d '#')
-                
-                if [ -n "$PR_NUM" ]; then
-                  # Fetch PR info from GitHub API
-                  PR_INFO=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM" \
-                    --jq '{title: .title, author: .user.login}' 2>/dev/null || echo "{}")
-                  
-                  PR_TITLE=$(echo "$PR_INFO" | jq -r '.title // empty')
-                  PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author // empty')
-                  
-                  if [ -n "$PR_TITLE" ] && [ -n "$PR_AUTHOR" ]; then
-                    PR_URL="https://github.com/${{ github.repository }}/pull/$PR_NUM"
-                    PR_SECTION="${PR_SECTION}- ${PR_TITLE} ([#${PR_NUM}](${PR_URL})) by @${PR_AUTHOR}"$'\n'
-                    PR_COUNT=$((PR_COUNT + 1))
-                    echo "   ✅ PR #$PR_NUM: $PR_TITLE by @$PR_AUTHOR"
-                  else
-                    echo "   ⚠️ PR #$PR_NUM: Could not fetch info"
-                  fi
-                fi
+            while read -r PR_NUM; do
+              if [ -z "$PR_NUM" ]; then
+                continue
               fi
-            done <<< "$MERGE_COMMITS"
-            
+              PR_INFO=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUM" \
+                --jq '{title: .title, author: .user.login, url: .html_url}' 2>/dev/null || echo "{}")
+              PR_TITLE=$(echo "$PR_INFO" | jq -r '.title // empty')
+              PR_AUTHOR=$(echo "$PR_INFO" | jq -r '.author // empty')
+              PR_URL=$(echo "$PR_INFO" | jq -r '.url // empty')
+
+              if [ -n "$PR_TITLE" ] && [ -n "$PR_AUTHOR" ] && [ -n "$PR_URL" ]; then
+                PR_SECTION="${PR_SECTION}- ${PR_TITLE} ([#${PR_NUM}](${PR_URL})) by @${PR_AUTHOR}"$'\n'
+                PR_COUNT=$((PR_COUNT + 1))
+                echo "   ✅ PR #$PR_NUM: $PR_TITLE by @$PR_AUTHOR"
+              else
+                echo "   ⚠️ PR #$PR_NUM: Could not fetch info"
+              fi
+            done <<< "$PR_NUMBERS"
+
             if [ "$PR_COUNT" -gt 0 ]; then
-              # Append PR section to changelog
               {
                 echo ""
                 echo "### 💜 Community Contributions"
@@ -696,7 +743,7 @@ jobs:
               echo "   ✅ Added $PR_COUNT PRs to Community Contributions section"
             fi
           else
-            echo "   ℹ️ No merge commits found in range"
+            echo "   ℹ️ No associated PRs found in range"
           fi
         else
           echo "⚠️ Layer PR: Skipped (no previous tag available)"
@@ -732,6 +779,7 @@ jobs:
         fi
 
     - name: Debug artifact contents
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       run: |
         echo "🔍 Debugging artifact contents..."
@@ -748,6 +796,7 @@ jobs:
         find release-assets -type f 2>/dev/null || echo "No files found in release-assets"
 
     - name: Generate Build Metadata
+      if: steps.version.outputs.should_release == 'true'
       id: metadata
       shell: bash
       env:
@@ -810,6 +859,7 @@ jobs:
         echo "  - Contributors: $CONTRIBUTORS_LIST"
 
     - name: Create Release
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       run: |
         # Prepare changelog content - prefer resolved version if available
@@ -921,10 +971,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     - name: Prune Old Releases
-      if: always() # Run even if release creation failed (optional, but safer to run only on success usually. Let's stick to default behavior which is success)
-      # Actually, if release creation failed, we probably don't want to prune.
-      # But wait, the user might want to prune even if the new release fails? No, usually we prune to make space for the new one or clean up after.
-      # Let's stick to running only on success of previous steps.
+      if: steps.version.outputs.should_release == 'true'
       shell: bash
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
