@@ -32,6 +32,11 @@
 #   - PR marked ready for review       -> review
 #   - PR reopened (non-draft)          -> review
 #   - Push/synchronize + 'Agent Monitored' label -> review
+#   - Review requested via the GitHub button ON OUR IDENTITY -> review
+#     (the pull_request[review_requested] event fires for EVERY reviewer
+#     addition — humans included — so the requested reviewer's login is
+#     checked against our identity family, case-insensitively; requests
+#     for anyone else are a no-op)
 #   - Everything else                  -> no review (EXPECTED outcome: the run
 #     still concludes green — a declined review is not a failure — and the
 #     "Signal review" step stays SKIPPED, dispatching nothing. PR Review is
@@ -49,7 +54,7 @@ run-name: 'AutoTrigger PR #${{ github.event.pull_request.number }} (${{ github.e
 
 on:
   pull_request_target:
-    types: [opened, synchronize, ready_for_review, reopened]
+    types: [opened, synchronize, ready_for_review, reopened, review_requested]
 
 permissions:
   statuses: write   # pending compliance-check marker only
@@ -114,12 +119,26 @@ jobs:
           ACTION: ${{ github.event.action }}
           DRAFT: ${{ github.event.pull_request.draft }}
           LABELS_JSON: ${{ toJSON(github.event.pull_request.labels) }}
+          # Empty for non-review_requested events; the requested reviewer's
+          # login otherwise (checked against our identity family below).
+          REQUESTED_LOGIN: ${{ github.event.requested_reviewer.login || '' }}
         run: |
           review=false
           if [ "$DRAFT" != "true" ]; then
             case "$ACTION" in
               opened|ready_for_review|reopened)
                 review=true
+                ;;
+              review_requested)
+                # Fires for EVERY reviewer addition; act only when WE are
+                # the requested reviewer (case-insensitive identity match).
+                rl=$(printf '%s' "$REQUESTED_LOGIN" | tr 'A-Z' 'a-z')
+                case "$rl" in
+                  mirrobot-agent|mirrobot-agent\[bot\]) review=true ;;
+                  *)
+                    echo "Review requested of '@${REQUESTED_LOGIN}' - not our identity; no-op."
+                    ;;
+                esac
                 ;;
               synchronize)
                 # Only re-review labeled PRs on push (original auto rule)

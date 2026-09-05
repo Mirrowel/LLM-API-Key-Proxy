@@ -27,6 +27,13 @@ concurrency:
   cancel-in-progress: false
 
 on:
+  # Anti-phantom: an explicit never-matching push trigger. Dispatch-only
+  # workflows otherwise get dead push-event runs (red X, 0 jobs) whenever
+  # a push modifies the workflow file (actions/runner#4001 residue, live-
+  # observed repeatedly). With this declared, push-event evaluation finds
+  # no matching ref and creates NO run at all. Semantics unchanged.
+  push:
+    branches-ignore: ["**"]
   workflow_dispatch:
     inputs:
       # required: false at the SCHEMA level, enforced at RUNTIME instead
