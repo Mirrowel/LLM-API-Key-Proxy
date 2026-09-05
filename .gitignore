@@ -134,14 +134,5 @@ cache/antigravity/thought_signatures.json
 
 /usage/
 
-# Keep classifier-scoped routing regression tests reviewable even when a local
-# exclude file ignores the tests directory, without surfacing unrelated tests.
-!tests/
-tests/*
-!tests/test_classifier_scoped_routing.py
-!tests/test_session_tracking.py
-!tests/test_selection_engine.py
-docs/ignored/
-
 # locally rendered assembled agent prompts (generated, not source)
 .github/prompts/rendered/
