@@ -40,7 +40,7 @@ class RecordingStreamTransport:
 def _context(
     provider,
     *,
-    output_protocol: str = "openai_chat",
+    client_protocol: str = "openai_chat",
     credential_id: str = "credential-a",
     session_id: str = "session-a",
     model: str = "model-a",
@@ -53,7 +53,7 @@ def _context(
         model=model,
         protocol_name=provider.get_protocol_name(model),
         input_protocol_name=provider.get_protocol_name(model),
-        output_protocol_name=output_protocol,
+        client_protocol_name=client_protocol,
         endpoint="https://provider.test/generate",
         operation=operation,
         credential_id=credential_id,
@@ -139,11 +139,11 @@ def _injected_state(provider, payload: dict[str, Any]) -> Any:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider", STATEFUL_PROVIDERS, ids=lambda provider: provider.provider_env_name)
-@pytest.mark.parametrize("output_protocol", OUTPUT_PROTOCOLS)
-async def test_real_provider_non_stream_state_is_output_protocol_independent(provider, output_protocol: str) -> None:
+@pytest.mark.parametrize("client_protocol", OUTPUT_PROTOCOLS)
+async def test_real_provider_non_stream_state_is_client_protocol_independent(provider, client_protocol: str) -> None:
     executor = NativeProviderExecutor()
     transport = RecordingResponseTransport([_response(provider, "state-one"), _response(provider, "state-two")])
-    context = _context(provider, output_protocol=output_protocol)
+    context = _context(provider, client_protocol=client_protocol)
 
     first = await executor.execute(_request(provider), context, transport)
     await executor.execute(_request(provider), context, transport)

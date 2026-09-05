@@ -7,8 +7,6 @@ from fastapi.testclient import TestClient
 
 from proxy_app import main as proxy_main
 from rotator_library.client.gemini import GeminiHandler
-from rotator_library.client.rotating_client import RotatingClient
-from rotator_library.client.protocol_selection import request_output_protocol
 
 
 class SurfaceClient:
@@ -17,37 +15,20 @@ class SurfaceClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
-    def resolve_output_protocol(self, payload, *, input_protocol, request=None, explicit=None):
-        return explicit or request_output_protocol(request) or input_protocol
-
     async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
-        self.resolve_output_protocol(
-            payload,
-            input_protocol=input_protocol,
-            request=request,
-            explicit=kwargs.get("output_protocol"),
-        )
         self.calls.append(
             {
                 "payload": payload,
+                "kwargs": dict(kwargs),
                 "input_protocol": input_protocol,
-                "output_header": request.headers.get("X-Proxy-Output-Protocol"),
             }
         )
         if payload.get("stream"):
+
             async def stream():
-                yield 'data: {"candidates":[{"content":{"role":"model","parts":[{"text":"streamed"}]}}]}\n\n'
+                yield 'data: {"id":"chat_surface_stream","object":"chat.completion.chunk","choices":[{"delta":{"content":"streamed"}}]}\n\n'
+
             return stream()
-        if request.headers.get("X-Proxy-Output-Protocol") == "anthropic_messages":
-            return {
-                "id": "msg_surface",
-                "type": "message",
-                "role": "assistant",
-                "model": payload["model"],
-                "content": [{"type": "text", "text": "selected"}],
-                "stop_reason": "end_turn",
-                "usage": {"input_tokens": 1, "output_tokens": 1},
-            }
         return {
             "id": "chat_surface",
             "object": "chat.completion",
@@ -61,7 +42,6 @@ class SurfaceClient:
                 "payload": payload,
                 "model": model,
                 "input_protocol": "gemini",
-                "output_header": raw_request.headers.get("X-Proxy-Output-Protocol"),
             }
         )
         return {
@@ -91,7 +71,7 @@ def _surface_client() -> tuple[TestClient, SurfaceClient]:
     return TestClient(proxy_main.app), rotating
 
 
-def test_chat_route_forwards_independent_output_protocol_selector() -> None:
+def test_chat_route_uses_client_request_protocol_without_override_machinery() -> None:
     client, rotating = _surface_client()
 
     response = client.post(
@@ -100,10 +80,44 @@ def test_chat_route_forwards_independent_output_protocol_selector() -> None:
         json={"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}]},
     )
 
+    # D1: the response protocol equals the request protocol regardless of any
+    # client-supplied header; unknown headers are plain data and never honored.
     assert response.status_code == 200
-    assert response.json()["type"] == "message"
+    assert response.json()["object"] == "chat.completion"
     assert rotating.calls[0]["input_protocol"] == "openai_chat"
-    assert rotating.calls[0]["output_header"] == "anthropic_messages"
+
+
+def test_spoofed_output_headers_are_ignored_for_streams_and_unknown_values() -> None:
+    client, _ = _surface_client()
+
+    unknown = client.post(
+        "/v1/chat/completions",
+        headers={"X-Proxy-Output-Protocol": "garbage"},
+        json={"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}]},
+    )
+    streamed = client.post(
+        "/v1/chat/completions",
+        headers={"X-Proxy-Output-Protocol": "gemini"},
+        json={"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}], "stream": True},
+    )
+
+    assert unknown.status_code == 200
+    assert unknown.json()["object"] == "chat.completion"
+    assert streamed.status_code == 200
+    assert "chat.completion.chunk" in streamed.text
+
+
+def test_no_proxy_internal_kwargs_leak_into_client_payload() -> None:
+    client, rotating = _surface_client()
+
+    client.post(
+        "/v1/chat/completions",
+        json={"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    kwargs = rotating.calls[0]["kwargs"]
+    leaked = [key for key in (*kwargs.keys(), *rotating.calls[0]["payload"].keys()) if key.startswith("_")]
+    assert leaked == []
 
 
 def test_gemini_generate_and_count_routes_preserve_native_client_shape() -> None:
@@ -134,24 +148,6 @@ def test_gemini_stream_generate_route_preserves_native_stream_shape() -> None:
     assert rotating.calls[0]["operation"] == "stream_generate"
 
 
-def test_cross_protocol_stream_selection_reaches_selected_wire_format() -> None:
-    client, _ = _surface_client()
-
-    response = client.post(
-        "/v1/chat/completions",
-        headers={"X-Proxy-Output-Protocol": "gemini"},
-        json={
-            "model": "openai/gpt-test",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": True,
-        },
-    )
-
-    assert response.status_code == 200
-    assert '"candidates"' in response.text
-    assert "streamed" in response.text
-
-
 def test_gemini_generate_rejects_stream_flag_until_stream_route_exists() -> None:
     client, _ = _surface_client()
 
@@ -162,40 +158,6 @@ def test_gemini_generate_rejects_stream_flag_until_stream_route_exists() -> None
 
     assert response.status_code == 400
     assert response.json()["error"]["status"] == "INVALID_ARGUMENT"
-
-
-def test_output_protocol_precedence_is_explicit_then_header_then_provider_then_input() -> None:
-    client = RotatingClient.__new__(RotatingClient)
-    client._get_provider_instance = lambda provider: SimpleNamespace(
-        get_default_output_protocol=lambda model: "responses"
-    )
-    request = SimpleNamespace(headers={"X-Proxy-Output-Protocol": "anthropic"})
-    payload = {"model": "configured/model"}
-
-    assert client.resolve_output_protocol(payload, input_protocol="gemini", request=request, explicit="chat") == "openai_chat"
-    assert client.resolve_output_protocol(payload, input_protocol="gemini", request=request) == "anthropic_messages"
-    assert client.resolve_output_protocol(payload, input_protocol="gemini") == "responses"
-    assert client.resolve_output_protocol({"model": "bare"}, input_protocol="gemini") == "gemini"
-
-
-def test_output_protocol_provider_default_resolves_through_model_alias(monkeypatch) -> None:
-    monkeypatch.setenv("MODEL_ROUTE_ALIAS", "configured/model")
-    client = RotatingClient.__new__(RotatingClient)
-    client._get_provider_instance = lambda provider: SimpleNamespace(
-        get_default_output_protocol=lambda model: "anthropic_messages"
-    )
-
-    assert client.resolve_output_protocol({"model": "alias"}, input_protocol="gemini") == "anthropic_messages"
-
-
-def test_output_header_is_case_insensitive_and_unknown_values_are_client_errors() -> None:
-    assert request_output_protocol(SimpleNamespace(headers={"X-Proxy-Output-Protocol": "Anthropic"})) == "anthropic_messages"
-    try:
-        request_output_protocol(SimpleNamespace(headers={"X-Proxy-Output-Protocol": "unknown"}))
-    except ValueError as error:
-        assert "Unsupported output protocol" in str(error)
-    else:
-        raise AssertionError("unknown output protocol must fail")
 
 
 class FailingSurfaceClient(SurfaceClient):
@@ -210,90 +172,49 @@ class FailingSurfaceClient(SurfaceClient):
 
 
 @pytest.mark.parametrize(
-    ("path", "headers", "body", "assertion"),
+    ("path", "body", "assertion"),
     (
         (
             "/v1/chat/completions",
-            {"X-Proxy-Output-Protocol": "anthropic_messages"},
             {"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}]},
-            lambda payload: payload["type"] == "error" and payload["error"]["type"] == "invalid_request_error",
+            lambda payload: payload["error"]["type"] == "invalid_request",
         ),
         (
             "/v1/messages",
-            {"X-Proxy-Output-Protocol": "gemini"},
             {"model": "claude-test", "max_tokens": 8, "messages": [{"role": "user", "content": "hello"}]},
-            lambda payload: payload["error"]["status"] == "INVALID_ARGUMENT",
+            lambda payload: payload["type"] == "error" and payload["error"]["type"] == "invalid_request_error",
         ),
         (
             "/v1beta/models/gemini-2.5-pro:generateContent",
-            {"X-Proxy-Output-Protocol": "openai_chat"},
             {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
-            lambda payload: payload["error"]["type"] == "invalid_request",
+            lambda payload: payload["error"]["status"] == "INVALID_ARGUMENT",
         ),
     ),
 )
-def test_proxy_side_errors_use_selected_output_protocol(path, headers, body, assertion) -> None:
+def test_proxy_side_errors_use_each_routes_own_protocol(path, body, assertion) -> None:
     proxy_main.PROXY_API_KEY = None
     proxy_main.ENABLE_RAW_LOGGING = False
     proxy_main.app.state.rotating_client = FailingSurfaceClient()
 
-    response = TestClient(proxy_main.app).post(path, headers=headers, json=body)
+    response = TestClient(proxy_main.app).post(path, json=body)
 
     assert response.status_code == 400
     assert assertion(response.json())
     assert "detail" not in response.json()
 
 
-def test_unknown_output_header_is_a_400_in_input_protocol_shape() -> None:
-    client, _ = _surface_client()
-
-    response = client.post(
-        "/v1/chat/completions",
-        headers={"X-Proxy-Output-Protocol": "unknown"},
-        json={"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}]},
-    )
-
-    assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request"
-    assert "Unsupported output protocol" in response.json()["error"]["message"]
-
-
-@pytest.mark.parametrize(
-    ("output_protocol", "assertion"),
-    (
-        (
-            "anthropic_messages",
-            lambda payload: payload["type"] == "error" and payload["error"]["type"] == "invalid_request_error",
-        ),
-        (
-            "gemini",
-            lambda payload: payload["error"]["status"] == "INVALID_ARGUMENT",
-        ),
-    ),
-)
-def test_responses_malformed_json_uses_selected_output_protocol(output_protocol, assertion) -> None:
+def test_responses_malformed_json_uses_responses_error_shape() -> None:
     client, _ = _surface_client()
 
     response = client.post(
         "/v1/responses",
-        headers={
-            "Content-Type": "application/json",
-            "X-Proxy-Output-Protocol": output_protocol,
-        },
+        headers={"Content-Type": "application/json"},
         content="{",
     )
 
     assert response.status_code == 400
-    assert assertion(response.json())
+    assert response.json()["error"]["type"] == "invalid_request"
     assert "detail" not in response.json()
-
-
-def test_library_accepts_all_generative_cross_protocol_stream_pairs() -> None:
-    from rotator_library.client.protocol_selection import require_same_protocol_stream
-
-    for source in ("openai_chat", "anthropic_messages", "responses", "gemini"):
-        for output in ("openai_chat", "anthropic_messages", "responses", "gemini"):
-            require_same_protocol_stream(source, output)
 
 
 class GeminiRuntimeClient:
@@ -319,10 +240,10 @@ def test_gemini_handler_defaults_bare_models_but_preserves_model_routes(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_gemini_handler_forwards_raw_request_to_generic_runtime_selector() -> None:
+async def test_gemini_handler_forwards_raw_request_to_generic_runtime() -> None:
     client = GeminiRuntimeClient()
     handler = GeminiHandler(client)
-    request = SimpleNamespace(headers={"X-Proxy-Output-Protocol": "anthropic_messages"})
+    request = SimpleNamespace(headers={})
 
     await handler.generate(
         {"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},

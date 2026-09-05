@@ -25,12 +25,8 @@ class FakeStreamingClient:
 
 
 class NativeResponsesStreamingClient:
-    def __init__(self, output_protocol: str = "responses") -> None:
-        self.output_protocol = output_protocol
+    def __init__(self) -> None:
         self.calls = []
-
-    def resolve_output_protocol(self, payload, *, input_protocol, request=None):
-        return self.output_protocol
 
     async def agenerate(self, payload, **kwargs):
         self.calls.append((payload, kwargs))
@@ -253,7 +249,6 @@ async def test_native_responses_stream_uses_agenerate_and_stores_terminal_object
     events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, client)]
 
     assert client.calls[0][1]["input_protocol"] == "responses"
-    assert client.calls[0][1]["output_protocol"] == "responses"
     assert "event: response.output_text.delta" in "".join(events)
     stored = await store.get("resp_native")
     assert stored is not None
@@ -261,17 +256,18 @@ async def test_native_responses_stream_uses_agenerate_and_stores_terminal_object
 
 
 @pytest.mark.asyncio
-async def test_native_responses_stream_reformats_after_storing_responses_object() -> None:
+async def test_native_responses_stream_passes_frames_through_and_stores_terminal_object() -> None:
     store = InMemoryResponsesStore()
     service = ResponsesService(store=store)
-    client = NativeResponsesStreamingClient("anthropic_messages")
+    client = NativeResponsesStreamingClient()
 
     events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, client)]
 
     output = "".join(events)
-    assert "event: message_start" in output
+    assert "event: response.created" in output
+    assert "event: response.output_text.delta" in output
     assert "native" in output
-    assert "event: message_stop" in output
+    assert "event: response.completed" in output
     assert await store.get("resp_native") is not None
 
 

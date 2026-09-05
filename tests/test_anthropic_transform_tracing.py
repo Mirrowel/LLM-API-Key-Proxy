@@ -33,11 +33,10 @@ class FakeNativeProtocolClient:
     def __init__(self) -> None:
         self.call = None
 
-    async def agenerate(self, payload, *, input_protocol, output_protocol, **kwargs):
+    async def agenerate(self, payload, *, input_protocol, **kwargs):
         self.call = {
             "payload": payload,
             "input_protocol": input_protocol,
-            "output_protocol": output_protocol,
         }
         if payload.get("stream"):
             async def stream():
@@ -93,7 +92,6 @@ async def test_anthropic_handler_uses_protocol_native_runtime_when_available() -
     response = await AnthropicHandler(client).messages(request)
 
     assert client.call["input_protocol"] == "anthropic_messages"
-    assert client.call["output_protocol"] == "anthropic_messages"
     assert client.call["payload"]["system"] == "rule"
     assert response["content"][0]["text"] == "native answer"
     assert response["id"].startswith("msg_")
@@ -113,7 +111,6 @@ async def test_anthropic_handler_uses_protocol_native_runtime_for_streams() -> N
     output = "".join([chunk async for chunk in stream])
 
     assert client.call["input_protocol"] == "anthropic_messages"
-    assert client.call["output_protocol"] == "anthropic_messages"
     assert "native stream" in output
 
 

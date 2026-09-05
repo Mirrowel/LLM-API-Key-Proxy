@@ -168,68 +168,6 @@ async def test_provider_session_hook_receives_provider_native_shape(monkeypatch)
 
 
 @pytest.mark.asyncio
-async def test_provider_default_output_applies_only_without_explicit_override(monkeypatch) -> None:
-    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
-
-    class Provider:
-        def get_default_output_protocol(self, model=""):
-            return "anthropic_messages"
-
-    builder = RequestContextBuilder(
-        resolve_scope_for_provider=_scope,
-        model_resolver=FakeModelResolver(),
-        session_tracker=FakeSessionTracker(),
-        get_global_timeout=lambda: 30,
-        get_enable_request_logging=lambda: False,
-        get_provider_instance=lambda provider: Provider(),
-    )
-    implicit = await builder.build_completion_context(
-        None,
-        None,
-        {"model": "openai/gpt-5.1", "messages": [{"role": "user", "content": "hello"}]},
-    )
-    explicit = await builder.build_completion_context(
-        None,
-        None,
-        {
-            "_output_protocol": "responses",
-            "model": "openai/gpt-5.1",
-            "messages": [{"role": "user", "content": "hello"}],
-        },
-    )
-
-    assert implicit.output_protocol_name == "anthropic_messages"
-    assert explicit.output_protocol_name == "responses"
-
-
-@pytest.mark.asyncio
-async def test_request_builder_carries_independent_cross_protocol_stream_selection(monkeypatch) -> None:
-    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
-    builder = RequestContextBuilder(
-        resolve_scope_for_provider=_scope,
-        model_resolver=FakeModelResolver(),
-        session_tracker=FakeSessionTracker(),
-        get_global_timeout=lambda: 30,
-        get_enable_request_logging=lambda: False,
-    )
-
-    context = await builder.build_completion_context(
-        None,
-        None,
-        {
-            "_input_protocol": "openai_chat",
-            "_output_protocol": "gemini",
-            "model": "openai/gpt-5.1",
-            "messages": [],
-            "stream": True,
-        },
-    )
-
-    assert context.streaming is True
-    assert context.input_protocol_name == "openai_chat"
-    assert context.output_protocol_name == "gemini"
-
-@pytest.mark.asyncio
 async def test_request_builder_classifier_domain_is_stable_across_providers(monkeypatch) -> None:
     monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
     openai_tracker = FakeSessionTracker()
@@ -280,11 +218,10 @@ async def test_request_builder_keeps_raw_and_canonical_protocol_views(
     context = await _builder().build_completion_context(
         None,
         None,
-        {**payload, "_input_protocol": input_protocol, "_output_protocol": "anthropic_messages"},
+        {**payload, "_input_protocol": input_protocol},
     )
 
     assert context.input_protocol_name == input_protocol
-    assert context.output_protocol_name == "anthropic_messages"
     assert context.protocol_request[source_only_key] == payload[source_only_key]
     assert context.unified_request.source_protocol == input_protocol
     assert "messages" in context.kwargs
@@ -329,3 +266,34 @@ def test_only_typed_internal_hints_can_contribute_global_identity() -> None:
     assert rejected.global_strong_anchors == []
     assert rejected.strong_anchors == ["ordinary-internal", "provider-native"]
     assert self_owned.global_strong_anchors == ["proxy-owned-global"]
+
+
+@pytest.mark.asyncio
+async def test_internal_proxy_kwargs_never_reach_protocol_parse(monkeypatch) -> None:
+    """W1a leak guard: the runtime's internal underscore kwargs must all be
+    consumed before the payload is handed to ``parse_request``."""
+
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+
+    def callback(request, kwargs):
+        return None
+
+    context = await _builder().build_completion_context(
+        None,
+        callback,
+        {
+            "_input_protocol": "openai_chat",
+            "_parent_log_dir": None,
+            "_disable_provider_continuation": False,
+            "classifier": "leak-guard",
+            "model": "openai/gpt-5.1",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+    )
+
+    leaked = [key for key in context.protocol_request if str(key).startswith("_")]
+    assert leaked == []
+    leaked_kwargs = [key for key in context.kwargs if str(key).startswith("_")]
+    assert leaked_kwargs == []
+    assert "classifier" not in context.protocol_request
+    assert context.protocol_request["messages"] == [{"role": "user", "content": "hello"}]

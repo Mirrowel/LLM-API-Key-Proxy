@@ -14,19 +14,30 @@ class FakeClient:
     def __init__(self) -> None:
         self.calls = []
 
-    async def acompletion(self, **kwargs):
-        self.calls.append(kwargs)
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
+        self.calls.append({"payload": payload, "kwargs": kwargs})
+        index = len(self.calls)
         return {
-            "id": "chat_response_1",
-            "model": kwargs["model"],
-            "choices": [{"message": {"role": "assistant", "content": "Hello back"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            "id": f"resp_fake_{index}",
+            "object": "response",
+            "model": payload.get("model", "gpt-test"),
+            "status": "completed",
+            "output": [
+                {
+                    "id": f"msg_{index}",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "Hello back"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
         }
 
 
 class FakeCostClient(FakeClient):
-    async def acompletion(self, **kwargs):
-        response = await super().acompletion(**kwargs)
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
+        response = await super().agenerate(payload, input_protocol=input_protocol, request=request, **kwargs)
         response["usage"]["cost_details"] = {"total_cost": 0.033, "source": "responses_provider"}
         return response
 
@@ -37,7 +48,7 @@ class FakeInternalClient(FakeClient):
         self._request_builder = object()
         self._executor = object()
 
-    async def acompletion(self, **kwargs):
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
         callback = kwargs.pop("_request_context_callback", None)
         hints = kwargs.pop("_session_tracking_hints", None)
         if callback:
@@ -58,7 +69,7 @@ class FakeInternalClient(FakeClient):
                 )()
             )
         self.internal_hints = hints
-        return await super().acompletion(**kwargs)
+        return await super().agenerate(payload, input_protocol=input_protocol, request=request, **kwargs)
 
 
 class FakeNativeProtocolClient:
@@ -69,7 +80,7 @@ class FakeNativeProtocolClient:
         self._request_builder = object()
         self._executor = object()
 
-    async def agenerate(self, payload, *, input_protocol, output_protocol, request=None, **kwargs):
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
         callback = kwargs.pop("_request_context_callback", None)
         if callback:
             callback(
@@ -93,7 +104,6 @@ class FakeNativeProtocolClient:
             {
                 "payload": payload,
                 "input_protocol": input_protocol,
-                "output_protocol": output_protocol,
                 "kwargs": kwargs,
             }
         )
@@ -117,18 +127,13 @@ class FakeNativeProtocolClient:
 
 
 class FakeNativeProtocolErrorClient(FakeNativeProtocolClient):
-    async def agenerate(self, payload, *, input_protocol, output_protocol, request=None, **kwargs):
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
         raise StructuredAPIResponseError(
             "provider busy",
             error_type="rate_limit",
             status_code=429,
             response={"error": {"status": 429, "message": "provider busy"}},
         )
-
-
-class FakeSelectedOutputClient(FakeNativeProtocolClient):
-    def resolve_output_protocol(self, payload, *, input_protocol, request=None, explicit=None):
-        return "anthropic_messages"
 
 
 @pytest.mark.asyncio
@@ -145,7 +150,7 @@ async def test_native_structured_errors_keep_responses_status_and_type() -> None
     assert raised.value.error_type == "rate_limit"
 
 
-def test_responses_service_errors_follow_selected_output_protocol() -> None:
+def test_responses_service_errors_format_per_protocol() -> None:
     error = ResponsesServiceError("provider busy", status_code=429, error_type="rate_limit")
 
     assert error.to_protocol_payload("gemini") == {
@@ -210,7 +215,6 @@ async def test_internal_responses_path_uses_native_protocol_and_expands_local_co
 
     assert second["id"] == "resp_native_2"
     assert client.calls[0]["input_protocol"] == "responses"
-    assert client.calls[0]["output_protocol"] == "responses"
     assert client.calls[0]["payload"]["input"] == ["first"]
     assert client.calls[1]["payload"]["input"] == [
         "first",
@@ -222,18 +226,18 @@ async def test_internal_responses_path_uses_native_protocol_and_expands_local_co
 
 
 @pytest.mark.asyncio
-async def test_responses_storage_stays_native_before_selected_output_conversion() -> None:
+async def test_responses_storage_keeps_native_payload_without_conversion() -> None:
     store = InMemoryResponsesStore()
     service = ResponsesService(store=store)
-    client = FakeSelectedOutputClient()
+    client = FakeNativeProtocolClient()
 
     result = await service.create_response(
         {"model": "openai/gpt-test", "input": "hello"},
         client,
     )
 
-    assert result["type"] == "message"
-    assert result["content"][0]["text"] == "answer 1"
+    assert result["object"] == "response"
+    assert result["output"][0]["content"][0]["text"] == "answer 1"
     stored = await store.get("resp_native_1", "public")
     assert stored is not None
     assert stored.response["object"] == "response"
@@ -315,10 +319,10 @@ async def test_create_response_stores_non_streaming_response() -> None:
 
     response = await service.create_response({"model": "gpt-test", "input": "Hello"}, client)
 
-    assert response["id"] == "chat_response_1"
+    assert response["id"] == "resp_fake_1"
     assert response["output"][0]["content"][0]["text"] == "Hello back"
-    assert (await store.get("chat_response_1")) is not None
-    assert client.calls[0]["messages"] == [{"role": "user", "content": "Hello"}]
+    assert (await store.get("resp_fake_1")) is not None
+    assert client.calls[0]["payload"]["input"] == ["Hello"]
 
 
 @pytest.mark.asyncio
@@ -352,10 +356,10 @@ async def test_service_default_store_honors_max_items() -> None:
             super().__init__()
             self.index = 0
 
-        async def acompletion(self, **kwargs):
+        async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
             self.index += 1
-            response = await super().acompletion(**kwargs)
-            response["id"] = f"chat_response_{self.index}"
+            response = await super().agenerate(payload, input_protocol=input_protocol, request=request, **kwargs)
+            response["id"] = f"resp_sequenced_{self.index}"
             return response
 
     service = ResponsesService(store_settings=ResponsesStoreSettings(max_items=1))
@@ -394,10 +398,10 @@ async def test_previous_response_id_loads_parent_context() -> None:
 
     await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client)
 
-    assert client.calls[0]["messages"] == [
-        {"role": "user", "content": "Earlier"},
-        {"role": "assistant", "content": "Earlier"},
-        {"role": "user", "content": "Continue"},
+    assert client.calls[0]["payload"]["input"] == [
+        "Earlier",
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Earlier"}]},
+        "Continue",
     ]
 
 
@@ -412,6 +416,8 @@ async def test_previous_response_id_loads_full_lineage_oldest_first() -> None:
             scope_key="public",
             request={"model": "gpt-test", "input": "First"},
             response={"id": "resp_grandparent", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "First answer"}]}]},
+            input_items=["First"],
+            output_items=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "First answer"}]}],
         )
     )
     await store.save(
@@ -422,18 +428,20 @@ async def test_previous_response_id_loads_full_lineage_oldest_first() -> None:
             scope_key="public",
             request={"model": "gpt-test", "input": "Second", "previous_response_id": "resp_grandparent"},
             response={"id": "resp_parent", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Second answer"}]}]},
+            input_items=["Second"],
+            output_items=[{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Second answer"}]}],
         )
     )
     client = FakeClient()
 
     await ResponsesService(store=store).create_response({"model": "gpt-test", "input": "Third", "previous_response_id": "resp_parent"}, client)
 
-    assert client.calls[0]["messages"] == [
-        {"role": "user", "content": "First"},
-        {"role": "assistant", "content": "First answer"},
-        {"role": "user", "content": "Second"},
-        {"role": "assistant", "content": "Second answer"},
-        {"role": "user", "content": "Third"},
+    assert client.calls[0]["payload"]["input"] == [
+        "First",
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "First answer"}]},
+        "Second",
+        {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Second answer"}]},
+        "Third",
     ]
 
 
@@ -518,8 +526,8 @@ async def test_scoped_responses_preserve_routing_but_never_store_or_trace_secret
 
     assert stored is not None
     assert stored.scope_key is not None and stored.scope_key.startswith("bundle:")
-    assert client.calls[0]["api_keys"] == raw_request["api_keys"]
-    assert client.calls[0]["providers"] == raw_request["providers"]
+    assert client.calls[0]["kwargs"]["api_keys"] == raw_request["api_keys"]
+    assert client.calls[0]["kwargs"]["providers"] == raw_request["providers"]
     persisted_text = json.dumps(stored.to_dict())
     trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
     assert "super-secret-routing-key" not in persisted_text
@@ -561,7 +569,7 @@ async def test_responses_service_records_response_id_session_anchor() -> None:
     tracker = Tracker()
 
     class Client(FakeInternalClient):
-        async def acompletion(self, **kwargs):
+        async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
             callback = kwargs.pop("_request_context_callback", None)
             kwargs.pop("_session_tracking_hints", None)
             if callback:
@@ -581,17 +589,28 @@ async def test_responses_service_records_response_id_session_anchor() -> None:
                         },
                     )()
                 )
-            self.calls.append(kwargs)
+            self.calls.append({"payload": payload, "kwargs": kwargs})
             return {
                 "id": "resp_parent",
-                "model": kwargs["model"],
-                "choices": [{"message": {"role": "assistant", "content": "Hello back"}, "finish_reason": "stop"}],
+                "object": "response",
+                "model": payload.get("model", "gpt-test"),
+                "status": "completed",
+                "output": [
+                    {
+                        "id": "msg_1",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "Hello back"}],
+                    }
+                ],
             }
 
     await ResponsesService(store=InMemoryResponsesStore()).create_response({"model": "gpt-test", "input": "Hello"}, Client())
 
     assert tracker.calls[0][0][0] == "session-parent"
-    assert tracker.calls[0][1]["response"] == {"id": "resp_parent", "object": "response"}
+    assert tracker.calls[0][1]["response"]["id"] == "resp_parent"
+    assert tracker.calls[0][1]["response"]["object"] == "response"
 
 
 @pytest.mark.asyncio
@@ -627,8 +646,8 @@ async def test_service_emits_transform_trace_passes(tmp_path) -> None:
     assert pass_names == [
         "responses_raw_request",
         "responses_parsed_request",
-        "responses_bridge_chat_request",
-        "responses_bridge_chat_response",
+        "responses_native_protocol_request",
+        "responses_native_protocol_response",
         "responses_parsed_response",
         "usage_accounting_summary",
         "responses_stored_response",
@@ -645,7 +664,7 @@ async def test_service_usage_trace_includes_provider_reported_cost(tmp_path) -> 
 
     usage_entry = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"][-1]
     assert usage_entry["data"]["cost"]["provider_reported_cost"] == 0.033
-    assert usage_entry["metadata"]["pricing_source"] == "usage.cost_details"
+    assert usage_entry["metadata"]["pricing_source"] == "responses_provider"
 
 
 def test_trace_responses_usage_returns_before_conversion_without_logger(monkeypatch) -> None:

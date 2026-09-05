@@ -78,7 +78,7 @@ class GeminiHandler:
                 source_protocol="gemini",
                 target_protocol="openai_chat",
                 input_protocol="gemini",
-                output_protocol="gemini",
+                client_protocol="gemini",
                 model=request_payload["model"],
             ),
         )

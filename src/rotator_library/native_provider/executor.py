@@ -41,10 +41,10 @@ class NativeProviderExecutor:
         logger = context.transaction_logger
         provider_protocol = get_protocol(context.protocol_name)
         input_protocol = get_protocol(context.input_protocol_name or context.protocol_name)
-        output_protocol = get_protocol(context.output_protocol_name or context.input_protocol_name or context.protocol_name)
+        client_protocol = get_protocol(context.client_protocol_name or context.input_protocol_name or context.protocol_name)
         context = _without_provider_continuation_rules(context)
         self._ensure_supported_operation(provider_protocol, context)
-        self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": provider_protocol.name, "output_protocol": output_protocol.name}, direction="metadata", stage="protocol")
+        self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": provider_protocol.name, "client_protocol": client_protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
             cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
@@ -99,7 +99,7 @@ class NativeProviderExecutor:
             self._trace(context, "after_response_field_cache_extraction", {"source": "response", "payload": "raw_provider_response"}, direction="response", stage="adapter", snapshot=False)
             response_context = context.protocol_context(
                 source_protocol=provider_protocol.name,
-                target_protocol=output_protocol.name,
+                target_protocol=client_protocol.name,
                 source_provider=context.provider,
                 target_provider=None,
                 provider_state_compatible=False,
@@ -109,8 +109,8 @@ class NativeProviderExecutor:
             self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
-            self._trace(context, "native_response_protocol_selected", {"protocol": output_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
-            client_response = output_protocol.format_response(unified_response, response_context)
+            self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
+            client_response = client_protocol.format_response(unified_response, response_context)
             self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
@@ -164,10 +164,10 @@ class NativeProviderExecutor:
         logger = context.transaction_logger
         protocol = get_protocol(context.protocol_name)
         input_protocol = get_protocol(context.input_protocol_name or context.protocol_name)
-        output_protocol = get_protocol(context.output_protocol_name or context.input_protocol_name or context.protocol_name)
+        client_protocol = get_protocol(context.client_protocol_name or context.input_protocol_name or context.protocol_name)
         context = _without_provider_continuation_rules(context)
         self._ensure_supported_operation(protocol, context)
-        self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": protocol.name, "output_protocol": output_protocol.name}, direction="metadata", stage="protocol")
+        self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": protocol.name, "client_protocol": client_protocol.name}, direction="metadata", stage="protocol")
         try:
             self._trace(context, "raw_native_client_request", raw_request, direction="request", stage="client")
             cache_engine = FieldCacheEngine(context.field_cache_rules, store=self.field_cache_store)
@@ -227,7 +227,7 @@ class NativeProviderExecutor:
             usage_record = extract_usage_record(None, provider=context.provider, model=context.model, source="native_provider_stream")
             response_context = context.protocol_context(
                 source_protocol=protocol.name,
-                target_protocol=output_protocol.name,
+                target_protocol=client_protocol.name,
                 source_provider=context.provider,
                 target_provider=None,
                 provider_state_compatible=False,
@@ -250,7 +250,7 @@ class NativeProviderExecutor:
                 if event.type == "done":
                     event_payload = stream_event_payload(event)
                     self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
-                    formatted = output_protocol.format_stream_event(event, response_context)
+                    formatted = client_protocol.format_stream_event(event, response_context)
                     for frame in _formatted_stream_frames(formatted):
                         self._trace(context, "formatted_client_stream_event", frame, direction="stream", stage="final", snapshot=False)
                         yield frame
@@ -275,7 +275,7 @@ class NativeProviderExecutor:
                     stage="adapter",
                     snapshot=False,
                 )
-                formatted = output_protocol.format_stream_event(event, response_context)
+                formatted = client_protocol.format_stream_event(event, response_context)
                 for frame in _formatted_stream_frames(formatted):
                     self._trace(context, "formatted_client_stream_event", frame, direction="stream", stage="final", snapshot=False)
                     yield frame

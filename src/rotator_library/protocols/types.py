@@ -476,7 +476,7 @@ class ProtocolContext(ProtocolSerializable):
     target_protocol: Optional[str] = None
     input_protocol: Optional[str] = None
     provider_protocol: Optional[str] = None
-    output_protocol: Optional[str] = None
+    client_protocol: Optional[str] = None
     source_provider: Optional[str] = None
     target_provider: Optional[str] = None
     provider_state_compatible: bool = False
@@ -494,7 +494,7 @@ class ProtocolContext(ProtocolSerializable):
         "target_protocol",
         "input_protocol",
         "provider_protocol",
-        "output_protocol",
+        "client_protocol",
         "source_provider",
         "target_provider",
         "provider_state_compatible",

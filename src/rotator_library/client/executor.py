@@ -690,11 +690,11 @@ class RequestExecutor:
         source_protocol_name: str,
         context: RequestContext,
     ) -> Any:
-        """Format a non-native execution result into the selected client protocol."""
+        """Format a non-native execution result into the client's protocol."""
 
-        output_protocol = get_protocol(context.output_protocol_name)
+        client_protocol = get_protocol(context.input_protocol_name)
         source_protocol = get_protocol(source_protocol_name)
-        if output_protocol.name == source_protocol.name:
+        if client_protocol.name == source_protocol.name:
             return response
         if isinstance(response, dict):
             payload = deepcopy(response)
@@ -708,17 +708,17 @@ class RequestExecutor:
             provider=context.provider,
             model=context.model,
             source_protocol=source_protocol.name,
-            target_protocol=output_protocol.name,
+            target_protocol=client_protocol.name,
             input_protocol=context.input_protocol_name,
             provider_protocol=source_protocol.name,
-            output_protocol=output_protocol.name,
+            client_protocol=client_protocol.name,
             source_provider=context.provider,
             session_id=context.session_id,
             transport="http",
         )
         unified_response = source_protocol.parse_response(payload, protocol_context)
         unified_response.model = context.model
-        return output_protocol.format_response(unified_response, protocol_context)
+        return client_protocol.format_response(unified_response, protocol_context)
 
     def _build_native_provider_context(
         self,
@@ -759,9 +759,10 @@ class RequestExecutor:
             operation=operation,
             input_protocol_name=context.input_protocol_name,
             # The operational stream handler consumes canonical Chat SSE. The
-            # selected client protocol is applied once after timeout/retry/usage
-            # and completion-gated session handling.
-            output_protocol_name="openai_chat" if stream else context.output_protocol_name,
+            # client's own protocol is applied once after timeout/retry/usage
+            # and completion-gated session handling. (W1b/W5 seam: the forced
+            # chat value goes away when the neutral operational layer lands.)
+            client_protocol_name="openai_chat" if stream else context.input_protocol_name,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,
@@ -1169,15 +1170,15 @@ class RequestExecutor:
     ) -> Tuple[str, ...]:
         """Return executor-created terminal SSE lines and trace them first."""
 
-        output_protocol = getattr(context, "output_protocol_name", None) or "openai_chat"
-        input_protocol = getattr(context, "input_protocol_name", None) or "openai_chat"
+        client_protocol_name = getattr(context, "input_protocol_name", None) or "openai_chat"
+        input_protocol = client_protocol_name
         protocol_context = protocol_context or ProtocolContext(
                 provider=context.provider,
                 model=context.model,
                 source_protocol="openai_chat",
-                target_protocol=output_protocol,
+                target_protocol=client_protocol_name,
                 input_protocol=input_protocol,
-                output_protocol=output_protocol,
+                client_protocol=client_protocol_name,
                 request_id=getattr(context, "request_id", None),
                 session_id=context.session_id,
                 transport="sse",
@@ -1186,7 +1187,7 @@ class RequestExecutor:
         lines = tuple(
             format_canonical_stream_event(
                 UnifiedStreamEvent(type="error", error=error),
-                output_protocol,
+                client_protocol_name,
                 protocol_context,
             )
         )
@@ -1755,10 +1756,10 @@ class RequestExecutor:
                                             provider=provider,
                                             model=model,
                                             source_protocol="openai_chat",
-                                            target_protocol=context.output_protocol_name,
+                                            target_protocol=context.input_protocol_name,
                                             input_protocol=context.input_protocol_name,
                                             provider_protocol=stream_provider_protocol,
-                                            output_protocol=context.output_protocol_name,
+                                            client_protocol=context.input_protocol_name,
                                             source_provider=provider,
                                             target_provider=None,
                                             provider_state_compatible=False,
@@ -1770,7 +1771,7 @@ class RequestExecutor:
                                     client_stream = convert_protocol_stream(
                                         base_stream,
                                         source_protocol=get_protocol("openai_chat"),
-                                        output_protocol=get_protocol(context.output_protocol_name),
+                                        client_protocol=get_protocol(context.input_protocol_name),
                                         context=client_protocol_context,
                                     )
 

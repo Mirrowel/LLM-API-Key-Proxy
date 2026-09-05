@@ -15,7 +15,6 @@ from ..routing.types import RouteTarget, RoutingDecision
 from ..session_tracking import SessionTrackingHints
 from ..transaction_logger import TransactionLogger
 from .scopes import derive_session_isolation_key
-from .protocol_selection import require_same_protocol_stream
 
 
 class RequestContextBuilder:
@@ -154,7 +153,7 @@ class RequestContextBuilder:
                     ProtocolContext(
                         input_protocol=input_protocol,
                         provider_protocol=provider_protocol.name,
-                        output_protocol=input_protocol,
+                        client_protocol=input_protocol,
                         source_protocol=input_protocol,
                         target_protocol=provider_protocol.name,
                         source_provider=None,
@@ -234,17 +233,13 @@ class RequestContextBuilder:
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
         disable_provider_continuation = bool(kwargs.pop("_disable_provider_continuation", False))
         requested_input_protocol = str(kwargs.pop("_input_protocol", "openai_chat") or "openai_chat")
-        raw_output_protocol = kwargs.pop("_output_protocol", None)
-        output_protocol_explicit = raw_output_protocol not in (None, "")
-        requested_output_protocol = str(raw_output_protocol or requested_input_protocol)
         input_protocol = get_protocol(requested_input_protocol)
-        output_protocol = get_protocol(requested_output_protocol)
         protocol_request = deepcopy(kwargs)
         protocol_context = ProtocolContext(
             source_protocol=input_protocol.name,
             target_protocol=input_protocol.name,
             input_protocol=input_protocol.name,
-            output_protocol=output_protocol.name,
+            client_protocol=input_protocol.name,
         )
         unified_request = input_protocol.parse_request(protocol_request, protocol_context)
         if input_protocol.name != "openai_chat":
@@ -255,7 +250,7 @@ class RequestContextBuilder:
                     target_protocol="openai_chat",
                     input_protocol=input_protocol.name,
                     provider_protocol="openai_chat",
-                    output_protocol=output_protocol.name,
+                    client_protocol=input_protocol.name,
                 ),
             )
         session_isolation_key = self._session_isolation_key(
@@ -298,17 +293,6 @@ class RequestContextBuilder:
 
         resolved_model = self._model_resolver.resolve_model_id(routing_targets[0].prefixed_model if routing_targets else model, provider)
         kwargs["model"] = resolved_model
-        if not output_protocol_explicit and self._get_provider_instance:
-            plugin = self._get_provider_instance(provider)
-            default_output = (
-                plugin.get_default_output_protocol(resolved_model)
-                if plugin and hasattr(plugin, "get_default_output_protocol")
-                else None
-            )
-            if default_output:
-                output_protocol = get_protocol(default_output)
-        if unified_request.stream:
-            require_same_protocol_stream(input_protocol.name, output_protocol.name)
 
         transaction_logger = None
         if self._get_enable_request_logging():
@@ -366,7 +350,6 @@ class RequestContextBuilder:
             routing_targets=routing_targets,
             routing_group_name=routing_decision.group_name if routing_decision else None,
             input_protocol_name=input_protocol.name,
-            output_protocol_name=output_protocol.name,
             protocol_request=protocol_request,
             unified_request=unified_request,
             input_provider=provider,

@@ -33,7 +33,6 @@ _PROVIDER_CONFIG_KEYS = {
     "auth_mode",
     "auth_header_name",
     "models",
-    "default_output_protocol",
     "adapter_names",
     "adapter_config",
     "native_streaming_supported",
@@ -126,7 +125,6 @@ class ProviderRuntimeConfig:
     auth_mode: str = "bearer"
     auth_header_name: Optional[str] = None
     models: tuple[str, ...] = ()
-    default_output_protocol: Optional[str] = None
     adapter_names: Optional[tuple[str, ...]] = None
     adapter_config: dict[str, dict[str, Any]] = field(default_factory=dict)
     native_streaming_supported: Optional[bool] = None
@@ -335,7 +333,6 @@ def get_provider_runtime_config(
         auth_mode=_configured_auth_mode(raw.get("auth_mode")),
         auth_header_name=_configured_auth_header_name(raw.get("auth_header_name")),
         models=_configured_models(raw.get("models")),
-        default_output_protocol=_configured_output_protocol(raw.get("default_output_protocol")),
         adapter_names=adapter_names,
         adapter_config=adapter_config,
         native_streaming_supported=native_streaming_supported,
@@ -459,7 +456,6 @@ def _validate_provider_sections(value: Any) -> None:
         if unsupported:
             raise ExperimentalConfigError(f"providers.{provider} contains unsupported keys: {', '.join(sorted(unsupported))}")
         _configured_provider_protocol(raw.get("protocol_name"))
-        _configured_output_protocol(raw.get("default_output_protocol"))
         _configured_adapters(raw.get("adapter_names"))
         _configured_adapter_config(raw.get("adapter_config", {}))
         _configured_api_base(raw.get("api_base"))
@@ -490,22 +486,6 @@ def _configured_protocol(value: Any) -> Optional[str]:
     except Exception as exc:
         raise ExperimentalConfigError(f"Unknown provider protocol_name {name!r}") from exc
     return protocol.name
-
-
-def _configured_output_protocol(value: Any) -> Optional[str]:
-    """Return one supported generative client output protocol."""
-
-    protocol_name = _configured_protocol(value)
-    if protocol_name and protocol_name not in {
-        "openai_chat",
-        "responses",
-        "anthropic_messages",
-        "gemini",
-    }:
-        raise ExperimentalConfigError(
-            f"default_output_protocol must be a generative protocol, got {protocol_name!r}"
-        )
-    return protocol_name
 
 
 def _configured_provider_protocol(value: Any) -> Optional[str]:

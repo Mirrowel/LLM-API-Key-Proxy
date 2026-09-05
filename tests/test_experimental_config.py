@@ -171,8 +171,6 @@ def test_provider_config_validates_protocol_and_adapter_names() -> None:
         {"endpoint_paths": {"chat": "/chat#token=secret"}},
         {"endpoint_paths": {"chat": "/models/{unknown}:generate"}},
         {"endpoint_paths": {"chat": 42}},
-        {"default_output_protocol": "missing_protocol"},
-        {"default_output_protocol": "embeddings"},
     ],
 )
 def test_provider_config_validates_dynamic_transport_settings(provider_config) -> None:

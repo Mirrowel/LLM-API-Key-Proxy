@@ -67,7 +67,7 @@ def test_streaming_matrix_preserves_text_reasoning_tools_usage_and_terminal_life
         target_protocol=output_protocol,
         input_protocol=source_protocol,
         provider_protocol=source_protocol,
-        output_protocol=output_protocol,
+        client_protocol=output_protocol,
         transport="sse",
     )
     converter = ProtocolStreamConverter(
@@ -212,8 +212,7 @@ def test_terminal_responses_error_reuses_active_stream_lifecycle() -> None:
         streaming=True,
         credentials=[],
         deadline=9999999999.0,
-        input_protocol_name="openai_chat",
-        output_protocol_name="responses",
+        input_protocol_name="responses",
     )
 
     terminal = "".join(RequestExecutor.__new__(RequestExecutor)._terminal_stream_error_lines(
@@ -257,7 +256,7 @@ async def test_native_executor_stream_matrix_uses_provider_reader_and_selected_w
         model="model-a",
         protocol_name=provider_protocol,
         input_protocol_name="openai_chat",
-        output_protocol_name=output_protocol,
+        client_protocol_name=output_protocol,
         endpoint="https://provider.test/stream",
         operation=operations[provider_protocol],
     )
@@ -341,10 +340,10 @@ class _UsageManager:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("output_protocol", PROTOCOLS)
-async def test_request_executor_formats_litellm_stream_in_selected_protocol(
+@pytest.mark.parametrize("input_protocol", PROTOCOLS)
+async def test_request_executor_formats_litellm_stream_in_client_protocol(
     monkeypatch,
-    output_protocol: str,
+    input_protocol: str,
 ) -> None:
     usage_manager = _UsageManager()
     executor = RequestExecutor(
@@ -375,8 +374,7 @@ async def test_request_executor_formats_litellm_stream_in_selected_protocol(
         credentials=["credential-1"],
         credential_secrets={"credential-1": "secret"},
         deadline=9999999999.0,
-        input_protocol_name="gemini",
-        output_protocol_name=output_protocol,
+        input_protocol_name=input_protocol,
     )
 
     chunks = [chunk async for chunk in executor._execute_streaming(context)]
@@ -389,7 +387,7 @@ async def test_request_executor_formats_litellm_stream_in_selected_protocol(
         "responses": "event: response.created",
         "gemini": '"candidates"',
     }
-    assert markers[output_protocol] in output
+    assert markers[input_protocol] in output
 
 
 class _NativeErrorRuntimeProvider(_RuntimeProvider):
@@ -423,7 +421,7 @@ class _RotatingNativeStreamClient:
 
 
 @pytest.mark.asyncio
-async def test_native_stream_error_rotates_credentials_before_selected_output(monkeypatch) -> None:
+async def test_native_stream_error_rotates_credentials_before_client_output(monkeypatch) -> None:
     monkeypatch.setenv("TRANSIENT_RETRY_DELAY", "0")
     monkeypatch.setenv("TRANSIENT_RETRY_JITTER", "0")
     credentials = ("credential-1", "credential-2")
@@ -453,8 +451,7 @@ async def test_native_stream_error_rotates_credentials_before_selected_output(mo
         credentials=list(credentials),
         credential_secrets={"credential-1": "secret-1", "credential-2": "secret-2"},
         deadline=9999999999.0,
-        input_protocol_name="openai_chat",
-        output_protocol_name="responses",
+        input_protocol_name="responses",
         protocol_request=dict(kwargs),
         unified_request=get_protocol("openai_chat").parse_request(kwargs),
         input_provider="native_stream_runtime",
@@ -470,12 +467,12 @@ async def test_native_stream_error_rotates_credentials_before_selected_output(mo
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("output_protocol", "start_marker"),
+    ("input_protocol", "start_marker"),
     (("anthropic_messages", "event: message_start"), ("responses", "event: response.created")),
 )
 async def test_litellm_in_band_error_rotates_without_duplicate_destination_start(
     monkeypatch,
-    output_protocol: str,
+    input_protocol: str,
     start_marker: str,
 ) -> None:
     monkeypatch.setenv("TRANSIENT_RETRY_DELAY", "0")
@@ -517,8 +514,7 @@ async def test_litellm_in_band_error_rotates_without_duplicate_destination_start
         credentials=list(credentials),
         credential_secrets={"credential-1": "secret-1", "credential-2": "secret-2"},
         deadline=9999999999.0,
-        input_protocol_name="openai_chat",
-        output_protocol_name=output_protocol,
+        input_protocol_name=input_protocol,
     )
 
     output = "".join([chunk async for chunk in executor._execute_streaming(context)])
@@ -576,8 +572,7 @@ async def test_custom_in_band_mapping_error_rotates_before_output(monkeypatch) -
         credentials=list(credentials),
         credential_secrets={"credential-1": "secret-1", "credential-2": "secret-2"},
         deadline=9999999999.0,
-        input_protocol_name="openai_chat",
-        output_protocol_name="gemini",
+        input_protocol_name="gemini",
     )
 
     output = "".join([chunk async for chunk in executor._execute_streaming(context)])
@@ -622,8 +617,7 @@ async def test_in_band_error_after_visible_output_closes_same_responses_lifecycl
         credentials=list(credentials),
         credential_secrets={"credential-1": "secret-1", "credential-2": "secret-2"},
         deadline=9999999999.0,
-        input_protocol_name="openai_chat",
-        output_protocol_name="responses",
+        input_protocol_name="responses",
     )
 
     output = "".join([chunk async for chunk in executor._execute_streaming(context)])

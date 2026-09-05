@@ -36,7 +36,6 @@ def test_provider_json_protocol_adapters_field_cache_and_quota_groups_are_wired(
             "providers": {
                 "configured": {
                     "protocol_name": "openai_chat",
-                    "default_output_protocol": "anthropic_messages",
                     "adapter_names": ["model_override"],
                     "adapter_config": {"model_override": {"model": "upstream-model"}},
                     "native_streaming_supported": True,
@@ -52,7 +51,6 @@ def test_provider_json_protocol_adapters_field_cache_and_quota_groups_are_wired(
     provider = ConfiguredProvider()
 
     assert provider.get_protocol_name("configured/gpt") == "openai_chat"
-    assert provider.get_default_output_protocol("configured/gpt") == "anthropic_messages"
     assert provider.get_adapter_names("configured/gpt") == ("model_override",)
     assert provider.get_adapter_config("configured/gpt") == {"model_override": {"model": "upstream-model"}}
     assert provider.supports_native_streaming("configured/gpt", "chat") is True
@@ -144,7 +142,6 @@ async def test_config_defined_provider_can_use_any_native_protocol(tmp_path, mon
                 "configured_native": {
                     "api_base": "https://native.example/v1beta",
                     "protocol_name": "gemini",
-                    "default_output_protocol": "anthropic_messages",
                     "auth_mode": "x-goog-api-key",
                     "models": ["gemini-custom"],
                     "native_streaming_supported": True,
@@ -160,7 +157,6 @@ async def test_config_defined_provider_can_use_any_native_protocol(tmp_path, mon
     provider = _create_dynamic_plugin_class("configured_native")()
 
     assert provider.get_protocol_name("configured_native/gemini-custom") == "gemini"
-    assert provider.get_default_output_protocol("configured_native/gemini-custom") == "anthropic_messages"
     assert provider.get_native_operation("gemini-custom", stream=True) == "stream_generate"
     assert provider.get_native_endpoint("configured_native/gemini-custom", "generate") == (
         "https://native.example/v1beta/models/gemini-custom:generateContent"

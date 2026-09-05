@@ -16,8 +16,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator, NoReturn, Optional
 
-from ..protocols import ProtocolContext, get_protocol
-from ..protocols.streaming import ProtocolStreamConverter
+from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
 from ..config.experimental import get_stream_runtime_settings
 from ..client.scopes import derive_session_isolation_key
@@ -200,15 +199,6 @@ class ResponsesService:
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
 
         resolved_scope = self._resolve_request_scope(raw_request, request_scope)
-        selected_output = (
-            client.resolve_output_protocol(
-                raw_request,
-                input_protocol="responses",
-                request=request,
-            )
-            if hasattr(client, "resolve_output_protocol")
-            else "responses"
-        )
         isolation_key = resolved_scope.key
         safe_request = _safe_stored_request(raw_request)
         self._trace(transaction_logger, "responses_raw_request", safe_request, direction="request", stage="client")
@@ -243,61 +233,33 @@ class ResponsesService:
         session_info: dict[str, Any] = {
             "scope_access_hash": resolved_scope.access_token_hash,
         }
-        if hasattr(client, "agenerate"):
-            native_request = _expanded_responses_request(raw_request, parent_lineage)
-            internal_kwargs = _internal_client_kwargs(client, session_hints, session_info)
-            self._trace(
-                transaction_logger,
-                "responses_native_protocol_request",
-                _redact_sensitive_fields(native_request),
-                direction="request",
-                stage="protocol",
-                metadata={"lineage_depth": len(parent_lineage), "has_session_hints": bool(session_hints)},
+        native_request = _expanded_responses_request(raw_request, parent_lineage)
+        internal_kwargs = _internal_client_kwargs(client, session_hints, session_info)
+        self._trace(
+            transaction_logger,
+            "responses_native_protocol_request",
+            _redact_sensitive_fields(native_request),
+            direction="request",
+            stage="protocol",
+            metadata={"lineage_depth": len(parent_lineage), "has_session_hints": bool(session_hints)},
+        )
+        try:
+            response = await client.agenerate(
+                native_request,
+                input_protocol="responses",
+                request=request,
+                _disable_provider_continuation=bool(parent_lineage),
+                **_routing_kwargs(raw_request),
+                **internal_kwargs,
             )
-            try:
-                response = await client.agenerate(
-                    native_request,
-                    input_protocol="responses",
-                    output_protocol="responses",
-                    request=request,
-                    _disable_provider_continuation=bool(parent_lineage),
-                    **_routing_kwargs(raw_request),
-                    **internal_kwargs,
-                )
-            except StructuredAPIResponseError as exc:
-                raise ResponsesServiceError(
-                    str(exc),
-                    error_type=exc.error_type,
-                    status_code=exc.http_status,
-                ) from exc
-            response_payload = self._response_to_dict(response)
-            self._trace(transaction_logger, "responses_native_protocol_response", response_payload, direction="response", stage="provider")
-        else:
-            chat_kwargs = self.bridge.to_chat_kwargs(
-                unified,
-                parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None,
-            )
-            bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
-            chat_kwargs.pop("_session_tracking_hints", None)
-            chat_kwargs.update(_routing_kwargs(raw_request))
-            chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
-            self._trace(
-                transaction_logger,
-                "responses_bridge_chat_request",
-                _without_internal_kwargs(chat_kwargs),
-                direction="request",
-                stage="adapter",
-                metadata={"bridge_metadata": {"extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()), "has_session_hints": bool(session_hints)}},
-            )
-            chat_kwargs["_output_protocol"] = "openai_chat"
-            chat_response = await client.acompletion(request=request, **chat_kwargs)
-            if transaction_logger:
-                self._trace(transaction_logger, "responses_bridge_chat_response", self._response_to_dict(chat_response), direction="response", stage="provider")
-            try:
-                response_payload = self.bridge.from_chat_response(chat_response, unified)
-            except Exception as exc:
-                self._log_transform_error(transaction_logger, "responses_bridge_chat_response", exc, self._response_to_dict(chat_response))
-                raise
+        except StructuredAPIResponseError as exc:
+            raise ResponsesServiceError(
+                str(exc),
+                error_type=exc.error_type,
+                status_code=exc.http_status,
+            ) from exc
+        response_payload = self._response_to_dict(response)
+        self._trace(transaction_logger, "responses_native_protocol_response", response_payload, direction="response", stage="provider")
         _record_responses_session_anchor(session_info, response_payload)
         self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
@@ -312,22 +274,7 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
         self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")
-        if selected_output == "responses":
-            return response_payload
-        unified_response = self.protocol.parse_response(
-            response_payload,
-            ProtocolContext(source_protocol="responses", target_protocol=selected_output),
-        )
-        return get_protocol(selected_output).format_response(
-            unified_response,
-            ProtocolContext(
-                source_protocol="responses",
-                target_protocol=selected_output,
-                input_protocol="responses",
-                output_protocol=selected_output,
-                provider_state_compatible=False,
-            ),
-        )
+        return response_payload
 
     async def stream_response(
         self,
@@ -422,52 +369,33 @@ class ResponsesService:
         session_info: dict[str, Any] = {
             "scope_access_hash": resolved_scope.access_token_hash,
         }
-        selected_output = (
-            client.resolve_output_protocol(
-                stream_request,
-                input_protocol="responses",
-                request=request,
-            )
-            if hasattr(client, "resolve_output_protocol")
-            else "responses"
-        )
         self._trace(
             transaction_logger,
             "responses_native_protocol_stream_request",
             _redact_sensitive_fields(native_request),
             direction="request",
             stage="protocol",
-            metadata={"lineage_depth": len(parent_lineage), "selected_output": selected_output},
+            metadata={"lineage_depth": len(parent_lineage)},
         )
         response_stream = await client.agenerate(
             native_request,
             input_protocol="responses",
-            output_protocol="responses",
             request=request,
             _disable_provider_continuation=bool(parent_lineage),
             **_routing_kwargs(raw_request),
             **_internal_client_kwargs(client, session_hints, session_info),
         )
+        completed = False
         response_context = ProtocolContext(
             model=unified.model,
             source_protocol="responses",
-            target_protocol=selected_output,
+            target_protocol="responses",
             input_protocol="responses",
             provider_protocol="responses",
-            output_protocol=selected_output,
+            client_protocol="responses",
             transport=transport,
             provider_state_compatible=False,
         )
-        converter = (
-            ProtocolStreamConverter(
-                self.protocol,
-                get_protocol(selected_output),
-                response_context,
-            )
-            if selected_output != "responses"
-            else None
-        )
-        completed = False
         async for raw_frame in response_stream:
             if isinstance(raw_frame, str) and raw_frame.lstrip().startswith(":"):
                 yield raw_frame
@@ -494,11 +422,7 @@ class ResponsesService:
                     direction="metadata",
                     stage="final",
                 )
-            if converter is None:
-                yield raw_frame
-            else:
-                for formatted in converter.convert(raw_frame):
-                    yield formatted
+            yield raw_frame
         if not completed:
             raise ResponsesServiceError(
                 "Responses stream ended without a terminal response event",

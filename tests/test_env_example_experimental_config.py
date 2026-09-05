@@ -36,7 +36,6 @@ def test_env_example_documents_experimental_config_knobs() -> None:
 
     assert "Do not put API keys" in text
     assert "protocol_name (openai_chat, responses, anthropic_messages, or gemini)" in text
-    assert "default_output_protocol" in text
     assert "model_quota_groups" in text
     assert "credentials must stay in" in text
     for default_line in (

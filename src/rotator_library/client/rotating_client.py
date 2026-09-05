@@ -42,8 +42,6 @@ from .model_discovery import ModelDiscoveryService
 from .usage_managers import UsageManagerRegistry
 from .request_builder import RequestContextBuilder
 from .quota import QuotaService
-from .protocol_selection import canonical_protocol_name, request_output_protocol, require_same_protocol_stream
-from ..routing import FallbackResolver, load_routing_config_from_env
 from ..session_tracking import SessionTracker
 
 # Import providers and other dependencies
@@ -597,64 +595,25 @@ class RotatingClient:
         payload: Dict[str, Any],
         *,
         input_protocol: str,
-        output_protocol: Optional[str] = None,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
         **routing_kwargs: Any,
     ) -> Union[Any, AsyncGenerator[str, None]]:
-        """Execute a generative request with independent wire protocols.
+        """Execute a generative request in the client's own wire protocol.
 
         Provider selection is still driven by the request model and existing
         routing controls. Providers receive only their declared native format;
-        the selected output defaults to the client's input format.
+        the client response protocol equals the client request protocol (D1).
         """
 
-        selected_output = self.resolve_output_protocol(
-            payload,
-            input_protocol=input_protocol,
-            request=request,
-            explicit=output_protocol,
-        )
-        if payload.get("stream"):
-            require_same_protocol_stream(input_protocol, selected_output)
         kwargs = dict(payload)
         kwargs.update(routing_kwargs)
         kwargs["_input_protocol"] = input_protocol
-        kwargs["_output_protocol"] = selected_output
         return await self.acompletion(
             request=request,
             pre_request_callback=pre_request_callback,
             **kwargs,
         )
-
-    def resolve_output_protocol(
-        self,
-        payload: Dict[str, Any],
-        *,
-        input_protocol: str,
-        request: Optional[Any] = None,
-        explicit: Optional[str] = None,
-    ) -> str:
-        """Resolve explicit, HTTP, provider-default, then input output format."""
-
-        selected = explicit or request_output_protocol(request)
-        if selected:
-            return canonical_protocol_name(selected)
-        model = str(payload.get("model") or "")
-        provider = model.split("/", 1)[0] if "/" in model else ""
-        if not provider and model:
-            routing = load_routing_config_from_env()
-            if model.lower() in routing.model_routes:
-                decision = FallbackResolver(routing).resolve(model)
-                if decision.targets:
-                    provider = decision.targets[0].provider
-        plugin = self._get_provider_instance(provider) if provider else None
-        configured = (
-            plugin.get_default_output_protocol(model)
-            if plugin and hasattr(plugin, "get_default_output_protocol")
-            else None
-        )
-        return canonical_protocol_name(configured or input_protocol)
 
     async def acompletion(
         self,

@@ -232,7 +232,7 @@ async def test_native_cross_protocol_stream_formats_openai_chat_sse() -> None:
         model="claude-sonnet-4-5",
         protocol_name="anthropic_messages",
         input_protocol_name="anthropic_messages",
-        output_protocol_name="openai_chat",
+        client_protocol_name="openai_chat",
         endpoint="https://example.test/messages",
         operation="messages",
     )
@@ -338,7 +338,7 @@ async def test_provider_stream_state_is_cached_for_followups_but_not_exposed(
         model="gpt-test",
         protocol_name=protocol,
         input_protocol_name=protocol,
-        output_protocol_name="openai_chat",
+        client_protocol_name="openai_chat",
         endpoint="https://example.test/stream",
         operation=operation,
         credential_id="credential-1",

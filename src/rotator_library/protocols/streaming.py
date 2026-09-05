@@ -59,18 +59,18 @@ class StreamFormatState:
 
 
 class ProtocolStreamConverter:
-    """Convert raw source frames to one independently selected output protocol."""
+    """Convert raw source frames to the client's own protocol."""
 
     def __init__(
         self,
         source_protocol: Any,
-        output_protocol: Any,
+        client_protocol: Any,
         context: ProtocolContext,
     ) -> None:
         self.source_protocol = source_protocol
-        self.output_protocol = output_protocol
+        self.client_protocol = client_protocol
         self.context = context
-        self.state = stream_format_state(context, output_protocol.name)
+        self.state = stream_format_state(context, client_protocol.name)
 
     def convert(self, raw_event: Any) -> list[Any]:
         """Parse and format one source frame, expanding destination lifecycle frames."""
@@ -78,7 +78,7 @@ class ProtocolStreamConverter:
         event = self.source_protocol.parse_stream_event(raw_event, self.context)
         return format_canonical_stream_event(
             event,
-            self.output_protocol.name,
+            self.client_protocol.name,
             self.context,
             state=self.state,
         )
@@ -88,12 +88,12 @@ async def convert_protocol_stream(
     stream: AsyncIterator[Any],
     *,
     source_protocol: Any,
-    output_protocol: Any,
+    client_protocol: Any,
     context: ProtocolContext,
 ) -> AsyncIterator[Any]:
     """Convert a resilient source stream while preserving transport heartbeats."""
 
-    converter = ProtocolStreamConverter(source_protocol, output_protocol, context)
+    converter = ProtocolStreamConverter(source_protocol, client_protocol, context)
     async for raw_event in stream:
         if isinstance(raw_event, str) and raw_event.lstrip().startswith(":"):
             yield raw_event

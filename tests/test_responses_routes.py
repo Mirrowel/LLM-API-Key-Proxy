@@ -10,19 +10,30 @@ from rotator_library.responses import InMemoryResponsesStore, ResponsesService, 
 
 
 class FakeClient:
-    async def acompletion(self, **kwargs):
-        if kwargs.get("stream"):
-            async def chunks():
-                yield 'data: {"choices":[{"delta":{"content":"route"}}]}\n\n'
-                yield 'data: {"choices":[{"delta":{"content":" stream"}}]}\n\n'
-                yield "data: [DONE]\n\n"
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
+        if payload.get("stream"):
 
-            return chunks()
+            async def frames():
+                yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_route_1","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+                yield 'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","item_id":"msg_0","output_index":0,"content_index":0,"delta":"route ok"}\n\n'
+                yield 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_route_1","object":"response","status":"completed","model":"gpt-test","output":[{"id":"msg_0","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"route ok"}]}],"usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}\n\n'
+
+            return frames()
         return {
-            "id": "chat_route_1",
-            "model": kwargs["model"],
-            "choices": [{"message": {"role": "assistant", "content": "route ok"}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            "id": "resp_route_1",
+            "object": "response",
+            "model": payload.get("model", "gpt-test"),
+            "status": "completed",
+            "output": [
+                {
+                    "id": "msg_0",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "route ok"}],
+                }
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
         }
 
 
@@ -68,7 +79,7 @@ def test_post_responses_non_stream_success() -> None:
 
     assert response.status_code == 200
     body = response.json()
-    assert body["id"] == "chat_route_1"
+    assert body["id"] == "resp_route_1"
     assert body["object"] == "response"
     assert body["output"][0]["content"][0]["text"] == "route ok"
     assert response.headers["x-proxy-session-domain"] == "public"
@@ -83,7 +94,7 @@ def test_post_responses_missing_model_returns_400() -> None:
     assert response.json()["error"]["type"] == "invalid_request_error"
 
 
-def test_responses_provider_error_uses_selected_output_protocol() -> None:
+def test_responses_provider_error_uses_responses_protocol() -> None:
     class ErrorService(ResponsesService):
         async def create_response(self, *args, **kwargs):
             raise ResponsesServiceError(
@@ -97,13 +108,12 @@ def test_responses_provider_error_uses_selected_output_protocol() -> None:
 
     response = client.post(
         "/v1/responses",
-        headers={"X-Proxy-Output-Protocol": "gemini"},
         json={"model": "openai/gpt-test", "input": "hello"},
     )
 
     assert response.status_code == 429
     assert response.json() == {
-        "error": {"code": 429, "message": "provider busy", "status": "RESOURCE_EXHAUSTED"}
+        "error": {"code": 429, "message": "provider busy", "type": "rate_limit"}
     }
 
 
@@ -252,9 +262,9 @@ def test_scoped_stream_uses_same_access_capability_for_stored_response() -> None
     created_payload = next(
         json.loads(line.removeprefix("data: "))
         for line in response.text.splitlines()
-        if line.startswith("data: {")
+        if line.startswith("data: {") and '"response.created"' in line
     )
-    response_id = created_payload["id"]
+    response_id = created_payload["response"]["id"]
 
     assert response.status_code == 200
     assert capability.startswith("bundle:")

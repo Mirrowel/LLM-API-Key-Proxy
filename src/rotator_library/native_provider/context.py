@@ -28,7 +28,7 @@ class NativeProviderContext:
     endpoint: str
     operation: str = "chat"
     input_protocol_name: Optional[str] = None
-    output_protocol_name: Optional[str] = None
+    client_protocol_name: Optional[str] = None
     headers: dict[str, str] = field(default_factory=dict)
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
@@ -55,7 +55,7 @@ class NativeProviderContext:
         """Build a protocol context for parse/build/format passes."""
 
         input_protocol = self.input_protocol_name or self.protocol_name
-        output_protocol = self.output_protocol_name or input_protocol
+        client_protocol = self.client_protocol_name or input_protocol
         return ProtocolContext(
             provider=self.provider,
             model=self.model,
@@ -63,7 +63,7 @@ class NativeProviderContext:
             target_protocol=target_protocol or self.protocol_name,
             input_protocol=input_protocol,
             provider_protocol=self.protocol_name,
-            output_protocol=output_protocol,
+            client_protocol=client_protocol,
             source_provider=source_provider,
             target_provider=target_provider,
             provider_state_compatible=provider_state_compatible,

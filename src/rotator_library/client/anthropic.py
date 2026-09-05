@@ -105,19 +105,9 @@ class AnthropicHandler:
         anthropic_request = request.model_dump(exclude_none=True)
 
         if hasattr(self._client, "agenerate"):
-            selected_output = (
-                self._client.resolve_output_protocol(
-                    anthropic_request,
-                    input_protocol="anthropic_messages",
-                    request=raw_request,
-                )
-                if hasattr(self._client, "resolve_output_protocol")
-                else "anthropic_messages"
-            )
             response = await self._client.agenerate(
                 anthropic_request,
                 input_protocol="anthropic_messages",
-                output_protocol=selected_output,
                 request=raw_request,
                 pre_request_callback=pre_request_callback,
                 _parent_log_dir=anthropic_logger.log_dir if anthropic_logger and anthropic_logger.log_dir else None,
@@ -125,8 +115,6 @@ class AnthropicHandler:
             if request.stream:
                 return response
             anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-            if selected_output != "anthropic_messages":
-                return anthropic_response
             anthropic_response["id"] = request_id
             _trace_anthropic(
                 anthropic_logger,

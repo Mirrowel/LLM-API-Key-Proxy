@@ -171,11 +171,9 @@ def _output_text(protocol_name: str, payload: dict[str, Any]) -> str | None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize("input_protocol", PROTOCOLS)
 @pytest.mark.parametrize("provider_protocol", PROTOCOLS)
-@pytest.mark.parametrize("output_protocol", PROTOCOLS)
-async def test_runtime_keeps_input_provider_and_output_protocols_independent(
+async def test_runtime_formats_every_client_protocol_from_every_provider_protocol(
     input_protocol: str,
     provider_protocol: str,
-    output_protocol: str,
 ) -> None:
     preparer_calls: list[dict[str, Any]] = []
 
@@ -191,7 +189,7 @@ async def test_runtime_keeps_input_provider_and_output_protocols_independent(
         endpoint="https://provider.test/generate",
         operation=OPERATIONS[provider_protocol],
         input_protocol_name=input_protocol,
-        output_protocol_name=output_protocol,
+        client_protocol_name=input_protocol,
         credential_id="credential-1",
         session_id="session-1",
         metadata={"public_model": "provider/model-test", "input_provider": "provider"},
@@ -210,11 +208,10 @@ async def test_runtime_keeps_input_provider_and_output_protocols_independent(
     assert prepared_payload.pop("_proxy_model") == "provider/model-test"
     assert "_proxy_model" not in transport.payload
     assert transport.payload == prepared_payload
-    assert _output_text(output_protocol, result) == "answer"
+    assert _output_text(input_protocol, result) == "answer"
 
 
-@pytest.mark.parametrize("output_protocol", PROTOCOLS)
-def test_litellm_and_custom_chat_results_use_the_selected_output_protocol(output_protocol: str) -> None:
+def test_litellm_and_custom_chat_results_use_the_client_request_protocol() -> None:
     context = RequestContext(
         model="provider/model-test",
         provider="provider",
@@ -223,7 +220,6 @@ def test_litellm_and_custom_chat_results_use_the_selected_output_protocol(output
         credentials=["credential-1"],
         deadline=9999999999.0,
         input_protocol_name="gemini",
-        output_protocol_name=output_protocol,
     )
 
     result = RequestExecutor._format_execution_response(
@@ -232,7 +228,7 @@ def test_litellm_and_custom_chat_results_use_the_selected_output_protocol(output
         context,
     )
 
-    assert _output_text(output_protocol, result) == "answer"
+    assert _output_text("gemini", result) == "answer"
 
 
 @pytest.mark.asyncio
@@ -252,7 +248,7 @@ async def test_structured_errors_raise_before_cross_protocol_success_formatting(
         streaming=False,
         credentials=["credential-1"],
         deadline=9999999999.0,
-        output_protocol_name="anthropic_messages",
+        input_protocol_name="anthropic_messages",
         routing_targets=(target,),
     )
     context.routing_target_index = 0
@@ -358,7 +354,7 @@ async def test_native_structured_errors_raise_before_provider_response_parsing()
         endpoint="https://provider.test/generate",
         operation="generate",
         input_protocol_name="openai_chat",
-        output_protocol_name="responses",
+        client_protocol_name="responses",
     )
     transport = RecordingTransport(
         {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "quota exhausted"}}
@@ -412,7 +408,7 @@ async def test_response_adapters_run_on_selected_client_protocol_payload() -> No
         endpoint="https://provider.test/messages",
         operation="messages",
         input_protocol_name="openai_chat",
-        output_protocol_name="openai_chat",
+        client_protocol_name="openai_chat",
         adapter_names=("reasoning_content",),
         adapter_config={
             "reasoning_content": {
@@ -446,7 +442,7 @@ async def test_opaque_thought_signatures_are_cached_but_never_returned_to_client
         endpoint="https://provider.test/generate",
         operation="generate",
         input_protocol_name="gemini",
-        output_protocol_name="gemini",
+        client_protocol_name="gemini",
         credential_id="credential-1",
         session_id="session-1",
         field_cache_rules=rules,
@@ -509,7 +505,6 @@ async def test_real_callback_nested_edits_preserve_source_native_metadata() -> N
         credentials=["credential-1"],
         deadline=9999999999.0,
         input_protocol_name="anthropic_messages",
-        output_protocol_name="anthropic_messages",
         protocol_request=source_payload,
         unified_request=unified,
         input_provider="provider",
@@ -561,7 +556,6 @@ def test_internal_attempt_fields_do_not_become_same_protocol_extensions() -> Non
         credentials=["credential-1"],
         deadline=9999999999.0,
         input_protocol_name="openai_chat",
-        output_protocol_name="openai_chat",
         protocol_request=source_payload,
         unified_request=unified,
         input_provider="provider",
@@ -597,7 +591,7 @@ async def test_proxy_expanded_responses_history_suppresses_cached_provider_conti
         endpoint="https://provider.test/responses",
         operation="responses",
         input_protocol_name="responses",
-        output_protocol_name="responses",
+        client_protocol_name="responses",
         credential_id="credential-1",
         session_id="session-1",
         field_cache_rules=rules,
@@ -723,7 +717,6 @@ async def test_agenerate_runs_real_builder_to_native_executor_handoff() -> None:
     result = await client.agenerate(
         deepcopy(REQUESTS["anthropic_messages"]),
         input_protocol="anthropic_messages",
-        output_protocol="responses",
     )
 
     assert "contents" in http_client.calls[0]["json"]
@@ -734,5 +727,5 @@ async def test_agenerate_runs_real_builder_to_native_executor_handoff() -> None:
     assert "messages" not in validated_provider_requests[0]
     assert http_client.calls[0]["json"]["systemInstruction"]["parts"][0]["text"] == "follow the rule"
     assert http_client.calls[0]["json"]["contents"][0]["parts"][0]["text"] == "changed by callback"
-    assert result["object"] == "response"
-    assert _output_text("responses", result) == "answer"
+    assert result["type"] == "message"
+    assert _output_text("anthropic_messages", result) == "answer"

@@ -370,7 +370,7 @@ async def test_native_response_source_extracts_raw_provider_response_before_clie
         model="claude-sonnet-4-5",
         protocol_name="anthropic_messages",
         input_protocol_name="anthropic_messages",
-        output_protocol_name="openai_chat",
+        client_protocol_name="openai_chat",
         endpoint="https://example.test/messages",
         operation="messages",
         field_cache_rules=(rule,),

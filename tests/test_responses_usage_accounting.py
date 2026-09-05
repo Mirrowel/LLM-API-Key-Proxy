@@ -9,15 +9,25 @@ from rotator_library.transaction_logger import TransactionLogger
 
 
 class FakeUsageClient:
-    async def acompletion(self, **kwargs):
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
         return {
-            "id": "chatcmpl_1",
-            "model": "gpt-test",
-            "choices": [{"message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "id": "resp_usage_1",
+            "object": "response",
+            "model": payload.get("model", "gpt-test"),
+            "status": "completed",
+            "output": [
+                {
+                    "id": "msg_1",
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": "hi"}],
+                }
+            ],
             "usage": {
-                "prompt_tokens": 20,
-                "completion_tokens": 8,
-                "completion_tokens_details": {"reasoning_tokens": 3},
+                "input_tokens": 20,
+                "output_tokens": 8,
+                "output_tokens_details": {"reasoning_tokens": 3},
             },
         }
 
