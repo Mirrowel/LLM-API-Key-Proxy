@@ -1423,6 +1423,13 @@ class SessionTracker:
                 response_message = dict(message)
                 response_message.setdefault("role", "assistant")
                 messages.append(response_message)
+        if not messages:
+            # Neutral response envelopes carry assistant evidence directly on a
+            # top-level `messages` list (stream pipelines, future neutral
+            # responses) instead of protocol-specific choices/candidates.
+            for message in data.get("messages") or []:
+                if isinstance(message, dict) and message.get("role") == "assistant":
+                    messages.append(dict(message))
         if messages:
             response_group = "response_event:" + self._hash_json(
                 [self._message_signature(message) for message in messages]

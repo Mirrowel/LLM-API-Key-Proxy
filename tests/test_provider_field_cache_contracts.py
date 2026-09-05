@@ -162,14 +162,16 @@ async def test_real_provider_mixed_stream_and_non_stream_share_latest_logical_st
     await executor.execute(_request(provider), _context(provider), first_transport)
 
     stream_transport = RecordingStreamTransport(_stream_chunks(provider, "stream-state"))
-    stream_output = [frame async for frame in executor.stream(_request(provider), _context(provider, stream=True), stream_transport)]
+    stream_events = [event async for event in executor.stream(_request(provider), _context(provider, stream=True), stream_transport)]
 
     final_transport = RecordingResponseTransport([_response(provider, "final-state")])
     await executor.execute(_request(provider), _context(provider), final_transport)
 
     expected = "stream-state" if isinstance(provider, CodexProvider) else ["non-stream-state", "stream-state"]
     assert _injected_state(provider, final_transport.requests[0]) == expected
-    assert "stream-state" not in "".join(stream_output)
+    # Neutral events are internal; the client never sees cached provider state.
+    # (Client-side non-exposure is fixture-locked in test_native_provider_streaming.)
+    assert all(not isinstance(event, str) for event in stream_events)
 
 
 @pytest.mark.asyncio

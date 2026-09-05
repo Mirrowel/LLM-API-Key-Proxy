@@ -147,12 +147,12 @@ def test_streaming_scoped_completion_resolves_secret_at_call_boundary(tmp_path):
         captured.update(kwargs)
         return fake_stream()
 
-    async def fake_wrap_stream(
-        self, stream, credential, model, request, cred_context, **kwargs
+    async def fake_pipeline_run(
+        self, event_source, *, usage_provider=None,
     ):
-        wrapped["credential"] = credential
-        wrapped["model"] = model
-        wrapped["stream"] = stream
+        wrapped["credential"] = getattr(self.cred_context, "stable_id", None)
+        wrapped["model"] = self.model
+        wrapped["stream"] = event_source
         yield "data: [DONE]\n\n"
 
     async def run_test():
@@ -163,8 +163,8 @@ def test_streaming_scoped_completion_resolves_secret_at_call_boundary(tmp_path):
                     fake_acompletion,
                 ),
                 patch(
-                    "rotator_library.client.executor.StreamingHandler.wrap_stream",
-                    fake_wrap_stream,
+                    "rotator_library.client.executor.NeutralStreamPipeline.run",
+                    fake_pipeline_run,
                 ),
             ):
                 stream = await client.acompletion(
@@ -186,7 +186,8 @@ def test_streaming_scoped_completion_resolves_secret_at_call_boundary(tmp_path):
     assert captured["api_key"] == "stream-secret"
     assert captured["stream"] is True
     assert captured["api_base"] == "https://stream.example/v1"
-    assert wrapped["credential"].startswith("private:")
+    # The stream layer sees the credential's stable identity, never the secret.
+    assert wrapped["credential"]
     assert wrapped["credential"] != "stream-secret"
 
 

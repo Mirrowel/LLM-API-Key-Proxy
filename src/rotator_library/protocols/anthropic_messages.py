@@ -501,7 +501,18 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 content_block = ContentBlock(type="tool_call", tool_call=call, raw=deepcopy(delta))
         message = UnifiedMessage(role="assistant", content=[content_block] if content_block else [])
         self._promote_message_blocks(message)
-        return UnifiedStreamEvent(type=str(data.get("type") or "content_block_delta"), operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=str(data.get("type") or "content_block_delta"), delta=message, raw=deepcopy(raw_event), extra={"payload": data, "index": data.get("index")})
+        block_index = data.get("index")
+        return UnifiedStreamEvent(
+            type=str(data.get("type") or "content_block_delta"),
+            operation=OPERATION_MESSAGES,
+            logical_operation=OPERATION_GENERATE,
+            source_protocol=self.name,
+            native_type=str(data.get("type") or "content_block_delta"),
+            delta=message,
+            content_index=block_index if isinstance(block_index, int) else None,
+            raw=deepcopy(raw_event),
+            extra={"payload": data, "index": data.get("index")},
+        )
 
 
 def _operation_from_context(context: ProtocolContext | None, default: str) -> str:

@@ -8,6 +8,7 @@ import pytest
 
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.client.filters import CredentialFilter
+from rotator_library.client.stream_ops import NeutralStreamPipeline
 from rotator_library.client.transforms import ProviderTransforms
 from rotator_library.core.types import RequestContext
 from rotator_library.native_provider import NativeProviderContext, NativeProviderExecutor
@@ -262,15 +263,33 @@ async def test_native_executor_stream_matrix_uses_provider_reader_and_selected_w
     )
     transport = _NativeStreamTransport(_source_frames(provider_protocol))
 
-    frames = [
-        frame
-        async for frame in NativeProviderExecutor().stream(
+    events = [
+        event
+        async for event in NativeProviderExecutor().stream(
             {"model": "model-a", "messages": [{"role": "user", "content": "hello"}], "stream": True},
             context,
             transport,
         )
     ]
-    output = "".join(frames)
+
+    async def _event_source():
+        for event in events:
+            yield event
+
+    pipeline = NeutralStreamPipeline(
+        client_protocol_name=output_protocol,
+        protocol_context=ProtocolContext(
+            provider="provider",
+            model="model-a",
+            source_protocol=provider_protocol,
+            target_protocol=output_protocol,
+            input_protocol="openai_chat",
+            client_protocol=output_protocol,
+            transport="sse",
+        ),
+        model="model-a",
+    )
+    output = "".join([frame async for frame in pipeline.run(_event_source())])
 
     assert "hi" in output
     assert "weather" in output

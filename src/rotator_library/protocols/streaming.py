@@ -44,6 +44,7 @@ class StreamFormatState:
     terminal: bool = False
     completion_emitted: bool = False
     role_emitted: bool = False
+    finish_emitted: bool = False
     stop_reason: str | None = None
     usage: Usage | None = None
     next_index: int = 0
@@ -56,6 +57,12 @@ class StreamFormatState:
     tool_names: dict[str, str] = field(default_factory=dict)
     tool_ids: dict[str, str] = field(default_factory=dict)
     emitted_tools: set[str] = field(default_factory=set)
+    # Block-identity bookkeeping (defect 8): events that carry explicit
+    # content/output indexes use them directly; identity-less wires (chat
+    # chunks) mint a family epoch that reopens when a different block family
+    # intervenes, so `text -> tool -> text` stays three distinct blocks.
+    family_epoch: dict[str, int] = field(default_factory=dict)
+    last_family: str | None = None
 
 
 class ProtocolStreamConverter:
@@ -169,14 +176,15 @@ def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         frames.append(_data_frame(_openai_chunk(state, delta=delta, finish_reason=None, usage=event.usage)))
 
     terminal = _is_terminal(event)
-    if event.stop_reason or event.extra.get("stop_reason"):
+    if (event.stop_reason or event.extra.get("stop_reason")) and not state.finish_emitted:
         reason = event.stop_reason or event.extra.get("stop_reason")
         state.stop_reason = str(reason)
         frames.append(_data_frame(_openai_chunk(state, delta={}, finish_reason=format_stop_reason(state.stop_reason, "openai_chat"), usage=event.usage)))
+        state.finish_emitted = True
     if terminal:
         frames.append("data: [DONE]\n\n")
         state.terminal = True
-    elif event.usage is not None and not delta:
+    elif event.usage is not None and not delta and not state.finish_emitted:
         frames.append(_data_frame(_openai_chunk(state, delta={}, finish_reason=None, usage=event.usage)))
     return frames
 
@@ -188,7 +196,7 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
 
     frames = _anthropic_start(state)
     for block in _event_blocks(event):
-        key, block_type = _block_key(block, state)
+        key, block_type = _block_key(block, state, event)
         if key not in state.open_blocks:
             index = state.next_index
             state.next_index += 1
@@ -239,7 +247,7 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
 
     frames = _responses_start(state)
     for block in _event_blocks(event):
-        key, kind = _block_key(block, state)
+        key, kind = _block_key(block, state, event)
         if key not in state.item_ids:
             item_id = _responses_item_id(kind, state.next_index)
             state.next_index += 1
@@ -271,7 +279,7 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
     parts: list[dict[str, Any]] = []
     for block in _event_blocks(event):
         if block.tool_call:
-            key, _ = _block_key(block, state)
+            key, _ = _block_key(block, state, event)
             call = block.tool_call
             state.tool_names[key] = call.name or state.tool_names.get(key, "")
             state.tool_ids[key] = call.id or state.tool_ids.get(key, "")
@@ -320,6 +328,10 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
     if event.stop_reason or event.extra.get("stop_reason"):
         state.stop_reason = str(event.stop_reason or event.extra.get("stop_reason"))
         finish_reason = format_stop_reason(state.stop_reason, "gemini")
+    if finish_reason and state.completion_emitted:
+        # Duplicate completion (e.g. synthetic terminal after a finish frame):
+        # never re-emit the finish reason.
+        finish_reason = None
     if parts or finish_reason or event.usage is not None:
         candidate: dict[str, Any] = {"index": 0}
         if parts:
@@ -330,7 +342,7 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         if state.model:
             payload["modelVersion"] = state.model
         usage = _gemini_usage(event.usage)
-        if usage:
+        if usage and not state.completion_emitted:
             payload["usageMetadata"] = usage
         frames.append(_data_frame(payload))
         if finish_reason:
@@ -368,14 +380,45 @@ def _event_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
     return ordered_message_blocks(message)
 
 
-def _block_key(block: ContentBlock, state: StreamFormatState) -> tuple[str, str]:
+def _block_key(block: ContentBlock, state: StreamFormatState, event: UnifiedStreamEvent | None = None) -> tuple[str, str]:
     if block.tool_call:
         call = block.tool_call
         identity = call.index if call.index is not None else call.id or call.name or "default"
+        # Tool blocks also advance the family sequence so a following text
+        # block reopens as a new block instead of merging with the earlier one.
+        state.last_family = "tool"
         return f"tool:{identity}", "tool"
-    if block.reasoning:
-        return "reasoning:0", "reasoning"
-    return "text:0", "text"
+    family = "reasoning" if block.reasoning else "text"
+    explicit_index = _event_block_index(event)
+    if explicit_index is not None:
+        return f"{family}:{explicit_index}", family
+    epoch = state.family_epoch.get(family, 0)
+    if state.last_family is not None and state.last_family != family:
+        epoch += 1
+        state.family_epoch[family] = epoch
+    else:
+        state.family_epoch.setdefault(family, epoch)
+    state.last_family = family
+    return f"{family}:{epoch}", family
+
+
+def _event_block_index(event: UnifiedStreamEvent | None) -> str | None:
+    """Composite explicit block identity: item/output index + content index.
+
+    Responses-style events set both (content_index is per-item, so two output
+    items sharing content_index 0 must NOT merge); identity-less wires (chat)
+    return None and fall back to the family-epoch heuristic.
+    """
+
+    if event is None:
+        return None
+    content_index = getattr(event, "content_index", None)
+    output_index = getattr(event, "output_index", None)
+    if output_index is None and content_index is None:
+        return None
+    output_part = f"o{output_index}" if isinstance(output_index, int) else "o-"
+    content_part = f"c{content_index}" if isinstance(content_index, int) else "c-"
+    return f"{output_part}:{content_part}"
 
 
 def _openai_delta(message: UnifiedMessage | None) -> dict[str, Any]:

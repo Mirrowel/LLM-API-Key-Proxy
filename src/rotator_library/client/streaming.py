@@ -4,13 +4,11 @@
 """
 Streaming response handler.
 
-Extracts streaming logic from client.py _safe_streaming_wrapper (lines 904-1117).
-Handles:
-- Chunk processing with finish_reason logic
-- JSON reassembly for fragmented responses
-- Error detection in streamed data
-- Usage tracking from final chunks
-- Client disconnect handling
+DEPRECATED as the live operational layer (W5): the neutral-event pipeline in
+``client/stream_ops.py`` owns stream operations; this module retains shared
+helpers it imports (``StreamBuffer``, in-band error detection, SSE cost-frame
+parsing). The legacy ``StreamingHandler`` class is kept only for its existing
+direct tests until the W10 cleanup retires it — do not add new callers.
 """
 
 import asyncio

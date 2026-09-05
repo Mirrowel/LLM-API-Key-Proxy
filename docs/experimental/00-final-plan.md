@@ -273,7 +273,7 @@ Full D1-D9 reasoning history: `_superseded/protocol-interoperability-second-opin
 | Item | Disposition |
 |---|---|
 | `anthropic_compat/` + `client/anthropic.py` no-`agenerate` facade branch | **DELETE**; unify `/v1/messages` (incl. legacy fallback and count_tokens translation) on the protocol runtime |
-| `responses/bridge.py` non-`agenerate` fallback (`service.py:275-300`, forced `_output_protocol` at :292) | **DELETE** the fallback branch (the `agenerate` branch at :261 keeps, minus its output-protocol kwarg per 5.1). Done in W1a. The stream-path `stream_events` legacy surface is **intentionally retained until W5** — it is the transport-neutral event seam (§2.5) and the anchor of the phase-8c timing/heartbeat suite; its bridge-based implementation retires when neutral events replace it (re-sequenced from this workstream to W5). |
+| `responses/bridge.py` non-`agenerate` fallback (`service.py:275-300`, forced `_output_protocol` at :292) | **DELETE** the fallback branch (the `agenerate` branch at :261 keeps, minus its output-protocol kwarg per 5.1). Done in W1a. The stream-path `stream_events` legacy surface is **retained through W5** (landed) and its bridge-based implementation retires in **W6+W9** — retiring it is route-level consolidation onto the executor's neutral pipeline, and the transport-neutral `ResponsesStreamEvent` seam plus the phase-8c timing/heartbeat suite depend on it (2026-09-05 re-sequencing, review-confirmed). |
 
 ## 6. Defect Closure Requirements (audit of 2026-09-05, HEAD f4ac60a)
 

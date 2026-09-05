@@ -29,6 +29,10 @@ class NativeProviderContext:
     operation: str = "chat"
     input_protocol_name: Optional[str] = None
     client_protocol_name: Optional[str] = None
+    # Authoritative stream usage assembled by the native executor from events
+    # AND raw provider chunks (including provider-reported cost frames). The
+    # operational stream layer adopts this record on completion.
+    stream_usage_record: Any = None
     headers: dict[str, str] = field(default_factory=dict)
     credential_id: Optional[str] = None
     session_id: Optional[str] = None

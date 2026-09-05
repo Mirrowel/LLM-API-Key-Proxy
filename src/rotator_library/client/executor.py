@@ -71,7 +71,7 @@ from ..routing.policy import normalize_route_error_type
 from ..routing.types import RouteTarget
 from ..native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from ..protocols import ProtocolContext, UnifiedStreamEvent, get_protocol
-from ..protocols.streaming import convert_protocol_stream, format_canonical_stream_event
+from ..protocols.streaming import format_canonical_stream_event
 from ..native_provider.streaming import provider_supports_native_streaming as native_provider_supports_streaming
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..transform_trace import REDACTED
@@ -81,7 +81,7 @@ from ..usage.costs import CostBreakdown, CostCalculator
 from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
-from .streaming import StreamingHandler
+from .stream_ops import ChatWireStreamAdapter, NeutralStreamPipeline
 from ..streaming.policy import can_retry_stream_after_error, is_stream_heartbeat_or_comment, is_visible_stream_output
 
 if TYPE_CHECKING:
@@ -160,7 +160,8 @@ class RequestExecutor:
         self._litellm_logger_fn = litellm_logger_fn
         self._experimental_config = experimental_config
         # StreamingHandler no longer needs usage_manager - we pass cred_context directly
-        self._streaming_handler = StreamingHandler()
+        # (legacy chat-chunk handler retained for reference; the neutral pipeline
+        # in stream_ops owns live stream operations)
         self._native_executor = NativeProviderExecutor()
         self._failure_history = FailureHistory()
 
@@ -758,11 +759,10 @@ class RequestExecutor:
             endpoint=endpoint,
             operation=operation,
             input_protocol_name=context.input_protocol_name,
-            # The operational stream handler consumes canonical Chat SSE. The
-            # client's own protocol is applied once after timeout/retry/usage
-            # and completion-gated session handling. (W1b/W5 seam: the forced
-            # chat value goes away when the neutral operational layer lands.)
-            client_protocol_name="openai_chat" if stream else context.input_protocol_name,
+            # The client protocol of the request is the client protocol of the
+            # response (D1); native streams yield neutral events that the
+            # operational pipeline formats exactly once (W5).
+            client_protocol_name=context.input_protocol_name,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,
@@ -1655,6 +1655,7 @@ class RequestExecutor:
                                     # the non-streaming path: explicit LiteLLM wins, explicit custom
                                     # requires custom logic, explicit native fails closed, and auto
                                     # prefers custom before native streaming.
+                                    native_stream_context = None
                                     if execution == "litellm_fallback":
                                         kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True
@@ -1708,6 +1709,7 @@ class RequestExecutor:
                                         )
                                         stream = self._get_native_executor().stream(native_request, native_context, NativeHTTPTransport(self._http_client))
                                         stream_provider_protocol = native_context.protocol_name
+                                        native_stream_context = native_context
                                     else:
                                         kwargs["api_key"] = credential_secret
                                         kwargs["stream"] = True
@@ -1736,21 +1738,12 @@ class RequestExecutor:
                                         snapshot=False,
                                     )
 
-                                    # Hand off to streaming handler with cred_context
-                                    # The handler will call mark_success on completion
-                                    base_stream = self._streaming_handler.wrap_stream(
-                                        stream,
-                                        cred,
-                                        model,
-                                        context.request,
-                                        cred_context,
-                                        skip_cost_calculation=skip_cost_calculation,
-                                        response_callback=lambda response: self._record_session_response(
-                                            context, response
-                                        ),
-                                        success_callback=lambda: self._clear_failure_history_on_success(provider, model),
-                                        transaction_logger=context.transaction_logger,
-                                    )
+                                    # Neutral-event pipeline (W5): every execution
+                                    # path yields UnifiedStreamEvent objects; the
+                                    # operational layer runs retry/usage/session/
+                                    # metrics on events and formats the client's
+                                    # protocol exactly once at the tail. There is
+                                    # no chat-shaped intermediate on any path.
                                     if client_protocol_context is None:
                                         client_protocol_context = ProtocolContext(
                                             provider=provider,
@@ -1768,12 +1761,29 @@ class RequestExecutor:
                                             credential_stable_id=cred_context.stable_id,
                                             transport="sse",
                                         )
-                                    client_stream = convert_protocol_stream(
-                                        base_stream,
-                                        source_protocol=get_protocol("openai_chat"),
-                                        client_protocol=get_protocol(context.input_protocol_name),
-                                        context=client_protocol_context,
+                                    pipeline = NeutralStreamPipeline(
+                                        client_protocol_name=context.input_protocol_name,
+                                        protocol_context=client_protocol_context,
+                                        model=model,
+                                        request=context.request,
+                                        cred_context=cred_context,
+                                        skip_cost_calculation=skip_cost_calculation,
+                                        response_callback=lambda response: self._record_session_response(
+                                            context, response
+                                        ),
+                                        success_callback=lambda: self._clear_failure_history_on_success(provider, model),
+                                        transaction_logger=context.transaction_logger,
                                     )
+                                    if native_stream_context is not None:
+                                        event_source = stream
+                                        usage_provider = lambda native_ctx=native_stream_context: getattr(
+                                            native_ctx, "stream_usage_record", None
+                                        )
+                                    else:
+                                        chat_adapter = ChatWireStreamAdapter(model)
+                                        event_source = chat_adapter.events(stream, pipeline.usage)
+                                        usage_provider = None
+                                    client_stream = pipeline.run(event_source, usage_provider=usage_provider)
 
                                     lib_logger.info(
                                         f"Stream connection established for credential {mask_credential(cred)}. "
@@ -2583,7 +2593,7 @@ class RequestExecutor:
         Yields all chunks unchanged while accumulating them for final logging.
 
         Args:
-            stream: The SSE stream from wrap_stream
+            stream: The client-protocol SSE stream from the neutral pipeline
             transaction_logger: TransactionLogger instance
             request_kwargs: Original request kwargs for context
 

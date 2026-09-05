@@ -165,6 +165,9 @@ class NativeProviderExecutor:
         protocol = get_protocol(context.protocol_name)
         input_protocol = get_protocol(context.input_protocol_name or context.protocol_name)
         client_protocol = get_protocol(context.client_protocol_name or context.input_protocol_name or context.protocol_name)
+        # The executor holds the ORIGINAL context object; rebinding below
+        # (dataclasses.replace) must not detach per-stream state from it.
+        root_context = context
         context = _without_provider_continuation_rules(context)
         self._ensure_supported_operation(protocol, context)
         self._trace(context, "native_protocol_selected", {"input_protocol": input_protocol.name, "provider_protocol": protocol.name, "client_protocol": client_protocol.name}, direction="metadata", stage="protocol")
@@ -239,7 +242,7 @@ class NativeProviderExecutor:
                 if event.type == "error" or event.error is not None:
                     error = event.error if isinstance(event.error, dict) else {"message": str(event.error or "Provider stream failed")}
                     raise StreamedAPIError(
-                        str(error.get("message") or error.get("type") or "Provider stream failed"),
+                        str(error.get("message") or error.get("type") or error.get("code") or "Provider stream failed"),
                         data={"error": deepcopy(error)},
                     )
                 usage_record = _merge_stream_usage_records(
@@ -248,12 +251,12 @@ class NativeProviderExecutor:
                     extract_usage_record(raw_chunk, provider=context.provider, model=context.model, source="native_raw_stream_event"),
                 )
                 if event.type == "done":
-                    event_payload = stream_event_payload(event)
-                    self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
-                    formatted = client_protocol.format_stream_event(event, response_context)
-                    for frame in _formatted_stream_frames(formatted):
-                        self._trace(context, "formatted_client_stream_event", frame, direction="stream", stage="final", snapshot=False)
-                        yield frame
+                    # Terminal provider signal: hand the operational layer the
+                    # authoritative event and stop reading the wire.
+                    self._trace(context, "parsed_native_stream_event", stream_event_payload(event), direction="stream", stage="protocol")
+                    root_context.stream_usage_record = usage_record
+                    context.stream_usage_record = usage_record
+                    yield event
                     break
                 adapter_context = context.adapter_context()
                 # Native stream traces apply field-cache path redaction below.
@@ -275,10 +278,9 @@ class NativeProviderExecutor:
                     stage="adapter",
                     snapshot=False,
                 )
-                formatted = client_protocol.format_stream_event(event, response_context)
-                for frame in _formatted_stream_frames(formatted):
-                    self._trace(context, "formatted_client_stream_event", frame, direction="stream", stage="final", snapshot=False)
-                    yield frame
+                yield event
+            root_context.stream_usage_record = usage_record
+            context.stream_usage_record = usage_record
             cost_breakdown = CostCalculator().calculate(usage_record, model=context.model, provider=context.provider)
             self._trace(
                 context,
@@ -616,11 +618,4 @@ def _redact_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
             _redact_leaf_key(item, tokens)
 
 
-def _formatted_stream_frames(formatted: Any) -> list[Any]:
-    """Normalize one adapter result into destination frames."""
 
-    if formatted is None:
-        return []
-    if isinstance(formatted, list):
-        return formatted
-    return [formatted]
