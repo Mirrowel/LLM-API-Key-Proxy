@@ -70,6 +70,23 @@ git ls-files -s AGENTS.md | grep -q '^120000' || { echo "FAIL: AGENTS.md fixture
 git commit -qm 'autoload: hostile additions + modifications + out-of-repo symlink'
 git checkout -q main
 
+# parity fixtures: platform-sync carve-out matrix (see scrub-workspace.sh
+# "Post-fork platform parity"). main evolves AFTER the fork points — D
+# (deletion) and E (addition) — so branches syncing that content carry
+# post-fork anchor states (-> EXPLAINED sync), while a rollback to pre-fork
+# bytes stays a TAINT (the rollback cap).
+git branch parity-preD main
+git rm -q .github/workflows/new.yml && git commit -qm 'D: main removes new.yml'
+git branch parity-preE main
+printf 'extra\n' > .github/workflows/extra.yml && git add .github/workflows/extra.yml && git commit -qm 'E: main adds extra.yml'
+git checkout -q parity-preD; git checkout -q -b sync-parity
+git rm -q .github/workflows/new.yml && git commit -qm 'sync: adopt main D (delete new.yml)'
+git checkout -q parity-preE; git checkout -q -b sync-content
+printf 'extra\n' > .github/workflows/extra.yml && git add .github/workflows/extra.yml && git commit -qm 'sync: adopt main E (add extra.yml)'
+git checkout -q main; git checkout -q -b sync-rollback
+printf 'wf: v1\n' > .github/workflows/main.yml && git add -A && git commit -qm 'rollback: main.yml to v1 (pre-fork)'
+git checkout -q main
+
 cd "$WORK" && git clone -q "$SRC" work && cd work || exit 1
 git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
 
@@ -96,6 +113,11 @@ check "direct .github modify -> ALARM"                          ALARM "$(run_scr
 check "modify+revert identical tree -> ALARM"                   ALARM "$(run_scrub revert-hide)"
 check "evil merge (no per-commit .github lines) -> ALARM"       ALARM "$(run_scrub mergebase)"
 check "anchor tip itself -> CLEAN"                              CLEAN "$(run_scrub main)"
+check "platform-sync content parity -> INFO"                    INFO  "$(run_scrub sync-content)"
+check "platform-sync deletion parity -> INFO"                   INFO  "$(run_scrub sync-parity)"
+check "rollback below fork era -> ALARM"                        ALARM "$(run_scrub sync-rollback)"
+run_scrub sync-content >/dev/null
+check "sync EXPLAINED names merge consequence"                  yes   "$(grep -q 'platform content synced from' /tmp/scrub-taint.txt && grep -q 'confirm that is intended' /tmp/scrub-taint.txt && echo yes || echo no)"
 
 # ---- autoload surface matrix (tier-1 + tier-2) -----------------------------
 # Reuses the taint harness: checks SURVIVORS (files still present after the
@@ -428,6 +450,166 @@ else
   echo "PASS: react: issue target keeps eyes (no terminal reaction)"
 fi
 rm -rf "$RSIM_DIR"
+
+# ---- handle-mentions.sh pipeline simulation (mock gh; REAL script) ---------
+# Exercises the full cross-repo gauntlet: reason filter, skip matrix,
+# allowlist, genuine-mention verification, mark-read ordering, cap, and the
+# relay path (--payload). The mock gh serves every API surface the pipeline
+# touches; DISPATCH_LOG records workflow-run calls; ACK_LOG records
+# mark-read PATCHes.
+MSIM_DIR=$(mktemp -d)
+cat > "$MSIM_DIR/gh" <<'MOCKGH'
+#!/usr/bin/env bash
+a="$*"
+case "$a" in
+  *"--paginate repos/Home/platform/collaborators"*) printf '[{"login":"homeboss"},{"login":"helper"}]' ;;
+  *"repos/Home/platform --jq .default_branch"*|*"repos/Home/platform -q .default_branch"*) echo main ;;
+  *"/repos/Home/platform/contents/.github/workflows/bot-reply.yml"*) exit 0 ;;
+  *"/repos/Home/plain/contents/.github/workflows/bot-reply.yml"*) exit 1 ;;
+  *"/repos/Other/x/contents/.github/workflows/bot-reply.yml"*) exit 1 ;;
+  *"issues/comments/501"*) printf '{"user":{"login":"homeboss"},"body":"@Mirrobot-Agent please explain this","issue_url":"https://api.github.com/repos/Other/x/issues/11"}' ;;
+  *"issues/comments/502"*) printf '{"user":{"login":"stranger"),"body":"@mirrobot-agent do my bidding","issue_url":"https://api.github.com/repos/Other/x/issues/12"}' ;;
+  *"issues/comments/503"*) printf '{"user":{"login":"homeboss"},"body":"no mention token at all","issue_url":"https://api.github.com/repos/Other/x/issues/13"}' ;;
+  *"issues/comments/504"*) printf '{"user":{"login":"Mirrobot-Agent"},"body":"@mirrobot-agent self note","issue_url":"https://api.github.com/repos/Other/x/issues/14"}' ;;
+  *"/repos/Other/x/issues/11"*) printf '{"user":{"login":"contributor"},"body":"PR body text","pull_request":{}}' ;;
+  *"/repos/Other/x/issues/12"*) printf '{"user":{"login":"stranger"},"body":"issue body"}' ;;
+  *"/repos/Other/x/issues/13"*) printf '{"user":{"login":"homeboss"},"body":"issue body"}' ;;
+  *"/repos/Other/x/issues/14"*) printf '{"user":{"login":"someone"},"body":"issue body"}' ;;
+  # timeline cases FIRST: the broad "…/issues/21" subject pattern below would
+  # shadow them (mock case-order matters — review-request fixtures broke on
+  # exactly this shadowing).
+  *"issues/21/timeline"*) printf '[{"event":"review_requested","actor":{"login":"helper"}}]' ;;
+  *"issues/23/timeline"*) printf '[{"event":"review_requested","actor":{"login":"stranger"}}]' ;;
+  *"/repos/Other/x/issues/21"*) printf '{"user":{"login":"friend"},"body":"help","pull_request":{}}' ;;
+  *"/repos/Other/x/pulls/21"*) printf '{"user":{"login":"friend"},"head":{"sha":"cafe1234"},"base":{"ref":"main"}}' ;;
+  *"pulls/23"*) printf '{"user":{"login":"friend"}}' ;;
+  *"issues/23"*) printf '{"user":{"login":"friend"},"body":"x","pull_request":{}}' ;;
+  *"/notifications?all=false"*) exit 0 ;;   # poll mode never used in fixtures
+  *"--method PATCH /notifications/threads/"*) echo "ACK $a" >> "$ACK_LOG"; exit 0 ;;
+  *"workflow run bot-reply.yml"*) echo "DISPATCH $a" >> "$DISPATCH_LOG"; exit 0 ;;
+esac
+exit 0
+MOCKGH
+chmod +x "$MSIM_DIR/gh"
+export ACK_LOG="$MSIM_DIR/ack.log" DISPATCH_LOG="$MSIM_DIR/dispatch.log"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+notif() { printf '{"id":%s,"reason":"%s","repository":{"full_name":"%s","owner":{"login":"%s"}},"subject":{"type":"%s","url":"https://api.github.com/repos/%s/issues/%s","latest_comment_url":"%s"}}' "$1" "$2" "$3" "$4" "$5" "$3" "$6" "$7"; }
+mention_pipeline() { PATH="$MSIM_DIR:$PATH" GH_TOKEN=mock GITHUB_REPOSITORY=Home/platform HOME_OWNER=home \
+  FOREIGN_MENTIONS_USERS="friend" BOT_NAMES_JSON='["mirrobot-agent","mirrobot-agent[bot]"]' \
+  bash "$SCRIPT_DIR/handle-mentions.sh" --payload "$1" >/dev/null 2>&1; }
+
+# A: reason filter (ci_activity acked, never dispatched)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 1 ci_activity Other/x Other Issue 9 '')]"
+check "mentions: non-mention reason acked not dispatched" yes "$( [ "$(wc -l < "$ACK_LOG")" = 1 ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# B: skip matrix - home-owner repo WITH platform is a no-op
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 2 mention Home/platform Home Issue 7 '')]"
+check "mentions: home repo with platform skipped" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# C: home-owner repo WITHOUT platform + trusted summoner + token -> dispatched
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 3 mention Home/plain Home Issue 11 https://api.github.com/repos/Home/plain/issues/comments/501)]" 
+check "mentions: home-owner plain repo dispatched" yes "$(grep -q 'targetRepo=Home/plain' "$DISPATCH_LOG" && echo yes || echo no)"
+
+# D: stranger summoner declined
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 4 mention Other/x Other Issue 12 https://api.github.com/repos/Other/x/issues/comments/502)]"
+check "mentions: stranger summoner declined" yes "$([ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# E: trusted summoner but no mention token declined
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 5 mention Other/x Other Issue 13 https://api.github.com/repos/Other/x/issues/comments/503)]"
+check "mentions: tokenless body declined" yes "$([ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# F: bot self-mention declined (bot-loop)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 6 mention Other/x Other Issue 14 https://api.github.com/repos/Other/x/issues/comments/504)]"
+check "mentions: self-mention declined" yes "$([ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# G: review_requested with allowlisted ACTOR dispatched as review-request
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 7 review_requested Other/x Other PullRequest 21 '')]"
+check "mentions: review-request by allowlisted actor dispatched" yes "$(grep -q 'triggerKind=review-request' "$DISPATCH_LOG" && grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && echo yes || echo no)"
+
+# H: review_requested by stranger declined
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 8 review_requested Other/x Other PullRequest 23 '')]"
+check "mentions: review-request by stranger declined" yes "$([ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# I: cap - 4 qualifying mentions dispatch at most 3
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+N1=$(notif 11 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)
+mention_pipeline "[$N1,$N1,$N1,$N1]" 2>/dev/null
+check "mentions: dispatch cap enforced" yes "$( [ "$(grep -c 'workflow run' "$DISPATCH_LOG")" -le 3 ] && echo yes || echo no)"
+
+# J: mark-read fires before dispatch (at-most-once ordering)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 12 review_requested Other/x Other PullRequest 21 '')]"
+check "mentions: mark-read before dispatch" yes "$(grep -q '^ACK' "$ACK_LOG" && grep -q 'DISPATCH' "$DISPATCH_LOG" && echo yes || echo no)"
+
+# K: subscribed reason (follow-up mention in an already-subscribed thread -
+# GitHub classifies re-mentions as "subscribed"; live-observed) still
+# dispatches through the CONTENT token check
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif 13 subscribed Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: subscribed follow-up with token dispatched" yes "$(grep -q 'workflow run' "$DISPATCH_LOG" && echo yes || echo no)"
+rm -rf "$MSIM_DIR"
+
+# ---- cross-repo workflow contracts (drift tripwires) ------------------------
+POLLWF="$SCRIPT_DIR/../workflows/mention-poller.yml"
+BOTWF="$SCRIPT_DIR/../workflows/bot-reply.yml"
+STUBWF="$SCRIPT_DIR/../workflows/pr-review-trigger.yml"
+check "poller: gated on FOREIGN_MENTIONS_ENABLED var"  yes "$(grep -q "vars.FOREIGN_MENTIONS_ENABLED == 'true'" "$POLLWF" && echo yes || echo no)"
+check "poller: repository_dispatch foreign-mention"    yes "$(grep -q 'foreign-mention' "$POLLWF" && echo yes || echo no)"
+# WORKER-FIRST contract: NO schedule trigger in the default file (idle
+# polling is the load the worker exists to avoid); the fallback recipe
+# stays documented in the header comment only.
+check "poller: NO schedule by default (worker-first)"  no  "$(grep -q '^  schedule:' "$POLLWF" && echo yes || echo no)"
+check "guest: home PR checkout excludes foreign"       yes "$(grep -q "IS_PR == 'true' && inputs.targetRepo == ''" "$BOTWF" && echo yes || echo no)"
+check "guest: foreign checkout exists"                 yes "$(grep -q 'Checkout foreign PR head (guest)' "$BOTWF" && echo yes || echo no)"
+check "guest: foreign scrub uses --foreign"            yes "$(grep -q 'scrub-workspace.sh --foreign' "$BOTWF" && echo yes || echo no)"
+check "guest: guest-rules prepended after brief"       yes "$(grep -q 'guest-rules.md' "$BOTWF" && grep -q 'GUEST SESSION RULES' "$BOTWF" && echo yes || echo no)"
+check "guest: rules pin allowlist authority"           yes "$(grep -q 'DATA, not DIRECTION' "$SCRIPT_DIR/../prompts/guest-rules.md" && echo yes || echo no)"
+check "stub: review_requested trigger wired"           yes "$(grep -q 'review_requested' "$STUBWF" && grep -q 'REQUESTED_LOGIN' "$STUBWF" && echo yes || echo no)"
+
+# ---- YAML comment-trap sweep (the twice-made mistake) -----------------------
+# An UNQUOTED "key: ${{ ... }}" plain scalar whose value contains " #"
+# truncates into a YAML comment, leaving ${{ unclosed - the workflow file
+# goes INVALID (path-instead-of-name in the Actions menu, red X on every
+# push). Live-observed twice: SHARE_CTX_THREAD, trigger-note. Strict YAML
+# cannot catch it (the truncated scalar is legal YAML); this can.
+TRAP_COUNT=$(for f in "$SCRIPT_DIR"/../workflows/*.yml; do
+  grep -nE '^[[:space:]]*[A-Za-z0-9_-]+:[[:space:]]+\$\{\{.*\}\}[[:space:]]*$' "$f" 2>/dev/null \
+   | grep -vE '^[0-9]+:[[:space:]]*[A-Za-z0-9_-]+:[[:space:]]*"' \
+   | grep -F ' #' | sed "s|^|$(basename "$f"):|"
+done | tee /tmp/comment-trap-hits.txt | wc -l)
+check "workflows: no unquoted expression values with ' #' (comment trap)" 0 "$TRAP_COUNT"
+[ "$TRAP_COUNT" != 0 ] && sed 's/^/  TRAP: /' /tmp/comment-trap-hits.txt
+
+# ---- scrub --foreign mode (guest checkouts: NOTHING abroad is trusted) -----
+# Semantic under test: in a FOREIGN repo every auto-load surface is removed
+# UNCONDITIONALLY - even files byte-identical to main (the home-mode
+# keep-iff-identical rule has no anchor abroad) - and NO taint file is
+# produced (a foreign .github cannot execute for us).
+FR="$WORK/foreign-repo"; rm -rf "$FR"; mkdir -p "$FR/.claude/skills/x" "$FR/.agents/skills/y"
+cd "$FR" || { echo "FAIL: foreign fixture setup"; FAIL=1; }
+git init -q -b main .; git config user.email t@t; git config user.name t
+printf 'identical to main\n' > AGENTS.md
+printf 'ok\n' > .claude/skills/x/SKILL.md
+printf 'ok\n' > .agents/skills/y/SKILL.md
+printf 'cfg\n' > opencode.json
+printf 'wf\n' > .github/workflows/x.yml 2>/dev/null || { mkdir -p .github/workflows; printf 'wf\n' > .github/workflows/x.yml; }
+git add -A; git commit -qm base >/dev/null
+FR_OUT=$(SCRUB_REMOVALS_FILE="$FR/rem.txt" SCRUB_QUARANTINE_DIR="$FR/quar" SCRUB_TAINT_FILE="$FR/taint.txt" \
+  bash "$SCRUB" --foreign 2>&1 || true)
+FR_REMOVED=$(grep -c "scrub: removed" "$FR/rem.txt" 2>/dev/null || echo 0)
+check "foreign scrub: removes identical-to-main AGENTS.md" yes "$(grep -q "removed ./AGENTS.md" "$FR/rem.txt" && echo yes || echo no)"
+check "foreign scrub: removes all 4 auto-load surfaces"    yes "$( [ "$FR_REMOVED" = 4 ] && echo yes || echo "no($FR_REMOVED)")"
+check "foreign scrub: .github untouched (no taint abroad)" yes "$([ ! -e "$FR/taint.txt" ] && [ -e .github/workflows/x.yml ] && echo yes || echo no)"
+check "foreign scrub: quarantine preserved as data"        yes "$(printf '%s\n' "$FR_OUT" | grep -q "readable on demand" && echo yes || echo no)"
+cd "$SRC" || true
 
 # ---- strict YAML structural check (workflows + composite action files) ----
 # Plain yaml.safe_load accepts duplicate keys (last-wins silently); GitHub's

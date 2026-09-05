@@ -1,0 +1,44 @@
+name = "mirrobot-mention-worker"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# SCHEDULING: the DO alarm loop in worker.js is the ONLY scheduling
+# mechanism (30s period). No cron attached — crons = [] is EXPLICIT (an
+# absent [triggers] block leaves any stale schedule attached; only an
+# empty list clears them). Backup option if ever needed: set
+#   crons = ["* * * * *"]
+# — the scheduled() handler already runs the same pipeline; duplicate
+# fires are no-ops (mark-read-before-dispatch in the repo pipeline is the
+# at-most-once guard). Deliberately NOT set: cron dispatch is broken on
+# this account (registered, never fired once — live evidence 2026-09-04).
+[triggers]
+crons = []
+
+# Dashboard observability: per-invocation logs (the [alarm] lines) land in
+# Workers -> Logs on the dashboard, searchable, with invocation context.
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
+
+# Free tier: SQLite-backed DOs + alarms. The Scheduler singleton owns the
+# 60s poll loop; at-most-once semantics live in the repo pipeline.
+[durable_objects]
+bindings = [{ name = "SCHEDULER", class_name = "Scheduler" }]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Scheduler"]
+
+[vars]
+# The repository running mention-poller.yml (the platform home).
+PLATFORM_REPO = "Mirrowel/Mirrobot-agent"
+
+# Secrets — set once with:
+#   npx wrangler secret put BOT_PAT
+#   npx wrangler secret put DISPATCH_PAT
+# (BOT_PAT: bot account classic PAT, public_repo + notifications.
+#  DISPATCH_PAT: fine-grained PAT, contents:write, scoped to PLATFORM_REPO
+#  only. Never use a classic `repo`-scope token here.)

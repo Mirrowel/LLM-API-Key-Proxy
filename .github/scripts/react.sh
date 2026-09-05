@@ -15,7 +15,11 @@
 #   env: GH_TOKEN (session token - App installation or account PAT; the
 #        acting identity/BOT_LOGIN is derived from it via /user, falling
 #        back to mirrobot-agent[bot] when /user is not answerable),
-#        GITHUB_REPOSITORY.
+#        GITHUB_REPOSITORY,
+#        TARGET_REPO (optional override: the repository the reaction
+#        belongs to - set for cross-repo guest sessions where the trigger
+#        comment lives in a foreign repository; defaults to
+#        GITHUB_REPOSITORY).
 #   exit: 0 on all runtime paths (reactions are cosmetic); the ${:?} guards
 #         exit 1 on MISCONFIGURATION (missing args/env) - loud by design; every
 #         call site carries continue-on-error, so a guard firing is visible
@@ -26,6 +30,7 @@ action="${1:?usage: react.sh <start|success|failure> <comment|issue> <id>}"
 kind="${2:?target type: comment|issue}"
 target_id="${3:?target id}"
 : "${GH_TOKEN:?}" "${GITHUB_REPOSITORY:?}"
+: "${TARGET_REPO:=$GITHUB_REPOSITORY}"
 # Derive the acting identity from the token when possible: account-mode tokens
 # answer /user with the account login; app installation tokens 403 there and
 # fall through to the app-bot default. Without this, account-mode runs filter
@@ -37,9 +42,9 @@ if [ -z "${BOT_LOGIN:-}" ]; then
 fi
 
 if [ "$kind" = "comment" ]; then
-  base="/repos/${GITHUB_REPOSITORY}/issues/comments/${target_id}/reactions"
+  base="/repos/${TARGET_REPO}/issues/comments/${target_id}/reactions"
 else
-  base="/repos/${GITHUB_REPOSITORY}/issues/${target_id}/reactions"
+  base="/repos/${TARGET_REPO}/issues/${target_id}/reactions"
 fi
 
 add() { # content
