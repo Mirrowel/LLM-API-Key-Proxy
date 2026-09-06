@@ -8,9 +8,6 @@ from rotator_library.adapters import PayloadAdapter, register_adapter
 from rotator_library.core.errors import StreamedAPIError
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
-from rotator_library.providers.antigravity_provider import AntigravityProvider
-from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
-from rotator_library.providers.codex_provider import CodexProvider
 from rotator_library.transaction_logger import TransactionLogger
 
 

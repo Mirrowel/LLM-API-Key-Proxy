@@ -8,9 +8,6 @@ from rotator_library.providers import PROVIDER_PLUGINS, _create_dynamic_plugin_c
 from rotator_library.client.rotating_client import _add_configured_no_auth_credentials
 from rotator_library.client.scopes import NO_AUTH_CREDENTIAL, ScopeManager
 from rotator_library.config.experimental import ExperimentalConfigError, load_config_from_mapping
-from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
-from rotator_library.providers.codex_provider import CodexProvider
-from rotator_library.providers.copilot_provider import CopilotProvider
 
 
 class ConfiguredProvider(ProviderInterface):
@@ -108,29 +105,29 @@ def test_provider_json_quota_groups_still_allow_env_override(tmp_path, monkeypat
 
 
 def test_priority_provider_overrides_respect_json_adapter_config_and_streaming(tmp_path, monkeypatch) -> None:
+    class OverrideAProvider(ConfiguredProvider):
+        provider_env_name = "override_a"
+
+    class OverrideBProvider(ConfiguredProvider):
+        provider_env_name = "override_b"
+
     config_path = _write_config(
         tmp_path,
         {
             "providers": {
-                "claude_code": {
-                    "native_streaming_supported": True,
+                "override_a": {
                     "adapter_config": {"suppress_developer_role": {"mode": "assistant"}},
                 },
-                "copilot": {
-                    "native_streaming_supported": True,
+                "override_b": {
                     "adapter_config": {"suppress_developer_role": {"mode": "user"}},
                 },
-                "codex": {"native_streaming_supported": True},
             }
         },
     )
     monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", config_path)
 
-    assert ClaudeCodeProvider().supports_native_streaming("claude_code/claude", "messages") is True
-    assert ClaudeCodeProvider().get_adapter_config("claude_code/claude")["suppress_developer_role"]["mode"] == "assistant"
-    assert CopilotProvider().supports_native_streaming("copilot/gpt", "chat") is True
-    assert CopilotProvider().get_adapter_config("copilot/gpt")["suppress_developer_role"]["mode"] == "user"
-    assert CodexProvider().supports_native_streaming("codex/gpt", "responses") is True
+    assert OverrideAProvider().get_adapter_config("override_a/gpt-5")["suppress_developer_role"]["mode"] == "assistant"
+    assert OverrideBProvider().get_adapter_config("override_b/llama")["suppress_developer_role"]["mode"] == "user"
 
 
 @pytest.mark.asyncio

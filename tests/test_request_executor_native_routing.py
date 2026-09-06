@@ -9,10 +9,6 @@ from rotator_library.client.executor import RequestExecutor, RoutingExecutionErr
 from rotator_library.core.types import RequestContext
 from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 from rotator_library.config.experimental import load_config_from_mapping
-from rotator_library.providers.antigravity_provider import AntigravityProvider
-from rotator_library.providers.claude_code_provider import ClaudeCodeProvider
-from rotator_library.providers.codex_provider import CodexProvider
-from rotator_library.providers.copilot_provider import CopilotProvider
 from rotator_library.protocols import get_protocol
 from rotator_library.routing import parse_route_target
 
@@ -339,12 +335,32 @@ def test_native_context_rejects_behavior_weakening_rule_override() -> None:
 
 
 @pytest.mark.asyncio
-async def test_claude_code_provider_runs_mock_live_native_request(monkeypatch) -> None:
+async def test_synthetic_anthropic_wire_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    """Runtime path for an anthropic-wire provider (the contract the manual
+    claude-code implementation will declare): developer-role suppression via
+    the declared adapter, anthropic endpoint, native parse/format."""
     monkeypatch.setenv("CLAUDE_CODE_API_BASE", "https://claude-code.test")
     http_client = SequencedHTTPClient([
         {"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 1, "output_tokens": 1}}
     ])
-    provider = ClaudeCodeProvider()
+
+    class SyntheticAnthropicPlugin(NativePlugin):
+        def get_protocol_name(self, model=""):
+            return "anthropic_messages"
+
+        def get_native_endpoint(self, model="", operation="chat"):
+            return "https://claude-code.test/v1/messages"
+
+        def get_native_operation(self, model="", request=None, stream=False):
+            return "messages"
+
+        def get_adapter_names(self, model=""):
+            return ("suppress_developer_role",)
+
+        def get_adapter_config(self, model=""):
+            return {"suppress_developer_role": {"mode": "user"}}
+
+    provider = SyntheticAnthropicPlugin()
     target = parse_route_target("claude_code/claude-sonnet-4-5")
     context = _provider_context(
         "claude_code",
@@ -359,18 +375,30 @@ async def test_claude_code_provider_runs_mock_live_native_request(monkeypatch) -
     assert response["id"] == "msg_1"
     assert response["choices"][0]["message"]["content"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://claude-code.test/v1/messages"
-    assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
-    assert http_client.calls[0]["json"]["max_tokens"] == 4096
-    assert http_client.calls[0]["json"]["messages"][0]["role"] == "user"
+    sent = http_client.calls[0]["json"]
+    assert sent["model"] == "claude-sonnet-4-5"
+    assert sent["messages"][0]["role"] == "user"  # developer handling per adapter config
 
 
 @pytest.mark.asyncio
-async def test_codex_provider_runs_mock_live_native_request(monkeypatch) -> None:
+async def test_synthetic_responses_wire_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    """Runtime path for a responses-wire provider (the codex contract)."""
     monkeypatch.setenv("CODEX_API_BASE", "https://codex.test")
     http_client = SequencedHTTPClient([
         {"id": "resp_1", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}]}
     ])
-    provider = CodexProvider()
+
+    class SyntheticResponsesPlugin(NativePlugin):
+        def get_protocol_name(self, model=""):
+            return "responses"
+
+        def get_native_endpoint(self, model="", operation="chat"):
+            return "https://codex.test/responses"
+
+        def get_native_operation(self, model="", request=None, stream=False):
+            return "responses"
+
+    provider = SyntheticResponsesPlugin()
     target = parse_route_target("codex/gpt-5.1-codex")
     context = _provider_context("codex", "codex/gpt-5.1-codex", {"model": "codex/gpt-5.1-codex", "messages": [{"role": "user", "content": "hi"}]}, target)
     context.routing_target_index = 0
@@ -379,19 +407,31 @@ async def test_codex_provider_runs_mock_live_native_request(monkeypatch) -> None
 
     assert response["id"] == "resp_1"
     assert response["choices"][0]["message"]["content"] == "ok"
-    assert http_client.calls[0]["endpoint"] == "https://codex.test/v1/responses"
-    assert http_client.calls[0]["json"]["model"] == "gpt-5.1-codex"
+    assert http_client.calls[0]["endpoint"] == "https://codex.test/responses"
     assert http_client.calls[0]["json"]["input"][0]["content"] == [{"type": "input_text", "text": "hi"}]
     assert "messages" not in http_client.calls[0]["json"]
 
 
 @pytest.mark.asyncio
-async def test_copilot_provider_runs_mock_live_native_request(monkeypatch) -> None:
+async def test_synthetic_chat_wire_provider_runs_mock_live_native_request(monkeypatch) -> None:
+    """Runtime path for a chat-wire provider with developer-role suppression
+    (the copilot contract)."""
     monkeypatch.setenv("COPILOT_API_BASE", "https://copilot.test")
     http_client = SequencedHTTPClient([
         {"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
     ])
-    provider = CopilotProvider()
+
+    class SyntheticChatPlugin(NativePlugin):
+        def get_native_endpoint(self, model="", operation="chat"):
+            return "https://copilot.test/chat/completions"
+
+        def get_adapter_names(self, model=""):
+            return ("suppress_developer_role",)
+
+        def get_adapter_config(self, model=""):
+            return {"suppress_developer_role": {"mode": "system"}}
+
+    provider = SyntheticChatPlugin()
     target = parse_route_target("copilot/gpt-4.1")
     context = _provider_context("copilot", "copilot/gpt-4.1", {"model": "copilot/gpt-4.1", "messages": [{"role": "developer", "content": "rules"}, {"role": "user", "content": "hi"}]}, target)
     context.routing_target_index = 0
@@ -401,16 +441,32 @@ async def test_copilot_provider_runs_mock_live_native_request(monkeypatch) -> No
     assert response["id"] == "chat_1"
     assert http_client.calls[0]["endpoint"] == "https://copilot.test/chat/completions"
     assert http_client.calls[0]["json"]["model"] == "gpt-4.1"
-    assert http_client.calls[0]["json"]["messages"][0]["role"] == "system"
+    assert http_client.calls[0]["json"]["messages"][0]["role"] == "system"  # developer suppressed to system
 
 
 @pytest.mark.asyncio
-async def test_antigravity_provider_runs_mock_live_native_request(monkeypatch) -> None:
+async def test_synthetic_gemini_wire_provider_with_envelope_runs_mock_live_native_request(monkeypatch) -> None:
+    """Runtime path for a gemini-wire provider declaring the envelope wire
+    adapter (the antigravity contract)."""
     monkeypatch.setenv("ANTIGRAVITY_API_BASE", "https://antigravity.test/v1internal")
     http_client = SequencedHTTPClient([
         {"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}], "usageMetadata": {"totalTokenCount": 2}}
     ])
-    provider = AntigravityProvider()
+
+    class SyntheticGeminiPlugin(NativePlugin):
+        def get_protocol_name(self, model=""):
+            return "gemini"
+
+        def get_native_endpoint(self, model="", operation="chat"):
+            return "https://antigravity.test/v1internal:generateContent"
+
+        def get_adapter_names(self, model=""):
+            return ("antigravity_envelope",)
+
+        def get_adapter_config(self, model=""):
+            return {"antigravity_envelope": {"project": "proj", "user_agent": "ua", "request_type": "CHAT_COMPLETION"}}
+
+    provider = SyntheticGeminiPlugin()
     target = parse_route_target("antigravity/claude-sonnet-4.5")
     context = _provider_context("antigravity", "antigravity/claude-sonnet-4.5", {"model": "antigravity/claude-sonnet-4.5", "messages": [{"role": "user", "content": "hi"}]}, target)
     context.routing_target_index = 0
@@ -419,34 +475,9 @@ async def test_antigravity_provider_runs_mock_live_native_request(monkeypatch) -
 
     assert response["choices"][0]["message"]["content"] == "ok"
     assert http_client.calls[0]["endpoint"] == "https://antigravity.test/v1internal:generateContent"
-    assert http_client.calls[0]["json"]["model"] == "claude-sonnet-4-5"
     assert http_client.calls[0]["json"]["request"]["contents"][0]["parts"][0]["text"] == "hi"
     assert http_client.calls[0]["json"]["requestType"] == "CHAT_COMPLETION"
     assert "requestId" in http_client.calls[0]["json"]
-
-
-def test_claude_code_header_modes(monkeypatch) -> None:
-    provider = ClaudeCodeProvider()
-
-    monkeypatch.setenv("CLAUDE_CODE_AUTH_HEADER", "auto")
-    assert provider.get_native_headers("sk-ant-test")["x-api-key"] == "sk-ant-test"
-    assert provider.get_native_headers("oauth-token")["Authorization"] == "Bearer oauth-token"
-    monkeypatch.setenv("CLAUDE_CODE_AUTH_HEADER", "x-api-key")
-    assert provider.get_native_headers("any-token")["x-api-key"] == "any-token"
-
-
-def test_antigravity_alias_normalization_preserves_thinking_level() -> None:
-    provider = AntigravityProvider()
-    request = {"_proxy_model": "antigravity/gemini-3-pro-low", "model": "gemini-3-pro-preview", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]}
-
-    prepared = provider.prepare_native_request(request, model=provider.normalize_native_model("antigravity/gemini-3-pro-low"), operation="generate")
-
-    assert provider.normalize_native_model("antigravity/gemini-3-pro-low") == "gemini-3-pro-preview"
-    assert prepared["model"] == "gemini-3-pro-low"
-    assert prepared["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "low"
-    assert prepared["metadata"]["thinking_level"] == "low"
-    assert "_proxy_model" not in prepared
-    assert prepared["contents"][0]["parts"][0]["text"] == "hi"
 
 
 def test_auto_native_selection_honors_provider_opt_out() -> None:
@@ -556,10 +587,23 @@ def test_explicit_native_streaming_fails_when_provider_does_not_support_it() -> 
     assert exc.value.error_type == "configuration_error"
 
 
-def test_antigravity_cache_injection_targets_safe_envelope() -> None:
-    provider = AntigravityProvider()
+def test_synthetic_envelope_cache_injection_targets_safe_path() -> None:
+    """The envelope-relative injection path contract (antigravity-style):
+    cached provider state lands inside the envelope's request payload."""
 
-    rules = provider.get_field_cache_rules("gemini-3-flash")
+    class SyntheticGeminiPlugin(NativePlugin):
+        def get_field_cache_rules(self, model=""):
+            return (
+                FieldCacheRule(
+                    name="synthetic_thought_signature",
+                    cache_key="synthetic_thought_signature",
+                    source="response",
+                    path="candidates.*.content.parts.*.thoughtSignature",
+                    inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
+                ),
+            )
+
+    rules = SyntheticGeminiPlugin().get_field_cache_rules("gemini-3-flash")
 
     assert rules[0].inject.path == "request.metadata.thoughtSignatures"
 

@@ -13,8 +13,6 @@ from rotator_library.client.request_builder import RequestContextBuilder
 from rotator_library.client.rotating_client import RotatingClient
 from rotator_library.core.errors import StructuredAPIResponseError, is_structured_error_payload
 from rotator_library.core.types import ErrorAction, RequestContext
-from rotator_library.providers.codex_provider import CodexProvider
-from rotator_library.providers.antigravity_provider import AntigravityProvider
 from rotator_library.protocols import ProtocolContext, get_protocol
 from rotator_library.protocols.types import first_text
 from rotator_library.routing import parse_route_target
@@ -455,12 +453,33 @@ async def test_response_adapters_run_on_provider_native_payload() -> None:
     assert "adapted::" in str(results["gemini"]["candidates"])
 
 
+def _synthetic_thought_signature_rules() -> tuple:
+    """Contract shape a gemini-wire provider declares for opaque thought
+    signatures (the durable antigravity-style contract, synthetically)."""
+    from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
+
+    return (
+        FieldCacheRule(
+            name="synthetic_thought_signature",
+            cache_key="synthetic_thought_signature",
+            source="response",
+            path="candidates.*.content.parts.*.thoughtSignature",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
+        ),
+        FieldCacheRule(
+            name="synthetic_thought_signature_stream",
+            cache_key="synthetic_thought_signature",
+            source="stream_event",
+            path="raw.candidates.*.content.parts.*.thoughtSignature",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_opaque_thought_signatures_are_cached_but_never_returned_to_clients() -> None:
-    provider = AntigravityProvider()
-    rules = provider.get_field_cache_rules("antigravity/gemini-3-pro")
-    adapter_names = provider.get_adapter_names("antigravity/gemini-3-pro")
-    adapter_config = provider.get_adapter_config("antigravity/gemini-3-pro")
     context = NativeProviderContext(
         provider="antigravity",
         model="gemini-3-pro",
@@ -471,9 +490,9 @@ async def test_opaque_thought_signatures_are_cached_but_never_returned_to_client
         client_protocol_name="gemini",
         credential_id="credential-1",
         session_id="session-1",
-        field_cache_rules=rules,
-        adapter_names=adapter_names,
-        adapter_config=adapter_config,
+        field_cache_rules=_synthetic_thought_signature_rules(),
+        adapter_names=("antigravity_envelope",),
+        adapter_config={"antigravity_envelope": {"project": "proj", "user_agent": "ua", "request_type": "GENERATE"}},
         metadata={"public_model": "antigravity/gemini-3-pro", "input_provider": "antigravity"},
     )
     signed_response = deepcopy(RESPONSES["gemini"])
@@ -608,7 +627,28 @@ def test_internal_attempt_fields_do_not_become_same_protocol_extensions() -> Non
 
 @pytest.mark.asyncio
 async def test_proxy_expanded_responses_history_suppresses_cached_provider_continuation() -> None:
-    rules = CodexProvider().get_field_cache_rules("codex/gpt-5.1-codex")
+    from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
+
+    rules = (
+        FieldCacheRule(
+            name="synthetic_previous_response_id",
+            cache_key="synthetic_previous_response_id",
+            source="response",
+            path="id",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
+            metadata={"provider_continuation": True},
+        ),
+        FieldCacheRule(
+            name="synthetic_stream_previous_response_id",
+            cache_key="synthetic_previous_response_id",
+            source="stream_event",
+            path="raw.response.id",
+            scope=("provider", "model", "credential", "session"),
+            inject=FieldCacheInjection(target="request", path="previous_response_id", when_missing_only=True),
+            metadata={"provider_continuation": True},
+        ),
+    )
     executor = NativeProviderExecutor()
     base_context = NativeProviderContext(
         provider="codex",
