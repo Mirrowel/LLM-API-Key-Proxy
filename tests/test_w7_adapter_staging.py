@@ -52,12 +52,23 @@ class ContextCapturingAdapter(PayloadAdapter):
         _ContextCapture.contexts.append(("response", context))
         return payload
 
+    async def transform_stream_event(self, payload, context):
+        _ContextCapture.contexts.append(("stream_event", context))
+        return payload
+
+
+def _context_signature(context) -> tuple:
+    """Everything an adapter can observe about a context."""
+    import dataclasses
+
+    return dataclasses.asdict(context)
+
 
 @pytest.mark.asyncio
 async def test_adapters_never_observe_the_client_protocol() -> None:
     """The adapter context carries only provider-side identity — running
     the same provider request with different CLIENT protocols must give
-    adapters byte-identical contexts and inputs."""
+    adapters identical contexts (production-like metadata included)."""
     register_adapter(ContextCapturingAdapter, replace=True)
     _ContextCapture.reset()
 
@@ -71,6 +82,7 @@ async def test_adapters_never_observe_the_client_protocol() -> None:
         "usage": {"input_tokens": 1, "output_tokens": 1},
     }
 
+    signatures = []
     for client_protocol in ("openai_chat", "gemini", "responses"):
         context = NativeProviderContext(
             provider="provider",
@@ -81,6 +93,7 @@ async def test_adapters_never_observe_the_client_protocol() -> None:
             input_protocol_name=client_protocol,
             client_protocol_name=client_protocol,
             adapter_names=("w7_context_capture",),
+            metadata={"public_model": "provider/model-test", "input_provider": "provider"},
         )
         await NativeProviderExecutor().execute(
             deepcopy(request),
@@ -89,15 +102,20 @@ async def test_adapters_never_observe_the_client_protocol() -> None:
         )
 
     assert len(_ContextCapture.contexts) == 6  # request + response per client
+    stages = {stage for stage, _ in _ContextCapture.contexts}
+    assert stages == {"request", "response"}
     # No context field or metadata key mentions a client-side protocol.
     for stage, ctx in _ContextCapture.contexts:
         assert ctx.protocol == "anthropic_messages"
         for field in ("input_protocol", "client_protocol", "input_protocol_name", "client_protocol_name"):
             assert not hasattr(ctx, field)
         flat = str(ctx.metadata or {})
-        assert "openai_chat" not in flat and "gemini" not in flat and "responses" not in flat
-    # Identical request payload for every client (adapter saw the same wire).
-    assert _ContextCapture.contexts[0][1].provider == _ContextCapture.contexts[-1][1].provider
+        assert "openai_chat" not in flat and '"gemini"' not in flat and '"responses"' not in flat
+    # Contexts are byte-identical across the three clients (equality, not
+    # substring luck): production-like metadata included.
+    signatures = [_context_signature(ctx) for _, ctx in _ContextCapture.contexts]
+    assert signatures[0] == signatures[2] == signatures[4]
+    assert signatures[1] == signatures[3] == signatures[5]
 
 
 @pytest.mark.asyncio
@@ -157,6 +175,7 @@ async def test_envelope_adapter_composes_after_content_adapters() -> None:
 
         async def transform_request(self, payload, context):
             if isinstance(payload, dict):
+                payload = deepcopy(payload)
                 payload["model"] = "aliased-model"
             return payload
 
@@ -182,3 +201,65 @@ async def test_envelope_adapter_composes_after_content_adapters() -> None:
     assert "request" in sent and "requestType" in sent  # envelope applied
     assert sent["request"]["contents"][0]["parts"][0]["text"] == "hi"
     assert sent["model"] == "aliased-model"  # content edit inside the envelope
+
+
+@pytest.mark.asyncio
+async def test_adapted_wire_feeds_cache_extract_usage_and_traces(tmp_path) -> None:
+    """Field-cache extraction and usage accounting both observe the
+    ADAPTED provider wire (adapters fix the dialect first), and the trace
+    order pins adapter-before-extract."""
+    import json
+
+    from rotator_library.transaction_logger import TransactionLogger
+
+    class ReasoningFixer(PayloadAdapter):
+        name = "w7_reasoning_fixer"
+        supported_stages = ("response",)
+
+        async def transform_response(self, payload, context):
+            if isinstance(payload, dict):
+                payload = deepcopy(payload)
+                for block in payload.get("content", []):
+                    if block.get("type") == "text" and block.get("text") == "hidden":
+                        block["text"] = "fixed"
+                payload.setdefault("usage", {})
+            return payload
+
+    register_adapter(ReasoningFixer, replace=True)
+    logger = TransactionLogger("provider", "model-test", parent_dir=tmp_path)
+    context = NativeProviderContext(
+        provider="provider",
+        model="model-test",
+        protocol_name="anthropic_messages",
+        endpoint="https://provider.test/messages",
+        operation="messages",
+        input_protocol_name="anthropic_messages",
+        client_protocol_name="anthropic_messages",
+        adapter_names=("w7_reasoning_fixer",),
+        raw_client_request={"model": "model-test", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}]},
+        transaction_logger=logger,
+    )
+    response = {
+        "id": "msg_1",
+        "model": "model-test",
+        "role": "assistant",
+        "stop_reason": "end_turn",
+        "content": [{"type": "text", "text": "hidden"}],
+        "usage": {"input_tokens": 1, "output_tokens": 1},
+    }
+
+    result = await NativeProviderExecutor().execute(
+        {"model": "model-test", "messages": [{"role": "user", "content": "hi"}]},
+        context,
+        RecordingTransport(response),
+    )
+
+    # The adapted value is what the client receives AND what downstream
+    # stages (cache extract, usage) saw — traced in the right order.
+    assert result["content"][0]["text"] == "fixed"
+    trace = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    pass_names = [entry["pass_name"] for entry in trace]
+    assert pass_names.index("after_response_adapter_chain") < pass_names.index("after_response_field_cache_extraction")
+    assert pass_names.index("after_response_adapter_chain") < pass_names.index("parsed_native_unified_response")
+    usage_entry = next(entry for entry in trace if entry["pass_name"] == "usage_accounting_summary")
+    assert usage_entry["data"]["usage"]["input_tokens"] == 1  # adapted wire usage

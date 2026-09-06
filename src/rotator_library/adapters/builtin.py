@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from typing import Any
 from uuid import uuid4
@@ -74,11 +75,16 @@ class SuppressDeveloperRoleAdapter(PayloadAdapter):
 
 
 class ReasoningContentAdapter(PayloadAdapter):
-    """Normalize common reasoning fields on assistant messages.
+    """Normalize reasoning fields on OpenAI-chat-shaped assistant messages.
 
-    This base adapter copies `reasoning`, `reasoning_content`, or configured
-    aliases into the configured output field. It deliberately does not delete
-    source fields; provider-specific subclasses can choose stricter behavior.
+    This is an ``openai_chat`` WIRE fixer: it operates on the provider's
+    native chat response (``choices[].message``), copying `reasoning`,
+    `reasoning_content`, or configured aliases into the configured output
+    field. On other provider dialects (anthropic content blocks, gemini
+    candidates, responses output items) it is a recorded no-op — configure
+    ``field_rename`` rules for those dialects instead. It deliberately does
+    not delete source fields; provider-specific subclasses can choose
+    stricter behavior.
     """
 
     name = "reasoning_content"
@@ -92,7 +98,13 @@ class ReasoningContentAdapter(PayloadAdapter):
         output_field = config.get("output_field", "reasoning_content")
         source_fields = tuple(config.get("source_fields", ("reasoning_content", "reasoning")))
         updated = deepcopy(payload)
-        for choice in updated.get("choices", []) if isinstance(updated.get("choices"), list) else []:
+        choices = updated.get("choices") if isinstance(updated.get("choices"), list) else []
+        if not choices and context.protocol and context.protocol != "openai_chat":
+            logging.getLogger("rotator_library.adapters").warning(
+                "reasoning_content adapter is an openai_chat wire fixer; provider protocol '%s' has no choices[] message shape — adapter is a no-op here (use field_rename rules for this dialect)",
+                context.protocol,
+            )
+        for choice in choices:
             message = choice.get("message") if isinstance(choice, dict) else None
             if not isinstance(message, dict):
                 continue
@@ -133,7 +145,12 @@ class FieldRenameAdapter(PayloadAdapter):
             return payload
         updated = deepcopy(payload)
         for rule in context.config_for(self.name).get("rules", []):
-            if rule.get("stage", stage) != stage:
+            rule_stage = rule.get("stage", stage)
+            if rule_stage not in ("request", "response", "stream_event"):
+                raise ValueError(
+                    f"field_rename rule stage '{rule_stage}' is not one of request/response/stream_event"
+                )
+            if rule_stage != stage:
                 continue
             values = extract_path(updated, rule["source_path"])
             if not values:
@@ -156,6 +173,12 @@ class AntigravityEnvelopeAdapter(PayloadAdapter):
     The active provider restores only stable envelope fields. Device profiles,
     fingerprints, and other volatile client-emulation fields are intentionally
     not generated here until they are verified against current service behavior.
+
+    Ordering convention: envelope adapters must be declared LAST in
+    ``adapter_names`` — they wrap the final payload, so content-level
+    adapters (model aliases, renames, role fixes) must run before the
+    envelope to land inside it; content edits after an envelope would
+    write siblings of ``request`` that never reach the provider.
     """
 
     name = "antigravity_envelope"

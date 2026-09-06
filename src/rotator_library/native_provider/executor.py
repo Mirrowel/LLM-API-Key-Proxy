@@ -302,17 +302,6 @@ class NativeProviderExecutor:
             )
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
-                # W7 contract: stream adapters are WIRE adapters — they run on
-                # the provider's raw stream chunk BEFORE parsing, in the
-                # provider's dialect (never on the neutral event, which is
-                # client-agnostic meaning, not provider wire).
-                adapter_context = context.adapter_context()
-                # Native stream traces apply field-cache path redaction below.
-                # Suppress generic adapter-chain snapshots here so provider state
-                # cannot leak before rule-aware redaction runs.
-                adapter_context.transaction_logger = None
-                raw_chunk = await run_adapter_chain(adapters, raw_chunk, adapter_context, stage="stream_event")
-                self._trace(context, "after_stream_event_adapter_chain", raw_chunk, direction="stream", stage="adapter", snapshot=False)
                 event = protocol.parse_stream_event(raw_chunk, response_context)
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
                 if event.type == "error" or event.error is not None:
@@ -334,6 +323,17 @@ class NativeProviderExecutor:
                     context.stream_usage_record = usage_record
                     yield event
                     break
+                # W7 contract (plan §2.5): stream adapters run on the NEUTRAL
+                # parsed event — provider frames are SSE-wrapped transport,
+                # not discrete wire payloads; neutral is the protocol-free
+                # seam where adapter edits stay client-agnostic.
+                adapter_context = context.adapter_context()
+                # Native stream traces apply field-cache path redaction below.
+                # Suppress generic adapter-chain snapshots here so provider state
+                # cannot leak before rule-aware redaction runs.
+                adapter_context.transaction_logger = None
+                event = await run_adapter_chain(adapters, event, adapter_context, stage="stream_event")
+                self._trace(context, "after_stream_event_adapter_chain", event, direction="stream", stage="adapter", snapshot=False)
                 await cache_engine.extract("unified_stream_event", serialize_value(event), context.field_cache_context(), transaction_logger=logger)
                 self._trace(context, "after_unified_stream_event_field_cache_extraction", {"source": "unified_stream_event"}, direction="stream", stage="adapter", snapshot=False)
                 event_payload = stream_event_payload(event)

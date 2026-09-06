@@ -196,11 +196,9 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
         supported_stages = ("stream_event",)
 
         async def transform_stream_event(self, payload, context):
-            # W7 contract: stream adapters see the provider's RAW chunk
-            # (wire dialect), applied before parsing. String sentinel
-            # frames (e.g. "[DONE]") pass through untouched.
-            if isinstance(payload, dict) and payload.get("choices"):
-                payload["choices"][0]["delta"]["content"] = "adapted"
+            # W7 contract (plan §2.5): stream adapters run on the NEUTRAL
+            # parsed event — protocol-free, client-agnostic.
+            payload.delta.content[0].text = "adapted"
             return payload
 
     register_adapter(StreamTextAdapter, replace=True)
