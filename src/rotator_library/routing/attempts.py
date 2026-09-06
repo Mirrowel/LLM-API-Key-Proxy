@@ -38,9 +38,9 @@ def clone_context_for_target(
     # addressing — the operator's fallback plan is the later, more specific
     # intent; the request profile survives only for same-provider targets
     # that do not address one themselves.
-    target_profile = target.profile if target.profile is not None else (
-        context.execution_profile if target.provider == context.provider else None
-    )
+    target_profile = getattr(target, "profile", None)
+    if target_profile is None and target.provider == context.provider:
+        target_profile = context.execution_profile
     return replace(
         context,
         model=target.prefixed_model,

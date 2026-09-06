@@ -2849,7 +2849,7 @@ def _target_trace(target: RouteTarget) -> Dict[str, Any]:
         "model": target.prefixed_model,
         "execution": target.execution,
         "protocol": target.protocol,
-        "profile": target.profile,
+        "profile": getattr(target, "profile", None),
     }
 
 
