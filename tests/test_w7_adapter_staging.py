@@ -18,6 +18,8 @@ from pathlib import Path
 
 from copy import deepcopy
 
+import json
+
 import pytest
 
 from rotator_library.adapters import PayloadAdapter, register_adapter
@@ -29,6 +31,9 @@ from rotator_library.native_provider.http import NativeHTTPTransport
 
 
 @pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 
 
 def _trace_text(log_dir):
@@ -36,9 +41,6 @@ def _trace_text(log_dir):
 
     entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
     return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class RecordingTransport:
     def __init__(self, response):
         self.response = response

@@ -25,11 +25,13 @@ def _trace_level_2(monkeypatch):
 
 
 def _make_logger(tmp_path):
+    # Isolated from the developer's real log store: nested under tmp_path
+    # (parent_dir set → no root-logger retention pruning of real logs).
     return TransactionLogger(
         provider="nvidia_nim",
         model="mistral-medium-3.5",
         enabled=True,
-        parent_dir=None,
+        parent_dir=tmp_path,
     )
 
 

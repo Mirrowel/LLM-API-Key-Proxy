@@ -448,6 +448,7 @@ class ResponsesService:
         except Exception as exc:
             # Post-start failures never escape into the transport: the client
             # receives a protocol-valid terminal sequence instead (defect 10).
+            self._finalize_stream_metadata(transaction_logger, error=exc)
             async for frame in self._terminal_stream_failure(
                 stream_request,
                 unified.model,
@@ -460,6 +461,14 @@ class ResponsesService:
             return
         if not completed:
             # The stream ended without a terminal event — synthesize one.
+            self._finalize_stream_metadata(
+                transaction_logger,
+                error=ResponsesServiceError(
+                    "Responses stream ended without a terminal response event",
+                    status_code=502,
+                    error_type="upstream_error",
+                ),
+            )
             async for frame in self._terminal_stream_failure(
                 stream_request,
                 unified.model,
@@ -473,6 +482,26 @@ class ResponsesService:
                 session_info=session_info,
             ):
                 yield frame
+            return
+        # Completed streams still get their L1 summary.
+        self._finalize_stream_metadata(transaction_logger)
+
+    def _finalize_stream_metadata(
+        self,
+        transaction_logger: Optional[Any],
+        *,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Best-effort metadata finalize for streamed responses (never raises)."""
+
+        if transaction_logger is None or not hasattr(transaction_logger, "finalize_metadata"):
+            return
+        try:
+            transaction_logger.finalize_metadata(status_code=200 if error is None else 500, error=error)
+            if error is not None and hasattr(transaction_logger, "flush_capture_on_error"):
+                transaction_logger.flush_capture_on_error(error)
+        except Exception:
+            pass
 
     async def _terminal_stream_failure(
         self,

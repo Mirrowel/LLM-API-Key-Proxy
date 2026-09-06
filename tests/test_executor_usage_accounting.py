@@ -15,6 +15,9 @@ from rotator_library.transaction_logger import TransactionLogger
 
 
 @pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 
 
 def _trace_text(log_dir):
@@ -22,9 +25,6 @@ def _trace_text(log_dir):
 
     entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
     return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 def _executor() -> RequestExecutor:
     return RequestExecutor({}, None, None, None, {}, None)
 

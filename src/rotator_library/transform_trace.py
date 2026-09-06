@@ -270,6 +270,11 @@ class TransformTraceWriter:
         self._sequence = 0
         self.trace_file = log_dir / "transform_trace.jsonl"
         self.snapshot_dir = log_dir / "transforms"
+        # Batched JSONL writes: the compressed rewrite is per-call cost, so
+        # entries accumulate and flush every FLUSH_EVERY entries (and on
+        # explicit flush_pending at transaction finalize).
+        self._pending: list[dict[str, Any]] = []
+        self.FLUSH_EVERY = 64
         # Ring buffer: every entry, always, for capture-on-error (bounded).
         self._ring_entries: list[dict[str, Any]] = []
         self._ring_chars = 0
@@ -301,19 +306,22 @@ class TransformTraceWriter:
         return drained
 
     def _ring_add(self, payload: str) -> None:
-        if (
-            len(self._ring_entries) >= self.ring_max_entries
-            or self._ring_chars + len(payload) > self.ring_max_chars
-        ):
-            if self._ring_entries:
-                self._ring_entries.pop(0)
-                self.ring_dropped += 1
-                self._ring_chars -= len(str(self._ring_entries))  # approximate; bounded either way
-            elif len(payload) > self.ring_max_chars:
-                self.ring_dropped += 1
-                return
+        """Bounded eviction: oldest entries leave until BOTH caps hold; a
+        single oversize payload empties the ring and is dropped."""
+
+        if len(payload) > self.ring_max_chars:
+            self._ring_entries.clear()
+            self._ring_chars = 0
+            self.ring_dropped += 1
+            return
         self._ring_entries.append(payload)
         self._ring_chars += len(payload)
+        while self._ring_entries and (
+            len(self._ring_entries) > self.ring_max_entries
+            or self._ring_chars > self.ring_max_chars
+        ):
+            self._ring_chars -= len(self._ring_entries.pop(0))
+            self.ring_dropped += 1
 
     def record(
         self,
@@ -364,10 +372,16 @@ class TransformTraceWriter:
             pass
         if self.level < 2:
             return entry
+        # L2 = intermediates tier (JSONL + snapshots). L3 is RESERVED for
+        # verbose per-frame additions; it currently behaves as L2.
         try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            zstd_io.append_jsonl(self.trace_file, [entry.to_dict()])
-            if snapshot and direction != "stream" and self.level >= 2:
+            self._pending.append(entry.to_dict())
+            # Small transactions flush per entry (keeps immediately-readable
+            # semantics); large ones batch so the compressed rewrite stays
+            # bounded instead of quadratic per entry.
+            if len(self._pending) >= self.FLUSH_EVERY or self._sequence < 100:
+                self.flush_pending()
+            if snapshot and direction != "stream":
                 self.snapshot_dir.mkdir(parents=True, exist_ok=True)
                 namespace = f"{sanitize_filename(self.snapshot_namespace)}_" if self.snapshot_namespace else ""
                 snapshot_name = f"{entry.sequence:04d}_{namespace}{sanitize_filename(pass_name)}.json"
@@ -375,6 +389,18 @@ class TransformTraceWriter:
         except Exception as exc:
             lib_logger.debug("Transform trace write failed for %s: %s", pass_name, exc)
         return entry
+
+    def flush_pending(self) -> None:
+        """Write buffered JSONL entries in one batch (call at finalize)."""
+
+        if not self._pending or not self.enabled or self.level < 2:
+            return
+        batch, self._pending = self._pending, []
+        try:
+            self.log_dir.mkdir(parents=True, exist_ok=True)
+            zstd_io.append_jsonl(self.trace_file, batch)
+        except Exception as exc:
+            lib_logger.debug("Transform trace flush failed: %s", exc)
 
 
 def provider_snapshot_namespace() -> str:

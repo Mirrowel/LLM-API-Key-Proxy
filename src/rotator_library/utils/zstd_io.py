@@ -71,8 +71,8 @@ def append_jsonl(path: Path, entries: Iterable[Any], *, flush: bool = True) -> b
     """Append JSONL entries (compressed rewrite when compressing).
 
     zstd streams are not appendable; the file is decompressed, extended,
-    and recompressed atomically. For high-frequency appends prefer
-    ``JsonlBuffer`` which batches in memory.
+    and recompressed. Batch callers should pass many entries per call —
+    the rewrite cost is per-call, not per-entry.
     Returns True when the stored bytes are zstd-compressed.
     """
 
@@ -93,7 +93,19 @@ def append_jsonl(path: Path, entries: Iterable[Any], *, flush: bool = True) -> b
     except Exception:
         lib_logger.debug("zstd jsonl append failed for %s; falling back", path, exc_info=True)
         try:
-            with open(path, "a", encoding="utf-8") as handle:
+            # Fallback keeps ONE readable stream: if a compressed file
+            # already exists, merge into a plain side file the reader also
+            # merges (never a silent split the reader cannot see).
+            fallback = Path(str(path) + ".fallback.jsonl")
+            if compressed and target.exists():
+                try:
+                    with _LOCK:
+                        prior = _DECOMPRESSOR.decompress(target.read_bytes()).decode("utf-8")
+                    fallback.write_text(prior, encoding="utf-8")
+                    target.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            with open(fallback if fallback.exists() else (path if not compressed else fallback), "a", encoding="utf-8") as handle:
                 handle.write(lines)
         except Exception:
             lib_logger.debug("fallback append also failed for %s", path, exc_info=True)
@@ -112,15 +124,18 @@ class JsonlBuffer:
 
     def add(self, entry: Any) -> None:
         line = json.dumps(entry, ensure_ascii=False, default=str)
-        if len(self._entries) >= self.max_entries or self._chars + len(line) > self.max_chars:
-            if self._entries:
-                self._entries.pop(0)
-                self.dropped += 1
-            elif len(line) > self.max_chars:
-                self.dropped += 1
-                return
+        if len(line) > self.max_chars:
+            self._entries.clear()
+            self._chars = 0
+            self.dropped += 1
+            return
         self._entries.append(line)
         self._chars += len(line)
+        while self._entries and (
+            len(self._entries) > self.max_entries or self._chars > self.max_chars
+        ):
+            self._chars -= len(self._entries.pop(0))
+            self.dropped += 1
 
     def flush_to(self, path: Path) -> bool:
         if not self._entries:
@@ -153,12 +168,15 @@ def read_json_any(path: Path) -> Any:
 
 
 def read_jsonl_any(path: Path) -> list[Any]:
-    """Read a JSONL file whether or not it is zstd-compressed."""
+    """Read a JSONL file whether or not it is zstd-compressed (merging any
+    fallback side file written after a compression failure)."""
 
     entries: list[Any] = []
+    found = False
     for candidate in (Path(str(path) + ".zst"), path):
         if not candidate.exists():
             continue
+        found = True
         raw = candidate.read_bytes()
         if candidate.suffix == ".zst":
             if not _COMPRESSION_AVAILABLE:
@@ -169,5 +187,13 @@ def read_jsonl_any(path: Path) -> list[Any]:
             line = line.strip()
             if line:
                 entries.append(json.loads(line))
-        return entries
-    raise FileNotFoundError(path)
+    fallback = Path(str(path) + ".fallback.jsonl")
+    if fallback.exists():
+        found = True
+        for line in fallback.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                entries.append(json.loads(line))
+    if not found:
+        raise FileNotFoundError(path)
+    return entries

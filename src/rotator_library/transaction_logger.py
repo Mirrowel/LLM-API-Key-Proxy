@@ -152,30 +152,45 @@ def _resolve_trace_level() -> int:
 
 # Rotation-class failures: expected under load, carry no request evidence
 # worth archiving (the enumerated capture-on-error exclusion set — the
-# classifier vocabulary in error_handler.py is the single source).
+# classifier vocabulary in error_handler.py is the single source; the
+# alias-coverage test pins this set against classify_error outputs).
 _ROTATION_ERROR_TYPES = {
     "rate_limit",
     "quota_exceeded",
     "proxy_all_credentials_exhausted",
     "authentication",
+    "authentication_error",
     "auth",
     "invalid_auth",
     "reauth",
     "credential_reauth",
+    "credential_reauth_needed",
+    "forbidden",
+    "proxy_timeout",
 }
 
 
 def _error_qualifies_for_capture(error: BaseException) -> bool:
     """Request-related failures archive buffered intermediates (400-class
     payload/protocol problems, unexpected crashes); rotation-class
-    failures (429s, quota, credential refresh) do not."""
+    failures (429s, quota, credential refresh, transport timeouts) do
+    not."""
 
     explicit = getattr(error, "error_type", None)
     if isinstance(explicit, str) and explicit:
-        return explicit not in _ROTATION_ERROR_TYPES
+        normalized = explicit.strip().lower().replace("-", "_").replace(" ", "_")
+        return normalized not in _ROTATION_ERROR_TYPES
+    # Mid-stream errors: their payload may carry a provider error type.
+    data = getattr(error, "data", None)
+    if isinstance(data, dict):
+        inner = data.get("error")
+        if isinstance(inner, dict):
+            inner_type = str(inner.get("type") or inner.get("code") or "").strip().lower().replace("-", "_")
+            if inner_type and inner_type in _ROTATION_ERROR_TYPES:
+                return False
     structured_status = getattr(error, "status_code", None)
     if isinstance(structured_status, int):
-        if structured_status in (429, 401, 408):
+        if structured_status in (429, 401, 403, 408, 504):
             return False
         return True
     # Unexpected exception types (crashes) always qualify.
@@ -188,7 +203,9 @@ def _prune_old_transactions() -> None:
 
     try:
         raw = os.getenv("TRANSACTION_LOG_RETENTION", "1000")
-        keep = max(1, int(raw))
+        keep = int(raw)
+        if keep <= 0:
+            return  # 0 or negative = unlimited retention
     except (TypeError, ValueError):
         keep = 1000
     try:
@@ -196,7 +213,8 @@ def _prune_old_transactions() -> None:
         if not transactions_root.exists():
             return
         dirs = [entry for entry in transactions_root.iterdir() if entry.is_dir()]
-        dirs.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
+        # (mtime, name) breaks same-second ties deterministically.
+        dirs.sort(key=lambda entry: (entry.stat().st_mtime, entry.name), reverse=True)
         for stale in dirs[keep:]:
             shutil.rmtree(stale, ignore_errors=True)
     except Exception:
@@ -519,12 +537,12 @@ class TransactionLogger:
         drained = self._trace_writer.drain_ring()
         if not drained:
             return False
-        self._capture_flushed = True
         try:
             capture_dir = self.log_dir / "capture"
             capture_dir.mkdir(parents=True, exist_ok=True)
             entries = [json.loads(line) for line in drained]
             zstd_io.write_json(capture_dir / "captured_trace.json", entries, indent=None)
+            self._capture_flushed = True
             return True
         except Exception as e:
             lib_logger.error(f"TransactionLogger: capture flush failed: {e}")
@@ -557,7 +575,15 @@ class TransactionLogger:
         routes) — the L1 summary is always produced."""
 
         self._flush_chunk_buffer()
+        self._finalize_trace_writer()
         self._log_metadata({}, status_code, (time.time() - self.start_time) * 1000)
+
+    def _finalize_trace_writer(self) -> None:
+        if self._trace_writer is not None:
+            try:
+                self._trace_writer.flush_pending()
+            except Exception:
+                lib_logger.debug("trace writer finalize flush failed", exc_info=True)
 
     def log_request(
         self, request_data: Dict[str, Any], filename: str = "request.json"
@@ -637,7 +663,7 @@ class TransactionLogger:
         if changed_from_previous is False:
             return
 
-        logged = _strip_framework_keys(transformed_data)
+        logged = _strip_framework_keys(sanitize_for_trace(transformed_data))
         data = {
             "request_id": self.request_id,
             "timestamp_utc": _utc_timestamp(),
@@ -711,6 +737,7 @@ class TransactionLogger:
         )
         self._write_json(filename, data)
         self._flush_chunk_buffer()
+        self._finalize_trace_writer()
 
         # Also write metadata
         self._log_metadata(safe_response, status_code, duration_ms)
@@ -1061,7 +1088,8 @@ class ProviderLogger:
             direction="request",
             transport="http",
         )
-        self._write_json("request_payload.json", payload)
+        # L1 boundary redaction applies at the provider boundary too.
+        self._write_json("request_payload.json", sanitize_for_trace(payload))
 
     def log_response_chunk(self, chunk: str) -> None:
         """
@@ -1091,7 +1119,7 @@ class ProviderLogger:
             response_data,
             direction="response",
         )
-        self._write_json("final_response.json", response_data)
+        self._write_json("final_response.json", sanitize_for_trace(response_data))
 
     def log_error(self, error_message: str) -> None:
         """

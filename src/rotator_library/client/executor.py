@@ -2612,62 +2612,78 @@ class RequestExecutor:
         """
         chunks = []
 
-        async for sse_line in stream:
-            trace_sse_line = _redact_stream_sse_for_trace(
-                sse_line,
-                context,
-                plugin,
-                config=getattr(self, "_experimental_config", None),
-            )
-            transaction_logger.log_transform_pass(
-                "raw_stream_chunk",
-                trace_sse_line,
-                direction="stream",
-                stage="client",
-                transport="sse",
-                snapshot=False,
-            )
-            if sse_line.startswith("data: [DONE]"):
+        try:
+            async for sse_line in stream:
+                trace_sse_line = _redact_stream_sse_for_trace(
+                    sse_line,
+                    context,
+                    plugin,
+                    config=getattr(self, "_experimental_config", None),
+                )
                 transaction_logger.log_transform_pass(
-                    "stream_done_event",
-                    {"raw": trace_sse_line},
+                    "raw_stream_chunk",
+                    trace_sse_line,
                     direction="stream",
-                    stage="final",
+                    stage="client",
                     transport="sse",
                     snapshot=False,
                 )
-            yield sse_line
-
-            # Parse and accumulate for final logging
-            if sse_line.startswith("data: ") and not sse_line.startswith(
-                "data: [DONE]"
-            ):
-                try:
-                    content = sse_line[6:].strip()
-                    if content:
-                        chunk_data = json.loads(content)
-                        chunks.append(chunk_data)
-                        trace_chunk_data = _redact_context_field_cache_paths(
-                            chunk_data,
-                            context,
-                            "stream",
-                            plugin,
-                            config=getattr(self, "_experimental_config", None),
-                        ) if context else chunk_data
-                        transaction_logger.log_stream_chunk(trace_chunk_data)
-                        if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
-                            transaction_logger.log_transform_pass(
-                                "stream_error_event",
-                                trace_chunk_data,
-                                direction="stream",
-                                stage="client",
-                                transport="sse",
-                                snapshot=False,
-                            )
-                except json.JSONDecodeError:
-                    lib_logger.debug(
-                        f"Failed to parse chunk for logging: {sse_line[:100]}"
+                if sse_line.startswith("data: [DONE]"):
+                    transaction_logger.log_transform_pass(
+                        "stream_done_event",
+                        {"raw": trace_sse_line},
+                        direction="stream",
+                        stage="final",
+                        transport="sse",
+                        snapshot=False,
                     )
+                yield sse_line
+
+                # Parse and accumulate for final logging
+                if sse_line.startswith("data: ") and not sse_line.startswith(
+                    "data: [DONE]"
+                ):
+                    try:
+                        content = sse_line[6:].strip()
+                        if content:
+                            chunk_data = json.loads(content)
+                            chunks.append(chunk_data)
+                            trace_chunk_data = _redact_context_field_cache_paths(
+                                chunk_data,
+                                context,
+                                "stream",
+                                plugin,
+                                config=getattr(self, "_experimental_config", None),
+                            ) if context else chunk_data
+                            transaction_logger.log_stream_chunk(trace_chunk_data)
+                            if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
+                                transaction_logger.log_transform_pass(
+                                    "stream_error_event",
+                                    trace_chunk_data,
+                                    direction="stream",
+                                    stage="client",
+                                    transport="sse",
+                                    snapshot=False,
+                                )
+                    except json.JSONDecodeError:
+                        lib_logger.debug(
+                            f"Failed to parse chunk for logging: {sse_line[:100]}"
+                        )
+        except BaseException as stream_error:
+            # Failed streams still get their L1 summary BEFORE the error
+            # propagates: metadata with the error record, capture-on-error
+            # for qualifying failures, and the buffered chunks preserved.
+            try:
+                transaction_logger.log_transform_error(
+                    "stream_transaction",
+                    stream_error,
+                    payload={"chunks_logged": len(chunks)},
+                    stage="client",
+                )
+                transaction_logger.finalize_metadata(status_code=500, error=stream_error)
+            except Exception:
+                lib_logger.debug("stream failure metadata finalize failed", exc_info=True)
+            raise
 
         # Log assembled final response
         if chunks:
