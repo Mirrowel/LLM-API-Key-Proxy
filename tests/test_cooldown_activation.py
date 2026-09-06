@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncio
 
 import pytest
@@ -11,6 +13,19 @@ from rotator_library.error_handler import ClassifiedError
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class FakeCooldown:
     def __init__(self) -> None:
         self.started = []
@@ -129,7 +144,7 @@ async def test_large_retry_after_starts_provider_cooldown_and_traces(tmp_path, m
     )
 
     assert cooldown.scoped_started == [("openai", 60, None, "provider", "retry_after")]
-    trace = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace = _trace_text(logger.log_dir)
     assert "provider_cooldown_started" in trace
 
 

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, fields, is_dataclass
@@ -33,7 +35,8 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from .transform_trace import TransformTraceWriter, provider_snapshot_namespace
+from .transform_trace import TransformTraceWriter, provider_snapshot_namespace, sanitize_for_trace
+from .utils import zstd_io
 from .utils.paths import get_logs_dir
 
 lib_logger = logging.getLogger("rotator_library")
@@ -136,6 +139,70 @@ def _utc_timestamp() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _resolve_trace_level() -> int:
+    """TRANSACTION_LOG_LEVEL: 1 = boundaries + metadata (default),
+    2 = + intermediates, 3 = + verbose per-frame tracing."""
+
+    raw = os.getenv("TRANSACTION_LOG_LEVEL", "1")
+    try:
+        return max(1, min(3, int(raw)))
+    except (TypeError, ValueError):
+        return 1
+
+
+# Rotation-class failures: expected under load, carry no request evidence
+# worth archiving (the enumerated capture-on-error exclusion set — the
+# classifier vocabulary in error_handler.py is the single source).
+_ROTATION_ERROR_TYPES = {
+    "rate_limit",
+    "quota_exceeded",
+    "proxy_all_credentials_exhausted",
+    "authentication",
+    "auth",
+    "invalid_auth",
+    "reauth",
+    "credential_reauth",
+}
+
+
+def _error_qualifies_for_capture(error: BaseException) -> bool:
+    """Request-related failures archive buffered intermediates (400-class
+    payload/protocol problems, unexpected crashes); rotation-class
+    failures (429s, quota, credential refresh) do not."""
+
+    explicit = getattr(error, "error_type", None)
+    if isinstance(explicit, str) and explicit:
+        return explicit not in _ROTATION_ERROR_TYPES
+    structured_status = getattr(error, "status_code", None)
+    if isinstance(structured_status, int):
+        if structured_status in (429, 401, 408):
+            return False
+        return True
+    # Unexpected exception types (crashes) always qualify.
+    return True
+
+
+def _prune_old_transactions() -> None:
+    """Bound L1 disk usage: keep only the newest TRANSACTION_LOG_RETENTION
+    transaction directories (default 1000). Never raises."""
+
+    try:
+        raw = os.getenv("TRANSACTION_LOG_RETENTION", "1000")
+        keep = max(1, int(raw))
+    except (TypeError, ValueError):
+        keep = 1000
+    try:
+        transactions_root = _get_transactions_dir()
+        if not transactions_root.exists():
+            return
+        dirs = [entry for entry in transactions_root.iterdir() if entry.is_dir()]
+        dirs.sort(key=lambda entry: entry.stat().st_mtime, reverse=True)
+        for stale in dirs[keep:]:
+            shutil.rmtree(stale, ignore_errors=True)
+    except Exception:
+        lib_logger.debug("transaction retention prune failed", exc_info=True)
+
+
 def _sanitize_name(name: str) -> str:
     """Sanitize a name for use in directory/file names."""
     # Replace problematic characters with underscores
@@ -183,6 +250,9 @@ class TransactionContext:
     trace_enabled: bool = False
     """Whether provider loggers should append transform trace entries."""
 
+    trace_level: int = 1
+    """W12 tier for trace writers (1 boundaries, 2 intermediates, 3 verbose)."""
+
 
 class TransactionLogger:
     """
@@ -214,6 +284,14 @@ class TransactionLogger:
         "_dir_available",
         "_context",
         "_trace_writer",
+        "trace_level",
+        "compressed",
+        "_attempt_records",
+        "_routing_records",
+        "_extra_metadata",
+        "_error_records",
+        "_chunk_buffer",
+        "_capture_flushed",
     )
 
     def __init__(
@@ -243,6 +321,16 @@ class TransactionLogger:
         self.scope_key: Optional[str] = None
         self.classifier: Optional[str] = None
         self.api_format = api_format
+        # W12 (D15): 1 = L1 boundaries + metadata (default); 2 = + intermediates
+        # (transform trace + snapshots); 3 = + verbose per-frame traces.
+        self.trace_level = _resolve_trace_level()
+        self.compressed = zstd_io.compression_available()
+        self._attempt_records: list[Dict[str, Any]] = []
+        self._routing_records: list[Dict[str, Any]] = []
+        self._extra_metadata: Dict[str, Any] = {}
+        self._error_records: list[Dict[str, Any]] = []
+        self._chunk_buffer = zstd_io.JsonlBuffer(max_entries=8192)
+        self._capture_flushed = False
 
         # Strip provider prefix from model if present
         # e.g., "openai/gpt-4.1" -> "gpt-4.1"
@@ -284,7 +372,10 @@ class TransactionLogger:
                 model=self.trace_model,
                 request_id=self.request_id,
                 enabled=True,
+                level=self.trace_level,
             )
+            if parent_dir is None:
+                _prune_old_transactions()
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to create directory: {e}")
             self.enabled = False
@@ -308,6 +399,7 @@ class TransactionLogger:
                 scope_key=self.scope_key,
                 classifier=self.classifier,
                 trace_enabled=bool(self._trace_writer),
+                trace_level=self.trace_level,
             )
         return self._context
 
@@ -400,6 +492,72 @@ class TransactionLogger:
             scrub_strings=True,
             snapshot=False,
         )
+        self._error_records.append(
+            {
+                "failed_pass_name": failed_pass_name,
+                "error_type": type(error).__name__,
+                "message": str(error)[:2000],
+                "stage": stage,
+            }
+        )
+        # Capture-on-error (D15): request-relevant failures archive the
+        # in-memory trace ring even when L2 disk tracing is off.
+        self.flush_capture_on_error(error)
+
+    def flush_capture_on_error(self, error: Optional[BaseException] = None) -> bool:
+        """Archive the buffered intermediates when the error looks
+        request-related (bad payload, protocol violation, unexpected
+        crash). Rotation-class failures (rate limit, quota, auth refresh)
+        do not trigger capture."""
+
+        if not self.enabled or not self._dir_available or self._capture_flushed:
+            return False
+        if error is not None and not _error_qualifies_for_capture(error):
+            return False
+        if self._trace_writer is None or self.log_dir is None:
+            return False
+        drained = self._trace_writer.drain_ring()
+        if not drained:
+            return False
+        self._capture_flushed = True
+        try:
+            capture_dir = self.log_dir / "capture"
+            capture_dir.mkdir(parents=True, exist_ok=True)
+            entries = [json.loads(line) for line in drained]
+            zstd_io.write_json(capture_dir / "captured_trace.json", entries, indent=None)
+            return True
+        except Exception as e:
+            lib_logger.error(f"TransactionLogger: capture flush failed: {e}")
+            return False
+
+    def record_attempt(self, record: Dict[str, Any]) -> None:
+        """Record a per-attempt routing/execution summary row (metadata v2)."""
+
+        if isinstance(record, dict):
+            self._attempt_records.append(_make_json_safe(record))
+
+    def record_routing(self, record: Dict[str, Any]) -> None:
+        """Record a routing decision (fallback groups, target selection)."""
+
+        if isinstance(record, dict):
+            self._routing_records.append(_make_json_safe(record))
+
+    def update_metadata(self, **fields: Any) -> None:
+        """Attach extra metadata fields (execution mode, protocols, overlays)."""
+
+        self._extra_metadata.update(_make_json_safe(dict(fields)))
+
+    def finalize_metadata(
+        self,
+        *,
+        status_code: int = 200,
+        error: Optional[BaseException] = None,
+    ) -> None:
+        """Write metadata.json without a response body (stream + responses
+        routes) — the L1 summary is always produced."""
+
+        self._flush_chunk_buffer()
+        self._log_metadata({}, status_code, (time.time() - self.start_time) * 1000)
 
     def log_request(
         self, request_data: Dict[str, Any], filename: str = "request.json"
@@ -419,7 +577,9 @@ class TransactionLogger:
         data = {
             "request_id": self.request_id,
             "timestamp_utc": _utc_timestamp(),
-            "data": request_data,
+            # L1 boundary redaction: key-based secret scrubbing incl.
+            # camelCase normalization (invariant: boundaries never log secrets).
+            "data": sanitize_for_trace(request_data),
         }
         self.log_transform_pass(
             "raw_client_request",
@@ -507,8 +667,8 @@ class TransactionLogger:
             transport="sse",
             snapshot=False,
         )
-        content = json.dumps(log_entry, ensure_ascii=False) + "\n"
-        self._append_text("streaming_chunks.jsonl", content)
+        # Memory-safe buffered chunks; flushed once at finalize (L1).
+        self._chunk_buffer.add(log_entry)
 
     def log_response(
         self,
@@ -539,7 +699,7 @@ class TransactionLogger:
             "status_code": status_code,
             "duration_ms": round(duration_ms),
             "headers": _make_json_safe(dict(headers)) if headers else None,
-            "data": safe_response,
+            "data": sanitize_for_trace(safe_response),
         }
         self.log_transform_pass(
             "final_client_response",
@@ -550,9 +710,18 @@ class TransactionLogger:
             metadata={"status_code": status_code, "headers": dict(headers) if headers else None},
         )
         self._write_json(filename, data)
+        self._flush_chunk_buffer()
 
         # Also write metadata
         self._log_metadata(safe_response, status_code, duration_ms)
+
+    def _flush_chunk_buffer(self) -> None:
+        """Persist the buffered stream chunks once (L1 boundary artifact)."""
+        if self._chunk_buffer and self.log_dir and self._dir_available:
+            try:
+                self._chunk_buffer.flush_to(self.log_dir / "streaming_chunks.jsonl")
+            except Exception as e:
+                lib_logger.error(f"TransactionLogger: chunk flush failed: {e}")
 
     def _log_metadata(
         self, response_data: Dict[str, Any], status_code: int, duration_ms: float
@@ -599,7 +768,24 @@ class TransactionLogger:
             "has_provider_logs": has_provider_logs,
             "reasoning_found": False,
             "reasoning_content": None,
+            # W12 metadata v2 (D15): correlation, tier, and reconstruction.
+            "schema": "2",
+            "trace_level": self.trace_level,
+            "compressed": self.compressed,
+            "session_id": self.session_id,
+            "scope_key": self.scope_key,
+            "classifier": self.classifier,
+            "attempts": self._attempt_records,
+            "routing": self._routing_records,
+            "errors": self._error_records,
+            "reconstruct": {
+                "script": "tools/reconstruct_traces.py",
+                "inputs": ["request.json", "metadata.json"],
+                "note": "regenerates L2 intermediates by replaying the deterministic pipeline; live-state decisions stay in metadata",
+            },
         }
+        if self._extra_metadata:
+            metadata["extra"] = self._extra_metadata
 
         # Extract reasoning if present
         reasoning = self._extract_reasoning(response_data)
@@ -632,12 +818,11 @@ class TransactionLogger:
         return None
 
     def _write_json(self, filename: str, data: Dict[str, Any]) -> None:
-        """Write JSON data to a file in the log directory."""
+        """Write JSON data to a file in the log directory (zstd when available)."""
         if not self.log_dir:
             return
         try:
-            with open(self.log_dir / filename, "w", encoding="utf-8") as f:
-                json.dump(_make_json_safe(data), f, indent=2, ensure_ascii=False)
+            zstd_io.write_json(self.log_dir / filename, _make_json_safe(data))
         except Exception as e:
             lib_logger.error(f"TransactionLogger: Failed to write {filename}: {e}")
 
@@ -834,6 +1019,7 @@ class ProviderLogger:
                     classifier=context.classifier,
                     snapshot_namespace=provider_snapshot_namespace(),
                     enabled=True,
+                    level=getattr(context, "trace_level", 1),
                 )
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to create directory: {e}")

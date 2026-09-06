@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 import asyncio
 
@@ -8,12 +10,30 @@ import pytest
 from rotator_library.client.streaming import StreamingHandler
 from rotator_library.core.errors import StreamedAPIError
 from rotator_library.transaction_logger import TransactionLogger
+from rotator_library.utils import zstd_io
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 async def _chunks():
     yield {"id": "chunk_1", "choices": [{"delta": {"content": "hi"}}]}
     yield {"id": "chunk_2", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
 
+
+def _trace_entries(log_dir):
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
+
+def _trace_text_exists(log_dir):
+    from rotator_library.utils import zstd_io
+
+    return (Path(log_dir) / "transform_trace.jsonl").exists() or (Path(log_dir) / "transform_trace.jsonl.zst").exists()
 
 class HangingStream:
     def __init__(self) -> None:
@@ -81,7 +101,7 @@ class DelayedDisconnectedRequest:
 
 
 def _trace_passes(log_dir):
-    return [json.loads(line)["pass_name"] for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    return [entry["pass_name"] for entry in zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")]
 
 
 @pytest.mark.asyncio
@@ -109,7 +129,7 @@ async def test_stream_trace_metrics_can_be_disabled_without_changing_output(tmp_
 
     assert chunks[0].startswith("data: ")
     assert chunks[-1] == "data: [DONE]\n\n"
-    if (logger.log_dir / "transform_trace.jsonl").exists():
+    if _trace_text_exists(logger.log_dir):
         pass_names = _trace_passes(logger.log_dir)
         assert "stream_started" in pass_names
         assert "stream_metrics_final" in pass_names

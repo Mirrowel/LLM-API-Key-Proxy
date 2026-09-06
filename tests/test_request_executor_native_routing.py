@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 
 import pytest
@@ -13,6 +15,12 @@ from rotator_library.protocols import get_protocol
 from rotator_library.routing import parse_route_target
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class FakeNativeResponse:
     def __init__(self, payload):
         self.payload = payload

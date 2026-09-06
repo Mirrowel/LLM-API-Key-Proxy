@@ -8,11 +8,23 @@ from rotator_library.client.executor import RequestExecutor
 from rotator_library.client.transforms import ProviderTransforms
 from rotator_library.transaction_logger import ProviderLogger, TransactionLogger
 from rotator_library.transform_trace import REDACTED
+from rotator_library.utils import zstd_io
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """These tests pin the L2 trace mechanics (intermediates tier)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 
 
 def _trace_entries(log_dir):
-    trace_file = log_dir / "transform_trace.jsonl"
-    return [json.loads(line) for line in trace_file.read_text(encoding="utf-8").splitlines()]
+    return zstd_io.read_jsonl_any(log_dir / "transform_trace.jsonl")
+
+
+def _artifact(log_dir, name):
+    """Resolve a boundary artifact whether or not zstd compressed."""
+    compressed = log_dir / (name + ".zst")
+    return compressed if compressed.exists() else log_dir / name
 
 
 def test_log_request_writes_legacy_file_and_raw_trace(tmp_path) -> None:
@@ -20,13 +32,13 @@ def test_log_request_writes_legacy_file_and_raw_trace(tmp_path) -> None:
 
     logger.log_request({"model": "gpt-test", "api_key": "secret", "messages": [{"role": "user", "content": "hi"}]})
 
-    assert (logger.log_dir / "request.json").exists()
+    assert _artifact(logger.log_dir, "request.json").exists()
     entries = _trace_entries(logger.log_dir)
     assert entries[0]["pass_name"] == "raw_client_request"
     assert entries[0]["request_id"] == logger.request_id
     assert entries[0]["direction"] == "request"
     assert entries[0]["data"]["api_key"] == REDACTED
-    assert (logger.log_dir / "transforms" / "0001_raw_client_request.json").exists()
+    assert any(entry.name.startswith("0001_raw_client_request.json") for entry in (logger.log_dir / "transforms").iterdir())
 
 
 def test_log_transformed_request_records_trace_even_when_legacy_file_skips(tmp_path) -> None:
@@ -43,7 +55,7 @@ def test_log_transformed_request_records_trace_even_when_legacy_file_skips(tmp_p
     assert entries[0]["session_id"] == "session_1"
     assert entries[0]["scope_key"] == "scope_1"
     assert entries[0]["classifier"] == "class_a"
-    assert not (logger.log_dir / "request_transformed.json").exists()
+    assert not _artifact(logger.log_dir, "request_transformed.json").exists()
 
 
 def test_log_response_and_stream_chunk_write_trace_entries(tmp_path) -> None:
@@ -59,7 +71,7 @@ def test_log_response_and_stream_chunk_write_trace_entries(tmp_path) -> None:
     assert "final_client_response" in pass_names
     stream_entry = next(entry for entry in entries if entry["pass_name"] == "parsed_stream_chunk")
     assert stream_entry["direction"] == "stream"
-    assert not (logger.log_dir / "transforms" / "0002_parsed_stream_chunk.json").exists()
+    assert not any(entry.name.startswith("0002_parsed_stream_chunk.json") for entry in (logger.log_dir / "transforms").iterdir())
 
 
 def test_provider_logger_writes_provider_trace_entries(tmp_path) -> None:

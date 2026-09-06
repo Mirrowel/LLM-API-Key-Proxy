@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 
 import pytest
@@ -9,8 +11,18 @@ from rotator_library.field_cache import FieldCacheContext, FieldCacheEngine, Fie
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 def _trace_entries(log_dir):
-    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
 
 
 @pytest.mark.asyncio

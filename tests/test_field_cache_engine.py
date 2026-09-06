@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncio
 import json
 
@@ -18,8 +20,25 @@ from rotator_library.field_cache.types import is_provider_continuation_path
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 def _trace_entries(log_dir):
-    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
 
 
 def _reasoning_rule(mode: str = "last", scope=("provider", "model", "credential", "session")) -> FieldCacheRule:
@@ -315,7 +334,7 @@ async def test_field_cache_trace_omits_raw_sample_values(tmp_path) -> None:
         transaction_logger=logger,
     )
 
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "provider-signature-secret" not in trace_text
     entries = _trace_entries(logger.log_dir)
     after_entry = next(entry for entry in entries if entry["pass_name"] == "after_field_cache_extraction")
@@ -340,7 +359,7 @@ async def test_field_cache_error_trace_omits_raw_payload_values(tmp_path) -> Non
             transaction_logger=logger,
         )
 
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "provider-signature-secret" not in trace_text
     assert "payload_type" in trace_text
 

@@ -5,6 +5,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
+import pytest
+
+from rotator_library.utils import zstd_io
 from rotator_library.transform_trace import (
     REDACTED,
     TransformTraceWriter,
@@ -85,7 +88,7 @@ def test_sanitize_filename_is_stable_and_filesystem_safe() -> None:
 
 
 def test_transform_trace_writer_records_jsonl_and_snapshots(tmp_path) -> None:
-    writer = TransformTraceWriter(tmp_path, component="client", provider="openai", model="gpt-test", request_id="req_1")
+    writer = TransformTraceWriter(tmp_path, component="client", provider="openai", model="gpt-test", request_id="req_1", level=2)
 
     first = writer.record("raw_client_request", {"model": "gpt-test"}, direction="request", stage="client")
     second = writer.record("parsed_stream_chunk", {"delta": "hi"}, direction="stream", stage="client", snapshot=True)
@@ -95,28 +98,30 @@ def test_transform_trace_writer_records_jsonl_and_snapshots(tmp_path) -> None:
     assert first.sequence == 1
     assert second.sequence == 2
 
-    lines = (tmp_path / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()
+    lines = zstd_io.read_jsonl_any(tmp_path / "transform_trace.jsonl")
     assert len(lines) == 2
-    assert json.loads(lines[0])["pass_name"] == "raw_client_request"
-    assert json.loads(lines[0])["request_id"] == "req_1"
-    assert json.loads(lines[1])["direction"] == "stream"
-    assert (tmp_path / "transforms" / "0001_raw_client_request.json").exists()
-    assert not (tmp_path / "transforms" / "0002_parsed_stream_chunk.json").exists()
+    assert lines[0]["pass_name"] == "raw_client_request"
+    assert lines[0]["request_id"] == "req_1"
+    assert lines[1]["direction"] == "stream"
+    snapshot_names = [entry.name for entry in (tmp_path / "transforms").iterdir()]
+    assert any(name.startswith("0001_raw_client_request.json") for name in snapshot_names)
+    assert not any(name.startswith("0002_parsed_stream_chunk.json") for name in snapshot_names)
 
 
 def test_transform_trace_writer_disabled_writes_nothing(tmp_path) -> None:
-    writer = TransformTraceWriter(tmp_path, component="client", enabled=False)
+    writer = TransformTraceWriter(tmp_path, component="client", enabled=False, level=2)
 
     assert writer.record("raw_client_request", {}, direction="request", stage="client") is None
     assert not (tmp_path / "transform_trace.jsonl").exists()
 
 
 def test_transform_trace_writer_snapshot_namespace_prevents_collisions(tmp_path) -> None:
-    first = TransformTraceWriter(tmp_path, component="provider", snapshot_namespace="provider_a")
-    second = TransformTraceWriter(tmp_path, component="provider", snapshot_namespace="provider_b")
+    first = TransformTraceWriter(tmp_path, component="provider", snapshot_namespace="provider_a", level=2)
+    second = TransformTraceWriter(tmp_path, component="provider", snapshot_namespace="provider_b", level=2)
 
     first.record("provider_request_payload", {"a": 1}, direction="request", stage="provider")
     second.record("provider_request_payload", {"b": 2}, direction="request", stage="provider")
 
-    assert (tmp_path / "transforms" / "0001_provider_a_provider_request_payload.json").exists()
-    assert (tmp_path / "transforms" / "0001_provider_b_provider_request_payload.json").exists()
+    snapshot_names = [entry.name for entry in (tmp_path / "transforms").iterdir()]
+    assert any(name.startswith("0001_provider_a_provider_request_payload.json") for name in snapshot_names)
+    assert any(name.startswith("0001_provider_b_provider_request_payload.json") for name in snapshot_names)

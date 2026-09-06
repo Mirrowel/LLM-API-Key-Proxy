@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 
 import pytest
@@ -11,6 +13,12 @@ from rotator_library.native_provider import NativeHTTPTransport, NativeProviderC
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class FakeStreamingClient:
     def __init__(self, chunks):
         self.chunks = chunks
@@ -23,7 +31,18 @@ class FakeStreamingClient:
 
 
 def _trace_entries(log_dir):
-    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
 
 
 @pytest.mark.asyncio
@@ -62,7 +81,7 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     assert pass_names.count("parsed_native_stream_event") == 2
     assert "after_field_cache_extraction" in pass_names
     assert "after_field_cache_stream_extraction" in pass_names
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "opaque-vendor-state" not in trace_text
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 
 import pytest
@@ -10,6 +12,12 @@ from rotator_library.core.errors import StructuredAPIResponseError
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class FakeClient:
     def __init__(self) -> None:
         self.calls = []
@@ -160,7 +168,18 @@ def test_responses_service_errors_format_per_protocol() -> None:
 
 
 def _trace_entries(log_dir):
-    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
 
 
 def test_responses_service_owns_request_scope_derivation() -> None:
@@ -465,7 +484,7 @@ async def test_internal_session_hints_do_not_leak_to_direct_clients_or_traces(tm
     await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client, transaction_logger=logger)
 
     assert "_session_tracking_hints" not in client.calls[0]
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "_session_tracking_hints" not in trace_text
     assert "has_session_hints" in trace_text
 
@@ -529,7 +548,7 @@ async def test_scoped_responses_preserve_routing_but_never_store_or_trace_secret
     assert client.calls[0]["kwargs"]["api_keys"] == raw_request["api_keys"]
     assert client.calls[0]["kwargs"]["providers"] == raw_request["providers"]
     persisted_text = json.dumps(stored.to_dict())
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "super-secret-routing-key" not in persisted_text
     assert "provider-secret-header" not in persisted_text
     assert "super-secret-routing-key" not in trace_text

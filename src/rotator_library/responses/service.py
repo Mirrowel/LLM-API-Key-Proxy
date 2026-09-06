@@ -274,6 +274,10 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
         self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")
+        # W12: the responses route never calls log_response (no chat-shaped
+        # body to file), so metadata is finalized here instead.
+        if transaction_logger is not None and hasattr(transaction_logger, "finalize_metadata"):
+            transaction_logger.finalize_metadata(status_code=200)
         return response_payload
 
     async def stream_response(

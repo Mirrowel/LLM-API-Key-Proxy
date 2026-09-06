@@ -17,6 +17,8 @@ import uuid
 from dataclasses import dataclass, field
 from dataclasses import is_dataclass
 from datetime import UTC, datetime
+
+from .utils import zstd_io
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -229,6 +231,12 @@ class TransformTraceWriter:
     One writer owns one local sequence counter. Phase 2 intentionally does not
     promise a global ordering across client and provider writers; entries include
     component and timestamps so interleaved logs remain understandable.
+
+    W12 tiering (D15): the writer records EVERY entry into a bounded in-memory
+    ring buffer regardless of level — that buffer is the capture-on-error
+    source when L2 disk tracing is off. Disk writes (JSONL + snapshots)
+    happen only when ``level >= 2``; the JSONL is zstd-compressed when the
+    zstandard package is available.
     """
 
     def __init__(
@@ -244,6 +252,9 @@ class TransformTraceWriter:
         classifier: Optional[str] = None,
         snapshot_namespace: Optional[str] = None,
         enabled: bool = True,
+        level: int = 1,
+        ring_max_entries: int = 2048,
+        ring_max_chars: int = 4_000_000,
     ) -> None:
         self.log_dir = log_dir
         self.component = component
@@ -255,9 +266,16 @@ class TransformTraceWriter:
         self.classifier = classifier
         self.snapshot_namespace = snapshot_namespace
         self.enabled = enabled
+        self.level = max(1, min(3, int(level)))
         self._sequence = 0
         self.trace_file = log_dir / "transform_trace.jsonl"
         self.snapshot_dir = log_dir / "transforms"
+        # Ring buffer: every entry, always, for capture-on-error (bounded).
+        self._ring_entries: list[dict[str, Any]] = []
+        self._ring_chars = 0
+        self.ring_max_entries = ring_max_entries
+        self.ring_max_chars = ring_max_chars
+        self.ring_dropped = 0
 
     def update_context(
         self,
@@ -274,6 +292,28 @@ class TransformTraceWriter:
             self.scope_key = scope_key
         if classifier is not None:
             self.classifier = classifier
+
+    def drain_ring(self) -> list[dict[str, Any]]:
+        """Return and clear the capture-on-error ring buffer."""
+
+        drained, self._ring_entries = self._ring_entries, []
+        self._ring_chars = 0
+        return drained
+
+    def _ring_add(self, payload: str) -> None:
+        if (
+            len(self._ring_entries) >= self.ring_max_entries
+            or self._ring_chars + len(payload) > self.ring_max_chars
+        ):
+            if self._ring_entries:
+                self._ring_entries.pop(0)
+                self.ring_dropped += 1
+                self._ring_chars -= len(str(self._ring_entries))  # approximate; bounded either way
+            elif len(payload) > self.ring_max_chars:
+                self.ring_dropped += 1
+                return
+        self._ring_entries.append(payload)
+        self._ring_chars += len(payload)
 
     def record(
         self,
@@ -319,15 +359,19 @@ class TransformTraceWriter:
             scrub_strings=scrub_strings,
         )
         try:
+            self._ring_add(json.dumps(entry.to_dict(), ensure_ascii=False))
+        except Exception:
+            pass
+        if self.level < 2:
+            return entry
+        try:
             self.log_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.trace_file, "a", encoding="utf-8") as handle:
-                handle.write(json.dumps(entry.to_dict(), ensure_ascii=False) + "\n")
-            if snapshot and direction != "stream":
+            zstd_io.append_jsonl(self.trace_file, [entry.to_dict()])
+            if snapshot and direction != "stream" and self.level >= 2:
                 self.snapshot_dir.mkdir(parents=True, exist_ok=True)
                 namespace = f"{sanitize_filename(self.snapshot_namespace)}_" if self.snapshot_namespace else ""
                 snapshot_name = f"{entry.sequence:04d}_{namespace}{sanitize_filename(pass_name)}.json"
-                with open(self.snapshot_dir / snapshot_name, "w", encoding="utf-8") as handle:
-                    json.dump(entry.to_dict(), handle, indent=2, ensure_ascii=False)
+                zstd_io.write_json(self.snapshot_dir / snapshot_name, entry.to_dict())
         except Exception as exc:
             lib_logger.debug("Transform trace write failed for %s: %s", pass_name, exc)
         return entry

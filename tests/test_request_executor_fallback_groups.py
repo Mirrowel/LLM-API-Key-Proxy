@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 from types import MethodType
 
@@ -13,11 +15,28 @@ from rotator_library.routing.types import FallbackGroup
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class ClassifiedFailure(Exception):
     def __init__(self, error_type: str) -> None:
         super().__init__(error_type)
         self.error_type = error_type
 
+
+def _trace_entries(log_dir):
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
 
 def _context(*, routing_targets=None, logger=None, routing_group=None) -> RequestContext:
     return RequestContext(
@@ -228,7 +247,7 @@ async def test_non_streaming_fallback_group_emits_routing_trace(tmp_path) -> Non
 
     await _executor_with_attempts(attempts)._execute_non_streaming_with_fallback(_context(routing_targets=targets, logger=logger))
 
-    pass_names = [json.loads(line)["pass_name"] for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    pass_names = [json.loads(line)["pass_name"] for line in _trace_text(logger.log_dir).splitlines()]
     assert "routing_decision" in pass_names
     assert pass_names.count("routing_target_attempt_started") == 2
     assert "routing_target_attempt_failed" in pass_names

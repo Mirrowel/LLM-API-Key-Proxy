@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 from copy import deepcopy
 from types import MethodType, SimpleNamespace
@@ -47,6 +49,12 @@ REQUESTS: dict[str, dict[str, Any]] = {
 }
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 def test_success_dictionaries_are_not_misclassified_as_api_errors() -> None:
     assert is_structured_error_payload(RESPONSES["openai_chat"]) is False
     assert is_structured_error_payload({"error": {"message": "failed"}}) is True

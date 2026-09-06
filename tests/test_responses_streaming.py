@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import asyncio
 import json
 
@@ -7,6 +9,19 @@ import pytest
 
 from rotator_library.responses import InMemoryResponsesStore, ResponsesSSEFormatter, ResponsesService, ResponsesStoreSettings, ResponsesStreamEvent, ResponsesWebSocketFormatter
 from rotator_library.transaction_logger import TransactionLogger
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
+
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
 
 
 def _event_names(events: list[str]) -> list[str]:
@@ -359,7 +374,7 @@ async def test_stream_response_store_false_does_not_persist(tmp_path) -> None:
 
     response_id = events[0].split('"id": "')[1].split('"')[0]
     assert await store.get(response_id) is None
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "responses_store_skipped" in trace_text
     assert "responses_stored_stream_response" not in trace_text
 
@@ -564,7 +579,7 @@ async def test_stream_response_store_failures_emit_store_specific_trace(tmp_path
             )
         ]
 
-    entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
     errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
     assert any(entry["data"]["failed_pass_name"] == "responses_store_stream_response" for entry in errors)
     assert "secret-token" not in json.dumps(errors)
@@ -585,7 +600,7 @@ async def test_stream_current_state_store_failures_emit_store_specific_trace(tmp
             )
         ]
 
-    entries = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
     errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
     assert any(entry["data"]["failed_pass_name"] == "responses_store_stream_current_state" for entry in errors)
     assert "secret-token" not in json.dumps(errors)
@@ -605,7 +620,7 @@ async def test_stream_response_failure_trace_scrubs_header_like_secret_text(tmp_
         )
     ]
 
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "secret-token" not in trace_text
     assert "[REDACTED]" in trace_text
 
@@ -818,7 +833,7 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
 
     _ = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, FakeStreamingClient(), transaction_logger=logger)]
 
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "stream_started" in trace_text
     assert "stream_first_byte" in trace_text
     assert "stream_first_visible_output" in trace_text
@@ -829,7 +844,7 @@ async def test_responses_stream_records_common_stream_metrics(tmp_path) -> None:
     assert "responses_stream_event_output_text_delta" in trace_text
     assert "responses_stream_event_completed" in trace_text
     assert "responses_sse_formatted_event" in trace_text
-    usage_entry = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines() if '"usage_accounting_summary"' in line][-1]
+    usage_entry = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines() if '"usage_accounting_summary"' in line][-1]
     assert usage_entry["data"]["cost"]["provider_reported_cost"] == 0.044
 
 

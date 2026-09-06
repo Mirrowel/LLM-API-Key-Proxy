@@ -16,6 +16,9 @@ httpx
 aiofiles
 aiohttp
 
+# zstd compression for leveled transaction logging artifacts
+zstandard
+
 colorlog
 
 rich

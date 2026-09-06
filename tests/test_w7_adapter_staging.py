@@ -14,6 +14,8 @@ client of the same provider.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from copy import deepcopy
 
 import pytest
@@ -24,6 +26,19 @@ from rotator_library.native_provider.executor import NativeProviderExecutor
 from rotator_library.native_provider.http import NativeHTTPTransport
 
 
+
+
+@pytest.fixture(autouse=True)
+
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class RecordingTransport:
     def __init__(self, response):
         self.response = response
@@ -291,7 +306,7 @@ async def test_adapted_wire_feeds_cache_extract_usage_and_traces(tmp_path) -> No
     # The adapted value is what the client receives AND what downstream
     # stages (cache extract, usage) saw — traced in the right order.
     assert result["content"][0]["text"] == "fixed"
-    trace = [json.loads(line) for line in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    trace = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
     pass_names = [entry["pass_name"] for entry in trace]
     assert pass_names.index("after_response_adapter_chain") < pass_names.index("after_response_field_cache_extraction")
     assert pass_names.index("after_response_adapter_chain") < pass_names.index("parsed_native_unified_response")

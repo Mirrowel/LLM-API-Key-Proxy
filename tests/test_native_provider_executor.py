@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import json
 
 import pytest
@@ -12,6 +14,12 @@ from rotator_library.core.errors import StructuredAPIResponseError, classify_err
 from rotator_library.transaction_logger import TransactionLogger
 
 
+
+
+@pytest.fixture(autouse=True)
+def _trace_level_2(monkeypatch):
+    """Trace mechanics live at L2 (D15 tiers)."""
+    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class FakeHTTPResponse:
     def __init__(self, payload):
         self.payload = payload
@@ -113,7 +121,18 @@ async def test_native_transport_rejects_redirects_as_non_success() -> None:
 
 
 def _trace_entries(log_dir):
-    return [json.loads(line) for line in (log_dir / "transform_trace.jsonl").read_text(encoding="utf-8").splitlines()]
+    from rotator_library.utils import zstd_io
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
+def _trace_text(log_dir):
+    from rotator_library.utils import zstd_io
+
+    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+
+    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+
 
 
 @pytest.mark.asyncio
@@ -154,7 +173,7 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
 
     assert result["id"] == "chat_1"
     assert client.calls[0]["json"]["model"] == "provider/gpt-test"
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "hidden" not in trace_text
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "native_protocol_selected" in pass_names
@@ -249,7 +268,7 @@ async def test_native_provider_trace_redacts_configured_injection_paths(tmp_path
         NativeHTTPTransport(FakeHTTPClient({"id": "chat_2", "choices": [{"message": {"role": "assistant", "content": "ok"}}]})),
     )
 
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "opaque-state" not in trace_text
     assert '"state": "[REDACTED]"' in trace_text
 
@@ -457,7 +476,7 @@ async def test_native_adapter_generic_traces_are_suppressed_for_field_cache_safe
     assert "before_adapter_chain" not in pass_names
     assert "after_adapter" not in pass_names
     assert "after_request_adapter_chain" in pass_names
-    assert "opaque-state" not in (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    assert "opaque-state" not in _trace_text(logger.log_dir)
 
 
 @pytest.mark.asyncio
@@ -522,7 +541,7 @@ async def test_native_metadata_injection_trace_redacts_configured_paths(tmp_path
         NativeHTTPTransport(FakeHTTPClient({"id": "chat_2", "choices": []})),
     )
 
-    trace_text = (logger.log_dir / "transform_trace.jsonl").read_text(encoding="utf-8")
+    trace_text = _trace_text(logger.log_dir)
     assert "metadata-secret" not in trace_text
     metadata_entries = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "after_metadata_field_cache_injection"]
     assert metadata_entries[-1]["data"]["cached_blob"] == "[REDACTED]"
