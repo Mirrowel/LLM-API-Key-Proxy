@@ -789,7 +789,7 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
             ttl_seconds=int(data["ttl_seconds"]) if data.get("ttl_seconds") is not None else None,
             metadata=_metadata_dict(data.get("metadata", {})),
             allow_missing_session=as_bool(data.get("allow_missing_session", False), name="field_cache.allow_missing_session"),
-            max_values=int(data.get("max_values", 1024)),
+            max_values=int(data.get("max_values") or 1024),
             max_bytes=int(data.get("max_bytes", 4 * 1024 * 1024)),
         )
     except KeyError as exc:

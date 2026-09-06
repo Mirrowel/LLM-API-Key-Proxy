@@ -521,6 +521,7 @@ class FieldCacheEngine:
                 "hit": operation.hit,
                 "skipped": operation.skipped,
                 "reason": operation.reason,
+                "profile": operation.profile,
                 # Cached fields can include provider signatures or session keys.
                 # Trace only shape/count metadata; keep raw samples out of logs.
                 "sample_value_count": len(operation.sample_values),
