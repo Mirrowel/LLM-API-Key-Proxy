@@ -359,7 +359,8 @@ class TransactionLogger:
         self.classifier: Optional[str] = None
         self.api_format = api_format
         # W12 (D15): 1 = L1 boundaries + metadata (default); 2 = + intermediates
-        # (transform trace + snapshots); 3 = + verbose per-frame traces.
+        # (transform trace + snapshots); 3 = reserved for verbose per-frame
+        # (currently behaves as 2).
         self.trace_level = _resolve_trace_level()
         self.compressed = zstd_io.compression_available()
         self._attempt_records: list[Dict[str, Any]] = []

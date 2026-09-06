@@ -96,7 +96,7 @@ def append_jsonl(path: Path, entries: Iterable[Any], *, flush: bool = True) -> b
             # Fallback keeps ONE readable stream: if a compressed file
             # already exists, merge into a plain side file the reader
             # also merges (never a silent split the reader cannot see).
-            fallback = Path(str(path) + ".fallback.jsonl")
+            fallback = path if not compressed else Path(str(path) + ".fallback.jsonl")
             if compressed and target.exists() and not fallback.exists():
                 try:
                     with _LOCK:
