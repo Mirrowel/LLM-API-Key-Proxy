@@ -282,6 +282,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # overrides. Providers without a stable public base (dynamic/config
     # defined) leave this None.
     default_api_base: Optional[str] = None
+    # Multi-profile providers (D13): ``{name: {"protocol": ..., "endpoint_path": ...}}``.
+    # Profiles share one provider identity (credentials, quota, accounting);
+    # addressing is ``provider:profile/model``. Single-protocol providers
+    # leave this None and keep the plain ``protocol_name`` declaration.
+    transport_profiles: Optional[Dict[str, Dict[str, Any]]] = None
+    default_profile: Optional[str] = None
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
@@ -328,17 +334,31 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
         return None
 
-    def get_protocol_name(self, model: str = "") -> Optional[str]:
+    def get_protocol_name(self, model: str = "", profile: Optional[str] = None) -> Optional[str]:
         """Return the native protocol adapter name this provider prefers.
 
-        Providers may override this method when protocol choice varies by model.
-        Returning ``None`` keeps the current fallback execution behavior. Later
-        provider phases will use this as the bridge from provider declarations to
-        native protocol parsing/building.
+        Multi-profile providers (D13) resolve per profile; single-protocol
+        providers ignore the profile argument. Returning ``None`` keeps the
+        LiteLLM fallback execution behavior.
         """
 
         configured = self._get_runtime_config(model).protocol_name
-        return configured or self.protocol_name
+        if configured:
+            return configured
+        if self.transport_profiles and profile:
+            from ..routing.profiles import ModelReferenceError
+
+            entry = self.transport_profiles.get(profile)
+            if not isinstance(entry, dict):
+                raise ModelReferenceError(
+                    f"{self.__class__.__name__} has no profile {profile!r}; "
+                    f"known: {sorted(self.transport_profiles)}"
+                )
+            return str(entry.get("protocol") or self.protocol_name)
+        if self.transport_profiles and self.default_profile:
+            entry = self.transport_profiles.get(self.default_profile) or {}
+            return str(entry.get("protocol") or self.protocol_name)
+        return self.protocol_name
 
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
         """Return ordered adapter names for this provider/model.
@@ -453,10 +473,25 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         return "chat"
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        """Return the upstream endpoint for a native operation."""
+    def get_native_endpoint(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> str:
+        """Return the upstream endpoint for a native operation.
 
+        The default derives from the transport base plus the profile's
+        endpoint path (D13), or the class's single-protocol convention via
+        overrides. Single-protocol providers that did not override and have
+        no default_api_base fail loudly here.
+        """
+
+        if self.transport_profiles and profile:
+            entry = self.transport_profiles.get(profile) or {}
+            path = entry.get("endpoint_path") or self._default_endpoint_path(operation)
+            return f"{self.get_provider_api_base()}{path}"
         raise NotImplementedError(f"{self.__class__.__name__} does not define a native endpoint")
+
+    def _default_endpoint_path(self, operation: str = "chat") -> str:
+        """Default per-operation endpoint path (profiles without one)."""
+
+        return "/chat/completions"
 
     def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
         """Return non-payload HTTP headers for native requests.

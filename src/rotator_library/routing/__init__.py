@@ -7,6 +7,14 @@ from .config import RoutingConfigError, load_routing_config_from_env, parse_rout
 from .attempts import clone_context_for_target
 from .executor import FallbackAttemptRunner, FallbackExhaustedError
 from .policy import FallbackPolicy
+from .profiles import (
+    ModelReference,
+    ModelReferenceError,
+    parse_model_reference,
+    resolve_profile,
+    split_profile_from_provider,
+    valid_profile_name,
+)
 from .resolver import FallbackResolver
 from .types import FallbackGroup, RouteTarget, RoutingConfig, RoutingDecision, TargetGroup, TargetSelector
 

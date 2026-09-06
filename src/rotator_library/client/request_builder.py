@@ -260,6 +260,20 @@ class RequestContextBuilder:
             private,
         )
         model = kwargs.get("model", "")
+        # D13 grammar: provider:profile/model addresses a transport profile.
+        # Identity normalizes to the bare provider immediately — usage pools,
+        # cooldowns, classifiers, and session namespaces never see profiles.
+        # Plain provider/model references (and bare model names resolved by
+        # fallback routing) bypass the grammar entirely.
+        requested_profile: Optional[str] = None
+        if ":" in str(model or ""):
+            from ..routing.profiles import ModelReferenceError, parse_model_reference
+
+            reference = parse_model_reference(str(model))
+            requested_profile = reference.profile
+            if requested_profile:
+                model = reference.bare
+                kwargs["model"] = model
         routing_decision = self._resolve_routing_decision(model)
         routing_targets = routing_decision.targets if routing_decision else None
         provider = routing_targets[0].provider if routing_targets else self._provider_from_model(model)
@@ -331,6 +345,7 @@ class RequestContextBuilder:
         return RequestContext(
             model=resolved_model,
             provider=provider,
+            execution_profile=requested_profile,
             kwargs=kwargs,
             streaming=kwargs.get("stream", False),
             credentials=scope["credentials"],

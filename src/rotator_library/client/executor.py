@@ -809,16 +809,38 @@ class RequestExecutor:
 
         if not plugin:
             raise RoutingExecutionError(f"Provider {provider} has no plugin for native execution")
-        protocol_name = _provider_native_protocol(plugin, model, target)
+        profile = getattr(context, "execution_profile", None)
+        protocol_name = _provider_native_protocol(plugin, model, target, profile=profile)
         if not protocol_name:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
+        if getattr(plugin, "transport_profiles", None) and not profile:
+            # Bare-name fast-path-or-error (D13): the profile whose protocol
+            # matches the client's, or an explicit endpoint-does-not-exist
+            # error — never a silent conversion.
+            from ..routing.profiles import ModelReferenceError, resolve_profile
+
+            try:
+                profile = resolve_profile(
+                    declared_profiles=plugin.transport_profiles,
+                    default_profile=getattr(plugin, "default_profile", None),
+                    protocol_name=plugin.protocol_name,
+                    client_protocol=context.input_protocol_name,
+                    requested_profile=None,
+                    provider=provider,
+                )
+            except ModelReferenceError as exc:
+                raise RoutingExecutionError(str(exc)) from exc
+            if profile:
+                # Re-resolve the protocol for the selected profile (the
+                # default-profile protocol was resolved above).
+                protocol_name = _provider_native_protocol(plugin, model, target, profile=profile) or protocol_name
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
         operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
         if hasattr(plugin, "supports_native_operation") and not plugin.supports_native_operation(native_model, operation):
             raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
         try:
-            endpoint = plugin.get_native_endpoint(model=native_model, operation=operation)
+            endpoint = _call_profile_aware(plugin, "get_native_endpoint", native_model, operation, profile)
             headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
         except NotImplementedError as exc:
             raise RoutingExecutionError(str(exc)) from exc
@@ -856,6 +878,7 @@ class RequestExecutor:
                 "public_model": public_model,
                 "input_provider": context.input_provider,
                 "disable_provider_continuation": context.disable_provider_continuation,
+                "execution_profile": profile,
             },
             request_preparer=plugin.prepare_native_request if hasattr(plugin, "prepare_native_request") else None,
             request_validator=plugin.validate_request if hasattr(plugin, "validate_request") else None,
@@ -2941,12 +2964,30 @@ def _current_route_target(context: RequestContext) -> Optional[RouteTarget]:
     return targets[context.routing_target_index]
 
 
-def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget]) -> Optional[str]:
+def _call_profile_aware(plugin: Any, method_name: str, model: str, operation: str, profile: Optional[str]) -> str:
+    """Call a provider native hook, passing the profile only when the
+    implementation accepts it (single-protocol providers predate D13)."""
+
+    method = getattr(plugin, method_name)
+    if profile:
+        try:
+            return method(model=model, operation=operation, profile=profile)
+        except TypeError:
+            pass
+    return method(model=model, operation=operation)
+
+
+def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], profile: Optional[str] = None) -> Optional[str]:
     """Resolve native protocol from target override or provider declaration."""
 
     if target and target.protocol:
         return target.protocol
     if plugin and hasattr(plugin, "get_protocol_name"):
+        if profile:
+            try:
+                return plugin.get_protocol_name(model, profile=profile)
+            except TypeError:
+                return plugin.get_protocol_name(model)
         return plugin.get_protocol_name(model)
     return None
 
