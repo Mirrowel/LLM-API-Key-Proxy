@@ -37,14 +37,22 @@ def _stream_error_frames(error: BaseException, *, input_protocol: str) -> list[s
         _, payload = format_client_protocol_error(
             input_protocol="gemini",
             error=error,
-            error_type="internal_error",
+            error_type="server_error",
             status_code=500,
         )
         return [f"data: {json.dumps(payload)}\n\n"]
+    if input_protocol == "anthropic_messages":
+        _, payload = format_client_protocol_error(
+            input_protocol="anthropic_messages",
+            error=error,
+            error_type="api_error",
+            status_code=500,
+        )
+        return [f"event: error\ndata: {json.dumps(payload)}\n\n"]
     _, payload = format_client_protocol_error(
         input_protocol="openai_chat",
         error=error,
-        error_type="proxy_internal_error",
+        error_type="server_error",
         status_code=500,
     )
     return [f"data: {json.dumps(payload)}\n\n", "data: [DONE]\n\n"]

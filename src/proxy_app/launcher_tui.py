@@ -10,6 +10,8 @@ import json
 import os
 import sys
 from pathlib import Path
+
+from .startup_display import mask_secret_for_display
 from rich.console import Console
 from rich.prompt import IntPrompt, Prompt
 from rich.panel import Panel
@@ -452,7 +454,7 @@ class LauncherTUI:
         # Show actual API key value
         proxy_key = os.getenv("PROXY_API_KEY")
         if proxy_key:
-            self.console.print(f"   Proxy API Key:       {proxy_key}")
+            self.console.print(f"   Proxy API Key:       {mask_secret_for_display(proxy_key)}")
         else:
             self.console.print("   Proxy API Key:       [red]Not Set (INSECURE!)[/red]")
 

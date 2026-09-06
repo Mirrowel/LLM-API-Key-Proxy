@@ -744,7 +744,7 @@ async def chat_completions(
         status, content = format_client_protocol_error(
             input_protocol="openai_chat",
             error=e,
-            error_type="internal_error",
+            error_type="server_error",
             status_code=500,
         )
         return JSONResponse(status_code=status, content=content)
@@ -841,7 +841,7 @@ async def responses_create(
     except Exception as e:
         logging.error(f"Responses endpoint error: {e}")
         payload = _responses_error_response(
-            ResponsesServiceError(str(e), status_code=500, error_type="internal_error"),
+            ResponsesServiceError(str(e), status_code=500, error_type="server_error"),
             "responses",
         )
         if logger:
@@ -970,9 +970,10 @@ async def anthropic_messages(
         result = await client.anthropic_messages(body, raw_request=request)
 
         if body.get("stream"):
-            # Streaming response
+            # Streaming response — wrapped so post-start failures end in an
+            # Anthropic error event instead of an aborted SSE stream.
             return StreamingResponse(
-                result,
+                streaming_response_wrapper(request, body, result, logger, input_protocol="anthropic_messages"),
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )
@@ -1033,7 +1034,7 @@ async def anthropic_messages(
             )
         status, content = format_client_protocol_error(
             input_protocol="anthropic_messages", error=e,
-            error_type="internal_error", status_code=500,
+            error_type="server_error", status_code=500,
         )
         return JSONResponse(status_code=status, content=content)
 
@@ -1126,7 +1127,7 @@ async def gemini_generate_content(
         return JSONResponse(status_code=status, content=content)
     except Exception as error:
         status, content = format_client_protocol_error(
-            input_protocol="gemini", error=error, error_type="internal_error",
+            input_protocol="gemini", error=error, error_type="server_error",
             status_code=500,
         )
         return JSONResponse(status_code=status, content=content)
@@ -1168,7 +1169,7 @@ async def gemini_stream_generate_content(
         )
     except Exception as error:
         status, content = format_client_protocol_error(
-            input_protocol="gemini", error=error, error_type="internal_error",
+            input_protocol="gemini", error=error, error_type="server_error",
             status_code=500,
         )
         return JSONResponse(status_code=status, content=content)
@@ -1271,7 +1272,7 @@ async def embeddings(
     except litellm.Timeout as e:
         status, content = format_client_protocol_error(
             input_protocol="openai_chat", error=e,
-            error_type="timeout", status_code=504,
+            error_type="proxy_timeout", status_code=504,
         )
         return JSONResponse(status_code=status, content=content)
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
@@ -1284,7 +1285,7 @@ async def embeddings(
         logging.error(f"Embedding request failed: {e}")
         status, content = format_client_protocol_error(
             input_protocol="openai_chat", error=e,
-            error_type="internal_error", status_code=500,
+            error_type="server_error", status_code=500,
         )
         return JSONResponse(status_code=status, content=content)
 
@@ -1533,16 +1534,24 @@ async def token_count(
         messages = data.get("messages")
 
         if not model or not messages:
-            raise HTTPException(
-                status_code=400, detail="'model' and 'messages' are required."
-            )
+            raise ValueError("'model' and 'messages' are required.")
 
         count = client.token_count(**data)
         return {"token_count": count}
 
+    except ValueError as e:
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Token count failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="server_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1/cost-estimate")
@@ -1580,7 +1589,13 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
         cache_creation_tokens = data.get("cache_creation_tokens", 0)
 
         if not model:
-            raise HTTPException(status_code=400, detail="'model' is required.")
+            status, content = format_client_protocol_error(
+                input_protocol="openai_chat",
+                error=ValueError("'model' is required."),
+                error_type="invalid_request",
+                status_code=400,
+            )
+            return JSONResponse(status_code=status, content=content)
 
         model_info_service = getattr(request.app.state, "model_info_service", None)
         if model_info_service is not None:
