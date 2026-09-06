@@ -764,7 +764,8 @@ class RequestExecutor:
             # operational pipeline formats exactly once (W5).
             client_protocol_name=context.input_protocol_name,
             # D4 raw fast path: same-protocol requests carry the pristine
-            # client payload as the transport basis.
+            # client payload as the transport basis. (Streaming never reads
+            # this field — the neutral-event pipeline owns stream transport.)
             raw_client_request=deepcopy(context.protocol_request) if (context.input_protocol_name == protocol_name and context.protocol_request) else None,
             headers=headers,
             credential_id=credential_id,

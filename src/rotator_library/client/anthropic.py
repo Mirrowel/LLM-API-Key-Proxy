@@ -102,6 +102,9 @@ class AnthropicHandler:
                 stage="client",
             )
 
+        # The pydantic round-trip keeps unknown/extension fields alive via
+        # extra="allow" on the compat models (D4 fidelity until the facade
+        # retires in W6+W9).
         anthropic_request = request.model_dump(exclude_none=True)
 
         if hasattr(self._client, "agenerate"):

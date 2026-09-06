@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 import pytest
 
 from rotator_library.native_provider import NativeProviderContext, NativeProviderExecutor
@@ -168,8 +170,91 @@ async def test_attempt_mutations_force_traced_rebuild() -> None:
     # payload: the canonical rebuild carries the mutation, raw cannot.
     await NativeProviderExecutor().execute(mutated, context, transport)
 
-    assert context.request_transport_overlays == [{"kind": "canonical_rebuild", "reason": "attempt_mutations"}]
+    assert context.request_transport_overlays == [{"kind": "canonical_rebuild", "reason": "payload_divergence"}]
     assert transport.payload["messages"][0]["content"] == "mutated"
+
+
+@pytest.mark.asyncio
+async def test_generation_param_mutation_is_never_silently_dropped() -> None:
+    payload = {
+        "model": "provider/model-a",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.5,
+    }
+    mutated = {
+        "model": "provider/model-a",
+        "messages": [{"role": "user", "content": "hi"}],
+        "temperature": 0.9,
+    }
+    transport = RecordingTransport({"choices": [], "usage": {"prompt_tokens": 1}})
+    context = _context("openai_chat", raw_client_request=payload)
+
+    await NativeProviderExecutor().execute(mutated, context, transport)
+
+    # The gate must see generation-param divergence: rebuild carries 0.9 and
+    # the deviation is traced — never silently dropped on the raw basis.
+    assert context.request_transport_overlays == [{"kind": "canonical_rebuild", "reason": "payload_divergence"}]
+    assert transport.payload["temperature"] == 0.9
+
+
+@pytest.mark.asyncio
+async def test_interleaved_system_messages_keep_raw_path() -> None:
+    payload = {
+        "model": "provider/model-a",
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "system", "content": "mid-conversation instruction"},
+            {"role": "user", "content": "q2"},
+        ],
+    }
+    transport = RecordingTransport({"choices": [], "usage": {"prompt_tokens": 1}})
+    context = _context("openai_chat", raw_client_request=payload)
+
+    await NativeProviderExecutor().execute(deepcopy(payload), context, transport)
+
+    # Legal interleaved system messages are source-native: the raw basis
+    # preserves the exact order (no instruction hoisting on the diagonal) and
+    # no overlay is recorded.
+    assert transport.payload == payload
+    assert context.request_transport_overlays == []
+
+
+@pytest.mark.asyncio
+async def test_executor_wires_protocol_request_as_raw_basis() -> None:
+    from rotator_library.client.executor import RequestExecutor
+    from rotator_library.core.types import RequestContext
+
+    class _Plugin:
+        def get_protocol_name(self, model):
+            return "openai_chat"
+
+        def get_native_endpoint(self, *, model, operation):
+            return "https://example.test/v1/chat/completions"
+
+        def get_native_headers(self, credential, *, model, operation):
+            return {}
+
+    executor = RequestExecutor.__new__(RequestExecutor)
+    context = RequestContext(
+        model="provider/model-a",
+        provider="provider",
+        kwargs={"model": "provider/model-a", "messages": []},
+        streaming=False,
+        credentials=["cred-1"],
+        deadline=9999999999.0,
+        protocol_request={"model": "provider/model-a", "messages": [{"role": "user", "content": "hi"}], "future": True},
+        input_protocol_name="openai_chat",
+    )
+    native_context = executor._build_native_provider_context(
+        "provider", "provider/model-a", _Plugin(), "secret", "cred-1", context, None
+    )
+    assert native_context.raw_client_request == context.protocol_request
+
+    context.input_protocol_name = "anthropic_messages"
+    cross_context = executor._build_native_provider_context(
+        "provider", "provider/model-a", _Plugin(), "secret", "cred-1", context, None
+    )
+    assert cross_context.raw_client_request is None
 
 
 @pytest.mark.asyncio

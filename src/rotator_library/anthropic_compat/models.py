@@ -9,7 +9,7 @@ enabling compatibility with Claude Code and other Anthropic API clients.
 """
 
 from typing import Any, List, Optional, Union
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 # --- Content Blocks ---
@@ -89,7 +89,14 @@ class AnthropicThinkingConfig(BaseModel):
 
 # --- Messages Request ---
 class AnthropicMessagesRequest(BaseModel):
-    """Anthropic Messages API request format."""
+    """Anthropic Messages API request format.
+
+    ``extra="allow"`` keeps unknown/extension fields alive through the
+    pydantic round-trip so same-protocol transport preserves them (D4);
+    the facade retires in W6+W9 when the route unifies on the runtime.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     model: str
     messages: List[AnthropicMessage]

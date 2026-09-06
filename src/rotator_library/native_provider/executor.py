@@ -84,11 +84,14 @@ class NativeProviderExecutor:
                     provider_request = deepcopy(raw_wire)
                     raw_basis_used = True
                     if "model" in provider_request and provider_request.get("model") != context.model:
+                        # Model overlay: traced, in-body only. Protocols whose
+                        # model rides the endpoint (Gemini) keep their native
+                        # keyless shape — the endpoint already carries it.
                         overlays.append({"field": "model", "from": provider_request.get("model"), "to": context.model})
                         provider_request["model"] = context.model
                 else:
                     provider_request = provider_protocol.build_request(unified_request, provider_context)
-                    overlays.append({"kind": "canonical_rebuild", "reason": "attempt_mutations"})
+                    overlays.append({"kind": "canonical_rebuild", "reason": "payload_divergence"})
             else:
                 provider_request = provider_protocol.build_request(unified_request, provider_context)
                 if not same_protocol:
@@ -148,11 +151,13 @@ class NativeProviderExecutor:
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
-            if raw_basis_used and not adapters:
-                # D4 raw response passthrough: same protocol, no response
+            response_stage_adapters = [a for a in adapters if "response" in getattr(a, "supported_stages", ("request", "response"))]
+            if raw_basis_used and not response_stage_adapters:
+                # D4 raw response passthrough: same protocol, no response-stage
                 # adapters, no proxy semantic edits — the provider's response
                 # IS the client's response, byte-for-byte (sidecar observation
-                # above feeds usage/session/accounting).
+                # above feeds usage/session/accounting). Request-stage adapters
+                # do not touch responses and do not disable the passthrough.
                 client_response = deepcopy(raw_response)
                 self._trace(context, "raw_fast_path_response", client_response, direction="response", stage="protocol")
             else:
@@ -479,13 +484,16 @@ class NativeProviderExecutor:
 def _wire_view_matches_unified(wire_view: Any, unified_request: Any) -> bool:
     """D4 gate: the pristine wire payload still matches the request we would send.
 
-    Compares the semantic core (messages, system, tools, structured output,
-    stream flag — model is overlaid separately). Any divergence means attempt
-    mutations or transforms edited the request and the canonical rebuild (an
-    explicit, traced overlay) must run instead of the raw basis.
+    Compares the full semantic core of the request — messages (in
+    instruction-normalized order, so legal interleaved system messages do not
+    spuriously diverge), system, tools, structured output, stream flag,
+    generation params, metadata, modalities, files, previous_response_id,
+    extensions, extra. Model is excluded (overlaid separately). Any divergence
+    means the canonical rebuild (an explicit, traced overlay) must run instead
+    of the raw basis — a mutation must never ship silently untraced.
     """
 
-    if wire_view.messages != unified_request.messages:
+    if _normalized_messages(wire_view) != _normalized_messages(unified_request):
         return False
     if wire_view.system != unified_request.system:
         return False
@@ -495,7 +503,38 @@ def _wire_view_matches_unified(wire_view: Any, unified_request: Any) -> bool:
         return False
     if bool(wire_view.stream) != bool(unified_request.stream):
         return False
+    if wire_view.generation_params != unified_request.generation_params:
+        return False
+    if wire_view.metadata != unified_request.metadata:
+        return False
+    if wire_view.modalities != unified_request.modalities:
+        return False
+    if wire_view.files != unified_request.files:
+        return False
+    if wire_view.previous_response_id != unified_request.previous_response_id:
+        return False
+    if wire_view.extensions != unified_request.extensions:
+        return False
+    if wire_view.extra != unified_request.extra:
+        return False
     return True
+
+
+def _normalized_messages(request: Any) -> list[Any]:
+    """Instruction-first message order (the canonical normalization).
+
+    Wire payloads may legally interleave system/developer messages; the
+    canonical model hoists instructions. Comparing in normalized order keeps
+    the D4 raw path for interleaved (still source-native) payloads while
+    catching every real content mutation.
+    """
+
+    messages = list(request.messages)
+    instructions = [m for m in messages if m.role in {"system", "developer"}]
+    if not instructions:
+        return messages
+    conversation = [m for m in messages if m.role not in {"system", "developer"}]
+    return instructions + conversation
 
 
 def _merge_stream_usage_records(base: Any, event_record: Any, raw_record: Any) -> Any:
