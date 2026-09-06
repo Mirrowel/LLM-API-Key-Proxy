@@ -270,13 +270,18 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Union[int, Tuple[int, ...], str], Dict[str, Dict[str, Any]]
     ] = {}
 
-    # Native protocol/adapter declarations introduced for the experimental
-    # protocol stack. Defaults are intentionally no-op so existing providers keep
-    # the LiteLLM-backed execution path until they opt into native protocols.
+    # Native protocol/adapter declarations. W11 flips the default execution
+    # mode: providers declaring ``protocol_name`` run native-by-default
+    # (LiteLLM is an explicit, logged fallback); undeclared providers keep
+    # the LiteLLM-backed path.
     protocol_name: Optional[str] = None
     adapter_names: Tuple[str, ...] = ()
     field_cache_rules: Tuple[Any, ...] = ()
     native_streaming_supported: bool = False
+    # Default transport base for native execution; env ``{PROVIDER}_API_BASE``
+    # overrides. Providers without a stable public base (dynamic/config
+    # defined) leave this None.
+    default_api_base: Optional[str] = None
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
@@ -454,9 +459,47 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         raise NotImplementedError(f"{self.__class__.__name__} does not define a native endpoint")
 
     def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
-        """Return non-payload HTTP headers for native requests."""
+        """Return non-payload HTTP headers for native requests.
 
-        raise NotImplementedError(f"{self.__class__.__name__} does not define native headers")
+        The default covers bearer-token OpenAI-compatible providers
+        (native-by-default, W11); providers with different auth schemes
+        (e.g. Gemini's ``x-goog-api-key``) override this.
+        """
+
+        return {"Authorization": f"Bearer {credential_identifier}"}
+
+    def get_provider_api_base(self) -> Optional[str]:
+        """Return this provider's transport base URL.
+
+        Resolution order: ``{PROVIDER}_API_BASE`` env override, then the
+        class-declared ``default_api_base``. Provider transport identity is
+        canonical in the provider class (never duplicated elsewhere).
+        """
+
+        if self.default_api_base is None:
+            return None
+        env_key = self._plugin_key()
+        override = os.getenv(f"{env_key.upper()}_API_BASE") if env_key else None
+        return (override or self.default_api_base).rstrip("/")
+
+    def _plugin_key(self) -> Optional[str]:
+        """Return this provider's registry key in PROVIDER_PLUGINS."""
+
+        cached = getattr(self, "_plugin_key_cache", None)
+        if cached is not None:
+            return cached or None
+        from . import PROVIDER_PLUGINS
+
+        key = None
+        for name, plugin_class in PROVIDER_PLUGINS.items():
+            if isinstance(self, plugin_class):
+                key = name
+                break
+        try:
+            self._plugin_key_cache = key or ""
+        except AttributeError:
+            pass
+        return key
 
     def normalize_native_model(self, model: str) -> str:
         """Return the upstream model name for native provider calls.

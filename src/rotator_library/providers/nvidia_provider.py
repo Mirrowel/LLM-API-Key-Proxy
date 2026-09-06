@@ -13,6 +13,14 @@ if not lib_logger.handlers:
 
 
 class NvidiaProvider(ProviderInterface):
+    protocol_name = "openai_chat"
+    native_streaming_supported = True
+    default_api_base = "https://integrate.api.nvidia.com/v1"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        base = self.get_provider_api_base()
+        return f"{base}/chat/completions"
+
     skip_cost_calculation = True
     """
     Provider implementation for the NVIDIA API.

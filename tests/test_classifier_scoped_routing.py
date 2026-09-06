@@ -42,9 +42,14 @@ def _make_client(tmp_path, **kwargs):
     )
 
 
-def test_default_completion_keeps_backward_compatible_global_pool(tmp_path):
+def test_default_completion_keeps_backward_compatible_global_pool(tmp_path, monkeypatch):
     captured = {}
     client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
+    # W11: openai is native-by-default; this fixture pins the LiteLLM
+    # backward-compat path, so the protocol declaration is disabled for it.
+    from rotator_library.providers import PROVIDER_PLUGINS
+
+    monkeypatch.setattr(PROVIDER_PLUGINS["openai"](), "protocol_name", None, raising=False)
 
     async def fake_acompletion(**kwargs):
         captured.update(kwargs)

@@ -649,7 +649,58 @@ class RequestExecutor:
 
         response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
         _raise_for_structured_response_error(response)
+        self._record_litellm_fallback_identity(context, provider, plugin, model, stream=False)
         return self._format_execution_response(response, "openai_chat", context)
+
+    def _record_litellm_fallback_identity(
+        self,
+        context: RequestContext,
+        provider: str,
+        plugin: Any,
+        model: str,
+        *,
+        stream: bool,
+    ) -> None:
+        """Record LiteLLM fallback identity when a native protocol existed.
+
+        Native-by-default (W11): LiteLLM is an explicit, logged fallback —
+        never a silent one. When a provider declares a native protocol but
+        the request still ran through LiteLLM (explicit execution override
+        or an operation without native support), the fallback identity
+        lands in the transaction metadata and the log.
+        """
+
+        try:
+            protocol = plugin.get_protocol_name(model) if plugin and hasattr(plugin, "get_protocol_name") else None
+        except Exception:
+            protocol = None
+        if not protocol:
+            return
+        logger = getattr(context, "transaction_logger", None)
+        if logger is not None:
+            try:
+                logger.record_attempt(
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "execution": "litellm_fallback",
+                        "stream": bool(stream),
+                        "native_protocol_available": protocol,
+                    }
+                )
+                logger.update_metadata(
+                    execution_mode="litellm_fallback",
+                    native_protocol_available=protocol,
+                )
+            except Exception:
+                lib_logger.debug("litellm fallback identity recording failed", exc_info=True)
+        lib_logger.warning(
+            "litellm_fallback: %s/%s executed via LiteLLM while native protocol '%s' was available%s",
+            provider,
+            model,
+            protocol,
+            " (streaming)" if stream else "",
+        )
 
     def _get_native_executor(self) -> NativeProviderExecutor:
         """Return the shared native executor for process-local field-cache state."""
@@ -796,6 +847,19 @@ class RequestExecutor:
             request_preparer=plugin.prepare_native_request if hasattr(plugin, "prepare_native_request") else None,
             request_validator=plugin.validate_request if hasattr(plugin, "validate_request") else None,
         )
+        # W12 metadata producers: protocol pair + execution identity + the
+        # raw fast-path/overlay record (reconstruction inputs).
+        if context.transaction_logger is not None:
+            try:
+                context.transaction_logger.update_metadata(
+                    input_protocol=context.input_protocol_name,
+                    upstream_protocol=protocol_name,
+                    execution_mode="native",
+                    native_endpoint=endpoint,
+                    fast_path=bool(native_context.raw_client_request),
+                )
+            except Exception:
+                lib_logger.debug("native metadata wiring failed", exc_info=True)
         if return_request:
             if context.unified_request is None:
                 raise RoutingExecutionError("Native execution requires a canonical request")
@@ -1681,6 +1745,7 @@ class RequestExecutor:
                                             metadata={"execution": "litellm_stream", "provider": provider, "model": model},
                                         )
                                         stream = await litellm.acompletion(**kwargs)
+                                        self._record_litellm_fallback_identity(context, provider, plugin, model, stream=True)
                                     elif execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
                                         if not plugin or not plugin.has_custom_logic():
                                             raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
@@ -2914,9 +2979,11 @@ def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:
 def _should_use_native_streaming(plugin: Any, model: str, target: Optional[RouteTarget], execution: str, provider: str) -> bool:
     """Return whether streaming may use the native executor.
 
-    Explicit `@native` routing is still constrained by provider capability.
-    Falling through to native streaming when a provider has not opted in is unsafe
-    because the generic stream wrapper currently expects LiteLLM-shaped chunks.
+    Explicit ``@native`` routing is still constrained by provider capability.
+    Since W5 the native stream path yields neutral events through the
+    operational pipeline, so declared protocols stream natively by default
+    (W11); undeclared providers fall back to LiteLLM with a logged fallback
+    identity instead of silently claiming native support.
     """
 
     if execution == "native":
