@@ -111,6 +111,54 @@ def test_rotation_class_failures_never_capture(tmp_path, monkeypatch) -> None:
     assert not (logger.log_dir / "capture").exists()
 
 
+def test_capture_bucket_covers_classifier_aliases() -> None:
+    """The exclusion set stays aligned with the classifier vocabulary:
+    every rotation-class error_type classify_error produces must be
+    excluded from capture; request-relevant classes must qualify."""
+
+    from rotator_library.error_handler import classify_error
+    from rotator_library.transaction_logger import _error_qualifies_for_capture
+
+    class _Fake(Exception):
+        def __init__(self, message: str, error_type: str) -> None:
+            super().__init__(message)
+            self.error_type = error_type
+
+    rotation_inputs = [
+        _Fake("Rate limit exceeded", "rate_limit"),
+        _Fake("quota exceeded on tier", "quota_exceeded"),
+        _Fake("authentication error", "authentication_error"),
+        _Fake("permission denied", "permission_error"),
+        _Fake("timeout", "proxy_timeout"),
+    ]
+    for exc in rotation_inputs:
+        assert _error_qualifies_for_capture(exc) is False, exc.error_type
+
+    # Native provider spellings normalize to classifier stems.
+    assert _error_qualifies_for_capture(_Fake("rl", "rate_limit_error")) is False
+    assert _error_qualifies_for_capture(_Fake("q", "Quota-Exceeded")) is False
+    # Structured status codes win over type labels.
+    class _Structured(Exception):
+        def __init__(self, status_code: int) -> None:
+            super().__init__("structured")
+            self.status_code = status_code
+
+    assert _error_qualifies_for_capture(_Structured(429)) is False
+    assert _error_qualifies_for_capture(_Structured(504)) is False
+    assert _error_qualifies_for_capture(_Structured(400)) is True
+    # Mid-stream provider error payloads.
+    class _Streamed(Exception):
+        def __init__(self, data: dict) -> None:
+            super().__init__("streamed")
+            self.data = data
+
+    assert _error_qualifies_for_capture(_Streamed({"error": {"type": "rate_limit_error"}})) is False
+    assert _error_qualifies_for_capture(_Streamed({"error": {"type": "invalid_request_error"}})) is True
+    # The real classifier agrees on the split for representative inputs.
+    classified = classify_error(_Fake("Rate limit exceeded", "rate_limit"))
+    assert classified.error_type in {"rate_limit", "rate_limit_error"}
+
+
 def test_log_transform_error_triggers_capture_and_records_metadata(tmp_path, monkeypatch) -> None:
     monkeypatch.delenv("TRANSACTION_LOG_LEVEL", raising=False)
     logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)

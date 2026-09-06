@@ -94,10 +94,10 @@ def append_jsonl(path: Path, entries: Iterable[Any], *, flush: bool = True) -> b
         lib_logger.debug("zstd jsonl append failed for %s; falling back", path, exc_info=True)
         try:
             # Fallback keeps ONE readable stream: if a compressed file
-            # already exists, merge into a plain side file the reader also
-            # merges (never a silent split the reader cannot see).
+            # already exists, merge into a plain side file the reader
+            # also merges (never a silent split the reader cannot see).
             fallback = Path(str(path) + ".fallback.jsonl")
-            if compressed and target.exists():
+            if compressed and target.exists() and not fallback.exists():
                 try:
                     with _LOCK:
                         prior = _DECOMPRESSOR.decompress(target.read_bytes()).decode("utf-8")
@@ -105,7 +105,7 @@ def append_jsonl(path: Path, entries: Iterable[Any], *, flush: bool = True) -> b
                     target.unlink(missing_ok=True)
                 except Exception:
                     pass
-            with open(fallback if fallback.exists() else (path if not compressed else fallback), "a", encoding="utf-8") as handle:
+            with open(fallback, "a", encoding="utf-8") as handle:
                 handle.write(lines)
         except Exception:
             lib_logger.debug("fallback append also failed for %s", path, exc_info=True)

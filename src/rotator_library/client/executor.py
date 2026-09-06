@@ -2671,8 +2671,10 @@ class RequestExecutor:
                         )
         except BaseException as stream_error:
             # Failed streams still get their L1 summary BEFORE the error
-            # propagates: metadata with the error record, capture-on-error
-            # for qualifying failures, and the buffered chunks preserved.
+            # propagates — except client disconnects (cancellation is not a
+            # request failure: no 500, no capture).
+            if isinstance(stream_error, (asyncio.CancelledError, GeneratorExit)):
+                raise
             try:
                 transaction_logger.log_transform_error(
                     "stream_transaction",
@@ -2708,6 +2710,12 @@ class RequestExecutor:
                 lib_logger.debug(
                     f"Failed to assemble/log final streaming response: {e}"
                 )
+        else:
+            # Empty successful streams still get their L1 summary.
+            try:
+                transaction_logger.finalize_metadata(status_code=200)
+            except Exception:
+                lib_logger.debug("empty-stream metadata finalize failed", exc_info=True)
 
 
 def _target_trace(target: RouteTarget) -> Dict[str, Any]:

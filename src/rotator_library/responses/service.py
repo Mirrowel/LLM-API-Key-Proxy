@@ -405,6 +405,9 @@ class ResponsesService:
                 session_info={"scope_access_hash": resolved_scope.access_token_hash},
             ):
                 yield frame
+            # Finalize AFTER the terminal frames so the error records the
+            # terminal path wrote land in metadata.
+            self._finalize_stream_metadata(transaction_logger, error=exc)
             return
         completed = False
         response_context = ProtocolContext(
@@ -448,7 +451,6 @@ class ResponsesService:
         except Exception as exc:
             # Post-start failures never escape into the transport: the client
             # receives a protocol-valid terminal sequence instead (defect 10).
-            self._finalize_stream_metadata(transaction_logger, error=exc)
             async for frame in self._terminal_stream_failure(
                 stream_request,
                 unified.model,
@@ -458,30 +460,27 @@ class ResponsesService:
                 session_info=session_info,
             ):
                 yield frame
+            # Finalize AFTER the terminal frames so their error records land
+            # in metadata (order matters: finalize reads _error_records).
+            self._finalize_stream_metadata(transaction_logger, error=exc)
             return
         if not completed:
             # The stream ended without a terminal event — synthesize one.
-            self._finalize_stream_metadata(
-                transaction_logger,
-                error=ResponsesServiceError(
-                    "Responses stream ended without a terminal response event",
-                    status_code=502,
-                    error_type="upstream_error",
-                ),
+            terminal_exc = ResponsesServiceError(
+                "Responses stream ended without a terminal response event",
+                status_code=502,
+                error_type="upstream_error",
             )
             async for frame in self._terminal_stream_failure(
                 stream_request,
                 unified.model,
                 parent,
-                ResponsesServiceError(
-                    "Responses stream ended without a terminal response event",
-                    status_code=502,
-                    error_type="upstream_error",
-                ),
+                terminal_exc,
                 transaction_logger=transaction_logger,
                 session_info=session_info,
             ):
                 yield frame
+            self._finalize_stream_metadata(transaction_logger, error=terminal_exc)
             return
         # Completed streams still get their L1 summary.
         self._finalize_stream_metadata(transaction_logger)
@@ -983,6 +982,7 @@ class ResponsesService:
             yield ResponsesStreamEvent("response.completed", completed)
             self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("done", {}, terminal=True)
+            self._finalize_stream_metadata(transaction_logger)
         except Exception as exc:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, _stream_failure_error(exc))
@@ -1005,6 +1005,9 @@ class ResponsesService:
             yield ResponsesStreamEvent("response.failed", failed)
             self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport, "failed": True})
             yield ResponsesStreamEvent("done", {}, terminal=True)
+            # Finalize AFTER the failure frames so their error records land
+            # in metadata (order matters: finalize reads _error_records).
+            self._finalize_stream_metadata(transaction_logger, error=exc)
         finally:
             if chat_stream is None and acquire_task is not None and acquire_task.done() and not acquire_task.cancelled():
                 try:

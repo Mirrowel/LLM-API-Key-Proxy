@@ -156,7 +156,9 @@ def _resolve_trace_level() -> int:
 # alias-coverage test pins this set against classify_error outputs).
 _ROTATION_ERROR_TYPES = {
     "rate_limit",
+    "rate_limit_error",
     "quota_exceeded",
+    "quota_exceeded_error",
     "proxy_all_credentials_exhausted",
     "authentication",
     "authentication_error",
@@ -165,35 +167,52 @@ _ROTATION_ERROR_TYPES = {
     "reauth",
     "credential_reauth",
     "credential_reauth_needed",
+    "permission_error",
     "forbidden",
     "proxy_timeout",
+    "timeout",
+    "request_timeout",
 }
+
+
+def _normalize_error_type(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
+
+
+def _is_rotation_error_type(value: Any) -> bool:
+    normalized = _normalize_error_type(value)
+    if normalized in _ROTATION_ERROR_TYPES:
+        return True
+    # Native provider spellings ("rate_limit_error") reduce to the
+    # classifier stem ("rate_limit").
+    for suffix in ("_error", "_exception"):
+        if normalized.endswith(suffix) and normalized[: -len(suffix)] in _ROTATION_ERROR_TYPES:
+            return True
+    return False
 
 
 def _error_qualifies_for_capture(error: BaseException) -> bool:
     """Request-related failures archive buffered intermediates (400-class
     payload/protocol problems, unexpected crashes); rotation-class
     failures (429s, quota, credential refresh, transport timeouts) do
-    not."""
+    not. Status codes win over type strings: a structured 429-class
+    response is rotation regardless of its type label."""
 
+    structured_status = getattr(error, "status_code", None)
+    if isinstance(structured_status, int) and structured_status in (429, 401, 403, 408, 504):
+        return False
     explicit = getattr(error, "error_type", None)
-    if isinstance(explicit, str) and explicit:
-        normalized = explicit.strip().lower().replace("-", "_").replace(" ", "_")
-        return normalized not in _ROTATION_ERROR_TYPES
+    if isinstance(explicit, str) and explicit and _is_rotation_error_type(explicit):
+        return False
     # Mid-stream errors: their payload may carry a provider error type.
     data = getattr(error, "data", None)
     if isinstance(data, dict):
         inner = data.get("error")
         if isinstance(inner, dict):
-            inner_type = str(inner.get("type") or inner.get("code") or "").strip().lower().replace("-", "_")
-            if inner_type and inner_type in _ROTATION_ERROR_TYPES:
-                return False
-    structured_status = getattr(error, "status_code", None)
-    if isinstance(structured_status, int):
-        if structured_status in (429, 401, 403, 408, 504):
-            return False
-        return True
-    # Unexpected exception types (crashes) always qualify.
+            for key in ("type", "code"):
+                if _is_rotation_error_type(inner.get(key)):
+                    return False
+    # 400-class, 5xx crashes, and unexpected exception types qualify.
     return True
 
 
@@ -574,6 +593,17 @@ class TransactionLogger:
         """Write metadata.json without a response body (stream + responses
         routes) — the L1 summary is always produced."""
 
+        if error is not None:
+            # Ensure the failure that triggered this finalize is recorded
+            # even when no log_transform_error ran first.
+            record = {
+                "failed_pass_name": "finalize",
+                "error_type": type(error).__name__,
+                "message": str(error)[:2000],
+                "stage": "final",
+            }
+            if not any(entry.get("error_type") == type(error).__name__ and entry.get("message") == record["message"] for entry in self._error_records):
+                self._error_records.append(record)
         self._flush_chunk_buffer()
         self._finalize_trace_writer()
         self._log_metadata({}, status_code, (time.time() - self.start_time) * 1000)
@@ -1075,6 +1105,20 @@ class ProviderLogger:
             snapshot=snapshot,
         )
 
+    def finalize(self) -> None:
+        """Flush the provider-side trace writer's pending batch.
+
+        The provider writer shares the transaction's transform_trace.jsonl
+        with the client writer but batches independently; terminal points
+        (final response, error) flush so no entries are lost.
+        """
+
+        if self._trace_writer is not None:
+            try:
+                self._trace_writer.flush_pending()
+            except Exception:
+                lib_logger.debug("provider trace writer finalize failed", exc_info=True)
+
     def log_request(self, payload: Dict[str, Any]) -> None:
         """
         Log the request payload sent to the provider API.
@@ -1120,6 +1164,7 @@ class ProviderLogger:
             direction="response",
         )
         self._write_json("final_response.json", sanitize_for_trace(response_data))
+        self.finalize()
 
     def log_error(self, error_message: str) -> None:
         """
@@ -1137,6 +1182,7 @@ class ProviderLogger:
             snapshot=False,
         )
         self._append_text("error.log", f"[{timestamp}] {error_message}\n")
+        self.finalize()
 
     def log_extra(self, filename: str, data: Union[Dict[str, Any], str]) -> None:
         """
