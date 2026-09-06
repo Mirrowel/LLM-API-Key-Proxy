@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from copy import deepcopy
 from functools import lru_cache
@@ -3260,9 +3261,7 @@ def _provider_env_cache_replay(provider: str) -> tuple[Any, ...]:
     """Compile ``<NAME>_CACHE_REPLAY`` once per distinct env value (the env
     is static for the process; per-request JSON parsing is waste)."""
 
-    import os
-
-    raw = os.getenv(f"{provider.upper().replace('-', '_')}_CACHE_REPLAY", "")
+    raw = os.getenv(f"{re.sub(r'[^A-Z0-9]+', '_', provider.upper())}_CACHE_REPLAY", "")
     if not raw.strip():
         return ()
     return _env_cache_replay_cached(raw, provider)

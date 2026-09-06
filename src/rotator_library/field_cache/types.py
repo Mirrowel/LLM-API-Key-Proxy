@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from types import MappingProxyType
 from typing import Any, Literal, Optional
 
 FieldCacheSource = Literal[
@@ -22,7 +21,6 @@ FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn",
 FieldCacheScope = Literal["provider", "model", "credential", "session", "classifier"]
 
 DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
-REQUIRED_PROVIDER_STATE_SCOPE = frozenset({"provider", "model", "credential", "session"})
 # D11: provider+model are the REQUIRED identity for cached provider state;
 # credential and session are optional refinements (single-operator proxy —
 # tightened additively for multi-user later). Missing optional dimensions
@@ -111,12 +109,18 @@ class FieldCacheRule:
             # Fail at construction (startup/config), never mid-request.
             from ..protocols.transforms import get_transform
 
-            get_transform(transform)
+            try:
+                get_transform(transform)
+            except KeyError as exc:
+                raise ValueError(f"Unknown transform {transform!r}") from exc
         if self.mode == "per_tool_call" and not self.metadata.get("tool_call_id_path"):
             raise ValueError("per_tool_call rules require metadata.tool_call_id_path")
-        # Cached rule objects are shared across requests (compiled once);
-        # metadata must not be mutable through the shared reference.
-        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
+        # Constructor-owned dict: callers never share the passed mapping,
+        # and stdlib copy/pickle/asdict keep working (the rule is shared
+        # across requests via compiled caches — mutating a rule's metadata
+        # after construction is a contract violation, enforced nowhere
+        # else by design).
+        object.__setattr__(self, "metadata", dict(self.metadata))
 
 
 def is_provider_continuation_path(path: str) -> bool:
@@ -139,6 +143,8 @@ class FieldCacheContext:
     model: Optional[str] = None
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
+    # Trace-correlation only ("conversation" scope retired per D11:
+    # session IS the conversation).
     conversation_id: Optional[str] = None
     classifier: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -152,8 +158,6 @@ class FieldCacheContext:
             return self.credential_id
         if scope == "session":
             return self.session_id
-        if scope == "conversation":
-            return self.conversation_id
         if scope == "classifier":
             return self.classifier
         raise ValueError(f"Unsupported field-cache scope: {scope}")

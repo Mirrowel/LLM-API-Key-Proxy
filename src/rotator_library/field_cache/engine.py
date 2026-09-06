@@ -32,6 +32,10 @@ class FieldCacheOperation:
     skipped: bool = False
     reason: Optional[str] = None
     sample_values: list[Any] = field(default_factory=list)
+    # Transport profile (W-PROF provenance): rules are identity-normalized
+    # to the bare provider, but WHICH profile served the request stays
+    # visible on every operation and trace.
+    profile: Optional[str] = None
 
 
 def _safe_scope_value(value: str) -> str:
@@ -156,7 +160,13 @@ class FieldCacheEngine:
         rules = self._rules_for_source(source)
         self._trace_summary(transaction_logger, "field_cache_extraction_start", payload, source=source, target=None, rules=rules, operations=operations)
         for rule in rules:
-            operation = FieldCacheOperation(rule_name=rule.name, cache_key=build_cache_key(rule, context))
+            operation = FieldCacheOperation(
+                rule_name=rule.name,
+                cache_key=build_cache_key(rule, context),
+                profile=(context.metadata or {}).get("execution_profile")
+                if isinstance(getattr(context, "metadata", None), dict)
+                else None,
+            )
             self._trace(transaction_logger, "before_field_cache_extraction", payload, rule, operation, source=source)
             if not operation.cache_key:
                 operation.skipped = True
@@ -192,7 +202,13 @@ class FieldCacheEngine:
         rules = self._rules_for_injection(target)
         self._trace_summary(transaction_logger, "field_cache_injection_start", updated, source=None, target=target, rules=rules, operations=operations)
         for rule in rules:
-            operation = FieldCacheOperation(rule_name=rule.name, cache_key=build_cache_key(rule, context))
+            operation = FieldCacheOperation(
+                rule_name=rule.name,
+                cache_key=build_cache_key(rule, context),
+                profile=(context.metadata or {}).get("execution_profile")
+                if isinstance(getattr(context, "metadata", None), dict)
+                else None,
+            )
             if not rule.inject:
                 continue
             self._trace(transaction_logger, "before_field_cache_injection", updated, rule, operation, target=target)

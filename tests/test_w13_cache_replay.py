@@ -459,9 +459,21 @@ def test_classifier_scoped_rules_fail_closed_without_classifier() -> None:
 
 
 def test_rule_metadata_is_immutable() -> None:
-    rule = FieldCacheRule(name="sig", source="response", path="sig", metadata={"compatibility": "bound"})
-    with pytest.raises(TypeError):
-        rule.metadata["compatibility"] = "portable"  # type: ignore[index]
+    """Constructor-owned copy + stdlib compatibility (deepcopy/pickle/asdict)."""
+
+    import copy
+    import dataclasses
+    import pickle
+
+    shared = {"compatibility": "bound"}
+    rule = FieldCacheRule(name="sig", source="response", path="sig", metadata=shared)
+    shared["compatibility"] = "portable"  # caller mutation never reaches the rule
+    assert rule.metadata["compatibility"] == "bound"
+    cloned = copy.deepcopy(rule)
+    assert cloned.metadata == rule.metadata
+    restored = pickle.loads(pickle.dumps(rule))
+    assert restored.metadata == rule.metadata
+    assert dataclasses.asdict(rule)["metadata"] == {"compatibility": "bound"}
 
 
 def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> None:
@@ -501,7 +513,8 @@ def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> 
         from rotator_library.client.executor import _env_cache_replay_cached
 
         _env_cache_replay_cached.cache_clear()
-        with pytest.raises(RoutingExecutionError, match="cannot weaken"):            _merged_field_cache_rules("shadowprov", "shadowprov/m", _Plugin(), config=None)
+        with pytest.raises(RoutingExecutionError, match="cannot weaken"):
+            _merged_field_cache_rules("shadowprov", "shadowprov/m", _Plugin(), config=None)
     finally:
         os.environ.pop("SHADOWPROV_CACHE_REPLAY", None)
         from rotator_library.client.executor import _env_cache_replay_cached
