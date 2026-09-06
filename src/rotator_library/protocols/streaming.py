@@ -10,6 +10,8 @@ heartbeats remain in ``client.streaming``.
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from dataclasses import dataclass, field
 import json
 import uuid
@@ -195,7 +197,7 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
         return [_event_frame("error", {"type": "error", "error": _error_payload(event.error)})]
 
     frames = _anthropic_start(state)
-    for block in _event_blocks(event):
+    for block in _client_visible_blocks(event):
         key, block_type = _block_key(block, state, event)
         if key not in state.open_blocks:
             index = state.next_index
@@ -247,6 +249,19 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
 
     frames = _responses_start(state)
     for block in _event_blocks(event):
+        if block.type == "builtin_tool" and block.builtin_tool is not None:
+            # Provider-executed tool records stream as native output items
+            # (raw item round-trip; synthesized shape only when raw missing).
+            raw_item = block.builtin_tool.raw if isinstance(block.builtin_tool.raw, dict) else None
+            item = raw_item or {
+                "type": f"{str(block.builtin_tool.kind).replace('-', '_')}_call",
+                "id": block.builtin_tool.call_id or _responses_item_id("builtin", state.next_index),
+                "status": block.builtin_tool.status or "completed",
+            }
+            frames.append(_event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index, "item": deepcopy(item)}))
+            frames.append(_event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": state.next_index, "item": deepcopy(item)}))
+            state.next_index += 1
+            continue
         key, kind = _block_key(block, state, event)
         if key not in state.item_ids:
             item_id = _responses_item_id(kind, state.next_index)
@@ -277,7 +292,7 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         return [_data_frame({"error": _error_payload(event.error)})]
 
     parts: list[dict[str, Any]] = []
-    for block in _event_blocks(event):
+    for block in _client_visible_blocks(event):
         if block.tool_call:
             key, _ = _block_key(block, state, event)
             call = block.tool_call
@@ -378,6 +393,17 @@ def _event_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
     if message is None:
         return []
     return ordered_message_blocks(message)
+
+
+def _client_visible_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
+    """Blocks a NON-responses client target may render.
+
+    Builtin tool records are provider-internal: the Responses stream
+    formatter emits them as native output items; every other target omits
+    them (no fabricated empty text blocks).
+    """
+
+    return [block for block in _event_blocks(event) if block.type != "builtin_tool"]
 
 
 def _block_key(block: ContentBlock, state: StreamFormatState, event: UnifiedStreamEvent | None = None) -> tuple[str, str]:
@@ -512,6 +538,11 @@ def _anthropic_block_delta(block: ContentBlock, key: str, state: StreamFormatSta
     if block.reasoning:
         text = block.reasoning.text or ""
         return {"type": "thinking_delta", "thinking": text} if text else None
+    if block.type == "refusal":
+        # Anthropic has no refusal part: the text survives as a text delta
+        # (same degradation as the non-stream path).
+        text = block.refusal or ""
+        return {"type": "text_delta", "text": text} if text else None
     text = block.text or ""
     return {"type": "text_delta", "text": text} if text else None
 

@@ -16,6 +16,9 @@ from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
 from .canonical import (
+    record_instruction_merge,
+    format_reasoning_controls,
+    attach_conversion_summary,
     add_conversion_warning,
     canonical_stop_reason,
     canonical_structured_output,
@@ -143,9 +146,20 @@ class ResponsesProtocol(ProtocolAdapter):
             "model": unified_request.model,
             "input": self._format_input(conversation_messages(unified_request), preserve_source=preserve_source),
         }
-        instructions = "\n\n".join(block.text or "" for block in instruction_blocks(unified_request) if block.text)
+        instruction_parts = instruction_blocks(unified_request)
+        instructions = "\n\n".join(block.text or "" for block in instruction_parts if block.text)
         if instructions:
             payload["instructions"] = instructions
+        dropped_non_text = [block for block in instruction_parts if block.text is None]
+        if dropped_non_text:
+            add_conversion_warning(
+                unified_request,
+                code="instruction_block_dropped",
+                message=f"{len(dropped_non_text)} non-text instruction block(s) have no Responses instructions representation",
+                field="system",
+                target_protocol=self.name,
+            )
+        record_instruction_merge(unified_request, self.name)
         if unified_request.previous_response_id:
             payload["previous_response_id"] = unified_request.previous_response_id
         if unified_request.tools:
@@ -202,6 +216,20 @@ class ResponsesProtocol(ProtocolAdapter):
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
         assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
         candidate_backed = len(assistants) > 1 and all(m.index is not None for m in assistants)
+        if not preserve_source:
+            dropped_media = [
+                block.type
+                for message in assistants
+                for block in message.content
+                if block.type in {"audio", "video"}
+            ]
+            if dropped_media:
+                _warn_responses_once(
+                    unified_response,
+                    code="media_dropped",
+                    message="audio/video output has no Responses output-part representation; dropped",
+                    field=f"content[{dropped_media[0]}]",
+                )
         if preserve_source and unified_response.output:
             output = deepcopy(unified_response.output)
             for fallback_index, message in enumerate(unified_response.messages):
@@ -239,7 +267,7 @@ class ResponsesProtocol(ProtocolAdapter):
             "usage": _format_responses_usage(unified_response.usage),
         }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return {k: v for k, v in payload.items() if v is not None}
+        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -706,8 +734,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 target_protocol=self.name,
             )
         reasoning = params.pop("reasoning", None)
-        if isinstance(reasoning, dict):
-            payload["reasoning"] = deepcopy(reasoning)
+        payload.update(format_reasoning_controls(reasoning, self.name, request))
         structured = params.pop("structured_output", None)
         if isinstance(structured, dict):
             payload["text"] = {"format": format_structured_output(structured, self.name)}
@@ -754,14 +781,14 @@ def _responses_output_modalities(messages: list[UnifiedMessage]) -> list[str]:
     return modalities
 
 
-def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, message: str) -> None:
+def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
     for warning in unified_response.warnings:
         if warning.code == code and warning.message == message:
             return
     unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol="responses")
+        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="responses")
     )
 
 

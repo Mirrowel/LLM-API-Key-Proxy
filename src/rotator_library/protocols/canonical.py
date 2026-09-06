@@ -195,6 +195,54 @@ def instruction_blocks(request: UnifiedRequest) -> list[ContentBlock]:
     return blocks
 
 
+def instruction_layout(request: UnifiedRequest) -> tuple[bool, int]:
+    """Describe the instruction placement of a canonical request.
+
+    Returns ``(interleaved, count)``: ``interleaved`` is True when a
+    system/developer message appears after conversation turns began (its
+    position cannot survive a merge into a single instruction field).
+    """
+
+    instruction_count = 0
+    interleaved = False
+    seen_conversation = False
+    for message in request.messages:
+        if message.role in {"system", "developer"}:
+            instruction_count += 1
+            if seen_conversation:
+                interleaved = True
+        else:
+            seen_conversation = True
+    if request.system and instruction_count == 0:
+        instruction_count = 1
+    return interleaved, instruction_count
+
+
+def record_instruction_merge(request: UnifiedRequest, target_protocol: str) -> bool:
+    """Record a D7 level-5 instruction merge when one occurred.
+
+    Returns True when instructions were merged or repositioned (any count > 1
+    instruction turn, or an interleaved instruction whose position is lost).
+    """
+
+    interleaved, count = instruction_layout(request)
+    if count > 1 or interleaved:
+        detail = []
+        if count > 1:
+            detail.append(f"{count} instruction turns merged in order")
+        if interleaved:
+            detail.append("interleaved instruction repositioned (destination mandates a single instruction field)")
+        add_conversion_warning(
+            request,
+            code="instructions_merged",
+            message="; ".join(detail),
+            field="system",
+            target_protocol=target_protocol,
+        )
+        return True
+    return False
+
+
 def add_conversion_warning(
     request: UnifiedRequest,
     *,
@@ -210,10 +258,207 @@ def add_conversion_warning(
             code=code,
             message=message,
             field=field,
-            source_protocol=request.source_protocol,
             target_protocol=target_protocol,
         )
     )
+
+
+# Deterministic reasoning-effort <-> budget-tokens approximation table (D7
+# level 3: deterministic inference). Chosen once, documented, warned on use.
+_EFFORT_TO_BUDGET_TOKENS = {
+    "minimal": 1024,
+    "low": 4096,
+    "medium": 8192,
+    "high": 16384,
+}
+
+
+def budget_tokens_from_effort(effort: str) -> int:
+    """Map a reasoning-effort label to a budget-token approximation."""
+
+    return _EFFORT_TO_BUDGET_TOKENS.get(str(effort).strip().lower(), _EFFORT_TO_BUDGET_TOKENS["medium"])
+
+
+def effort_from_budget_tokens(budget: int) -> str:
+    """Map a thinking budget to the nearest effort label."""
+
+    try:
+        value = int(budget)
+    except (TypeError, ValueError):
+        return "medium"
+    if value < 2048:
+        return "minimal"
+    if value < 8192:
+        return "low"
+    if value < 16384:
+        return "medium"
+    return "high"
+
+
+def format_reasoning_controls(
+    reasoning: Any,
+    target_protocol: str,
+    request: UnifiedRequest,
+) -> dict[str, Any]:
+    """Map canonical reasoning controls to a target protocol (D7 level 3).
+
+    Canonical shape: ``{"effort", "budget_tokens", "enabled", "include_thoughts"}``.
+    Every inference (effort <-> budget) is deterministic via the documented
+    table and recorded as a warning; every drop is recorded — nothing silent
+    (defect 7). Responses gets a normalized native dict — never foreign keys.
+    """
+
+    emissions: dict[str, Any] = {}
+    if not isinstance(reasoning, dict) or not reasoning:
+        return emissions
+
+    effort = reasoning.get("effort")
+    budget = reasoning.get("budget_tokens")
+    enabled = reasoning.get("enabled")
+    include_thoughts = reasoning.get("include_thoughts")
+
+    def _warn(code: str, message: str, field: str) -> None:
+        add_conversion_warning(request, code=code, message=message, field=field, target_protocol=target_protocol)
+
+    if target_protocol == "openai_chat":
+        if effort is not None:
+            emissions["reasoning_effort"] = effort
+        elif budget is not None:
+            approximated = effort_from_budget_tokens(budget)
+            emissions["reasoning_effort"] = approximated
+            _warn(
+                "reasoning_budget_approximated",
+                f"reasoning budget_tokens={budget} approximated as effort '{approximated}' (deterministic table)",
+                "reasoning.budget_tokens",
+            )
+        if enabled is False:
+            _warn(
+                "reasoning_disabled_omitted",
+                "reasoning disabled has no OpenAI Chat control; effort omitted",
+                "reasoning.enabled",
+            )
+            emissions.pop("reasoning_effort", None)
+        if include_thoughts is not None:
+            _warn(
+                "reasoning_control_dropped",
+                "include_thoughts has no OpenAI Chat representation",
+                "reasoning.include_thoughts",
+            )
+    elif target_protocol == "anthropic_messages":
+        if budget is not None:
+            emissions["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        elif effort is not None and effort != "none":
+            approximated = budget_tokens_from_effort(effort)
+            emissions["thinking"] = {"type": "enabled", "budget_tokens": approximated}
+            _warn(
+                "reasoning_effort_approximated",
+                f"reasoning effort '{effort}' approximated as budget_tokens={approximated} (deterministic table)",
+                "reasoning.effort",
+            )
+        if enabled is False or effort == "none":
+            emissions.pop("thinking", None)
+            emissions["thinking"] = {"type": "disabled"}
+        if include_thoughts is not None:
+            _warn(
+                "reasoning_control_dropped",
+                "include_thoughts has no Anthropic Messages control (summaries follow the thinking setting)",
+                "reasoning.include_thoughts",
+            )
+    elif target_protocol == "responses":
+        if enabled is False:
+            _warn(
+                "reasoning_disabled_omitted",
+                "reasoning disabled has no Responses control; reasoning block omitted",
+                "reasoning.enabled",
+            )
+        else:
+            native: dict[str, Any] = {}
+            if effort is not None:
+                native["effort"] = effort
+            elif budget is not None:
+                approximated = effort_from_budget_tokens(budget)
+                native["effort"] = approximated
+                _warn(
+                    "reasoning_budget_approximated",
+                    f"reasoning budget_tokens={budget} approximated as effort '{approximated}' (deterministic table)",
+                    "reasoning.budget_tokens",
+                )
+            if include_thoughts is not None:
+                native["summary"] = "auto" if include_thoughts else "none"
+            if native:
+                # Normalized native dict only — foreign spellings never leak
+                # onto the Responses wire (no hybrid payloads).
+                emissions["reasoning"] = native
+    elif target_protocol == "gemini":
+        thinking_config: dict[str, Any] = {}
+        if budget is not None:
+            thinking_config["thinkingBudget"] = budget
+        elif effort is not None and effort != "none":
+            approximated = budget_tokens_from_effort(effort)
+            thinking_config["thinkingBudget"] = approximated
+            _warn(
+                "reasoning_effort_approximated",
+                f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
+                "reasoning.effort",
+            )
+        if include_thoughts is not None:
+            thinking_config["includeThoughts"] = bool(include_thoughts)
+        if enabled is False:
+            _warn(
+                "reasoning_disabled_omitted",
+                "reasoning disabled has no Gemini off-switch; includeThoughts=false only",
+                "reasoning.enabled",
+            )
+            thinking_config = {"includeThoughts": False}
+        if thinking_config:
+            emissions["generation_config"] = {"thinkingConfig": thinking_config}
+    return emissions
+
+
+def attach_conversion_summary(payload: dict[str, Any], unified_response: Any) -> dict[str, Any]:
+    """Attach the recorded conversion summary to a client response payload.
+
+    The summary renders recorded warnings (deliberate omissions, merges,
+    approximations) under the ``x-proxy-conversion`` extension key — present
+    only when warnings exist. Raw-passthrough responses never carry it (they
+    produce no warnings); D7's "recorded summary" becomes client-visible
+    instead of internal-only.
+    """
+
+    summary = conversion_summary(getattr(unified_response, "warnings", None) or [])
+    if summary is not None:
+        payload["x-proxy-conversion"] = summary
+    return payload
+
+
+def conversion_summary(
+    warnings: list[Any],
+) -> dict[str, Any] | None:
+    """Render recorded conversion warnings as a wire-safe summary block.
+
+    Returned as the value of the response's ``x-proxy-conversion`` extension
+    key: present only when warnings exist, never fabricated, and never on
+    raw-passthrough (same-protocol fast) responses, which produce no warnings.
+    """
+
+    entries = [w for w in warnings if getattr(w, "code", None)]
+    if not entries:
+        return None
+    rendered: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for warning in entries:
+        key = (getattr(warning, "code", None), getattr(warning, "message", None), getattr(warning, "field", None))
+        if key in seen:
+            continue
+        seen.add(key)
+        rendered.append(
+            {
+                "code": warning.code,
+                "message": warning.message,
+                "field": warning.field,
+            }
+        )
+    return {"warnings": rendered}
 
 
 def retain_supported_generation_params(

@@ -16,6 +16,8 @@ from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
 from .canonical import (
+    format_reasoning_controls,
+    attach_conversion_summary,
     add_conversion_warning,
     canonical_stop_reason,
     canonical_structured_output,
@@ -26,6 +28,7 @@ from .canonical import (
     format_structured_output,
     format_tool_choice,
     instruction_blocks,
+    record_instruction_merge,
     is_same_protocol,
     message_reasoning,
     message_tool_calls,
@@ -148,6 +151,8 @@ class GeminiProtocol(ProtocolAdapter):
                     emit_opaque_state=emit_opaque_state,
                 )
             }
+        # D7 level 5: one systemInstruction field mandates the ordered merge.
+        record_instruction_merge(unified_request, self.name)
         generation_config, safety_settings, tool_config = self._format_generation_params(unified_request, preserve_source=preserve_source)
         if generation_config:
             payload["generationConfig"] = deepcopy(generation_config)
@@ -309,7 +314,7 @@ class GeminiProtocol(ProtocolAdapter):
             "promptFeedback": deepcopy(unified_response.metadata.get("promptFeedback")),
         }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return {k: v for k, v in payload.items() if v is not None}
+        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -600,14 +605,8 @@ class GeminiProtocol(ProtocolAdapter):
                 }
             )
         reasoning = params.pop("reasoning", None)
-        if isinstance(reasoning, dict):
-            thinking: dict[str, Any] = {}
-            if reasoning.get("budget_tokens") is not None:
-                thinking["thinkingBudget"] = reasoning["budget_tokens"]
-            if reasoning.get("include_thoughts") is not None:
-                thinking["includeThoughts"] = reasoning["include_thoughts"]
-            if thinking:
-                generation["thinkingConfig"] = thinking
+        reasoning_emissions = format_reasoning_controls(reasoning, self.name, request)
+        generation.update(reasoning_emissions.get("generation_config", {}))
         tool_choice = params.pop("tool_choice", None)
         if tool_choice is not None:
             tool_config = format_tool_choice(tool_choice, self.name)

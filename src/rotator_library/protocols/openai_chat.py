@@ -17,15 +17,18 @@ from typing import Any, ClassVar, Iterable, Optional
 
 from .base import ProtocolAdapter
 from .canonical import (
+    attach_conversion_summary,
     canonical_stop_reason,
     canonical_structured_output,
     canonical_tool_arguments,
     coalesce_assistant_message,
     canonical_tool_choice,
+    format_reasoning_controls,
     format_stop_reason,
     format_structured_output,
     format_tool_choice,
     conversation_messages,
+    instruction_layout,
     instruction_messages,
     is_same_protocol,
     retain_supported_generation_params,
@@ -145,10 +148,19 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
         validate_generative_request(unified_request, self.name, context)
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
+        # Chat can express system/developer messages anywhere: canonical
+        # message order is preserved verbatim (D7 level 1 — interleaved
+        # instructions never hoisted). A separate canonical `system` field
+        # (non-chat sources) is promoted to a leading system message.
+        interleaved, _ = instruction_layout(unified_request)
+        if interleaved or any(m.role in {"system", "developer"} for m in unified_request.messages):
+            wire_messages = list(unified_request.messages)
+        else:
+            wire_messages = [*instruction_messages(unified_request), *conversation_messages(unified_request)]
         payload: dict[str, Any] = {
             "model": unified_request.model,
             "messages": self._format_request_messages(
-                [*instruction_messages(unified_request), *conversation_messages(unified_request)],
+                wire_messages,
                 preserve_source=preserve_source,
             ),
         }
@@ -265,7 +277,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "usage": _format_openai_usage(unified_response.usage),
         }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return {k: v for k, v in payload.items() if v is not None}
+        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -437,6 +449,25 @@ class OpenAIChatProtocol(ProtocolAdapter):
         elif content is not None:
             payload["content"] = content
         extra = deepcopy(message.extra) if preserve_source else {}
+        if not preserve_source:
+            audio_blocks = [block for block in message.content if block.type == "audio"]
+            if audio_blocks and "audio" not in extra:
+                # Synthesize the Chat message-level audio field from a
+                # cross-protocol (e.g. Gemini inlineData) audio block.
+                synthesized: dict[str, Any] | None = None
+                for block in audio_blocks:
+                    source = block.source
+                    data = getattr(source, "data", None)
+                    if data:
+                        synthesized = {
+                            "id": (getattr(source, "file_id", None) or f"audio_{abs(hash(data)) & 0xFFFFFFFF:x}"),
+                            "data": data,
+                        }
+                        if getattr(source, "media_type", None):
+                            synthesized["format"] = str(source.media_type).split("/")[-1]
+                        break
+                if synthesized is not None:
+                    extra["audio"] = synthesized
         legacy_function_call = extra.get("function_call")
         tool_calls = _message_tool_calls(message)
         if tool_calls and not legacy_function_call:
@@ -639,8 +670,11 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if "stop_sequences" in params:
             payload["stop"] = params.pop("stop_sequences")
         reasoning = params.pop("reasoning", None)
-        if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
-            payload["reasoning_effort"] = reasoning["effort"]
+        payload.update(format_reasoning_controls(reasoning, self.name, request))
+        candidate_count = params.pop("candidate_count", None)
+        if candidate_count is not None:
+            # D9 direct mapping: canonical multiplicity -> Chat `n`.
+            payload["n"] = candidate_count
         if "structured_output" in params:
             payload["response_format"] = format_structured_output(params.pop("structured_output"), self.name)
         if "tool_choice" in params:
@@ -777,6 +811,11 @@ def _parse_openai_generation_params(source: dict[str, Any]) -> dict[str, Any]:
     reasoning_effort = params.pop("reasoning_effort", None)
     if reasoning_effort is not None:
         params["reasoning"] = {"effort": reasoning_effort}
+    # D9 multiplicity: Chat `n` and Gemini `candidateCount` share one
+    # canonical control.
+    n = params.pop("n", None)
+    if n is not None and "candidate_count" not in params:
+        params["candidate_count"] = n
     return params
 
 

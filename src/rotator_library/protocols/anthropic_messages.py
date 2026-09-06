@@ -16,6 +16,9 @@ from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
 from .canonical import (
+    record_instruction_merge,
+    format_reasoning_controls,
+    attach_conversion_summary,
     STOP_REASON_CONTENT_FILTER,
     canonical_stop_reason,
     canonical_structured_output,
@@ -133,6 +136,9 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         system = self._format_system(instruction_blocks(unified_request), preserve_source=preserve_source)
         if system is not None:
             payload["system"] = system
+        # D7 level 5: a single top-level system field mandates the ordered
+        # merge — recorded, never silent.
+        record_instruction_merge(unified_request, self.name)
         if unified_request.tools:
             payload["tools"] = [self._format_tool_definition(tool, preserve_source=preserve_source) for tool in unified_request.tools]
         if unified_request.stream:
@@ -201,6 +207,19 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         )
         has_annotations = any(block.annotations for block in message.content)
         has_builtin = any(block.type == "builtin_tool" for block in message.content)
+        dropped_media = [
+            block.type
+            for block in message.content
+            if block.type in {"audio", "video"} and not (preserve_source and isinstance(block.raw, dict))
+        ]
+        if not preserve_source and dropped_media:
+            _warn_once(
+                unified_response,
+                code="media_dropped",
+                message="audio/video output has no Anthropic Messages representation; dropped",
+                target_protocol=self.name,
+                field=f"content[{dropped_media[0]}]",
+            )
         if not preserve_source:
             if refusal_text:
                 stop_reason = STOP_REASON_CONTENT_FILTER
@@ -242,7 +261,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             "usage": self._format_usage(unified_response.usage),
         }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return {k: v for k, v in payload.items() if v is not None}
+        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -423,6 +442,20 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "tool_use_id", "content", "is_error"}),
             )
+        if block_type in {"server_tool_use", "web_search_tool_result"} or str(block.get("type", "")).endswith("_tool_result"):
+            # Anthropic server-side tool invocations normalize into canonical
+            # builtin records (Responses-native shape); same-protocol
+            # formatting round-trips the raw block.
+            from ..protocols.types import BuiltinToolCall
+
+            builtin = BuiltinToolCall(
+                kind=str(block.get("name") or block_type),
+                call_id=block.get("id") or block.get("tool_use_id"),
+                status="completed",
+                output=block.get("content") if block_type.endswith("_tool_result") else None,
+                raw=deepcopy(block),
+            )
+            return ContentBlock(type="builtin_tool", builtin_tool=builtin, index=index, raw=deepcopy(block))
         return ContentBlock(type=block_type, index=index, raw=deepcopy(block), extra=_without(block, {"type"}))
 
     def _format_content(
@@ -522,14 +555,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         if "structured_output" in params:
             payload["output_config"] = format_structured_output(params.pop("structured_output"), self.name)
         reasoning = params.pop("reasoning", None)
-        if isinstance(reasoning, dict):
-            thinking: dict[str, Any] = {}
-            if reasoning.get("budget_tokens") is not None:
-                thinking = {"type": "enabled", "budget_tokens": reasoning["budget_tokens"]}
-            elif reasoning.get("enabled") is False:
-                thinking = {"type": "disabled"}
-            if thinking:
-                payload["thinking"] = thinking
+        payload.update(format_reasoning_controls(reasoning, self.name, request))
         supported = {"temperature", "top_k", "top_p"}
         payload.update(
             retain_supported_generation_params(
@@ -666,14 +692,14 @@ def _anthropic_output_modalities(blocks: list[ContentBlock]) -> list[str]:
     return modalities
 
 
-def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, target_protocol: str) -> None:
+def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, target_protocol: str, field: str | None = None) -> None:
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
     for warning in unified_response.warnings:
         if warning.code == code and warning.message == message:
             return
     unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol=target_protocol)
+        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol=target_protocol)
     )
 
 

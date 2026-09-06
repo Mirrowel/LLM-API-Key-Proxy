@@ -1,0 +1,498 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""W4 acceptance fixtures: cross-protocol conversion (D7/D9).
+
+Every D7 semantic class has a defined behavior per protocol pair, and every
+deliberate omission/approximation/merge is recorded in a client-visible
+``x-proxy-conversion`` summary — content-asserted, never just structural.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from rotator_library.protocols import get_protocol
+from rotator_library.protocols.canonical import (
+    budget_tokens_from_effort,
+    effort_from_budget_tokens,
+)
+from rotator_library.protocols.types import ContentBlock, ProtocolContext, UnifiedResponse
+from rotator_library.protocols.validation import ProtocolError
+
+
+def _ctx(source: str, target: str) -> ProtocolContext:
+    return ProtocolContext(
+        source_protocol=source,
+        target_protocol=target,
+        input_protocol=source,
+        provider_protocol=target,
+        client_protocol=source,
+    )
+
+
+def _build(protocol_name: str, payload: dict, *, source: str) -> tuple[dict, object]:
+    protocol = get_protocol(protocol_name)
+    source_protocol = get_protocol(source)
+    unified = source_protocol.parse_request(payload, _ctx(source, protocol_name))
+    return protocol.build_request(unified, _ctx(source, protocol_name)), unified
+
+
+def _warnings_of(unified) -> list[str]:
+    return [w.code for w in unified.warnings]
+
+
+def _summary_codes(payload: dict) -> list[str]:
+    summary = payload.get("x-proxy-conversion") or {}
+    return [entry["code"] for entry in summary.get("warnings", [])]
+
+
+# ---------------------------------------------------------------------------
+# D7 recorded summaries (defect 7's consumer half)
+
+
+def test_unsupported_control_surfaces_in_response_summary() -> None:
+    built, unified = _build("anthropic_messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}], "seed": 42}, source="openai_chat")
+    assert "seed" not in built
+    assert "unsupported_optional_control" in _warnings_of(unified)
+
+    anthropic = get_protocol("anthropic_messages")
+    response = anthropic.parse_response(
+        {"id": "msg_1", "role": "assistant", "model": "m", "stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}]},
+        _ctx("anthropic_messages", "openai_chat"),
+    )
+    for warning in unified.warnings:
+        response.warnings.append(warning)
+    chat_payload = get_protocol("openai_chat").format_response(response, _ctx("anthropic_messages", "openai_chat"))
+    assert "unsupported_optional_control" in _summary_codes(chat_payload)
+    entry = next(e for e in chat_payload["x-proxy-conversion"]["warnings"] if e["code"] == "unsupported_optional_control")
+    assert entry["field"] == "seed"
+
+
+def test_clean_conversion_has_no_summary_block() -> None:
+    built, unified = _build(
+        "anthropic_messages",
+        {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}], "temperature": 0.3},
+        source="openai_chat",
+    )
+    assert built["temperature"] == 0.3
+    assert _warnings_of(unified) == []
+
+    anthropic = get_protocol("anthropic_messages")
+    response = anthropic.parse_response(
+        {"id": "msg_1", "role": "assistant", "model": "m", "stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}]},
+        _ctx("anthropic_messages", "openai_chat"),
+    )
+    chat_payload = get_protocol("openai_chat").format_response(response, _ctx("anthropic_messages", "openai_chat"))
+    assert "x-proxy-conversion" not in chat_payload
+
+
+# ---------------------------------------------------------------------------
+# Reasoning controls mapping table (deterministic, warned approximations)
+
+
+@pytest.mark.parametrize("effort,expected_budget", [("minimal", 1024), ("low", 4096), ("medium", 8192), ("high", 16384)])
+def test_effort_to_anthropic_budget_table(effort: str, expected_budget: int) -> None:
+    assert budget_tokens_from_effort(effort) == expected_budget
+    built, unified = _build(
+        "anthropic_messages",
+        {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": effort},
+        source="openai_chat",
+    )
+    assert built["thinking"] == {"type": "enabled", "budget_tokens": expected_budget}
+    assert "reasoning_effort_approximated" in _warnings_of(unified)
+
+
+@pytest.mark.parametrize("budget,expected_effort", [(1024, "minimal"), (4096, "low"), (9000, "medium"), (20000, "high")])
+def test_budget_to_chat_effort_table(budget: int, expected_effort: str) -> None:
+    assert effort_from_budget_tokens(budget) == expected_effort
+    built, unified = _build(
+        "openai_chat",
+        {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": budget}},
+        source="anthropic_messages",
+    )
+    assert built["reasoning_effort"] == expected_effort
+    assert "reasoning_budget_approximated" in _warnings_of(unified)
+
+
+def test_budget_to_responses_normalizes_never_foreign_keys() -> None:
+    built, unified = _build(
+        "responses",
+        {"model": "m", "max_tokens": 16, "input": "hi", "thinking": {"type": "enabled", "budget_tokens": 9000}},
+        source="anthropic_messages",
+    )
+    assert built["reasoning"] == {"effort": "medium"}
+    assert "budget_tokens" not in built["reasoning"]
+    assert "enabled" not in built["reasoning"]
+    assert "reasoning_budget_approximated" in _warnings_of(unified)
+
+
+def test_effort_to_gemini_budget_with_warning() -> None:
+    built, unified = _build(
+        "gemini",
+        {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "reasoning_effort": "high"},
+        source="openai_chat",
+    )
+    assert built["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 16384
+    assert "reasoning_effort_approximated" in _warnings_of(unified)
+
+
+def test_direct_effort_mapping_emits_no_approximation_warning() -> None:
+    built, unified = _build(
+        "responses",
+        {"model": "m", "input": "hi", "reasoning_effort": "high"},
+        source="openai_chat",
+    )
+    assert built["reasoning"]["effort"] == "high"
+    assert "reasoning_budget_approximated" not in _warnings_of(unified)
+    assert "reasoning_effort_approximated" not in _warnings_of(unified)
+
+
+def test_include_thoughts_maps_to_responses_summary() -> None:
+    built_true, _ = _build(
+        "responses",
+        {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"thinkingConfig": {"thinkingBudget": 2048, "includeThoughts": True}}},
+        source="gemini",
+    )
+    assert built_true["reasoning"]["summary"] == "auto"
+    built_false, _ = _build(
+        "responses",
+        {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"thinkingConfig": {"thinkingBudget": 2048, "includeThoughts": False}}},
+        source="gemini",
+    )
+    assert built_false["reasoning"]["summary"] == "none"
+
+
+def test_reasoning_disabled_is_recorded_not_silent() -> None:
+    built, unified = _build(
+        "openai_chat",
+        {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "disabled"}},
+        source="anthropic_messages",
+    )
+    assert "reasoning_effort" not in built
+    assert "reasoning_disabled_omitted" in _warnings_of(unified)
+
+
+# ---------------------------------------------------------------------------
+# Instruction ordering (defect 4)
+
+
+def test_chat_rebuild_preserves_interleaved_instructions() -> None:
+    payload = {
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "system", "content": "mid instruction"},
+            {"role": "user", "content": "q2"},
+        ],
+    }
+    built, _ = _build("openai_chat", payload, source="openai_chat")
+    roles = [message["role"] for message in built["messages"]]
+    assert roles == ["user", "system", "user"]
+
+
+def test_multiple_instructions_merge_in_order_with_summary() -> None:
+    payload = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "system", "content": "first"},
+            {"role": "system", "content": "second"},
+            {"role": "user", "content": "hi"},
+        ],
+    }
+    built, unified = _build("anthropic_messages", payload, source="openai_chat")
+    assert built["system"] == [{"type": "text", "text": "first"}, {"type": "text", "text": "second"}]
+    assert [m["role"] for m in built["messages"]] == ["user"]
+    assert "instructions_merged" in _warnings_of(unified)
+
+
+def test_interleaved_instruction_reposition_recorded() -> None:
+    payload = {
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "q1"},
+            {"role": "system", "content": "mid"},
+            {"role": "user", "content": "q2"},
+        ],
+    }
+    built, unified = _build("gemini", payload, source="openai_chat")
+    parts = built["systemInstruction"]["parts"]
+    assert parts == [{"text": "mid"}]
+    assert "instructions_merged" in _warnings_of(unified)
+
+
+def test_non_text_instruction_block_recorded_at_responses() -> None:
+    payload = {
+        "model": "m",
+        "input": "hi",
+    }
+    chat = get_protocol("openai_chat")
+    unified = chat.parse_request(
+        {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": [{"type": "image_url", "image_url": {"url": "https://x.test/i.png"}}]},
+                {"role": "user", "content": "hi"},
+            ],
+        },
+        _ctx("openai_chat", "responses"),
+    )
+    built = get_protocol("responses").build_request(unified, _ctx("openai_chat", "responses"))
+    assert "instructions" not in built or built["instructions"] == ""
+    assert "instruction_block_dropped" in _warnings_of(unified)
+
+
+# ---------------------------------------------------------------------------
+# D9 multiplicity on the request side
+
+
+def test_chat_n_maps_to_gemini_candidate_count() -> None:
+    built, _ = _build(
+        "gemini",
+        {"model": "g", "n": 3, "messages": [{"role": "user", "content": "hi"}]},
+        source="openai_chat",
+    )
+    assert built["generationConfig"]["candidateCount"] == 3
+
+
+def test_gemini_candidate_count_maps_to_chat_n() -> None:
+    built, _ = _build(
+        "openai_chat",
+        {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"candidateCount": 2}},
+        source="gemini",
+    )
+    assert built["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Media / audio
+
+
+def test_audio_block_synthesizes_chat_message_audio() -> None:
+    gemini = get_protocol("gemini")
+    response = gemini.parse_response(
+        {
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"inlineData": {"mimeType": "audio/wav", "data": "UklGRg=="}}]},
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+        },
+        _ctx("gemini", "openai_chat"),
+    )
+    payload = get_protocol("openai_chat").format_response(response, _ctx("gemini", "openai_chat"))
+    audio = payload["choices"][0]["message"].get("audio")
+    assert audio and audio["data"] == "UklGRg=="
+    assert audio["format"] == "wav"
+
+
+def _audio_response() -> UnifiedResponse:
+    gemini = get_protocol("gemini")
+    return gemini.parse_response(
+        {
+            "candidates": [
+                {
+                    "content": {"role": "model", "parts": [{"inlineData": {"mimeType": "audio/wav", "data": "UklGRg=="}}]},
+                    "finishReason": "STOP",
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 1, "candidatesTokenCount": 1, "totalTokenCount": 2},
+        },
+        _ctx("gemini", "openai_chat"),
+    )
+
+
+@pytest.mark.parametrize("target", ["anthropic_messages", "responses"])
+def test_audio_drop_recorded_at_unsupported_targets(target: str) -> None:
+    response = _audio_response()
+    payload = get_protocol(target).format_response(response, _ctx("gemini", target))
+    assert "media_dropped" in _summary_codes(payload)
+
+
+def test_image_maps_chat_to_anthropic_request() -> None:
+    built, _ = _build(
+        "anthropic_messages",
+        {
+            "model": "m",
+            "max_tokens": 16,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "see"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                    ],
+                }
+            ],
+        },
+        source="openai_chat",
+    )
+    blocks = built["messages"][0]["content"]
+    assert blocks[1] == {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "AA=="},
+    }
+
+
+# ---------------------------------------------------------------------------
+# Safety settings (gemini)
+
+
+def test_safety_settings_rejected_cross_protocol() -> None:
+    with pytest.raises(ProtocolError):
+        _build(
+            "openai_chat",
+            {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "safetySettings": [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}]},
+            source="gemini",
+        )
+
+
+def test_safety_settings_pass_through_same_protocol() -> None:
+    safety = [{"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"}]
+    built, _ = _build(
+        "gemini",
+        {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "safetySettings": safety},
+        source="gemini",
+    )
+    assert built["safetySettings"] == safety
+
+
+# ---------------------------------------------------------------------------
+# Stop/status table
+
+
+@pytest.mark.parametrize(
+    "target,field,expected",
+    [
+        ("openai_chat", "finish_reason", "content_filter"),
+        ("anthropic_messages", "stop_reason", "refusal"),
+        ("gemini", "finishReason", "SAFETY"),
+        ("responses", "status", "incomplete"),
+    ],
+)
+def test_content_filter_stop_reason_mapping(target: str, field: str, expected: str) -> None:
+    chat = get_protocol("openai_chat")
+    response = chat.parse_response(
+        {
+            "id": "r1",
+            "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "refusal": "no"}, "finish_reason": "content_filter"}],
+        },
+        _ctx("openai_chat", target),
+    )
+    payload = get_protocol(target).format_response(response, _ctx("openai_chat", target))
+    if target == "openai_chat":
+        assert payload["choices"][0][field] == expected
+    elif target == "anthropic_messages":
+        assert payload[field] == expected
+    elif target == "responses":
+        assert payload[field] == expected
+    else:
+        assert payload["candidates"][0][field] == expected
+
+
+# ---------------------------------------------------------------------------
+# Structured output
+
+
+def test_structured_output_chat_to_responses_json_schema() -> None:
+    schema = {"type": "json_schema", "json_schema": {"name": "out", "strict": True, "schema": {"type": "object"}}}
+    built, _ = _build(
+        "responses",
+        {"model": "m", "input": "hi", "response_format": schema},
+        source="openai_chat",
+    )
+    assert built["text"]["format"]["type"] == "json_schema"
+    assert built["text"]["format"]["schema"] == {"type": "object"}
+    assert built["text"]["format"]["name"] == "out"
+
+
+# ---------------------------------------------------------------------------
+# W2 carry-ins: anthropic server tools + stream-side emission
+
+
+def test_anthropic_server_tools_parse_to_builtin_records() -> None:
+    ant = get_protocol("anthropic_messages")
+    response = ant.parse_response(
+        {
+            "id": "m1",
+            "model": "m",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "server_tool_use", "id": "srvu_1", "name": "web_search", "input": {"query": "x"}},
+                {"type": "web_search_tool_result", "tool_use_id": "srvu_1", "content": [{"type": "web_search_result", "title": "t", "url": "https://x"}]},
+            ],
+        },
+        None,
+    )
+    blocks = response.messages[0].content
+    assert [b.type for b in blocks] == ["builtin_tool", "builtin_tool"]
+    assert blocks[0].builtin_tool.kind == "web_search"
+    assert blocks[0].builtin_tool.call_id == "srvu_1"
+    # Same-protocol round-trip keeps the raw blocks verbatim.
+    back = ant.format_response(response, None)
+    assert [b["type"] for b in back["content"]] == ["server_tool_use", "web_search_tool_result"]
+
+
+def test_stream_builtin_items_emit_native_at_responses_and_omit_elsewhere() -> None:
+    from rotator_library.protocols.streaming import format_canonical_stream_event
+    from rotator_library.protocols.types import BuiltinToolCall, UnifiedMessage, UnifiedStreamEvent
+
+    raw_item = {"type": "web_search_call", "id": "ws_1", "status": "completed"}
+    event = UnifiedStreamEvent(
+        type="message.delta",
+        source_protocol="openai_chat",
+        native_type="message.delta",
+        delta=UnifiedMessage(
+            role="assistant",
+            content=[ContentBlock(type="builtin_tool", builtin_tool=BuiltinToolCall(kind="web_search", call_id="ws_1", status="completed", raw=raw_item))],
+        ),
+    )
+    resp_ctx = ProtocolContext(source_protocol="openai_chat", target_protocol="responses", input_protocol="openai_chat", client_protocol="responses", provider_protocol="responses")
+    frames = format_canonical_stream_event(event, "responses", resp_ctx)
+    joined = "".join(frames)
+    assert "response.output_item.added" in joined
+    assert "ws_1" in joined
+
+    ant_ctx = ProtocolContext(source_protocol="openai_chat", target_protocol="anthropic_messages", input_protocol="openai_chat", client_protocol="anthropic_messages", provider_protocol="anthropic_messages")
+    ant_frames = format_canonical_stream_event(event, "anthropic_messages", ant_ctx)
+    ant_joined = "".join(ant_frames)
+    # No fabricated empty text block for provider-internal records.
+    assert '"text": ""' not in ant_joined
+    assert "ws_1" not in ant_joined
+
+
+def test_stream_refusal_degrades_to_text_at_anthropic() -> None:
+    from rotator_library.protocols.streaming import format_canonical_stream_event
+    from rotator_library.protocols.types import UnifiedMessage, UnifiedStreamEvent
+
+    event = UnifiedStreamEvent(
+        type="message.delta",
+        source_protocol="openai_chat",
+        native_type="message.delta",
+        delta=UnifiedMessage(role="assistant", content=[ContentBlock(type="refusal", refusal="cannot help with that")]),
+    )
+    ctx = ProtocolContext(source_protocol="openai_chat", target_protocol="anthropic_messages", input_protocol="openai_chat", client_protocol="anthropic_messages", provider_protocol="anthropic_messages")
+    frames = format_canonical_stream_event(event, "anthropic_messages", ctx)
+    joined = "".join(frames)
+    assert "cannot help with that" in joined
+    assert '"type": "text"' in joined
+
+
+def test_gemini_strictness_strengthening_recorded() -> None:
+    built, unified = _build(
+        "gemini",
+        {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "out", "strict": False, "schema": {"type": "object"}}},
+        },
+        source="openai_chat",
+    )
+    assert built["generationConfig"]["responseMimeType"] == "application/json"
+    assert "structured_output_strictness_strengthened" in _warnings_of(unified)

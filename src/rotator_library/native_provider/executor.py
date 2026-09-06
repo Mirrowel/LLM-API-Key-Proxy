@@ -113,6 +113,11 @@ class NativeProviderExecutor:
                 self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
             else:
                 self._trace(context, "raw_fast_path_request", provider_request, direction="request", stage="protocol")
+            # D7 recorded summaries: request-side warnings (deliberate
+            # omissions, merges, approximations recorded during build) ride
+            # along and surface on the client response via
+            # attach_conversion_summary.
+            request_warnings = list(unified_request.warnings)
             provider_request = self._prepare_provider_request(provider_request, context)
             self._trace(context, "provider_native_request_prepared", provider_request, direction="request", stage="provider")
             adapters = [get_adapter(name) for name in context.adapter_names]
@@ -147,6 +152,9 @@ class NativeProviderExecutor:
             )
             unified_response = provider_protocol.parse_response(raw_response, response_context)
             unified_response.model = str(context.metadata.get("public_model") or unified_response.model or context.model)
+            for warning in request_warnings:
+                if warning not in unified_response.warnings:
+                    unified_response.warnings.append(warning)
             self._trace(context, "parsed_native_unified_response", unified_response, direction="response", stage="protocol")
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)

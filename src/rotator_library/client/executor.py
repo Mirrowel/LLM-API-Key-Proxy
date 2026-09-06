@@ -719,6 +719,12 @@ class RequestExecutor:
         )
         unified_response = source_protocol.parse_response(payload, protocol_context)
         unified_response.model = context.model
+        # D7 recorded summaries: request-side warnings ride along to the
+        # client response (x-proxy-conversion block).
+        source_warnings = getattr(context.unified_request, "warnings", None) or []
+        for warning in source_warnings:
+            if warning not in unified_response.warnings:
+                unified_response.warnings.append(warning)
         return client_protocol.format_response(unified_response, protocol_context)
 
     def _build_native_provider_context(
