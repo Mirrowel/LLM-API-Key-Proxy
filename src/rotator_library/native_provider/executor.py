@@ -378,8 +378,9 @@ class NativeProviderExecutor:
 
         OpenAI-compatible providers only include token usage in the final
         chunk when ``stream_options.include_usage`` is requested; without it
-        the stream completes with zero-token accounting. This is a
-        provider-required default (finalizer concern), applied after the
+        the stream completes with zero-token accounting. The flag is forced
+        true for accounting even when the client explicitly disabled it —
+        a provider-required default (finalizer concern), applied after the
         transport basis is chosen and recorded as a traced overlay.
         """
 

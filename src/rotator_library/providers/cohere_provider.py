@@ -17,7 +17,7 @@ class CohereProvider(ProviderInterface):
     """
     protocol_name = "openai_chat"
     native_streaming_supported = True
-    default_api_base = "https://api.cohere.com/compatibility/v1"
+    default_api_base = "https://api.cohere.ai/compatibility/v1"
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
         base = self.get_provider_api_base()

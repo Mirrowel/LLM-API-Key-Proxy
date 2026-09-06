@@ -492,7 +492,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         key = None
         for name, plugin_class in PROVIDER_PLUGINS.items():
-            if isinstance(self, plugin_class):
+            if type(self) is plugin_class:
                 key = name
                 break
         try:

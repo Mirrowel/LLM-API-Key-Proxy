@@ -692,6 +692,11 @@ class RequestExecutor:
                 logger.update_metadata(
                     execution_mode="litellm_fallback",
                     native_protocol_available=protocol,
+                    # Clear native-attempt fields so a rotation that moved
+                    # native -> LiteLLM never leaves stale endpoint/fast-path
+                    # metadata on the fallback attempt.
+                    native_endpoint=None,
+                    fast_path=None,
                 )
             except Exception:
                 lib_logger.debug("litellm fallback identity recording failed", exc_info=True)
