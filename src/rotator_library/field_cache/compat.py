@@ -147,8 +147,15 @@ def get_compatibility_registry() -> CompatibilityRegistry:
                 parsed = json.loads(raw)
                 if not isinstance(parsed, dict):
                     raise ValueError("not an object")
+                for name, members in parsed.items():
+                    if not isinstance(members, list):
+                        # Name the full value, not its first character (a
+                        # bare string would otherwise char-split confusingly).
+                        raise ValueError(
+                            f"group {name!r}: expected a list of model refs, got {members!r}"
+                        )
                 groups = {str(name): list(members) for name, members in parsed.items()}
-                # Member-shape errors raise here (add_group validation) —
+                # Member-shape errors raise in add_group validation —
                 # same never-crash-requests handling as JSON syntax errors.
                 _REGISTRY = CompatibilityRegistry(groups)
             except (ValueError, TypeError) as exc:

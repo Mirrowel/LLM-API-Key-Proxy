@@ -20,7 +20,7 @@ from rotator_library.field_cache.compat import (
 )
 from rotator_library.field_cache.engine import FieldCacheEngine, build_cache_key
 from rotator_library.field_cache.replay import compile_cache_replay, parse_cache_replay_config
-from rotator_library.field_cache.types import FieldCacheContext, FieldCacheRule
+from rotator_library.field_cache.types import FieldCacheContext, FieldCacheInjection, FieldCacheRule
 from rotator_library.field_cache.store import InMemoryFieldCacheStore
 
 
@@ -356,6 +356,112 @@ def test_unknown_credential_hit_records_none_provenance() -> None:
     updated, ops = asyncio.run(engine.inject("request", {}, _ctx(credential=None)))
     assert ops[0].hit is True
     assert ops[0].reason == "optional_scope_none:credential+session"
+
+
+def test_guard_blocks_isolation_widening_and_transform_changes() -> None:
+    """D12: a same-name replacement may never widen bound -> portable,
+    narrow is fine, and transforms may never be added or changed."""
+
+    from rotator_library.client.executor import _safe_field_cache_override
+
+    def _rule(compatibility=None, transform=None):
+        metadata = {}
+        if compatibility:
+            metadata["compatibility"] = compatibility
+        if transform:
+            metadata["transform"] = transform
+        return FieldCacheRule(
+            name="sig",
+            source="response",
+            path="signature",
+            metadata=metadata,
+        )
+
+    assert _safe_field_cache_override(_rule("bound"), _rule("portable")) is False
+    # Implicit class defaults to bound: widening still denied.
+    assert _safe_field_cache_override(_rule(), _rule("portable")) is False
+    # Narrowing portable -> bound stays allowed.
+    assert _safe_field_cache_override(_rule("portable"), _rule("bound")) is True
+    # Transforms never added or changed on replacement.
+    assert _safe_field_cache_override(_rule("portable"), _rule("portable", "identity")) is False
+
+
+def test_replay_scope_strengthens_to_d11_floor() -> None:
+    rules = compile_cache_replay(
+        [{"name": "r", "source": "response", "path": "x", "scope": ["model"], "inject": {"path": "y"}}],
+        provider="prov",
+    )
+    assert set(rules[0].scope) == {"provider", "model"}
+
+
+def test_per_tool_call_requires_tool_call_id_path_at_compile() -> None:
+    with pytest.raises(ValueError, match="tool_call_id_path"):
+        FieldCacheRule(name="sig", source="response", path="sig", mode="per_tool_call")
+    with pytest.raises(ValueError, match="tool_call_id_path"):
+        compile_cache_replay(
+            [{"name": "sig", "source": "response", "path": "sig", "keep": "per_tool_call"}],
+            provider="prov",
+        )
+
+
+def test_continuation_rules_bind_strict_session_regardless_of_lenient_flag() -> None:
+    """Engine-enforced: continuation state never pools at session=_none,
+    even when a declaration carries allow_missing_session=true."""
+
+    import asyncio
+
+    store = InMemoryFieldCacheStore()
+    rule = FieldCacheRule(
+        name="cont",
+        source="response",
+        path="id",
+        inject=FieldCacheInjection(target="request", path="previous_response_id"),
+        metadata={"provider_continuation": True},
+        allow_missing_session=True,
+    )
+    engine = FieldCacheEngine([rule], store)
+    asyncio.run(engine.extract("response", {"id": "resp_1"}, _ctx(session=None)))
+    updated, ops = asyncio.run(engine.inject("request", {}, _ctx(session=None)))
+    assert updated == {}
+    assert ops[0].hit is False
+    assert ops[0].reason == "missing_required_scope"
+
+
+def test_unknown_transform_rejected_at_rule_construction() -> None:
+    with pytest.raises(Exception, match="no_such_transform|Unknown transform"):
+        FieldCacheRule(
+            name="r",
+            source="response",
+            path="x",
+            metadata={"compatibility": "portable", "transform": "no_such_transform"},
+        )
+
+
+def test_classifier_scoped_rules_fail_closed_without_classifier() -> None:
+    import asyncio
+
+    store = InMemoryFieldCacheStore()
+    rule = FieldCacheRule(
+        name="cls",
+        source="response",
+        path="x",
+        scope=("provider", "model", "classifier"),
+        inject=FieldCacheInjection(target="request", path="x"),
+    )
+    engine = FieldCacheEngine([rule], store)
+    asyncio.run(engine.extract("response", {"x": "v"}, _ctx()))
+    updated, ops = asyncio.run(engine.inject("request", {}, _ctx()))
+    assert updated == {}
+    assert ops[0].hit is False
+    # Fail-closed with the required-scope reason (never pools across
+    # unknown classifiers).
+    assert ops[0].reason == "missing_required_scope"
+
+
+def test_rule_metadata_is_immutable() -> None:
+    rule = FieldCacheRule(name="sig", source="response", path="sig", metadata={"compatibility": "bound"})
+    with pytest.raises(TypeError):
+        rule.metadata["compatibility"] = "portable"  # type: ignore[index]
 
 
 def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> None:

@@ -91,11 +91,18 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
         if value is None or value == "":
             if scope in ("provider", "model"):
                 return None
-            if scope == "session" and not rule.allow_missing_session:
-                # Continuation-style rules opt into strict session binding;
-                # ordinary rules treat a missing session as _none (D11).
+            if scope == "session":
+                # Continuation state binds strict session ALWAYS — the
+                # lenient allow_missing_session flag never widens it
+                # (continuation under session=_none would leak across
+                # conversations). Ordinary rules pool at _none per D11:
+                # session is an optional refinement, never a disabler.
                 if rule.metadata.get("provider_continuation") is True:
                     return None
+            if scope == "classifier":
+                # The classifier is the multi-user isolation seed (D17):
+                # a rule scoped to it never pools across unknown classifiers.
+                return None
             value = "_none"
         safe_value = _safe_scope_value(value)
         parts.append(f"{scope}={safe_value}")

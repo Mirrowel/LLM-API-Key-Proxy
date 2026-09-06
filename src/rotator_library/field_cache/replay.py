@@ -8,6 +8,12 @@ keep it, and how to send it back — as JSON (env ``<NAME>_CACHE_REPLAY`` or
 the JSON provider config) or as a class attribute on code providers. The
 declaration compiles to ordinary FieldCacheRules: one surface, one engine.
 
+Extraction and injection run on the NATIVE execution path only (the
+engine lives in the native provider executor); traffic on the explicit
+LiteLLM fallback or a custom provider's own path neither caches nor
+injects — the fallback identity is recorded in transaction metadata
+(W11/W12).
+
 Declaration schema (list of entries):
 
 ``name``           unique rule name
@@ -123,6 +129,10 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
             scope = tuple(str(dimension) for dimension in scope_entry)  # type: ignore[assignment]
         else:
             scope = DEFAULT_SCOPE
+        # D11 floor: provider+model are the required identity for cached
+        # provider state — declared scopes are strengthened, never
+        # accepted weaker than the floor.
+        scope = tuple(dict.fromkeys(("provider", "model", *scope)))
         metadata: dict[str, Any] = {"cache_replay": True, "provider": provider}
         if compatibility:
             metadata["compatibility"] = str(compatibility)
@@ -141,7 +151,10 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
                 enabled=bool(entry.get("enabled", True)),
                 ttl_seconds=int(entry["ttl_seconds"]) if entry.get("ttl_seconds") is not None else None,
                 metadata=metadata,
-                allow_missing_session=bool(entry.get("allow_missing_session", True)),
+                # Matches the raw/JSON-configured rule default so the
+                # same-name weakening guard compares like with like across
+                # declaration layers.
+                allow_missing_session=bool(entry.get("allow_missing_session", False)),
                 # FieldCacheRule's uniform value bound applies when no
                 # turns cap is declared, keeping replay rules identical in
                 # shape to raw/JSON-configured rules (the weakening guard

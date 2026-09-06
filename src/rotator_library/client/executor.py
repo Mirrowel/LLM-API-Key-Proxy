@@ -3262,7 +3262,7 @@ def _provider_env_cache_replay(provider: str) -> tuple[Any, ...]:
 
     import os
 
-    raw = os.getenv(f"{provider.upper()}_CACHE_REPLAY", "")
+    raw = os.getenv(f"{provider.upper().replace('-', '_')}_CACHE_REPLAY", "")
     if not raw.strip():
         return ()
     return _env_cache_replay_cached(raw, provider)
@@ -3351,7 +3351,7 @@ def _safe_field_cache_override(declared: Any, configured: Any) -> bool:
         "turn_role_path",
         "turn_value_path",
     )
-    return (
+    if not (
         getattr(configured, "cache_key", None) == getattr(declared, "cache_key", None)
         and getattr(configured, "mode", None) == getattr(declared, "mode", None)
         and getattr(configured, "scope", None) == getattr(declared, "scope", None)
@@ -3365,8 +3365,21 @@ def _safe_field_cache_override(declared: Any, configured: Any) -> bool:
             == (getattr(declared, "metadata", {}) or {}).get(key)
             for key in behavior_keys
         )
-    )
-
+    ):
+        return False
+    # D12 isolation class: bound state may never widen to portable through
+    # a same-name replacement (narrowing portable -> bound stays safe).
+    declared_class = (getattr(declared, "metadata", {}) or {}).get("compatibility") or "bound"
+    configured_class = (getattr(configured, "metadata", {}) or {}).get("compatibility") or "bound"
+    if declared_class == "bound" and configured_class != "bound":
+        return False
+    # Inject shape: transforms may never be added or changed on a
+    # replacement (they change what the client receives on inject).
+    if (getattr(configured, "metadata", {}) or {}).get("transform") != (
+        getattr(declared, "metadata", {}) or {}
+    ).get("transform"):
+        return False
+    return True
 
 def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:
     """Read request-scope metadata attached by routing resolution."""

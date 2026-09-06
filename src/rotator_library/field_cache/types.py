@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import Any, Literal, Optional
 
 FieldCacheSource = Literal[
@@ -18,7 +19,7 @@ FieldCacheSource = Literal[
 ]
 FieldCacheTarget = Literal["request", "unified_request", "metadata"]
 FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"]
-FieldCacheScope = Literal["provider", "model", "credential", "session", "conversation", "classifier"]
+FieldCacheScope = Literal["provider", "model", "credential", "session", "classifier"]
 
 DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
 REQUIRED_PROVIDER_STATE_SCOPE = frozenset({"provider", "model", "credential", "session"})
@@ -30,7 +31,7 @@ OPTIONAL_SCOPE_DIMENSIONS = frozenset({"credential", "session"})
 _VALID_COMPATIBILITY = {"bound", "portable"}
 _VALID_SOURCES = {"request", "response", "stream_event", "unified_request", "unified_response", "unified_stream_event"}
 _VALID_TARGETS = {"request", "unified_request", "metadata"}
-_VALID_SCOPES = {"provider", "model", "credential", "session", "conversation", "classifier"}
+_VALID_SCOPES = {"provider", "model", "credential", "session", "classifier"}
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,15 @@ class FieldCacheRule:
                 raise ValueError(
                     "Transform-on-inject applies to portable fields only; bound opaque state never changes shape (D8)"
                 )
+            # Fail at construction (startup/config), never mid-request.
+            from ..protocols.transforms import get_transform
+
+            get_transform(transform)
+        if self.mode == "per_tool_call" and not self.metadata.get("tool_call_id_path"):
+            raise ValueError("per_tool_call rules require metadata.tool_call_id_path")
+        # Cached rule objects are shared across requests (compiled once);
+        # metadata must not be mutable through the shared reference.
+        object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
 
 def is_provider_continuation_path(path: str) -> bool:

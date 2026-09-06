@@ -247,7 +247,10 @@ def test_field_cache_rule_parses_ttl_metadata_and_insert_injection() -> None:
                             "path": "raw.tool.state",
                             "mode": "per_tool_call",
                             "ttl_seconds": 120,
-                            "metadata": {"tool_container_path": "tools"},
+                            "metadata": {
+                                "tool_container_path": "tools",
+                                "tool_call_id_path": "tools.id",
+                            },
                             "inject": {"target": "request", "path": "metadata.tool_state", "insert": True},
                         }
                     ]
@@ -260,7 +263,7 @@ def test_field_cache_rule_parses_ttl_metadata_and_insert_injection() -> None:
 
     assert rule.ttl_seconds == 120
     assert rule.cache_key == "shared_tool_state"
-    assert rule.metadata == {"tool_container_path": "tools"}
+    assert dict(rule.metadata) == {"tool_container_path": "tools", "tool_call_id_path": "tools.id"}
     assert rule.inject is not None
     assert rule.inject.insert is True
 
