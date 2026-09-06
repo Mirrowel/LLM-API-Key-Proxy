@@ -145,7 +145,9 @@ def test_engine_portable_inheritance_on_miss() -> None:
         engine2 = FieldCacheEngine([rule_inject], store)
         updated, ops = asyncio.run(engine2.inject("request", target_payload, _ctx(model="m2", session="s1")))
         assert ops[0].hit is True
-        assert ops[0].reason == "inherited_from_compatible_model"
+        # Inheritance through a _none credential dimension is still
+        # transparent (merged provenance per D11).
+        assert ops[0].reason == "inherited_from_compatible_model;optional_scope_none:credential"
         assert updated["reasoning_hint"] == {"v": "plaintext reasoning"}
     finally:
         os.environ.pop("FIELD_CACHE_COMPAT_GROUPS", None)
@@ -393,8 +395,7 @@ def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> 
         from rotator_library.client.executor import _env_cache_replay_cached
 
         _env_cache_replay_cached.cache_clear()
-        with pytest.raises(RoutingExecutionError, match="cannot weaken"):
-            _merged_field_cache_rules("shadowprov", "shadowprov/m", _Plugin(), config=None)
+        with pytest.raises(RoutingExecutionError, match="cannot weaken"):            _merged_field_cache_rules("shadowprov", "shadowprov/m", _Plugin(), config=None)
     finally:
         os.environ.pop("SHADOWPROV_CACHE_REPLAY", None)
         from rotator_library.client.executor import _env_cache_replay_cached

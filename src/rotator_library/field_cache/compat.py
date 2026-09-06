@@ -148,6 +148,9 @@ def get_compatibility_registry() -> CompatibilityRegistry:
                 if not isinstance(parsed, dict):
                     raise ValueError("not an object")
                 groups = {str(name): list(members) for name, members in parsed.items()}
+                # Member-shape errors raise here (add_group validation) —
+                # same never-crash-requests handling as JSON syntax errors.
+                _REGISTRY = CompatibilityRegistry(groups)
             except (ValueError, TypeError) as exc:
                 # Malformed group config never crashes requests: no groups
                 # (default-deny) plus a loud warning for the operator.
@@ -158,6 +161,7 @@ def get_compatibility_registry() -> CompatibilityRegistry:
                     COMPATIBILITY_ENV_VAR,
                     exc,
                 )
-                groups = {}
-        _REGISTRY = CompatibilityRegistry(groups)
+                _REGISTRY = CompatibilityRegistry({})
+        if _REGISTRY is None:
+            _REGISTRY = CompatibilityRegistry({})
     return _REGISTRY

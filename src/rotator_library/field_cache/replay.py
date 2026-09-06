@@ -142,7 +142,11 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
                 ttl_seconds=int(entry["ttl_seconds"]) if entry.get("ttl_seconds") is not None else None,
                 metadata=metadata,
                 allow_missing_session=bool(entry.get("allow_missing_session", True)),
-                max_values=turns_cap if turns_cap is not None else None,
+                # FieldCacheRule's uniform value bound applies when no
+                # turns cap is declared, keeping replay rules identical in
+                # shape to raw/JSON-configured rules (the weakening guard
+                # compares this field).
+                max_values=turns_cap if turns_cap is not None else 1024,
             )
         )
     return tuple(rules)

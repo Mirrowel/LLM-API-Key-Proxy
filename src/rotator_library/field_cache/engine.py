@@ -211,16 +211,18 @@ class FieldCacheEngine:
                     continue
                 operation.hit = True
                 if provenance_note is None:
-                    # D11 provenance: hits through optional _none dimensions
-                    # are visible (unknown credential/session transparency).
-                    none_dimensions = [
-                        scope
-                        for scope in rule.scope
-                        if scope in ("credential", "session")
-                        and (context.value_for_scope(scope) in (None, ""))
-                    ]
-                    if none_dimensions:
-                        provenance_note = {"none_dimensions": none_dimensions}
+                    provenance_note = {}
+                # Optional-dimension transparency applies to direct AND
+                # inherited hits (an inheritance through an unknown
+                # credential/session is still visible).
+                none_dimensions = [
+                    scope
+                    for scope in rule.scope
+                    if scope in ("credential", "session")
+                    and (context.value_for_scope(scope) in (None, ""))
+                ]
+                if none_dimensions:
+                    provenance_note["none_dimensions"] = none_dimensions
                 value = self._injection_value(rule, cached, updated, context, operation)
                 if operation.skipped:
                     operations.append(operation)
@@ -241,7 +243,13 @@ class FieldCacheEngine:
                             self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
                             continue
                 if provenance_note and provenance_note.get("inherited_from"):
-                    operation.reason = "inherited_from_compatible_model"
+                    inherited = "inherited_from_compatible_model"
+                    none_dimensions = provenance_note.get("none_dimensions")
+                    operation.reason = (
+                        inherited + ";optional_scope_none:" + "+".join(none_dimensions)
+                        if none_dimensions
+                        else inherited
+                    )
                 elif provenance_note and provenance_note.get("none_dimensions"):
                     operation.reason = "optional_scope_none:" + "+".join(provenance_note["none_dimensions"])
                 operation.changed = inject_path(

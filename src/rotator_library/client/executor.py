@@ -3320,7 +3320,8 @@ def _merged_field_cache_rules(
     order = [getattr(rule, "name", str(index)) for index, rule in enumerate(plugin_rules)]
     # Weaker-declaration layers apply first so stronger ones override them;
     # every same-name replacement passes the guard against the incumbent.
-    for rule in class_rules + env_rules + configured:
+    layer_sources = [("class", rule) for rule in class_rules] + [("env", rule) for rule in env_rules] + [("config", rule) for rule in configured]
+    for source, rule in layer_sources:
         name = getattr(rule, "name", "")
         if not name:
             continue
@@ -3330,7 +3331,7 @@ def _merged_field_cache_rules(
             incumbent = merged[name]
             if incumbent is not rule and not _safe_field_cache_override(incumbent, rule):
                 raise RoutingExecutionError(
-                    f"Configured field-cache rule {name!r} cannot weaken provider state isolation or injection behavior",
+                    f"Field-cache rule {name!r} ({source} declaration) cannot weaken provider state isolation or injection behavior",
                     error_type="configuration_error",
                 )
         merged[name] = rule
