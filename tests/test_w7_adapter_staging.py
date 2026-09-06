@@ -3,11 +3,13 @@
 
 """W7 acceptance fixtures: adapter staging contracts.
 
-Adapters are WIRE adapters: request-side they run on the built
-provider-native payload (after the finalizer), response-side on the raw
-provider response BEFORE parsing, stream-side on the raw provider chunk
-BEFORE parsing. They never see the client protocol, and their effect is
-identical for every client of the same provider.
+Adapters are WIRE adapters on the request and response sides: request-side
+they run on the built provider-native payload (after the finalizer),
+response-side on the raw provider response BEFORE parsing. Stream-side
+they run on the NEUTRAL parsed event (plan §2.5) — provider frames are
+SSE-wrapped transport, and neutral is the protocol-free seam. Adapters
+never see the client protocol, and their effect is identical for every
+client of the same provider.
 """
 
 from __future__ import annotations
@@ -53,6 +55,7 @@ class ContextCapturingAdapter(PayloadAdapter):
         return payload
 
     async def transform_stream_event(self, payload, context):
+        # Streaming neutral events also carry no client-protocol view.
         _ContextCapture.contexts.append(("stream_event", context))
         return payload
 
@@ -102,20 +105,48 @@ async def test_adapters_never_observe_the_client_protocol() -> None:
         )
 
     assert len(_ContextCapture.contexts) == 6  # request + response per client
-    stages = {stage for stage, _ in _ContextCapture.contexts}
-    assert stages == {"request", "response"}
     # No context field or metadata key mentions a client-side protocol.
     for stage, ctx in _ContextCapture.contexts:
         assert ctx.protocol == "anthropic_messages"
         for field in ("input_protocol", "client_protocol", "input_protocol_name", "client_protocol_name"):
             assert not hasattr(ctx, field)
         flat = str(ctx.metadata or {})
-        assert "openai_chat" not in flat and '"gemini"' not in flat and '"responses"' not in flat
+        for protocol_name in ("openai_chat", "gemini", "responses"):
+            assert f"'{protocol_name}'" not in flat and f'"{protocol_name}"' not in flat
     # Contexts are byte-identical across the three clients (equality, not
     # substring luck): production-like metadata included.
     signatures = [_context_signature(ctx) for _, ctx in _ContextCapture.contexts]
     assert signatures[0] == signatures[2] == signatures[4]
     assert signatures[1] == signatures[3] == signatures[5]
+
+    # Streaming neutral events carry the same client-protocol blind spot.
+    from .test_native_provider_streaming import FakeStreamingClient
+
+    stream_context = NativeProviderContext(
+        provider="provider",
+        model="model-test",
+        protocol_name="openai_chat",
+        endpoint="https://provider.test/chat",
+        operation="chat",
+        input_protocol_name="anthropic_messages",
+        client_protocol_name="anthropic_messages",
+        adapter_names=("w7_context_capture",),
+        metadata={"public_model": "provider/model-test", "input_provider": "provider"},
+    )
+    _ContextCapture.reset()
+    [
+        event
+        async for event in NativeProviderExecutor().stream(
+            {"model": "model-test", "messages": [{"role": "user", "content": "hi"}]},
+            stream_context,
+            NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "x"}}]}, "[DONE]"])),
+        )
+    ]
+    stream_stages = {stage for stage, _ in _ContextCapture.contexts}
+    assert "stream_event" in stream_stages
+    _, stream_ctx = _ContextCapture.contexts[-1]
+    assert stream_ctx.protocol == "openai_chat"
+    assert not hasattr(stream_ctx, "client_protocol")
 
 
 @pytest.mark.asyncio
@@ -131,6 +162,7 @@ async def test_response_wire_adapters_apply_once_before_parse_for_raw_passthroug
 
         async def transform_response(self, payload, context):
             call_count["n"] += 1
+            payload = deepcopy(payload)
             payload["touched"] = True
             return payload
 
@@ -222,7 +254,9 @@ async def test_adapted_wire_feeds_cache_extract_usage_and_traces(tmp_path) -> No
                 for block in payload.get("content", []):
                     if block.get("type") == "text" and block.get("text") == "hidden":
                         block["text"] = "fixed"
-                payload.setdefault("usage", {})
+                # Rewrite usage so the accounting pin cannot pass vacuously.
+                if isinstance(payload.get("usage"), dict):
+                    payload["usage"]["input_tokens"] = 99
             return payload
 
     register_adapter(ReasoningFixer, replace=True)
@@ -262,4 +296,4 @@ async def test_adapted_wire_feeds_cache_extract_usage_and_traces(tmp_path) -> No
     assert pass_names.index("after_response_adapter_chain") < pass_names.index("after_response_field_cache_extraction")
     assert pass_names.index("after_response_adapter_chain") < pass_names.index("parsed_native_unified_response")
     usage_entry = next(entry for entry in trace if entry["pass_name"] == "usage_accounting_summary")
-    assert usage_entry["data"]["usage"]["input_tokens"] == 1  # adapted wire usage
+    assert usage_entry["data"]["usage"]["input_tokens"] == 99  # adapted wire usage won

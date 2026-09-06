@@ -197,7 +197,7 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
 
         async def transform_stream_event(self, payload, context):
             # W7 contract (plan §2.5): stream adapters run on the NEUTRAL
-            # parsed event — protocol-free, client-agnostic.
+            # parsed event — protocol-free, client-agnostic, after parsing.
             payload.delta.content[0].text = "adapted"
             return payload
 
@@ -221,7 +221,7 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
         )
     ]
 
-    # The wire-level edit landed BEFORE parse — the neutral event carries it.
+    # The neutral-event edit landed after parse — the output carries it.
     assert events[0].delta.content[0].text == "adapted"
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "after_stream_event_adapter_chain" in pass_names
