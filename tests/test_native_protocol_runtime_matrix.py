@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from rotator_library.native_provider import NativeProviderContext, NativeProviderExecutor
+from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from rotator_library.client.executor import RequestExecutor
 from rotator_library.client.request_builder import RequestContextBuilder
 from rotator_library.client.rotating_client import RotatingClient
@@ -455,7 +455,9 @@ async def test_response_adapters_run_on_provider_native_payload() -> None:
 
 def _synthetic_thought_signature_rules() -> tuple:
     """Contract shape a gemini-wire provider declares for opaque thought
-    signatures (the durable antigravity-style contract, synthetically)."""
+    signatures (the durable antigravity-style contract, synthetically):
+    response + stream sources share one logical cache key, accumulate ALL
+    signatures (never just the latest), bounded TTL."""
     from rotator_library.field_cache import FieldCacheInjection, FieldCacheRule
 
     return (
@@ -465,7 +467,10 @@ def _synthetic_thought_signature_rules() -> tuple:
             source="response",
             path="candidates.*.content.parts.*.thoughtSignature",
             scope=("provider", "model", "credential", "session"),
+            mode="all",
+            ttl_seconds=3600,
             inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
+            metadata={"purpose": "preserve opaque thought signatures across turns"},
         ),
         FieldCacheRule(
             name="synthetic_thought_signature_stream",
@@ -473,21 +478,28 @@ def _synthetic_thought_signature_rules() -> tuple:
             source="stream_event",
             path="raw.candidates.*.content.parts.*.thoughtSignature",
             scope=("provider", "model", "credential", "session"),
+            mode="all",
+            ttl_seconds=3600,
             inject=FieldCacheInjection(target="request", path="request.metadata.thoughtSignatures", as_list=True),
+            metadata={"purpose": "preserve streamed opaque thought signatures across turns"},
         ),
     )
 
 
 @pytest.mark.asyncio
-async def test_opaque_thought_signatures_are_cached_but_never_returned_to_clients() -> None:
+@pytest.mark.parametrize("client_protocol", PROTOCOLS)
+async def test_opaque_thought_signatures_are_cached_but_never_returned_to_clients(client_protocol) -> None:
+    """State independence across client protocols: signatures are cached from
+    the provider wire and injected regardless of how the client speaks, and
+    never leak back in any client format."""
     context = NativeProviderContext(
         provider="antigravity",
         model="gemini-3-pro",
         protocol_name="gemini",
         endpoint="https://provider.test/generate",
         operation="generate",
-        input_protocol_name="gemini",
-        client_protocol_name="gemini",
+        input_protocol_name=client_protocol,
+        client_protocol_name=client_protocol,
         credential_id="credential-1",
         session_id="session-1",
         field_cache_rules=_synthetic_thought_signature_rules(),
@@ -516,6 +528,61 @@ async def test_opaque_thought_signatures_are_cached_but_never_returned_to_client
     assert second_transport.payload["request"]["metadata"]["thoughtSignatures"] == [
         "provider-secret-signature"
     ]
+
+
+@pytest.mark.asyncio
+async def test_shared_cache_key_accumulates_stream_and_non_stream_signatures() -> None:
+    """Response + stream rules sharing one logical cache key accumulate ALL
+    values across sources (mode="all"), never collapsing to the latest."""
+    context = NativeProviderContext(
+        provider="antigravity",
+        model="gemini-3-pro",
+        protocol_name="gemini",
+        endpoint="https://provider.test/generate",
+        operation="generate",
+        input_protocol_name="gemini",
+        client_protocol_name="gemini",
+        credential_id="credential-1",
+        session_id="session-1",
+        field_cache_rules=_synthetic_thought_signature_rules(),
+        adapter_names=("antigravity_envelope",),
+        adapter_config={"antigravity_envelope": {"project": "proj", "user_agent": "ua", "request_type": "GENERATE"}},
+        metadata={"public_model": "antigravity/gemini-3-pro", "input_provider": "antigravity"},
+    )
+    executor = NativeProviderExecutor()
+
+    signed_response = deepcopy(RESPONSES["gemini"])
+    signed_response["candidates"][0]["content"]["parts"].insert(
+        0,
+        {"text": "reasoning", "thought": True, "thoughtSignature": "non-stream-signature"},
+    )
+    await executor.execute(
+        deepcopy(REQUESTS["gemini"]),
+        context,
+        RecordingTransport(signed_response),
+    )
+
+    streamed = deepcopy(RESPONSES["gemini"])
+    streamed["candidates"][0]["content"]["parts"].insert(
+        0,
+        {"text": "stream reasoning", "thought": True, "thoughtSignature": "stream-signature"},
+    )
+    from .test_native_provider_streaming import FakeStreamingClient
+
+    [
+        event
+        async for event in executor.stream(
+            {"model": "gemini-3-pro", "contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+            context,
+            NativeHTTPTransport(FakeStreamingClient([streamed, "[DONE]"])),
+        )
+    ]
+
+    third_transport = RecordingTransport(deepcopy(RESPONSES["gemini"]))
+    await executor.execute(deepcopy(REQUESTS["gemini"]), context, third_transport)
+
+    injected = third_transport.payload["request"]["metadata"]["thoughtSignatures"]
+    assert injected == ["non-stream-signature", "stream-signature"]
 
 
 @pytest.mark.asyncio

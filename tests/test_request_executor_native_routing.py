@@ -339,7 +339,6 @@ async def test_synthetic_anthropic_wire_provider_runs_mock_live_native_request(m
     """Runtime path for an anthropic-wire provider (the contract the manual
     claude-code implementation will declare): developer-role suppression via
     the declared adapter, anthropic endpoint, native parse/format."""
-    monkeypatch.setenv("CLAUDE_CODE_API_BASE", "https://claude-code.test")
     http_client = SequencedHTTPClient([
         {"id": "msg_1", "type": "message", "role": "assistant", "content": [{"type": "text", "text": "ok"}], "usage": {"input_tokens": 1, "output_tokens": 1}}
     ])
@@ -383,7 +382,6 @@ async def test_synthetic_anthropic_wire_provider_runs_mock_live_native_request(m
 @pytest.mark.asyncio
 async def test_synthetic_responses_wire_provider_runs_mock_live_native_request(monkeypatch) -> None:
     """Runtime path for a responses-wire provider (the codex contract)."""
-    monkeypatch.setenv("CODEX_API_BASE", "https://codex.test")
     http_client = SequencedHTTPClient([
         {"id": "resp_1", "object": "response", "output": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]}]}
     ])
@@ -407,7 +405,9 @@ async def test_synthetic_responses_wire_provider_runs_mock_live_native_request(m
 
     assert response["id"] == "resp_1"
     assert response["choices"][0]["message"]["content"] == "ok"
+    # Endpoint path is a synthetic routing shape, not upstream contract evidence.
     assert http_client.calls[0]["endpoint"] == "https://codex.test/responses"
+    assert http_client.calls[0]["json"]["model"] == "gpt-5.1-codex"
     assert http_client.calls[0]["json"]["input"][0]["content"] == [{"type": "input_text", "text": "hi"}]
     assert "messages" not in http_client.calls[0]["json"]
 
@@ -416,7 +416,6 @@ async def test_synthetic_responses_wire_provider_runs_mock_live_native_request(m
 async def test_synthetic_chat_wire_provider_runs_mock_live_native_request(monkeypatch) -> None:
     """Runtime path for a chat-wire provider with developer-role suppression
     (the copilot contract)."""
-    monkeypatch.setenv("COPILOT_API_BASE", "https://copilot.test")
     http_client = SequencedHTTPClient([
         {"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok"}}]}
     ])
@@ -448,7 +447,6 @@ async def test_synthetic_chat_wire_provider_runs_mock_live_native_request(monkey
 async def test_synthetic_gemini_wire_provider_with_envelope_runs_mock_live_native_request(monkeypatch) -> None:
     """Runtime path for a gemini-wire provider declaring the envelope wire
     adapter (the antigravity contract)."""
-    monkeypatch.setenv("ANTIGRAVITY_API_BASE", "https://antigravity.test/v1internal")
     http_client = SequencedHTTPClient([
         {"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}], "usageMetadata": {"totalTokenCount": 2}}
     ])

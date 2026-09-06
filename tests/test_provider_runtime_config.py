@@ -111,6 +111,10 @@ def test_priority_provider_overrides_respect_json_adapter_config_and_streaming(t
     class OverrideBProvider(ConfiguredProvider):
         provider_env_name = "override_b"
 
+    class OverrideCProvider(ConfiguredProvider):
+        provider_env_name = "override_c"
+        protocol_name = "openai_chat"
+
     config_path = _write_config(
         tmp_path,
         {
@@ -121,6 +125,9 @@ def test_priority_provider_overrides_respect_json_adapter_config_and_streaming(t
                 "override_b": {
                     "adapter_config": {"suppress_developer_role": {"mode": "user"}},
                 },
+                "override_c": {
+                    "native_streaming_supported": True,
+                },
             }
         },
     )
@@ -128,6 +135,8 @@ def test_priority_provider_overrides_respect_json_adapter_config_and_streaming(t
 
     assert OverrideAProvider().get_adapter_config("override_a/gpt-5")["suppress_developer_role"]["mode"] == "assistant"
     assert OverrideBProvider().get_adapter_config("override_b/llama")["suppress_developer_role"]["mode"] == "user"
+    # JSON can flip native streaming support on for a declared-protocol provider.
+    assert OverrideCProvider().supports_native_streaming("override_c/gpt", "chat") is True
 
 
 @pytest.mark.asyncio
