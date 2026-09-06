@@ -518,7 +518,7 @@ def test_new_fields_serialize_round_trip() -> None:
     block = serialized_builtin["messages"][0]["content"][0]
     assert block["type"] == "builtin_tool"
     assert block["builtin_tool"]["kind"] == "web_search"
-    assert block["index"] == 0 or block["index"] is None
+    assert isinstance(block["index"], int)
 
 
 def test_chat_stream_refusal_delta_parses() -> None:
@@ -547,14 +547,11 @@ def test_chat_audio_response_round_trips_at_message_level() -> None:
 
     out = chat.format_response(parsed, _ctx("openai_chat", "openai_chat"))
     message = out["choices"][0]["message"]
-    # Native shape: audio at message level; content must NOT carry a typeless
-    # or duplicated audio content part.
+    # Native shape: audio at message level, content null — no typeless or
+    # duplicated audio content part.
     assert message["audio"]["id"] == "aud_1"
     assert message["audio"]["data"] == "QUJD"
-    content = message.get("content")
-    if isinstance(content, list):
-        assert all(isinstance(part, dict) and part.get("type") for part in content)
-        assert not any("QUJD" in str(part) for part in content)
+    assert message["content"] is None
 
 
 def test_refusal_history_degrades_to_text_across_all_targets() -> None:

@@ -743,7 +743,7 @@ def _format_response_message(payload: dict[str, Any], message: UnifiedMessage) -
     """
 
     if payload.get("content") is not None and message.content:
-        if all(block.type in {"text", "input_text", "output_text", "refusal"} and not block.extra for block in message.content):
+        if all(block.type in {"text", "input_text", "output_text", "refusal", "audio"} and not block.extra for block in message.content):
             payload = dict(payload)
             payload["content"] = _first_response_text(message.content) or ""
     if payload.get("content") is not None and not payload["content"]:
