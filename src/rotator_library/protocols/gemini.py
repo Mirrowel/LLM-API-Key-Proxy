@@ -42,9 +42,12 @@ from .canonical import (
 from .operation import OPERATION_CHAT, OPERATION_COUNT_TOKENS, OPERATION_GENERATE, OPERATION_UNKNOWN, normalize_operation
 from .validation import validate_generative_request, validate_generative_response
 from .types import (
+    Annotation,
     ContentBlock,
+    ConversionWarning,
     MediaSource,
     ProtocolContext,
+    ProtocolError,
     ReasoningBlock,
     ToolCall,
     ToolDefinition,
@@ -54,6 +57,7 @@ from .types import (
     UnifiedResponse,
     UnifiedStreamEvent,
     Usage,
+    serialize_value,
 )
 
 _REQUEST_CORE_FIELDS = {
@@ -70,6 +74,17 @@ _REQUEST_CORE_FIELDS = {
     "tool_config",
     "stream",
 }
+
+
+def _warn_gemini_once(unified_response: UnifiedResponse, *, code: str, message: str) -> None:
+    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+
+    for warning in unified_response.warnings:
+        if warning.code == code and warning.message == message:
+            return
+    unified_response.warnings.append(
+        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol="gemini")
+    )
 
 
 class GeminiProtocol(ProtocolAdapter):
@@ -147,19 +162,69 @@ class GeminiProtocol(ProtocolAdapter):
         payload.update(source_extensions(unified_request.extra, context, self.name, unified_request.source_protocol))
         return payload
 
+    def _attach_grounding_annotations(self, message: UnifiedMessage, candidate: dict[str, Any]) -> None:
+        """Lift Gemini grounding metadata onto text parts as annotations (W2)."""
+
+        grounding = candidate.get("groundingMetadata")
+        if not isinstance(grounding, dict):
+            return
+        chunks = grounding.get("groundingChunks")
+        web_query = grounding.get("webSearchQueries")
+        derived = []
+        if isinstance(chunks, list):
+            for chunk in chunks:
+                if isinstance(chunk, dict) and isinstance(chunk.get("web"), dict):
+                    web = chunk["web"]
+                    derived.append(
+                        Annotation(
+                            type="url_citation",
+                            url=web.get("uri") or web.get("url"),
+                            title=web.get("title"),
+                            raw=deepcopy(chunk),
+                        )
+                    )
+        if not derived and isinstance(grounding.get("searchEntryPoint"), dict):
+            # At minimum preserve the search entry point as evidence metadata.
+            message.extra["grounding_search_entry_point"] = deepcopy(grounding["searchEntryPoint"])
+        if web_query is not None:
+            message.extra["grounding_web_search_queries"] = deepcopy(web_query)
+        if derived:
+            for block in message.content:
+                if block.type == "text" and block.text:
+                    block.annotations.extend(derived)
+                    break
+            else:
+                message.extra["grounding_annotations"] = [serialize_value(a) for a in derived]
+
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         response = _as_dict(raw_response)
         messages: list[UnifiedMessage] = []
         stop_reason = None
-        for candidate in response.get("candidates") or []:
+        for candidate_position, candidate in enumerate(response.get("candidates") or []):
             if not isinstance(candidate, dict):
                 continue
             content = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
             message = self._parse_content(content)
             message.extra["candidate"] = _without(candidate, {"content"})
+            # Candidate identity (W2/D9): each alternative keeps its index and
+            # finish status so multiplicity survives cross-protocol conversion.
+            try:
+                message.index = int(candidate.get("index", candidate_position))
+            except (TypeError, ValueError):
+                message.index = candidate_position
+            message.stop_reason = canonical_stop_reason(candidate.get("finishReason"))
+            self._attach_grounding_annotations(message, candidate)
             messages.append(message)
             if candidate.get("finishReason") is not None:
                 stop_reason = candidate.get("finishReason")
+        modality_blocks = [block for message in messages for block in message.content]
+        modalities: list[str] = []
+        if any(block.type == "text" and block.text for block in modality_blocks):
+            modalities.append("text")
+        if any(block.type == "audio" for block in modality_blocks):
+            modalities.append("audio")
+        if any(block.type == "image" for block in modality_blocks):
+            modalities.append("image")
         canonical_reason = canonical_stop_reason(stop_reason)
         if canonical_reason == "stop" and any(message_tool_calls(message) for message in messages):
             canonical_reason = "tool_use"
@@ -171,6 +236,7 @@ class GeminiProtocol(ProtocolAdapter):
             messages=messages,
             stop_reason=canonical_reason,
             usage=self.extract_usage(response, context),
+            modalities=modalities,
             metadata={"promptFeedback": deepcopy(response.get("promptFeedback")), "modelVersion": response.get("modelVersion"), "native_stop_reason": stop_reason},
             source_protocol=self.name,
             raw=deepcopy(response),
@@ -188,12 +254,50 @@ class GeminiProtocol(ProtocolAdapter):
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
-        messages = unified_response.messages if preserve_source else [coalesce_assistant_message(unified_response.messages)]
+        # Gemini natively supports candidates: multiplicity is preserved
+        # cross-protocol too (D9 direct mapping), never coalesced.
+        if preserve_source:
+            messages = unified_response.messages
+        else:
+            assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
+            if len(assistants) > 1 and all(m.index is not None for m in assistants):
+                messages = assistants
+            else:
+                messages = [coalesce_assistant_message(unified_response.messages)]
+            has_annotations = any(block.annotations for m in messages for block in m.content)
+            if has_annotations:
+                _warn_gemini_once(
+                    unified_response,
+                    code="annotations_dropped",
+                    message="citations/annotations have no Gemini representation; dropped",
+                )
+            for m in messages:
+                has_builtin = any(block.type == "builtin_tool" for block in m.content)
+                has_representable = any(
+                    block.type in {"text", "reasoning", "tool_call", "tool_result", "image", "audio", "video", "file", "document", "refusal"}
+                    for block in m.content
+                ) or bool(m.tool_calls or m.reasoning)
+                if has_builtin:
+                    _warn_gemini_once(
+                        unified_response,
+                        code="builtin_tool_dropped",
+                        message="provider-executed tool records have no Gemini representation; dropped",
+                    )
+                if has_builtin and not has_representable:
+                    # D7: a record-only response the target cannot express is
+                    # rejected, never an empty success.
+                    raise ProtocolError(
+                        "Gemini generateContent cannot represent a provider-executed tool record as a successful candidate",
+                        protocol=self.name,
+                        pass_name="format_response",
+                        payload={"dropped_blocks": ["builtin_tool"]},
+                    )
         candidates = []
         for index, message in enumerate(message for message in messages if message.content or message.reasoning or message.tool_calls):
-            candidate = {"index": index, "content": self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state)}
-            if unified_response.stop_reason:
-                candidate["finishReason"] = format_stop_reason(unified_response.stop_reason, self.name)
+            candidate = {"index": message.index if message.index is not None else index, "content": self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state)}
+            per_candidate_reason = message.stop_reason or unified_response.stop_reason
+            if per_candidate_reason:
+                candidate["finishReason"] = format_stop_reason(per_candidate_reason, self.name)
             if preserve_source:
                 candidate.update(deepcopy(message.extra.get("candidate") or {}))
             candidates.append(candidate)
@@ -291,13 +395,22 @@ class GeminiProtocol(ProtocolAdapter):
         )
         payload = {"role": role, "parts": parts}
         if preserve_source:
-            payload.update({k: deepcopy(v) for k, v in message.extra.items() if k != "gemini_role"})
+            payload.update(
+                {
+                    k: deepcopy(v)
+                    for k, v in message.extra.items()
+                    if k != "gemini_role" and not k.startswith("grounding_") and k != "candidate"
+                }
+            )
         return payload
 
     def _parse_parts(self, parts: Iterable[Any]) -> list[ContentBlock]:
         blocks = []
-        for part in parts:
-            blocks.append(self._parse_part(part))
+        for position, part in enumerate(parts):
+            block = self._parse_part(part)
+            if block.index is None:
+                block.index = position
+            blocks.append(block)
         return blocks
 
     def _parse_part(self, part: Any) -> ContentBlock:
@@ -352,6 +465,15 @@ class GeminiProtocol(ProtocolAdapter):
                 elif not emit_opaque_state:
                     payload.pop("thoughtSignature", None)
                 parts.append(payload)
+            elif block.type == "refusal" and block.refusal is not None:
+                # Gemini has no refusal part; the text survives as a plain
+                # text part (stop_reason carries the refusal semantics).
+                parts.append({"text": block.refusal})
+            elif block.type == "builtin_tool":
+                # Handled by format_response guards (drop with warning or
+                # reject when nothing representable remains); never fabricated
+                # into an empty text part here.
+                continue
             else:
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {}
                 payload["text"] = block.text or ""

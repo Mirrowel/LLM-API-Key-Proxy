@@ -41,7 +41,10 @@ from .canonical import (
 from .operation import OPERATION_GENERATE, OPERATION_RESPONSES
 from .validation import validate_generative_request, validate_generative_response
 from .types import (
+    Annotation,
+    BuiltinToolCall,
     ContentBlock,
+    ConversionWarning,
     CostDetails,
     MediaSource,
     OutputItem,
@@ -182,6 +185,7 @@ class ResponsesProtocol(ProtocolAdapter):
             output=output,
             stop_reason=stop_reason,
             usage=self.extract_usage(response, context),
+            modalities=_responses_output_modalities(messages),
             metadata={"object": response.get("object"), "created_at": response.get("created_at"), "native_status": response.get("status"), "incomplete_details": deepcopy(response.get("incomplete_details"))},
             source_protocol=self.name,
             raw=deepcopy(response),
@@ -191,6 +195,8 @@ class ResponsesProtocol(ProtocolAdapter):
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
+        assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
+        candidate_backed = len(assistants) > 1 and all(m.index is not None for m in assistants)
         if preserve_source and unified_response.output:
             output = deepcopy(unified_response.output)
             for fallback_index, message in enumerate(unified_response.messages):
@@ -199,6 +205,16 @@ class ResponsesProtocol(ProtocolAdapter):
                     output[output_index] = self._format_output_message(message, output_index)
                 else:
                     output.append(self._format_output_message(message, fallback_index))
+        elif candidate_backed:
+            # D9 first-wins: a Responses object is one logical answer; extra
+            # candidates degrade to the first with a recorded summary, never
+            # concatenation.
+            _warn_responses_once(
+                unified_response,
+                code="candidates_first_wins",
+                message=f"{len(assistants) - 1} additional candidate(s) dropped: single-response object (first candidate wins)",
+            )
+            output = self._format_canonical_output(assistants[0])
         else:
             output = self._format_canonical_output(coalesce_assistant_message(unified_response.messages))
         payload = {
@@ -395,6 +411,32 @@ class ResponsesProtocol(ProtocolAdapter):
         if item_type in {"function_call", "custom_tool_call"}:
             call = ToolCall(id=item.get("call_id") or item.get("id"), name=item.get("name"), arguments=canonical_tool_arguments(item.get("arguments") or item.get("input")), type="function" if item_type == "function_call" else str(item_type), raw=deepcopy(item))
             return UnifiedMessage(role="assistant", content=[ContentBlock(type="tool_call", tool_call=call, raw=deepcopy(item))], tool_calls=[call], raw=deepcopy(item))
+        if item_type in _BUILTIN_TOOL_ITEM_TYPES:
+            # Provider-executed tool records (web search, file search, code
+            # interpreter, ...) are canonical capabilities (W2): never dropped,
+            # never turned into empty successes.
+            builtin = BuiltinToolCall(
+                kind=str(item_type).removesuffix("_call") or str(item_type),
+                call_id=item.get("call_id") or item.get("id"),
+                status=item.get("status"),
+                output=deepcopy(item.get("results") if "results" in item else item.get("output") if "output" in item else item.get("result")),
+                raw=deepcopy(item),
+            )
+            return UnifiedMessage(role="assistant", content=[ContentBlock(type="builtin_tool", builtin_tool=builtin, raw=deepcopy(item))], raw=deepcopy(item))
+        if item_type and item_type not in {"message", "reasoning", "function_call", "custom_tool_call", "item_reference"}:
+            # Unknown provider-executed / server-side item kinds (MCP list/
+            # approval, shell calls, future tools) become catch-all builtin
+            # records: retained with raw for same-protocol fidelity, guarded
+            # cross-protocol — never silently dropped.
+            builtin = BuiltinToolCall(
+                kind=str(item_type),
+                call_id=item.get("call_id") or item.get("id"),
+                status=item.get("status"),
+                output=deepcopy({k: v for k, v in item.items() if k not in {"type", "id", "call_id", "status"}}),
+                raw=deepcopy(item),
+                extra={"synthesized_kind": True},
+            )
+            return UnifiedMessage(role="assistant", content=[ContentBlock(type="builtin_tool", builtin_tool=builtin, raw=deepcopy(item))], raw=deepcopy(item))
         return None
 
     def _format_output_message(self, message: UnifiedMessage, index: int) -> dict[str, Any]:
@@ -413,6 +455,13 @@ class ResponsesProtocol(ProtocolAdapter):
                 payload["call_id"] = call.id
                 payload["name"] = call.name
                 payload["arguments"] = tool_arguments_text(call.arguments)
+                return payload
+            if item_type in _BUILTIN_TOOL_ITEM_TYPES:
+                # Provider-executed tool items round-trip their native shape.
+                return payload
+            if item_type and item_type != "message":
+                # Unknown/extension items round-trip their native shape; only
+                # genuine message items rebuild through canonical formatting.
                 return payload
         return {"id": f"msg_{index}", "type": "message", "role": message.role, "content": self._format_content(message.content, role=message.role, output=True, preserve_source=False)}
 
@@ -463,6 +512,34 @@ class ResponsesProtocol(ProtocolAdapter):
                 flush_visible()
                 output.append(self._format_function_result(block.tool_result, preserve_source=False))
                 item_index += 1
+            elif block.type == "refusal" and block.refusal is not None:
+                flush_visible()
+                output.append(
+                    {
+                        "id": f"msg_{item_index}",
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "refusal", "refusal": block.refusal}],
+                    }
+                )
+                item_index += 1
+            elif block.type == "builtin_tool" and block.builtin_tool is not None:
+                flush_visible()
+                builtin = block.builtin_tool
+                if isinstance(builtin.raw, dict):
+                    item = deepcopy(builtin.raw)
+                else:
+                    item = {
+                        "id": builtin.call_id or f"bc_{item_index}",
+                        "call_id": builtin.call_id or f"bc_{item_index}",
+                        "type": f"{builtin.kind}_call",
+                        "status": builtin.status or "completed",
+                    }
+                    if builtin.output is not None:
+                        item["results" if builtin.kind == "file_search" else "output"] = deepcopy(builtin.output)
+                output.append(item)
+                item_index += 1
             else:
                 visible.append(block)
         flush_visible()
@@ -476,25 +553,35 @@ class ResponsesProtocol(ProtocolAdapter):
         if not isinstance(content, list):
             return [ContentBlock(type="unknown", raw=deepcopy(content))]
         blocks = []
-        for block in content:
-            if isinstance(block, str):
-                blocks.append(ContentBlock(type="input_text", text=block, raw=block))
-                continue
-            if not isinstance(block, dict):
-                blocks.append(ContentBlock(type="unknown", raw=deepcopy(block)))
-                continue
-            block_type = str(block.get("type") or "text")
-            if block_type in {"input_text", "output_text", "text"}:
-                blocks.append(ContentBlock(type="text", text=block.get("text", ""), raw=deepcopy(block), extra={"source_type": block_type, **_without(block, {"type", "text"})}))
-            elif block_type in {"input_image", "image_url"}:
-                source = _parse_responses_media_source(block)
-                blocks.append(ContentBlock(type="image", source=source, raw=deepcopy(block), extra={"source_type": block_type, **_without(block, {"type", "image_url", "source"})}))
-            elif block_type in {"input_file", "file"}:
-                source = _parse_responses_media_source(block)
-                blocks.append(ContentBlock(type="file", source=source, raw=deepcopy(block), extra={"source_type": block_type, **_without(block, {"type", "file_id", "file_data", "file_url"})}))
-            else:
-                blocks.append(ContentBlock(type=block_type, raw=deepcopy(block), extra=_without(block, {"type"})))
+        for block_index, block in enumerate(content):
+            parsed_blocks = self._parse_content_block(block, block_index)
+            blocks.extend(parsed_blocks)
         return blocks
+
+    def _parse_content_block(self, block: Any, block_index: int = 0) -> list[ContentBlock]:
+        if isinstance(block, str):
+            return [ContentBlock(type="input_text", text=block, raw=block, index=block_index)]
+        if not isinstance(block, dict):
+            return [ContentBlock(type="unknown", raw=deepcopy(block), index=block_index)]
+        block_type = str(block.get("type") or "text")
+        if block_type in {"input_text", "output_text", "text"}:
+            return [ContentBlock(
+                type="text",
+                text=block.get("text", ""),
+                annotations=_parse_responses_annotations(block.get("annotations")),
+                index=block_index,
+                raw=deepcopy(block),
+                extra={"source_type": block_type, **_without(block, {"type", "text", "annotations"})},
+            )]
+        if block_type == "refusal":
+            return [ContentBlock(type="refusal", refusal=str(block.get("refusal") or ""), index=block_index, raw=deepcopy(block), extra=_without(block, {"type", "refusal"}))]
+        if block_type in {"input_image", "image_url"}:
+            source = _parse_responses_media_source(block)
+            return [ContentBlock(type="image", source=source, index=block_index, raw=deepcopy(block), extra={"source_type": block_type, **_without(block, {"type", "image_url", "source"})})]
+        if block_type in {"input_file", "file"}:
+            source = _parse_responses_media_source(block)
+            return [ContentBlock(type="file", source=source, index=block_index, raw=deepcopy(block), extra={"source_type": block_type, **_without(block, {"type", "file_id", "file_data", "file_url"})})]
+        return [ContentBlock(type=block_type, index=block_index, raw=deepcopy(block), extra=_without(block, {"type"}))]
 
     def _format_content(self, blocks: Iterable[ContentBlock], *, role: str = "user", output: bool = False, preserve_source: bool = True) -> list[dict[str, Any]]:
         formatted = []
@@ -503,9 +590,13 @@ class ResponsesProtocol(ProtocolAdapter):
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {}
                 payload["type"] = "output_text" if output or role in {"assistant", "model"} else "input_text"
                 payload["text"] = block.text or ""
+                if block.annotations:
+                    payload["annotations"] = _format_responses_annotations(block.annotations)
                 if preserve_source:
-                    payload.update({k: deepcopy(v) for k, v in block.extra.items() if k != "source_type"})
+                    payload.update({k: deepcopy(v) for k, v in block.extra.items() if k not in {"source_type", "annotations"}})
                 formatted.append(payload)
+            elif block.type == "refusal" and block.refusal is not None:
+                formatted.append({"type": "refusal", "refusal": block.refusal})
             elif block.type == "image":
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "input_image"}
                 payload["type"] = "input_image"
@@ -610,6 +701,91 @@ class ResponsesProtocol(ProtocolAdapter):
             )
         )
         return payload
+
+
+def _responses_output_modalities(messages: list[UnifiedMessage]) -> list[str]:
+    """Declare output modalities the output actually carries (W2)."""
+
+    blocks = [block for message in messages for block in message.content]
+    modalities: list[str] = []
+    if any(block.type == "text" and block.text for block in blocks):
+        modalities.append("text")
+    if any(block.type == "builtin_tool" and block.builtin_tool is not None and block.builtin_tool.kind == "image_generation" for block in blocks):
+        modalities.append("image")
+    return modalities
+
+
+def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, message: str) -> None:
+    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+
+    for warning in unified_response.warnings:
+        if warning.code == code and warning.message == message:
+            return
+    unified_response.warnings.append(
+        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol="responses")
+    )
+
+
+_BUILTIN_TOOL_ITEM_TYPES = {
+    "web_search_call",
+    "file_search_call",
+    "code_interpreter_call",
+    "computer_call",
+    "image_generation_call",
+    "mcp_call",
+    "local_shell_call",
+}
+
+
+def _parse_responses_annotations(payload: Any) -> list[Annotation]:
+    """Normalize Responses output-text annotations to canonical form."""
+
+    if not isinstance(payload, list):
+        return []
+    annotations: list[Annotation] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        citation = None
+        for nested_key in ("url_citation", "citation"):
+            if isinstance(entry.get(nested_key), dict):
+                citation = entry[nested_key]
+                break
+        annotations.append(
+            Annotation(
+                type=str(entry.get("type") or "url_citation"),
+                url=(citation or {}).get("url") or entry.get("url"),
+                title=(citation or {}).get("title") or entry.get("title"),
+                citation=(citation or {}).get("snippet") or (citation or {}).get("quote"),
+                start_index=(citation or {}).get("start_index") if isinstance((citation or {}).get("start_index"), int) else None,
+                end_index=(citation or {}).get("end_index") if isinstance((citation or {}).get("end_index"), int) else None,
+                raw=deepcopy(entry),
+            )
+        )
+    return annotations
+
+
+def _format_responses_annotations(annotations: list[Annotation]) -> list[dict[str, Any]]:
+    """Format canonical annotations back into Responses annotation objects."""
+
+    formatted: list[dict[str, Any]] = []
+    for annotation in annotations:
+        if isinstance(annotation.raw, dict) and annotation.raw.get("type"):
+            formatted.append(deepcopy(annotation.raw))
+            continue
+        formatted.append(
+            {
+                "type": annotation.type or "url_citation",
+                "url_citation": {
+                    "url": annotation.url,
+                    "title": annotation.title,
+                    "snippet": annotation.citation,
+                    "start_index": annotation.start_index,
+                    "end_index": annotation.end_index,
+                },
+            }
+        )
+    return [{k: v for k, v in entry.items() if v is not None} for entry in formatted]
 
 
 def _as_dict(value: Any) -> dict[str, Any]:

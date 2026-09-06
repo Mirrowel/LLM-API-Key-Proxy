@@ -36,10 +36,13 @@ from .canonical import (
 from .operation import OPERATION_CHAT, OPERATION_GENERATE
 from .validation import validate_generative_request, validate_generative_response
 from .types import (
+    Annotation,
     ContentBlock,
+    ConversionWarning,
     CostDetails,
     MediaSource,
     ProtocolContext,
+    ProtocolError,
     ReasoningBlock,
     ToolCall,
     ToolDefinition,
@@ -165,12 +168,23 @@ class OpenAIChatProtocol(ProtocolAdapter):
         response = _as_dict(raw_response)
         messages: list[UnifiedMessage] = []
         stop_reason = None
-        for choice in response.get("choices") or []:
+        for choice_position, choice in enumerate(response.get("choices") or []):
             if not isinstance(choice, dict):
                 continue
             message_payload = choice.get("message") or {}
             if message_payload:
-                messages.append(self._parse_message(message_payload))
+                message = self._parse_message(message_payload)
+                # Candidate identity (W2/D9): every alternative keeps its own
+                # choice index and finish status; n>1 survives cross-protocol.
+                try:
+                    message.index = int(choice.get("index", choice_position))
+                except (TypeError, ValueError):
+                    message.index = choice_position
+                message.stop_reason = canonical_stop_reason(choice.get("finish_reason"))
+                message_annotations = _parse_openai_annotations(message_payload.get("annotations"))
+                if message_annotations and message.content:
+                    message.content[0].annotations.extend(message_annotations)
+                messages.append(message)
             if choice.get("finish_reason") is not None:
                 stop_reason = choice.get("finish_reason")
 
@@ -182,6 +196,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             messages=messages,
             stop_reason=canonical_stop_reason(stop_reason),
             usage=self.extract_usage(response, context),
+            modalities=_openai_output_modalities(response, messages),
             metadata={
                 "object": response.get("object"),
                 "created": response.get("created"),
@@ -196,17 +211,42 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
-        messages = unified_response.messages if preserve_source else [coalesce_assistant_message(unified_response.messages)]
+        # Chat natively supports alternatives: candidate multiplicity is
+        # preserved cross-protocol too (D9 direct mapping), never coalesced.
+        messages = unified_response.messages if preserve_source else _cross_protocol_assistant_messages(unified_response)
+        if not preserve_source:
+            for message in messages:
+                has_builtin = any(block.type == "builtin_tool" for block in message.content)
+                has_representable = any(
+                    block.type in {"text", "reasoning", "tool_call", "tool_result", "image", "audio", "file", "refusal"}
+                    for block in message.content
+                ) or bool(message.tool_calls or message.reasoning)
+                if has_builtin:
+                    _warn_chat_once(
+                        unified_response,
+                        code="builtin_tool_dropped",
+                        message="provider-executed tool records have no Chat Completions representation; dropped",
+                    )
+                if has_builtin and not has_representable:
+                    # D7: server-side tool records have no Chat representation;
+                    # a record-only response is rejected, never an empty success.
+                    raise ProtocolError(
+                        "OpenAI Chat Completions cannot represent a provider-executed tool record as a successful message",
+                        protocol=self.name,
+                        pass_name="format_response",
+                        payload={"dropped_blocks": ["builtin_tool"]},
+                    )
         choices = []
-        for index, message in enumerate(messages):
+        for position, message in enumerate(messages):
+            per_choice_reason = message.stop_reason or unified_response.stop_reason
             choices.append(
                 {
-                    "index": index,
+                    "index": message.index if message.index is not None else position,
                     "message": _format_response_message(
                         self._format_message(message, preserve_source=preserve_source),
                         message,
                     ),
-                    "finish_reason": format_stop_reason(unified_response.stop_reason, self.name),
+                    "finish_reason": format_stop_reason(per_choice_reason, self.name),
                 }
             )
         payload = {
@@ -316,6 +356,12 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     raw=deepcopy(message),
                 )
             ]
+        refusal = payload.get("refusal")
+        if isinstance(refusal, str) and refusal and not any(block.type == "refusal" for block in content):
+            content.append(ContentBlock(type="refusal", refusal=refusal, raw=refusal))
+        audio = payload.get("audio")
+        if isinstance(audio, dict) and audio:
+            content.append(ContentBlock(type="audio", source=_openai_media_source({"audio": audio}, kind="audio"), raw=deepcopy(audio)))
         return UnifiedMessage(
             role=role,
             content=content,
@@ -386,6 +432,19 @@ class OpenAIChatProtocol(ProtocolAdapter):
             text = "".join(block.text or "" for block in message.reasoning if block.text)
             if text:
                 payload["reasoning_content"] = text
+        refusal_text = "".join(
+            block.refusal or "" for block in message.content if block.type == "refusal" and block.refusal
+        )
+        if refusal_text:
+            payload["refusal"] = refusal_text
+        annotations = [
+            annotation
+            for block in message.content
+            if block.type in {"text", "output_text"}
+            for annotation in block.annotations
+        ]
+        if annotations:
+            payload["annotations"] = _format_openai_annotations(annotations)
         payload.update(extra)
         return payload
 
@@ -425,8 +484,14 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 blocks.append(ContentBlock(type="unknown", raw=deepcopy(block)))
                 continue
             block_type = block.get("type", "text")
-            if block_type == "text":
-                blocks.append(ContentBlock(type="text", text=block.get("text", ""), raw=deepcopy(block), extra=_without(block, {"type", "text"})))
+            if block_type in {"text", "output_text"}:
+                blocks.append(ContentBlock(
+                    type="text",
+                    text=block.get("text", ""),
+                    annotations=_parse_openai_annotations(block.get("annotations")),
+                    raw=deepcopy(block),
+                    extra=_without(block, {"type", "text", "annotations"}),
+                ))
             elif block_type in {"image_url", "input_image"}:
                 raw_source = deepcopy(block.get("image_url") or block.get("source"))
                 source = _openai_media_source(raw_source, kind="image")
@@ -650,13 +715,19 @@ def _format_response_message(payload: dict[str, Any], message: UnifiedMessage) -
     Request messages may legitimately preserve content-part arrays. Assistant
     response messages from non-chat native protocols often arrive as text parts;
     Chat Completions clients expect the final message content to be a string in
-    that common case.
+    that common case. Refusal-only messages use content=null per the wire shape.
     """
 
     if payload.get("content") is not None and message.content:
-        if all(block.type in {"text", "input_text", "output_text"} and not block.extra for block in message.content):
+        if all(block.type in {"text", "input_text", "output_text", "refusal"} and not block.extra for block in message.content):
             payload = dict(payload)
             payload["content"] = _first_response_text(message.content) or ""
+    if payload.get("content") is not None and not payload["content"]:
+        if any(block.type == "refusal" for block in message.content) and not any(
+            block.type in {"text", "input_text", "output_text"} and block.text for block in message.content
+        ):
+            payload = dict(payload)
+            payload["content"] = None
     return payload
 
 
@@ -679,6 +750,89 @@ def _parse_openai_generation_params(source: dict[str, Any]) -> dict[str, Any]:
     if reasoning_effort is not None:
         params["reasoning"] = {"effort": reasoning_effort}
     return params
+
+
+def _format_openai_annotations(annotations: list[Annotation]) -> list[dict[str, Any]]:
+    """Format canonical annotations back into Chat annotation objects."""
+
+    formatted: list[dict[str, Any]] = []
+    for annotation in annotations:
+        if isinstance(annotation.raw, dict) and annotation.raw.get("type"):
+            formatted.append(deepcopy(annotation.raw))
+            continue
+        formatted.append(
+            {
+                "type": annotation.type or "url_citation",
+                "url_citation": {
+                    "url": annotation.url,
+                    "title": annotation.title,
+                    "start_index": annotation.start_index,
+                    "end_index": annotation.end_index,
+                },
+            }
+        )
+    return [{k: v for k, v in entry.items() if v is not None} for entry in formatted]
+
+
+def _warn_chat_once(unified_response: UnifiedResponse, *, code: str, message: str) -> None:
+    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+
+    for warning in unified_response.warnings:
+        if warning.code == code and warning.message == message:
+            return
+    unified_response.warnings.append(
+        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol="openai_chat")
+    )
+
+
+def _cross_protocol_assistant_messages(unified_response: UnifiedResponse) -> list[UnifiedMessage]:
+    """Cross-protocol message view: preserve candidates, else coalesce.
+
+    When the neutral response carries candidate identity (W2/D9 — n>1 from
+    chat or candidateCount from Gemini), every alternative is emitted as its
+    own choice.     Identity-less multi-message responses (e.g. mixed roles)
+    keep the legacy coalesced single-answer shape.
+    """
+
+    assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
+    if len(assistants) > 1 and all(m.index is not None for m in assistants):
+        return assistants
+    return [coalesce_assistant_message(unified_response.messages)]
+
+
+def _parse_openai_annotations(payload: Any) -> list[Annotation]:
+    """Normalize OpenAI-style url_citation annotations to canonical form."""
+
+    if not isinstance(payload, list):
+        return []
+    annotations: list[Annotation] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        citation = entry.get("url_citation") if isinstance(entry.get("url_citation"), dict) else entry
+        annotations.append(
+            Annotation(
+                type=str(entry.get("type") or "url_citation"),
+                url=citation.get("url"),
+                title=citation.get("title"),
+                citation=citation.get("citation") or citation.get("quote"),
+                start_index=citation.get("start_index") if isinstance(citation.get("start_index"), int) else None,
+                end_index=citation.get("end_index") if isinstance(citation.get("end_index"), int) else None,
+                raw=deepcopy(entry),
+            )
+        )
+    return annotations
+
+
+def _openai_output_modalities(response: Any, messages: list[UnifiedMessage]) -> list[str]:
+    """Declare output modalities the response actually carries (W2)."""
+
+    modalities: list[str] = []
+    if any(block.type == "text" and block.text for message in messages for block in message.content):
+        modalities.append("text")
+    if any(block.type == "audio" for message in messages for block in message.content):
+        modalities.append("audio")
+    return modalities
 
 
 def _openai_media_source(value: Any, *, kind: str) -> MediaSource:

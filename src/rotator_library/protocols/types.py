@@ -225,13 +225,71 @@ class ToolDefinition(ProtocolSerializable):
 
 
 @dataclass
+class Annotation(ProtocolSerializable):
+    """A citation/grounding annotation attached to generated content.
+
+    Cross-protocol capability (W2): OpenAI Chat message annotations, Responses
+    output-text annotations, and Gemini grounding metadata normalize here.
+    Destinations without a citation representation degrade honestly (drop with
+    a recorded conversion warning) rather than silently losing content.
+    """
+
+    type: str = "citation"
+    url: Optional[str] = None
+    title: Optional[str] = None
+    citation: Optional[str] = None
+    start_index: Optional[int] = None
+    end_index: Optional[int] = None
+    raw: Any = None
+    extra: JsonObject = field(default_factory=dict)
+
+    _fields: ClassVar[tuple[str, ...]] = (
+        "type",
+        "url",
+        "title",
+        "citation",
+        "start_index",
+        "end_index",
+        "raw",
+        "extra",
+    )
+
+
+@dataclass
+class BuiltinToolCall(ProtocolSerializable):
+    """A provider-executed (server-side) tool invocation record.
+
+    Responses `web_search_call` / `file_search_call` / `code_interpreter_call`
+    and equivalents normalize here. Same-protocol formatting round-trips the
+    native item; cross-protocol destinations degrade honestly per D7.
+    """
+
+    kind: str = "web_search"
+    call_id: Optional[str] = None
+    status: Optional[str] = None
+    output: Any = None
+    raw: Any = None
+    extra: JsonObject = field(default_factory=dict)
+
+    _fields: ClassVar[tuple[str, ...]] = (
+        "kind",
+        "call_id",
+        "status",
+        "output",
+        "raw",
+        "extra",
+    )
+
+
+@dataclass
 class ContentBlock(ProtocolSerializable):
     """A single message content block.
 
-    ``type`` is canonical (for example ``text``, ``image``, ``tool_call``, or
-    ``reasoning``). ``raw`` and ``extra`` retain source-protocol details for
-    same-protocol fidelity and field-cache extraction; foreign formatters must
-    not replay them without an explicit mapping.
+    ``type`` is canonical (for example ``text``, ``image``, ``tool_call``,
+    ``reasoning``, ``refusal``, or ``builtin_tool``). ``raw`` and ``extra``
+    retain source-protocol details for same-protocol fidelity and field-cache
+    extraction; foreign formatters must not replay them without an explicit
+    mapping.
     """
 
     type: str = "text"
@@ -240,6 +298,10 @@ class ContentBlock(ProtocolSerializable):
     tool_call: Optional[ToolCall] = None
     tool_result: Optional[ToolResult] = None
     reasoning: Optional[ReasoningBlock] = None
+    refusal: Optional[str] = None
+    builtin_tool: Optional[BuiltinToolCall] = None
+    annotations: list[Annotation] = field(default_factory=list)
+    index: Optional[int] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
@@ -250,6 +312,10 @@ class ContentBlock(ProtocolSerializable):
         "tool_call",
         "tool_result",
         "reasoning",
+        "refusal",
+        "builtin_tool",
+        "annotations",
+        "index",
         "raw",
         "extra",
     )
@@ -284,6 +350,11 @@ class UnifiedMessage(ProtocolSerializable):
     tool_call_id: Optional[str] = None
     tool_calls: list[ToolCall] = field(default_factory=list)
     reasoning: list[ReasoningBlock] = field(default_factory=list)
+    # Candidate identity (W2, D9): assistant alternatives keep their choice/
+    # candidate index and per-candidate stop status; single-response protocols
+    # consume the first candidate (first-wins) with a recorded summary.
+    index: Optional[int] = None
+    stop_reason: Optional[str] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
@@ -294,6 +365,8 @@ class UnifiedMessage(ProtocolSerializable):
         "tool_call_id",
         "tool_calls",
         "reasoning",
+        "index",
+        "stop_reason",
         "raw",
         "extra",
     )
@@ -388,6 +461,10 @@ class UnifiedResponse(ProtocolSerializable):
     content_type: Optional[str] = None
     stop_reason: Optional[str] = None
     usage: Optional[Usage] = None
+    # Output modality identity (W2): which output modalities the provider
+    # produced (text, audio, image); parsed when declared, preserved through
+    # same-protocol formatting.
+    modalities: list[str] = field(default_factory=list)
     metadata: JsonObject = field(default_factory=dict)
     source_protocol: Optional[str] = None
     extensions: dict[str, JsonObject] = field(default_factory=dict)
@@ -407,6 +484,7 @@ class UnifiedResponse(ProtocolSerializable):
         "content_type",
         "stop_reason",
         "usage",
+        "modalities",
         "metadata",
         "source_protocol",
         "extensions",

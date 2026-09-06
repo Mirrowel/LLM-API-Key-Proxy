@@ -16,6 +16,7 @@ from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
 from .canonical import (
+    STOP_REASON_CONTENT_FILTER,
     canonical_stop_reason,
     canonical_structured_output,
     canonical_tool_arguments,
@@ -42,9 +43,12 @@ from .canonical import (
 from .operation import OPERATION_COUNT_TOKENS, OPERATION_GENERATE, OPERATION_MESSAGES, OPERATION_UNKNOWN, normalize_operation
 from .validation import validate_generative_request, validate_generative_response
 from .types import (
+    Annotation,
     ContentBlock,
+    ConversionWarning,
     MediaSource,
     ProtocolContext,
+    ProtocolError,
     ReasoningBlock,
     ToolCall,
     ToolDefinition,
@@ -157,6 +161,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             messages=[] if operation == OPERATION_COUNT_TOKENS else [message] if response else [],
             stop_reason=canonical_stop_reason(response.get("stop_reason")),
             usage=self.extract_usage(response, context),
+            modalities=_anthropic_output_modalities(message.content),
             metadata={"stop_sequence": response.get("stop_sequence"), "type": response.get("type"), "native_stop_reason": response.get("stop_reason")},
             source_protocol=self.name,
             raw=deepcopy(response),
@@ -173,14 +178,66 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             return payload
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
-        message = unified_response.messages[0] if preserve_source and unified_response.messages else coalesce_assistant_message(unified_response.messages)
+        assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
+        candidate_backed = len(assistants) > 1 and all(m.index is not None for m in assistants)
+        # D9 first-wins: Anthropic Messages carries exactly one response part.
+        # Candidate-backed alternatives select the first with a recorded
+        # summary; item-oriented output (reasoning item + message item) still
+        # coalesces.
+        if candidate_backed and not preserve_source:
+            _warn_once(
+                unified_response,
+                code="candidates_first_wins",
+                message=f"{len(assistants) - 1} additional candidate(s) dropped: single-response protocol (first candidate wins)",
+                target_protocol=self.name,
+            )
+            message = assistants[0]
+            stop_reason = assistants[0].stop_reason or unified_response.stop_reason
+        else:
+            message = unified_response.messages[0] if preserve_source and unified_response.messages else coalesce_assistant_message(unified_response.messages)
+            stop_reason = unified_response.stop_reason
+        refusal_text = "".join(
+            block.refusal or "" for block in message.content if block.type == "refusal" and block.refusal
+        )
+        has_annotations = any(block.annotations for block in message.content)
+        has_builtin = any(block.type == "builtin_tool" for block in message.content)
+        if not preserve_source:
+            if refusal_text:
+                stop_reason = STOP_REASON_CONTENT_FILTER
+            if has_annotations:
+                _warn_once(
+                    unified_response,
+                    code="annotations_dropped",
+                    message="citations/annotations have no Anthropic Messages representation; dropped",
+                    target_protocol=self.name,
+                )
+            if has_builtin:
+                _warn_once(
+                    unified_response,
+                    code="builtin_tool_dropped",
+                    message="provider-executed tool records have no Anthropic Messages representation; dropped",
+                    target_protocol=self.name,
+                )
+            has_representable = any(
+                block.type in {"text", "reasoning", "tool_call", "tool_result", "image", "document", "refusal"}
+                for block in message.content
+            ) or bool(message.tool_calls or message.reasoning)
+            if has_builtin and not has_representable:
+                # D7: a provider-executed tool record the target cannot express
+                # is Required meaning — reject, never emit an empty success.
+                raise ProtocolError(
+                    "Anthropic Messages cannot represent a provider-executed tool record as a successful message",
+                    protocol=self.name,
+                    pass_name="format_response",
+                    payload={"dropped_blocks": ["builtin_tool"]},
+                )
         payload = {
             "id": unified_response.id,
             "type": unified_response.metadata.get("type", "message"),
             "role": message.role,
             "content": self._format_assistant_content(message, preserve_source=preserve_source, emit_opaque_state=may_emit_opaque_provider_state(context, preserve_source=preserve_source)),
             "model": unified_response.model,
-            "stop_reason": format_stop_reason(unified_response.stop_reason, self.name),
+            "stop_reason": format_stop_reason(stop_reason, self.name),
             "stop_sequence": unified_response.metadata.get("stop_sequence"),
             "usage": self._format_usage(unified_response.usage),
         }
@@ -321,16 +378,22 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             return text_blocks(content)
         if not isinstance(content, list):
             return [ContentBlock(type="unknown", raw=deepcopy(content))]
-        return [self._parse_content_block(block) for block in content]
+        return [self._parse_content_block(block, position) for position, block in enumerate(content)]
 
-    def _parse_content_block(self, block: Any) -> ContentBlock:
+    def _parse_content_block(self, block: Any, index: int = 0) -> ContentBlock:
         if isinstance(block, str):
-            return ContentBlock(type="text", text=block, raw=block)
+            return ContentBlock(type="text", text=block, raw=block, index=index)
         if not isinstance(block, dict):
-            return ContentBlock(type="unknown", raw=deepcopy(block))
+            return ContentBlock(type="unknown", raw=deepcopy(block), index=index)
         block_type = str(block.get("type") or "text")
         if block_type == "text":
-            return ContentBlock(type="text", text=block.get("text", ""), raw=deepcopy(block))
+            return ContentBlock(
+                type="text",
+                text=block.get("text", ""),
+                annotations=_parse_anthropic_citations(block.get("citations")),
+                index=index,
+                raw=deepcopy(block),
+            )
         if block_type in {"image", "document"}:
             source = _parse_anthropic_media_source(block.get("source"), kind=block_type)
             return ContentBlock(type=block_type, source=source, raw=deepcopy(block), extra=_without(block, {"type", "source"}))
@@ -373,7 +436,21 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "text"}
                 payload["type"] = "text"
                 payload["text"] = block.text or ""
+                if preserve_source and block.annotations:
+                    payload["citations"] = [
+                        deepcopy(annotation.raw) if isinstance(annotation.raw, dict) else {
+                            "type": "citation",
+                            "url": annotation.url,
+                            "title": annotation.title,
+                            "cited_text": annotation.citation,
+                        }
+                        for annotation in block.annotations
+                    ]
                 formatted.append(payload)
+            elif block.type == "refusal" and block.refusal is not None:
+                # Anthropic has no refusal part; the refusal text survives as a
+                # text block and stop_reason maps to "refusal" upstream.
+                formatted.append({"type": "text", "text": block.refusal})
             elif block.reasoning:
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "redacted_thinking" if block.reasoning.redacted else "thinking"}
                 payload["type"] = "redacted_thinking" if block.reasoning.redacted else "thinking"
@@ -574,6 +651,51 @@ def _parse_anthropic_generation_params(source: dict[str, Any]) -> dict[str, Any]
             "budget_tokens": thinking.get("budget_tokens"),
         }
     return params
+
+
+def _anthropic_output_modalities(blocks: list[ContentBlock]) -> list[str]:
+    """Declare output modalities the message actually carries (W2)."""
+
+    modalities: list[str] = []
+    if any(block.type == "text" and block.text for block in blocks):
+        modalities.append("text")
+    if any(block.type == "image" for block in blocks):
+        modalities.append("image")
+    return modalities
+
+
+def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, target_protocol: str) -> None:
+    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+
+    for warning in unified_response.warnings:
+        if warning.code == code and warning.message == message:
+            return
+    unified_response.warnings.append(
+        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol=target_protocol)
+    )
+
+
+def _parse_anthropic_citations(payload: Any) -> list[Annotation]:
+    """Normalize Anthropic text-block citations to canonical annotations."""
+
+    if not isinstance(payload, list):
+        return []
+    annotations: list[Annotation] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        annotations.append(
+            Annotation(
+                type=str(entry.get("type") or "citation"),
+                url=entry.get("url"),
+                title=entry.get("title"),
+                citation=entry.get("cited_text") or entry.get("quote"),
+                start_index=entry.get("start_char_index") if isinstance(entry.get("start_char_index"), int) else None,
+                end_index=entry.get("end_char_index") if isinstance(entry.get("end_char_index"), int) else None,
+                raw=deepcopy(entry),
+            )
+        )
+    return annotations
 
 
 def _parse_anthropic_media_source(value: Any, *, kind: str) -> MediaSource:
