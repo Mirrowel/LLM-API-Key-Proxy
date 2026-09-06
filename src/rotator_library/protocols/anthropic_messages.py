@@ -210,13 +210,13 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         dropped_media = [
             block.type
             for block in message.content
-            if block.type in {"audio", "video"} and not (preserve_source and isinstance(block.raw, dict))
+            if block.type in {"audio", "video", "image"} and not (preserve_source and isinstance(block.raw, dict))
         ]
         if not preserve_source and dropped_media:
             _warn_once(
                 unified_response,
                 code="media_dropped",
-                message="audio/video output has no Anthropic Messages representation; dropped",
+                message="media output has no Anthropic Messages assistant representation; dropped",
                 target_protocol=self.name,
                 field=f"content[{dropped_media[0]}]",
             )
@@ -367,8 +367,14 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     ) -> list[dict[str, Any]]:
         """Format reasoning, visible content, and tool calls in Anthropic order."""
 
+        blocks = ordered_message_blocks(message)
+        if not preserve_source:
+            # Assistant content is text/thinking/tool_use only: assistant
+            # images are dropped with a recorded media_dropped summary
+            # (never fabricated as image blocks in assistant output).
+            blocks = [block for block in blocks if block.type != "image"]
         return self._format_content(
-            ordered_message_blocks(message),
+            blocks,
             preserve_source=preserve_source,
             emit_opaque_state=emit_opaque_state,
         )
@@ -566,7 +572,11 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         if "structured_output" in params:
             payload["output_config"] = format_structured_output(params.pop("structured_output"), self.name)
         reasoning = params.pop("reasoning", None)
-        payload.update(format_reasoning_controls(reasoning, self.name, request))
+        if not preserve_source:
+            # Cross-protocol: map canonical controls onto Anthropic spellings.
+            # Same-protocol passthrough keeps the preserved original verbatim
+            # (no normalization, no warnings).
+            payload.update(format_reasoning_controls(reasoning, self.name, request))
         supported = {"temperature", "top_k", "top_p"}
         payload.update(
             retain_supported_generation_params(

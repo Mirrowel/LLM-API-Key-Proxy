@@ -252,18 +252,21 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
     frames = _responses_start(state)
     for block in _event_blocks(event):
         if block.type == "builtin_tool" and block.builtin_tool is not None:
-            # Provider-executed tool records stream as native output items
-            # (raw item round-trip; synthesized shape only when raw missing).
+            # Provider-executed tool records stream as native output items.
+            # Responses-native raw shapes round-trip verbatim; foreign raw
+            # shapes (e.g. Anthropic server_tool_use) synthesize the
+            # equivalent native call item — never leak foreign item types.
             # Registered in item_ids so downstream index derivation and the
             # terminal response object include them (no index collisions,
             # no identity collapse with interleaved text items).
-            raw_item = block.builtin_tool.raw if isinstance(block.builtin_tool.raw, dict) else None
+            builtin = block.builtin_tool
+            raw_item = builtin.raw if isinstance(builtin.raw, dict) and str(builtin.raw.get("type", "")).endswith("_call") else None
             item = raw_item or {
-                "type": f"{str(block.builtin_tool.kind).replace('-', '_')}_call",
-                "id": block.builtin_tool.call_id or _responses_item_id("builtin", state.next_index),
-                "status": block.builtin_tool.status or "completed",
+                "type": f"{str(builtin.kind).replace('-', '_')}_call",
+                "id": builtin.call_id or _responses_item_id("builtin", state.next_index),
+                "status": builtin.status or "completed",
             }
-            builtin_key = f"builtin:{item.get('id') or state.next_index}"
+            builtin_key = f"builtin:{item.get('id') or state.next_index}:{state.next_index}"
             state.item_ids[builtin_key] = item.get("id") or _responses_item_id("builtin", state.next_index)
             state.item_kinds[builtin_key] = "builtin"
             state.builtin_items[builtin_key] = deepcopy(item)
@@ -428,7 +431,12 @@ def _block_key(block: ContentBlock, state: StreamFormatState, event: UnifiedStre
         # block reopens as a new block instead of merging with the earlier one.
         state.last_family = "tool"
         return f"tool:{identity}", "tool"
-    family = "reasoning" if block.reasoning else "text"
+    if block.type == "refusal":
+        # Refusal keeps its own block family: ordinary text streams never
+        # merge into a refusal block (or vice versa) on any target.
+        family = "refusal"
+    else:
+        family = "reasoning" if block.reasoning else "text"
     explicit_index = _event_block_index(event)
     if explicit_index is not None:
         return f"{family}:{explicit_index}", family

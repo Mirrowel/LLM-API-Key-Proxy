@@ -97,7 +97,7 @@ def test_effort_to_anthropic_budget_table(effort: str, expected_budget: int) -> 
     assert budget_tokens_from_effort(effort) == expected_budget
     built, unified = _build(
         "anthropic_messages",
-        {"model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": effort},
+        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": effort},
         source="openai_chat",
     )
     assert built["thinking"] == {"type": "enabled", "budget_tokens": expected_budget}
@@ -742,8 +742,8 @@ def test_effort_and_budget_both_disclosure_of_discarded_budget() -> None:
         "input": "hi",
         "reasoning": {"effort": "high", "budget_tokens": 2048, "summary": "auto"},
     }
-    built, unified = _build("responses", payload, source="responses")
-    assert built["reasoning"]["effort"] == "high"
+    built, unified = _build("gemini", payload, source="responses")
+    assert built["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 16384
     assert "reasoning_control_dropped" in _warnings_of(unified)
 
 
@@ -767,6 +767,142 @@ def test_chat_promotes_dual_instruction_sources() -> None:
     )
     assert "INSTR_FIELD" in system_text and "INSTR_MSG" in system_text
     assert roles[-1] == "user"
+
+
+# ---------------------------------------------------------------------------
+# Round 4: budget headroom, disabled includeThoughts, diagonal purity,
+# refusal family, foreign builtins, assistant images
+
+
+def test_anthropic_budget_clamped_below_max_tokens() -> None:
+    built, unified = _build(
+        "anthropic_messages",
+        {"model": "m", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"},
+        source="openai_chat",
+    )
+    assert built["thinking"] == {"type": "enabled", "budget_tokens": 4095}
+    assert "reasoning_budget_coerced" in _warnings_of(unified)
+
+
+def test_anthropic_no_headroom_omits_thinking() -> None:
+    built, unified = _build(
+        "anthropic_messages",
+        {"model": "m", "max_tokens": 900, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"},
+        source="openai_chat",
+    )
+    assert "thinking" not in built
+    assert "reasoning_budget_invalid" in _warnings_of(unified)
+
+
+def test_gemini_disabled_forces_include_thoughts_false() -> None:
+    built, _ = _build(
+        "gemini",
+        {"model": "m", "input": "hi", "reasoning": {"effort": "none", "summary": "auto"}},
+        source="responses",
+    )
+    config = built["generationConfig"]["thinkingConfig"]
+    assert config["thinkingBudget"] == 0
+    assert config["includeThoughts"] is False
+
+
+def test_reasoning_same_protocol_diagonals_stay_verbatim() -> None:
+    ant = get_protocol("anthropic_messages")
+    unified = ant.parse_request(
+        {"model": "m", "max_tokens": 2048, "system": "s", "messages": [{"role": "user", "content": "hi"}], "thinking": {"type": "enabled", "budget_tokens": 1024}},
+        _ctx("anthropic_messages", "anthropic_messages"),
+    )
+    rebuilt = ant.build_request(unified, _ctx("anthropic_messages", "anthropic_messages"))
+    assert rebuilt["thinking"] == {"type": "enabled", "budget_tokens": 1024}
+    assert not unified.warnings
+
+    gem = get_protocol("gemini")
+    unified_gem = gem.parse_request(
+        {"model": "m", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "generationConfig": {"thinkingConfig": {"thinkingBudget": 0, "includeThoughts": True, "futureKey": "x"}}},
+        _ctx("gemini", "gemini"),
+    )
+    rebuilt_gem = gem.build_request(unified_gem, _ctx("gemini", "gemini"))
+    assert rebuilt_gem["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+    assert not unified_gem.warnings
+
+
+def test_stream_text_refusal_text_keeps_three_blocks() -> None:
+    from rotator_library.protocols.streaming import format_canonical_stream_event, stream_format_state
+    from rotator_library.protocols.types import UnifiedMessage, UnifiedStreamEvent
+
+    def _delta(blocks: list) -> UnifiedStreamEvent:
+        return UnifiedStreamEvent(type="message.delta", source_protocol="openai_chat", native_type="message.delta", delta=UnifiedMessage(role="assistant", content=blocks))
+
+    events = [
+        _delta([ContentBlock(type="text", text="hi ")]),
+        _delta([ContentBlock(type="refusal", refusal="cannot help")]),
+        _delta([ContentBlock(type="text", text="there")]),
+        UnifiedStreamEvent(type="done", source_protocol="openai_chat", native_type="done", stop_reason="stop", usage=Usage(input_tokens=1, output_tokens=1)),
+    ]
+    for target in ("responses", "anthropic_messages"):
+        ctx = _ctx("openai_chat", target)
+        state = stream_format_state(ctx, target)
+        joined = "".join(frame for event in events for frame in format_canonical_stream_event(event, target, ctx, state=state))
+        assert "cannot help" in joined
+        if target == "responses":
+            # Text never merges into the refusal part: three distinct items.
+            assert '"refusal": "cannot help"' in joined
+            assert '"text": "hi "' in joined and '"text": "there"' in joined
+            assert '"refusal": "hi ' not in joined and '"refusal": "cannot helpthere"' not in joined
+
+
+def test_foreign_builtin_raw_synthesizes_native_item_cross_protocol() -> None:
+    ant = get_protocol("anthropic_messages")
+    unified = ant.parse_response(
+        {
+            "id": "m1",
+            "model": "m",
+            "role": "assistant",
+            "stop_reason": "end_turn",
+            "content": [{"type": "server_tool_use", "id": "srvu_1", "name": "web_search", "input": {"query": "x"}}],
+        },
+        None,
+    )
+    formatted = get_protocol("responses").format_response(unified, _ctx("anthropic_messages", "responses"))
+    item_types = [item.get("type") for item in formatted["output"]]
+    assert "server_tool_use" not in item_types
+    assert "web_search_call" in item_types
+
+
+def test_assistant_image_output_drops_recorded_not_fabricated() -> None:
+    gem = get_protocol("gemini")
+    unified = gem.parse_response(
+        {
+            "candidates": [{"content": {"role": "model", "parts": [{"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}}]}, "finishReason": "STOP"}],
+            "modelVersion": "gemini-x",
+        },
+        None,
+    )
+    for target in ("anthropic_messages", "responses", "openai_chat"):
+        formatted = get_protocol(target).format_response(unified, _ctx("gemini", target))
+        payload_str = str(formatted)
+        assert "input_image" not in payload_str or target == "openai_chat"
+        warnings = {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
+        assert "media_dropped" in warnings, target
+
+
+def test_chat_field_plus_interleaved_system_keeps_positions() -> None:
+    resp = get_protocol("responses")
+    unified = resp.parse_request(
+        {
+            "model": "m",
+            "instructions": "INSTR_FIELD",
+            "input": [
+                {"role": "user", "content": [{"type": "input_text", "text": "q1"}]},
+                {"role": "system", "content": [{"type": "input_text", "text": "MID"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "q2"}]},
+            ],
+        },
+        _ctx("responses", "openai_chat"),
+    )
+    built = get_protocol("openai_chat").build_request(unified, _ctx("responses", "openai_chat"))
+    roles = [m["role"] for m in built["messages"]]
+    # Field leads; the interleaved system message keeps its position.
+    assert roles == ["system", "user", "system", "user"]
 
 
 def test_gemini_strictness_strengthening_recorded() -> None:

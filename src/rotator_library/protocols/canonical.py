@@ -362,6 +362,32 @@ def format_reasoning_controls(
                 "reasoning.budget_tokens",
             )
 
+    def _anthropic_budget(candidate: Any, max_output_tokens: Any) -> Any:
+        """Anthropic requires max_tokens > thinking.budget_tokens: clamp with
+        disclosure, or omit when no headroom exists (never a guaranteed
+        provider 400)."""
+
+        if not isinstance(candidate, int) or max_output_tokens is None or not isinstance(max_output_tokens, int):
+            return candidate
+        if candidate < max_output_tokens:
+            return candidate
+        if max_output_tokens <= 1024:
+            _warn(
+                "reasoning_budget_invalid",
+                f"max_tokens={max_output_tokens} leaves no room for thinking (budget must stay below it and at 1024+); thinking omitted",
+                "reasoning.budget_tokens",
+            )
+            return None
+        clamped = max(1024, max_output_tokens - 1)
+        if clamped < candidate:
+            _warn(
+                "reasoning_budget_coerced",
+                f"thinking budget_tokens={candidate} exceeds max_tokens={max_output_tokens}; clamped to {clamped}",
+                "reasoning.budget_tokens",
+            )
+            return clamped
+        return candidate
+
     if target_protocol == "openai_chat":
         if enabled is False:
             _warn(
@@ -415,15 +441,18 @@ def format_reasoning_controls(
                     "reasoning.budget_tokens",
                 )
             else:
-                emissions["thinking"] = {"type": "enabled", "budget_tokens": budget}
+                clamped = _anthropic_budget(budget, (request.generation_params or {}).get("max_output_tokens"))
+                if clamped is not None:
+                    emissions["thinking"] = {"type": "enabled", "budget_tokens": clamped}
         elif effort is not None:
             value, coerced = _effort_or_approximation()
-            approximated = budget_tokens_from_effort(value)
-            emissions["thinking"] = {"type": "enabled", "budget_tokens": approximated}
+            approximated = _anthropic_budget(budget_tokens_from_effort(value), (request.generation_params or {}).get("max_output_tokens"))
+            if approximated is not None:
+                emissions["thinking"] = {"type": "enabled", "budget_tokens": approximated}
             if not coerced:
                 _warn(
                     "reasoning_effort_approximated",
-                    f"reasoning effort '{effort}' approximated as budget_tokens={approximated} (deterministic table)",
+                    f"reasoning effort '{effort}' approximated as budget_tokens={budget_tokens_from_effort(value)} (deterministic table)",
                     "reasoning.effort",
                 )
         if include_thoughts is not None:
@@ -474,14 +503,16 @@ def format_reasoning_controls(
         if enabled is False or effort == "none":
             # thinkingBudget: 0 is Gemini's off-switch — model-dependent
             # (thinking can only be disabled on some models), so the
-            # emission is recorded, never silent.
+            # emission is recorded, never silent. includeThoughts is
+            # forced off: the API rejects it alongside disabled thinking.
             thinking_config["thinkingBudget"] = 0
+            thinking_config["includeThoughts"] = False
             _warn(
                 "reasoning_disabled_model_dependent",
                 "thinkingBudget=0 disables thinking only on models that support disabling; verify the target model",
                 "reasoning.enabled",
             )
-        elif budget is not None:
+        elif budget is not None and effort is None:
             thinking_config["thinkingBudget"] = budget
         elif effort is not None:
             value, coerced = _effort_or_approximation()
@@ -493,11 +524,18 @@ def format_reasoning_controls(
                     f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
                     "reasoning.effort",
                 )
+        elif enabled is True and include_thoughts is None and summary is None:
+            _warn(
+                "reasoning_control_dropped",
+                "reasoning enabled without a budget/effort has no Gemini representation",
+                "reasoning.enabled",
+            )
         _warn_budget_discarded()
-        if include_thoughts is not None:
-            thinking_config["includeThoughts"] = bool(include_thoughts)
-        elif summary is not None:
-            thinking_config["includeThoughts"] = summary != "none"
+        if not (enabled is False or effort == "none"):
+            if include_thoughts is not None:
+                thinking_config["includeThoughts"] = bool(include_thoughts)
+            elif summary is not None:
+                thinking_config["includeThoughts"] = summary != "none"
         if thinking_config:
             emissions["generation_config"] = {"thinkingConfig": thinking_config}
     return emissions
@@ -563,6 +601,7 @@ def conversion_summary(
                 "code": warning.code,
                 "message": warning.message,
                 "field": warning.field,
+                "target": getattr(warning, "target_protocol", None),
             }
         )
     return {"warnings": rendered}

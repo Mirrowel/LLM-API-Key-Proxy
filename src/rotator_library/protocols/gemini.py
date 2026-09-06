@@ -605,8 +605,11 @@ class GeminiProtocol(ProtocolAdapter):
                 }
             )
         reasoning = params.pop("reasoning", None)
-        reasoning_emissions = format_reasoning_controls(reasoning, self.name, request)
-        generation.update(reasoning_emissions.get("generation_config", {}))
+        if not preserve_source:
+            # Cross-protocol mapping only; same-protocol passthrough keeps
+            # the preserved original verbatim.
+            reasoning_emissions = format_reasoning_controls(reasoning, self.name, request)
+            generation.update(reasoning_emissions.get("generation_config", {}))
         tool_choice = params.pop("tool_choice", None)
         if tool_choice is not None:
             tool_config = format_tool_choice(tool_choice, self.name)

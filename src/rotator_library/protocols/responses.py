@@ -222,13 +222,13 @@ class ResponsesProtocol(ProtocolAdapter):
                 block.type
                 for message in assistants
                 for block in message.content
-                if block.type in {"audio", "video"}
+                if block.type in {"audio", "video", "image"}
             ]
             if dropped_media:
                 _warn_responses_once(
                     unified_response,
                     code="media_dropped",
-                    message="audio/video output has no Responses output-part representation; dropped",
+                    message="media output has no Responses output-part representation; dropped",
                     field=f"content[{dropped_media[0]}]",
                 )
         if preserve_source and unified_response.output:
@@ -597,9 +597,14 @@ class ResponsesProtocol(ProtocolAdapter):
             elif block.type == "builtin_tool" and block.builtin_tool is not None:
                 flush_visible()
                 builtin = block.builtin_tool
-                if isinstance(builtin.raw, dict):
-                    item = deepcopy(builtin.raw)
+                raw = builtin.raw if isinstance(builtin.raw, dict) else None
+                if raw is not None and raw.get("type") in _BUILTIN_TOOL_ITEM_TYPES:
+                    # Responses-native item shape: round-trip verbatim.
+                    item = deepcopy(raw)
                 else:
+                    # Foreign raw shapes (e.g. Anthropic server_tool_use blocks)
+                    # never leak onto the Responses wire: synthesize the
+                    # equivalent native call item.
                     item_type = builtin.kind if builtin.extra.get("synthesized_kind") else f"{builtin.kind}_call"
                     item = {
                         "id": builtin.call_id or f"bc_{item_index}",
@@ -675,6 +680,11 @@ class ResponsesProtocol(ProtocolAdapter):
                     # input_text per D7 (validator admits refusal).
                     formatted.append({"type": "input_text", "text": block.refusal})
             elif block.type == "image":
+                if output:
+                    # Output parts are output_text/refusal only: assistant
+                    # images drop with a recorded media_dropped summary —
+                    # never fabricated as input_image output parts.
+                    continue
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "input_image"}
                 payload["type"] = "input_image"
                 payload.update(_format_responses_image_source(block.source))
@@ -744,7 +754,10 @@ class ResponsesProtocol(ProtocolAdapter):
                 target_protocol=self.name,
             )
         reasoning = params.pop("reasoning", None)
-        payload.update(format_reasoning_controls(reasoning, self.name, request))
+        if not preserve_source:
+            # Cross-protocol mapping only; same-protocol passthrough keeps
+            # the preserved original verbatim.
+            payload.update(format_reasoning_controls(reasoning, self.name, request))
         structured = params.pop("structured_output", None)
         if isinstance(structured, dict):
             payload["text"] = {"format": format_structured_output(structured, self.name)}

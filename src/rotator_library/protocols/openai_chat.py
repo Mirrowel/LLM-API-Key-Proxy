@@ -158,7 +158,14 @@ class OpenAIChatProtocol(ProtocolAdapter):
         # instruction source is dropped.
         interleaved, _ = instruction_layout(unified_request)
         has_inline_instructions = any(m.role in {"system", "developer"} for m in unified_request.messages)
-        if unified_request.system or not (interleaved or has_inline_instructions):
+        if unified_request.system and interleaved:
+            # The canonical field leads as its own turn; interleaved inline
+            # instructions keep their conversation positions verbatim.
+            wire_messages = [
+                UnifiedMessage(role="system", content=deepcopy(unified_request.system)),
+                *unified_request.messages,
+            ]
+        elif unified_request.system or not (interleaved or has_inline_instructions):
             wire_messages = [*instruction_messages(unified_request), *conversation_messages(unified_request)]
         else:
             wire_messages = list(unified_request.messages)
@@ -278,6 +285,14 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         code="media_dropped",
                         message="video output has no Chat Completions representation; dropped",
                         field="content[video]",
+                    )
+                has_image = any(block.type == "image" for block in message.content)
+                if has_image and message.role == "assistant":
+                    _warn_chat_once(
+                        unified_response,
+                        code="media_dropped",
+                        message="assistant image output has no standard Chat Completions message representation; dropped",
+                        field="content[image]",
                     )
         choices = []
         for position, message in enumerate(messages):
