@@ -14,6 +14,9 @@ from pydantic import BaseModel, ConfigDict
 
 # --- Content Blocks ---
 class AnthropicTextBlock(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic text content block."""
 
     type: str = "text"
@@ -21,6 +24,9 @@ class AnthropicTextBlock(BaseModel):
 
 
 class AnthropicImageSource(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic image source for base64 images."""
 
     type: str = "base64"
@@ -29,6 +35,9 @@ class AnthropicImageSource(BaseModel):
 
 
 class AnthropicImageBlock(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic image content block."""
 
     type: str = "image"
@@ -36,6 +45,9 @@ class AnthropicImageBlock(BaseModel):
 
 
 class AnthropicToolUseBlock(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic tool use content block."""
 
     type: str = "tool_use"
@@ -45,6 +57,9 @@ class AnthropicToolUseBlock(BaseModel):
 
 
 class AnthropicToolResultBlock(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic tool result content block."""
 
     type: str = "tool_result"
@@ -55,6 +70,9 @@ class AnthropicToolResultBlock(BaseModel):
 
 # --- Message and Tool Definitions ---
 class AnthropicMessage(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic message format."""
 
     role: str
@@ -73,6 +91,9 @@ class AnthropicMessage(BaseModel):
 
 
 class AnthropicTool(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic tool definition."""
 
     name: str
@@ -81,6 +102,9 @@ class AnthropicTool(BaseModel):
 
 
 class AnthropicThinkingConfig(BaseModel):
+
+    # D4 fidelity: unknown/extension fields survive the round-trip.
+    model_config = ConfigDict(extra="allow")
     """Anthropic thinking configuration."""
 
     type: str  # "enabled" or "disabled"

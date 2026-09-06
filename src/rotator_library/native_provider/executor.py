@@ -152,12 +152,19 @@ class NativeProviderExecutor:
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
             response_stage_adapters = [a for a in adapters if "response" in getattr(a, "supported_stages", ("request", "response"))]
-            if raw_basis_used and not response_stage_adapters:
-                # D4 raw response passthrough: same protocol, no response-stage
-                # adapters, no proxy semantic edits — the provider's response
-                # IS the client's response, byte-for-byte (sidecar observation
-                # above feeds usage/session/accounting). Request-stage adapters
-                # do not touch responses and do not disable the passthrough.
+            if (
+                raw_basis_used
+                and not response_stage_adapters
+                and client_protocol.name == provider_protocol.name
+            ):
+                # D4 raw response passthrough: same protocol (request AND
+                # response — D1 makes these identical in production; the
+                # explicit check is defense-in-depth for hand-built contexts),
+                # no response-stage adapters, no proxy semantic edits — the
+                # provider's response IS the client's response, byte-for-byte
+                # (sidecar observation above feeds usage/session/accounting).
+                # Request-stage adapters do not touch responses and do not
+                # disable the passthrough.
                 client_response = deepcopy(raw_response)
                 self._trace(context, "raw_fast_path_response", client_response, direction="response", stage="protocol")
             else:

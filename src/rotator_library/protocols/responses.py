@@ -384,8 +384,10 @@ class ResponsesProtocol(ProtocolAdapter):
             for block in ordered_message_blocks(message):
                 if block.reasoning:
                     flush_visible()
-                    if block.reasoning.text:
-                        reasoning_item: dict[str, Any] = {"type": "reasoning", "summary": [{"type": "summary_text", "text": block.reasoning.text}]}
+                    if block.reasoning.text or block.reasoning.encrypted_content:
+                        reasoning_item: dict[str, Any] = {"type": "reasoning"}
+                        if block.reasoning.text:
+                            reasoning_item["summary"] = [{"type": "summary_text", "text": block.reasoning.text}]
                         if block.reasoning.encrypted_content:
                             # Bound opaque state (D8): survives same-protocol
                             # rebuilds byte-for-byte; never emitted by foreign
@@ -519,13 +521,14 @@ class ResponsesProtocol(ProtocolAdapter):
         for block in ordered_message_blocks(message):
             if block.reasoning:
                 flush_visible()
-                if block.reasoning.text:
+                if block.reasoning.text or block.reasoning.encrypted_content:
                     reasoning_output: dict[str, Any] = {
                         "id": f"rs_{item_index}",
                         "type": "reasoning",
-                        "summary": [{"type": "summary_text", "text": block.reasoning.text}],
                         "status": "completed",
                     }
+                    if block.reasoning.text:
+                        reasoning_output["summary"] = [{"type": "summary_text", "text": block.reasoning.text}]
                     if block.reasoning.encrypted_content:
                         reasoning_output["encrypted_content"] = block.reasoning.encrypted_content
                     output.append(reasoning_output)
