@@ -157,14 +157,6 @@ _plugin_count = len(PROVIDER_PLUGINS)
 
 
 # --- Pydantic Models ---
-class EmbeddingRequest(BaseModel):
-    model: str
-    input: Union[str, List[str]]
-    input_type: Optional[str] = None
-    dimensions: Optional[int] = None
-    user: Optional[str] = None
-
-
 class ModelCard(BaseModel):
     """Basic model card for minimal response."""
 
@@ -1590,17 +1582,40 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
         if not model:
             raise HTTPException(status_code=400, detail="'model' is required.")
 
-        result = {"model": model}
-        result.update(
-            request.app.state.model_info_service.estimate_cost(
-                model,
-                prompt_tokens,
-                completion_tokens,
-                cache_read_tokens,
-                cache_creation_tokens,
-            )
-        )
-        return result
+        model_info_service = getattr(request.app.state, "model_info_service", None)
+        if model_info_service is not None:
+            result = {"model": model}
+            try:
+                result.update(
+                    model_info_service.estimate_cost(
+                        model,
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    )
+                )
+            except Exception as e:
+                logging.error(f"Cost estimation error: {e}")
+                result.update(
+                    {
+                        "cost": None,
+                        "currency": "USD",
+                        "pricing": {},
+                        "source": "unknown",
+                        "error": "Pricing data not available for this model",
+                    }
+                )
+            return result
+
+        return {
+            "model": model,
+            "cost": None,
+            "currency": "USD",
+            "pricing": {},
+            "source": "unknown",
+            "error": "Pricing data not available for this model",
+        }
 
     except HTTPException:
         raise

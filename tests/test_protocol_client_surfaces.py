@@ -217,6 +217,34 @@ def test_responses_malformed_json_uses_responses_error_shape() -> None:
     assert "detail" not in response.json()
 
 
+def test_cost_estimate_degrades_gracefully_without_pricing_service() -> None:
+    """The route answers even when no model-info service is wired (or its
+    pricing lookup fails) — never a 500."""
+
+    class UnknownPricingService:
+        def estimate_cost(self, *args, **kwargs):
+            raise RuntimeError("registry exploded")
+
+    proxy_main.PROXY_API_KEY = None
+    proxy_main.app.state.rotating_client = FailingSurfaceClient()
+    proxy_main.app.state.model_info_service = UnknownPricingService()
+    try:
+        response = TestClient(proxy_main.app).post(
+            "/v1/cost-estimate",
+            json={"model": "unknown/model-x", "prompt_tokens": 10, "completion_tokens": 5},
+        )
+        assert response.status_code == 200
+        assert response.json()["model"] == "unknown/model-x"
+    finally:
+        # The exploding service must not poison later tests.
+        proxy_main.app.state.model_info_service = _GracefulPricingService()
+
+
+class _GracefulPricingService:
+    def estimate_cost(self, *args, **kwargs):
+        return {"cost": None, "currency": "USD", "pricing": {}, "source": "unknown", "error": "Pricing data not available for this model"}
+
+
 class GeminiRuntimeClient:
     def __init__(self) -> None:
         self.calls = []

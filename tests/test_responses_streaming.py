@@ -259,28 +259,44 @@ class NativeFailingAtCallClient:
     """Native client whose agenerate raises before the first frame."""
 
     async def agenerate(self, payload, *, input_protocol, **kwargs):
+        async def stream():
+            raise RuntimeError("native agenerate exploded")
+            yield  # pragma: no cover
+
         raise RuntimeError("native agenerate exploded")
-        yield  # pragma: no cover
 
 
 class NativeMidStreamRaisingClient:
     """Native client that yields one frame, then raises mid-stream."""
 
     async def agenerate(self, payload, *, input_protocol, **kwargs):
-        yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_mid","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
-        raise RuntimeError("mid-stream explosion")
+        async def stream():
+            yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_mid","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+            raise RuntimeError("mid-stream explosion")
+
+        return stream()
 
 
 class NativeTerminalLessClient:
     """Native client that ends without any terminal event."""
 
     async def agenerate(self, payload, *, input_protocol, **kwargs):
-        yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_none","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+        async def stream():
+            yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_none","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+
+        return stream()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("client_class", [NativeFailingAtCallClient, NativeMidStreamRaisingClient, NativeTerminalLessClient])
-async def test_native_stream_failures_end_in_terminal_frames(client_class) -> None:
+@pytest.mark.parametrize(
+    "client_class,expected_fragment",
+    [
+        (NativeFailingAtCallClient, "native agenerate exploded"),
+        (NativeMidStreamRaisingClient, "mid-stream explosion"),
+        (NativeTerminalLessClient, "ended without a terminal response event"),
+    ],
+)
+async def test_native_stream_failures_end_in_terminal_frames(client_class, expected_fragment) -> None:
     """Every post-start native failure ends in protocol-valid terminal
     frames and a failed stored response — never a raised exception."""
     store = InMemoryResponsesStore()
@@ -290,6 +306,7 @@ async def test_native_stream_failures_end_in_terminal_frames(client_class) -> No
 
     event_text = "".join(events)
     assert "event: response.failed" in event_text
+    assert expected_fragment in event_text, f"failure mode {client_class.__name__} did not produce its own error"
     assert event_text.rstrip().endswith("data: [DONE]")
     failed_ids = [
         line.split('"id": "')[1].split('"')[0]
@@ -315,6 +332,7 @@ async def test_native_stream_failure_survives_store_errors() -> None:
     events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, NativeMidStreamRaisingClient())]
 
     event_text = "".join(events)
+    assert "mid-stream explosion" in event_text  # the real mid-stream mode ran
     assert "event: response.failed" in event_text
     assert event_text.rstrip().endswith("data: [DONE]")
 
