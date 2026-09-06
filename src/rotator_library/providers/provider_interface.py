@@ -288,6 +288,9 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # leave this None and keep the plain ``protocol_name`` declaration.
     transport_profiles: Optional[Dict[str, Dict[str, Any]]] = None
     default_profile: Optional[str] = None
+    # Declarative cache-and-replay (W13/D14): list of rule entries compiled
+    # to FieldCacheRules at native-context build (see field_cache/replay.py).
+    cache_replay: Optional[List[Dict[str, Any]]] = None
 
     @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:

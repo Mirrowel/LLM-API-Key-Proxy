@@ -250,17 +250,23 @@ def test_continuation_aliases_require_semantic_registration(path: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_session_scope_skips_by_default() -> None:
+async def test_missing_session_scope_is_optional_refinement() -> None:
+    """D11: provider+model are the required identity; a missing session is
+    an optional refinement (``_none`` bucket), not a skip."""
+
     engine = FieldCacheEngine([_reasoning_rule()])
 
     operations = await engine.extract("response", {"choices": [{"message": {"reasoning_content": "x"}}]}, _context(session_id=None))
 
-    assert operations[0].skipped is True
-    assert operations[0].reason == "missing_required_scope"
+    assert operations[0].skipped is False
+    assert operations[0].matched == 1
 
 
 @pytest.mark.asyncio
-async def test_missing_credential_scope_skips_instead_of_sharing_none_bucket() -> None:
+async def test_missing_credential_scope_caches_in_none_bucket() -> None:
+    """D11: missing credentials never disable caching (injection proceeds,
+    provenance recorded); provider-continuation rules keep strict binding."""
+
     rule = _reasoning_rule(scope=("provider", "model", "credential"))
     engine = FieldCacheEngine([rule])
 
@@ -271,12 +277,10 @@ async def test_missing_credential_scope_skips_instead_of_sharing_none_bucket() -
     )
     updated, injection_operations = await engine.inject("request", {"messages": [{}]}, _context(credential_id=None))
 
-    assert operations[0].skipped is True
-    assert operations[0].reason == "missing_required_scope"
-    assert injection_operations[0].skipped is True
-    assert injection_operations[0].reason == "missing_required_scope"
-    assert updated == {"messages": [{}]}
-    assert build_cache_key(rule, _context(credential_id=None)) is None
+    assert operations[0].skipped is False
+    assert injection_operations[0].hit is True
+    assert updated["messages"][0].get("reasoning_content") is not None
+    assert build_cache_key(rule, _context(credential_id=None)) is not None
 
 
 @pytest.mark.asyncio

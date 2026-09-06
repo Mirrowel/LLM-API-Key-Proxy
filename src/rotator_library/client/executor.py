@@ -3264,6 +3264,31 @@ def _merged_field_cache_rules(
     """
 
     declared = list(plugin.get_field_cache_rules(model) if plugin and hasattr(plugin, "get_field_cache_rules") else ())
+    # Declarative cache-and-replay (W13/D14): <NAME>_CACHE_REPLAY env JSON
+    # and the class-level cache_replay declaration compile to ordinary
+    # rules — one surface, one engine, operator is the trust boundary.
+    try:
+        import os as _os
+
+        from ..field_cache.replay import parse_cache_replay_config
+
+        env_rules = parse_cache_replay_config(
+            _os.getenv(f"{provider.upper()}_CACHE_REPLAY"),
+            provider=provider,
+        )
+        class_rules = parse_cache_replay_config(
+            getattr(plugin, "cache_replay", None),
+            provider=provider,
+        )
+        declared.extend(env_rules)
+        declared.extend(class_rules)
+    except RoutingExecutionError:
+        raise
+    except Exception as exc:
+        raise RoutingExecutionError(
+            f"Invalid cache_replay configuration for {provider}/{model}",
+            error_type="configuration_error",
+        ) from exc
     try:
         from ..config.experimental import load_experimental_config, parse_field_cache_rules
 

@@ -22,6 +22,12 @@ FieldCacheScope = Literal["provider", "model", "credential", "session", "convers
 
 DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
 REQUIRED_PROVIDER_STATE_SCOPE = frozenset({"provider", "model", "credential", "session"})
+# D11: provider+model are the REQUIRED identity for cached provider state;
+# credential and session are optional refinements (single-operator proxy —
+# tightened additively for multi-user later). Missing optional dimensions
+# never disable caching.
+OPTIONAL_SCOPE_DIMENSIONS = frozenset({"credential", "session"})
+_VALID_COMPATIBILITY = {"bound", "portable"}
 _VALID_SOURCES = {"request", "response", "stream_event", "unified_request", "unified_response", "unified_stream_event"}
 _VALID_TARGETS = {"request", "unified_request", "metadata"}
 _VALID_SCOPES = {"provider", "model", "credential", "session", "conversation", "classifier"}
@@ -87,6 +93,19 @@ class FieldCacheRule:
             if self.metadata.get("provider_continuation") is not True:
                 raise ValueError(
                     "Continuation field-cache injection requires metadata.provider_continuation=true"
+                )
+        compatibility = self.metadata.get("compatibility")
+        if compatibility is not None and compatibility not in _VALID_COMPATIBILITY:
+            raise ValueError(
+                f"FieldCacheRule.metadata.compatibility must be 'bound' or 'portable', not {compatibility!r}"
+            )
+        transform = self.metadata.get("transform")
+        if transform is not None:
+            if not isinstance(transform, str) or not transform:
+                raise ValueError("FieldCacheRule.metadata.transform must be a registered transform name")
+            if compatibility == "bound":
+                raise ValueError(
+                    "Transform-on-inject applies to portable fields only; bound opaque state never changes shape (D8)"
                 )
 
 

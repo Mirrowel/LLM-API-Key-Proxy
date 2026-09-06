@@ -77,16 +77,25 @@ def _shared_cache_signature(rule: FieldCacheRule) -> tuple[Any, ...]:
 
 
 def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optional[str]:
-    """Build a scoped cache key or return None when required scope is absent."""
+    """Build a scoped cache key or return None when required scope is absent.
+
+    D11: provider+model are the required identity; credential and session
+    are optional refinements — a missing optional dimension participates as
+    ``_none`` instead of disabling the rule. Provider/model absence still
+    disables (identity is non-negotiable).
+    """
 
     parts = [f"rule={_safe_scope_value(rule.cache_key or rule.name)}"]
     for scope in rule.scope:
         value = context.value_for_scope(scope)
         if value is None or value == "":
-            if scope == "credential":
+            if scope in ("provider", "model"):
                 return None
             if scope == "session" and not rule.allow_missing_session:
-                return None
+                # Continuation-style rules opt into strict session binding;
+                # ordinary rules treat a missing session as _none (D11).
+                if rule.metadata.get("provider_continuation") is True:
+                    return None
             value = "_none"
         safe_value = _safe_scope_value(value)
         parts.append(f"{scope}={safe_value}")
@@ -188,6 +197,13 @@ class FieldCacheEngine:
                 continue
             try:
                 cached = await self.store.get(operation.cache_key)
+                provenance_note: Optional[dict[str, Any]] = None
+                if cached is None:
+                    # D12 portable inheritance: on a miss, walk declared
+                    # compatibility-group siblings (bound fields never walk).
+                    sibling_hit = await self._lookup_compatible_sibling(rule, context)
+                    if sibling_hit is not None:
+                        cached, provenance_note = sibling_hit
                 if cached is None:
                     operation.reason = "cache_miss"
                     operations.append(operation)
@@ -199,6 +215,22 @@ class FieldCacheEngine:
                     operations.append(operation)
                     self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
                     continue
+                transform_name = rule.metadata.get("transform")
+                if transform_name:
+                    from ..protocols.transforms import apply_transform
+
+                    if isinstance(value, list):
+                        value = [apply_transform(str(transform_name), item) for item in value]
+                        value = [item for item in value if item is not None]
+                    else:
+                        value = apply_transform(str(transform_name), value)
+                        if value is None:
+                            operation.reason = "transform_produced_nothing"
+                            operations.append(operation)
+                            self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
+                            continue
+                if provenance_note:
+                    operation.reason = "inherited_from_compatible_model"
                 operation.changed = inject_path(
                     updated,
                     rule.inject.path,
@@ -217,6 +249,44 @@ class FieldCacheEngine:
 
     def _rules_for_source(self, source: str) -> list[FieldCacheRule]:
         return [rule for rule in self.rules if rule.enabled and rule.source == source]
+
+    async def _lookup_compatible_sibling(
+        self,
+        rule: FieldCacheRule,
+        context: FieldCacheContext,
+    ) -> Optional[tuple[Any, dict[str, Any]]]:
+        """Portable-field inheritance across compatibility-group siblings.
+
+        Builds sibling cache keys with the same scope dimensions; the first
+        hit returns (value, provenance). Bound rules and rules without a
+        model in scope never inherit (identity match only).
+        """
+
+        if rule.metadata.get("compatibility") != "portable":
+            return None
+        if not context.provider or not context.model or "model" not in rule.scope:
+            return None
+        from .compat import ModelRef, get_compatibility_registry
+
+        registry = get_compatibility_registry()
+        target_ref = ModelRef(provider=context.provider, model=context.model)
+        for sibling in registry.siblings(target_ref, field_class="portable"):
+            sibling_context = FieldCacheContext(
+                provider=sibling.provider,
+                model=sibling.model,
+                credential_id=context.credential_id,
+                session_id=context.session_id,
+                conversation_id=context.conversation_id,
+                classifier=context.classifier,
+                metadata=dict(context.metadata),
+            )
+            sibling_key = build_cache_key(rule, sibling_context)
+            if not sibling_key or sibling_key == (None):
+                continue
+            cached = await self.store.get(sibling_key)
+            if cached is not None:
+                return cached, {"inherited_from": sibling.key}
+        return None
 
     def _rules_for_injection(self, target: str) -> list[FieldCacheRule]:
         return [rule for rule in self.rules if rule.enabled and rule.inject and rule.inject.target == target]
