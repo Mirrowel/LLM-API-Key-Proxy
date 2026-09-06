@@ -217,9 +217,11 @@ def test_litellm_identity_fires_on_explicit_fallback_branch() -> None:
     )
 
 
-def test_fallback_warning_fires_once_with_per_attempt_records() -> None:
+def test_fallback_warning_fires_once_with_per_attempt_records(caplog) -> None:
     """Retry-loop re-recording keeps per-attempt records but the warning is
-    emitted exactly once per request."""
+    emitted exactly once per request (single shared context)."""
+
+    import logging
 
     from rotator_library.client.executor import RequestExecutor
 
@@ -233,14 +235,24 @@ def test_fallback_warning_fires_once_with_per_attempt_records() -> None:
         def update_metadata(self, **fields):
             pass
 
-    class _Context:
-        transaction_logger = _Logger()
-        _litellm_fallback_warned = False
-
+    shared_context = type(
+        "SharedContext",
+        (),
+        {"transaction_logger": _Logger(), "_litellm_fallback_warned": False},
+    )()
     plugin = _plugin("openai")
-    executor._record_litellm_fallback_identity(_Context(), "openai", plugin, "openai/gpt-test", stream=False)
-    executor._record_litellm_fallback_identity(_Context(), "openai", plugin, "openai/gpt-test", stream=True)
+    lib_logger = logging.getLogger("rotator_library")
+    original_propagate = lib_logger.propagate
+    lib_logger.propagate = True  # caplog captures via the root handler
+    try:
+        with caplog.at_level(logging.WARNING, logger="rotator_library"):
+            executor._record_litellm_fallback_identity(shared_context, "openai", plugin, "openai/gpt-test", stream=False)
+            executor._record_litellm_fallback_identity(shared_context, "openai", plugin, "openai/gpt-test", stream=True)
+    finally:
+        lib_logger.propagate = original_propagate
     assert len(attempts) == 2
+    warnings = [record for record in caplog.records if record.levelno == logging.WARNING and "litellm_fallback" in record.message]
+    assert len(warnings) == 1
 
 
 def test_auto_fallthrough_records_fallback_identity() -> None:
