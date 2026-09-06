@@ -357,7 +357,6 @@ def test_gemini_target_refusal_text_and_builtin_rejection() -> None:
     out = gemini.format_response(record_with_text, _ctx("responses", "gemini"))
     assert out["candidates"][0]["content"]["parts"] == [{"text": "kept"}]
     assert any(w.code == "builtin_tool_dropped" for w in record_with_text.warnings)
-    assert any(w.code == "annotations_dropped" for w in ([w for w in []] or record_with_text.warnings)) or True
 
 
 def test_gemini_target_annotations_dropped_with_warning() -> None:

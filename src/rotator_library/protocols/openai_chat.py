@@ -182,8 +182,15 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     message.index = choice_position
                 message.stop_reason = canonical_stop_reason(choice.get("finish_reason"))
                 message_annotations = _parse_openai_annotations(message_payload.get("annotations"))
-                if message_annotations and message.content:
-                    message.content[0].annotations.extend(message_annotations)
+                if message_annotations:
+                    if message.content:
+                        message.content[0].annotations.extend(message_annotations)
+                    else:
+                        # Annotation-bearing refusal-only/empty messages keep
+                        # their citations on a synthesized empty text block.
+                        message.content.append(
+                            ContentBlock(type="text", text=message_payload.get("content") if isinstance(message_payload.get("content"), str) else None, annotations=message_annotations)
+                        )
                 messages.append(message)
             if choice.get("finish_reason") is not None:
                 stop_reason = choice.get("finish_reason")
@@ -196,7 +203,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             messages=messages,
             stop_reason=canonical_stop_reason(stop_reason),
             usage=self.extract_usage(response, context),
-            modalities=_openai_output_modalities(response, messages),
+            modalities=_openai_output_modalities(messages),
             metadata={
                 "object": response.get("object"),
                 "created": response.get("created"),
@@ -361,7 +368,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             content.append(ContentBlock(type="refusal", refusal=refusal, raw=refusal))
         audio = payload.get("audio")
         if isinstance(audio, dict) and audio:
-            content.append(ContentBlock(type="audio", source=_openai_media_source({"audio": audio}, kind="audio"), raw=deepcopy(audio)))
+            content.append(ContentBlock(type="audio", source=_openai_media_source(audio, kind="audio"), raw=deepcopy(audio)))
         return UnifiedMessage(
             role=role,
             content=content,
@@ -530,6 +537,11 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     payload.update(deepcopy(block.extra))
                 formatted.append(payload)
             elif block.type == "audio":
+                if preserve_source and isinstance(block.raw, dict):
+                    # Assistant audio output round-trips its native shape
+                    # (id/data/transcript), never a fabricated input_audio part.
+                    formatted.append(deepcopy(block.raw))
+                    continue
                 source = _media_source(block.source)
                 payload = {"type": "input_audio", "input_audio": {"data": source.data or "", "format": _audio_format(source.media_type)}}
                 formatted.append(payload)
@@ -824,7 +836,7 @@ def _parse_openai_annotations(payload: Any) -> list[Annotation]:
     return annotations
 
 
-def _openai_output_modalities(response: Any, messages: list[UnifiedMessage]) -> list[str]:
+def _openai_output_modalities(messages: list[UnifiedMessage]) -> list[str]:
     """Declare output modalities the response actually carries (W2)."""
 
     modalities: list[str] = []

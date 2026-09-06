@@ -18,10 +18,12 @@ from .types import MediaSource, ProtocolContext, ProtocolError, UnifiedRequest, 
 
 
 _CONTENT_CAPABILITIES: dict[str, set[str]] = {
-    "openai_chat": {"text", "image", "audio", "file", "document", "reasoning", "tool_call", "tool_result"},
-    "anthropic_messages": {"text", "image", "file", "document", "reasoning", "tool_call", "tool_result"},
-    "responses": {"text", "image", "file", "document", "reasoning", "tool_call", "tool_result"},
-    "gemini": {"text", "image", "audio", "video", "file", "document", "reasoning", "tool_call", "tool_result"},
+    "openai_chat": {"text", "image", "audio", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
+    # Refusal turns degrade to text with refusal stop semantics (D7
+    # equivalent construct) rather than blocking the whole request.
+    "anthropic_messages": {"text", "image", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
+    "responses": {"text", "image", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
+    "gemini": {"text", "image", "audio", "video", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
 }
 
 _RESPONSE_MODALITIES: dict[str, set[str]] = {

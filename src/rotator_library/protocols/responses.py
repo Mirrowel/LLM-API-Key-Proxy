@@ -222,7 +222,14 @@ class ResponsesProtocol(ProtocolAdapter):
             "object": unified_response.metadata.get("object", "response"),
             "created_at": unified_response.metadata.get("created_at"),
             "model": unified_response.model,
-            "status": format_stop_reason(unified_response.stop_reason, self.name),
+            # First-wins keeps the FIRST candidate's stop status (D9), never
+            # the response-level reason that parse derived from the LAST one.
+            "status": format_stop_reason(
+                (assistants[0].stop_reason or unified_response.stop_reason)
+                if candidate_backed and assistants
+                else unified_response.stop_reason,
+                self.name,
+            ),
             "output": output,
             "usage": _format_responses_usage(unified_response.usage),
         }
@@ -596,7 +603,12 @@ class ResponsesProtocol(ProtocolAdapter):
                     payload.update({k: deepcopy(v) for k, v in block.extra.items() if k not in {"source_type", "annotations"}})
                 formatted.append(payload)
             elif block.type == "refusal" and block.refusal is not None:
-                formatted.append({"type": "refusal", "refusal": block.refusal})
+                if output or role in {"assistant", "model"}:
+                    formatted.append({"type": "refusal", "refusal": block.refusal})
+                else:
+                    # Request-side history: Responses input has no refusal part;
+                    # degrade to input_text per D7 (validator admits refusal).
+                    formatted.append({"type": "input_text", "text": block.refusal})
             elif block.type == "image":
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "input_image"}
                 payload["type"] = "input_image"
