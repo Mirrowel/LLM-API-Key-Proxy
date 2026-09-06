@@ -181,6 +181,7 @@ def test_litellm_identity_fires_on_explicit_fallback_branch() -> None:
         provider = "openai"
         protocol = "openai_chat"
         name = "openai"
+        profile = None
         prefixed_model = "openai/gpt-test"
 
     import rotator_library.client.executor as executor_module

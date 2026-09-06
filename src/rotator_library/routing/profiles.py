@@ -117,17 +117,19 @@ def resolve_profile(
             )
         return None
     names = {str(name) for name in declared_profiles}
-    if default_profile and default_profile not in names:
-        raise ModelReferenceError(
-            f"Provider {provider} declares default profile {default_profile!r} "
-            f"but no such profile exists; known: {sorted(names)}"
-        )
     if requested_profile:
         if requested_profile not in names:
             raise ModelReferenceError(
                 f"Provider {provider} has no profile {requested_profile!r}; known: {sorted(names)}"
             )
         return requested_profile
+    # Explicit addressing never depends on default hygiene: validate the
+    # default only for bare-name resolution.
+    if default_profile and default_profile not in names:
+        raise ModelReferenceError(
+            f"Provider {provider} declares default profile {default_profile!r} "
+            f"but no such profile exists; known: {sorted(names)}"
+        )
     if default_profile and default_profile in names:
         default_protocol = _profile_protocol(declared_profiles, default_profile, protocol_name)
         if not client_protocol or default_protocol == client_protocol:

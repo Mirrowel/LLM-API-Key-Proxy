@@ -345,19 +345,26 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         configured = self._get_runtime_config(model).protocol_name
         if configured:
             return configured
-        if self.transport_profiles and profile:
+        if self.transport_profiles:
             from ..routing.profiles import ModelReferenceError
 
-            entry = self.transport_profiles.get(profile)
-            if not isinstance(entry, dict):
-                raise ModelReferenceError(
-                    f"{self.__class__.__name__} has no profile {profile!r}; "
-                    f"known: {sorted(self.transport_profiles)}"
-                )
-            return str(entry.get("protocol") or self.protocol_name)
-        if self.transport_profiles and self.default_profile:
-            entry = self.transport_profiles.get(self.default_profile) or {}
-            return str(entry.get("protocol") or self.protocol_name)
+            if profile:
+                entry = self.transport_profiles.get(profile)
+                if not isinstance(entry, dict):
+                    raise ModelReferenceError(
+                        f"{self.__class__.__name__} has no profile {profile!r}; "
+                        f"known: {sorted(self.transport_profiles)}"
+                    )
+            else:
+                if self.default_profile and self.default_profile not in self.transport_profiles:
+                    raise ModelReferenceError(
+                        f"{self.__class__.__name__} declares default profile "
+                        f"{self.default_profile!r} but no such profile exists; "
+                        f"known: {sorted(self.transport_profiles)}"
+                    )
+                entry = self.transport_profiles.get(self.default_profile or "") or {}
+            protocol = entry.get("protocol") or self.protocol_name
+            return str(protocol) if protocol else None
         return self.protocol_name
 
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
@@ -441,10 +448,14 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             name = name[: -len("Provider")]
         return name.lower()
 
-    def supports_native_operation(self, model: str = "", operation: str = "chat") -> bool:
-        """Return whether this provider supports a native operation."""
+    def supports_native_operation(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> bool:
+        """Return whether this provider supports a native operation.
 
-        protocol_name = self.get_protocol_name(model)
+        The check resolves the PROFILE's protocol (D13), not the default —
+        an anthropic_messages profile must not be gated by chat vocabulary.
+        """
+
+        protocol_name = self.get_protocol_name(model, profile=profile) if profile else self.get_protocol_name(model)
         if not protocol_name:
             return False
         try:
@@ -454,24 +465,35 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         except Exception:
             return False
 
+    def get_native_operation(self, model: str = "", request=None, stream: bool = False, profile: Optional[str] = None) -> str:
+        """Return the provider-native operation for a request.
+
+        Providers that expose native protocols often use operation names that
+        are not simply ``chat``: Anthropic-compatible providers use ``messages``,
+        Responses providers use ``responses``, and Gemini-style providers use a
+        generate operation. The default maps the resolved profile protocol
+        (D13) to its conventional operation; single-protocol providers keep
+        ``chat`` unless they override.
+        """
+
+        try:
+            protocol_name = self.get_protocol_name(model, profile=profile) if profile else self.get_protocol_name(model)
+        except Exception:
+            protocol_name = None
+        if protocol_name == "anthropic_messages":
+            return "messages"
+        if protocol_name == "responses":
+            return "responses"
+        if protocol_name == "gemini":
+            return "stream_generate" if stream else "generate"
+        return "chat"
+
     def should_use_native_protocol(self, model: str = "", operation: str = "chat", *, stream: bool = False, execution: str = "auto") -> bool:
         """Return whether routing should use this provider's native protocol."""
 
         if stream and not self.supports_native_streaming(model, operation):
             return False
         return bool(self.get_protocol_name(model) and self.supports_native_operation(model, operation))
-
-    def get_native_operation(self, model: str = "", request: Optional[Dict[str, Any]] = None, stream: bool = False) -> str:
-        """Return the provider-native operation for a request.
-
-        Providers that expose native protocols often use operation names that are
-        not simply ``chat``: Anthropic-compatible providers use ``messages``,
-        Responses providers use ``responses``, and Gemini-style providers use a
-        generate operation. The default stays ``chat`` so existing OpenAI-chat
-        providers remain compatible unless they opt in to something richer.
-        """
-
-        return "chat"
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> str:
         """Return the upstream endpoint for a native operation.

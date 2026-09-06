@@ -842,8 +842,10 @@ class RequestExecutor:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
-        operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
-        if hasattr(plugin, "supports_native_operation") and not plugin.supports_native_operation(native_model, operation):
+        # Operation resolution is profile-aware (D13): the selected profile's
+        # protocol vocabulary governs, not the default profile's.
+        operation = _call_profile_aware_operation(plugin, native_model, stream, profile)
+        if not _supports_profile_operation(plugin, native_model, operation, profile):
             raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
         try:
             endpoint = _call_profile_aware(plugin, "get_native_endpoint", native_model, operation, profile)
@@ -898,6 +900,7 @@ class RequestExecutor:
                     upstream_protocol=protocol_name,
                     execution_mode="native",
                     native_endpoint=endpoint,
+                    execution_profile=profile,
                     fast_path=bool(native_context.raw_client_request),
                 )
             except Exception:
@@ -1596,6 +1599,11 @@ class RequestExecutor:
                     except RoutingExecutionError as exc:
                         if exc.error_type == "configuration_error":
                             raise
+                    except StructuredAPIResponseError:
+                        # Client-visible addressing/validation failures
+                        # (invalid_request) never rotate: the next credential
+                        # would fail identically.
+                        raise
                     except Exception:
                         # Let context manager handle cleanup
                         pass
@@ -2242,6 +2250,9 @@ class RequestExecutor:
                         except RoutingExecutionError as exc:
                             if exc.error_type == "configuration_error":
                                 raise
+                        except StructuredAPIResponseError:
+                            # Client-visible failures never rotate streams.
+                            raise
                         except Exception:
                             # Let context manager handle cleanup
                             pass
@@ -2838,6 +2849,7 @@ def _target_trace(target: RouteTarget) -> Dict[str, Any]:
         "model": target.prefixed_model,
         "execution": target.execution,
         "protocol": target.protocol,
+        "profile": target.profile,
     }
 
 
@@ -2996,6 +3008,26 @@ def _accepts_profile_param(method: Any) -> bool:
     if "profile" in parameters:
         return True
     return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+def _call_profile_aware_operation(plugin: Any, model: str, stream: bool, profile: Optional[str]) -> str:
+    """Resolve the native operation with the profile when the hook accepts it."""
+
+    method = getattr(plugin, "get_native_operation", None)
+    if not callable(method):
+        return "chat"
+    if profile and _accepts_profile_param(method):
+        return method(model, None, stream=stream, profile=profile)
+    return method(model, None, stream=stream)
+
+
+def _supports_profile_operation(plugin: Any, model: str, operation: str, profile: Optional[str]) -> bool:
+    method = getattr(plugin, "supports_native_operation", None)
+    if not callable(method):
+        return True
+    if profile and _accepts_profile_param(method):
+        return bool(method(model, operation, profile=profile))
+    return bool(method(model, operation))
 
 
 def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], profile: Optional[str] = None) -> Optional[str]:

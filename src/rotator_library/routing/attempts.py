@@ -34,6 +34,10 @@ def clone_context_for_target(
     next_usage_key = usage_manager_key if usage_manager_key is not None else target.provider
     # Profiles are per-target transport steering, never identity: a target
     # without its own profile must not inherit another provider's profile.
+    # Precedence (D13): an explicit target profile wins over the request's
+    # addressing — the operator's fallback plan is the later, more specific
+    # intent; the request profile survives only for same-provider targets
+    # that do not address one themselves.
     target_profile = target.profile if target.profile is not None else (
         context.execution_profile if target.provider == context.provider else None
     )

@@ -221,6 +221,31 @@ def test_profile_endpoint_derivation_guards() -> None:
     assert endpoint.endswith("/responses")
 
 
+def test_cross_protocol_profile_operation_resolution() -> None:
+    """Explicit anthropic profile on a chat-default provider resolves the
+    anthropic operation vocabulary (messages), not the default's chat —
+    cross-protocol conversion executes instead of dying at the gate."""
+
+    provider = MultiProfileProvider()
+    assert provider.get_native_operation("m", None, stream=False, profile="anthropic") == "messages"
+    assert provider.supports_native_operation("m", "messages", profile="anthropic") is True
+    assert provider.supports_native_operation("m", "chat", profile="anthropic") is False
+
+
+def test_explicit_request_survives_bogus_default_profile() -> None:
+    assert (
+        resolve_profile(
+            declared_profiles=PROFILES,
+            default_profile="bogus",
+            protocol_name=None,
+            client_protocol="openai_chat",
+            requested_profile="chat",
+            provider="synthetic",
+        )
+        == "chat"
+    )
+
+
 # --- Provider interface integration ---
 
 

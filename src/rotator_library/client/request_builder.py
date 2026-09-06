@@ -373,8 +373,9 @@ class RequestContextBuilder:
         kwargs: Dict[str, Any],
     ) -> RequestContext:
         # Same D13 grammar as completions: normalize addressing before any
-        # identity use. (Embedding providers are single-protocol today, so an
-        # explicit profile fails loudly at transport resolution.)
+        # identity use. Embedding transport is single-protocol today, so a
+        # requested profile is dropped after normalization (no multi-protocol
+        # embedding profiles exist to address).
         _normalize_profile_reference(kwargs)
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
