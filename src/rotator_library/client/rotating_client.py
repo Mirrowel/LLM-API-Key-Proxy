@@ -913,7 +913,7 @@ class RotatingClient:
 
     async def anthropic_messages(
         self,
-        request: Any,
+        request: Dict[str, Any],
         raw_request: Optional[Any] = None,
         pre_request_callback: Optional[Any] = None,
     ) -> Any:
@@ -932,7 +932,7 @@ class RotatingClient:
 
     async def anthropic_count_tokens(
         self,
-        request: Any,
+        request: Dict[str, Any],
     ) -> dict:
         """Count tokens for an Anthropic Messages request locally."""
 

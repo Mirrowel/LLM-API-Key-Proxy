@@ -13,8 +13,9 @@ anthropic_messages protocol adapter.
 
 from __future__ import annotations
 
+import json
 import uuid
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from ..protocols import get_protocol
 from ..protocols.operation import OPERATION_COUNT_TOKENS
@@ -54,7 +55,7 @@ class AnthropicHandler:
 
     async def messages(
         self,
-        request: Any,
+        request: Dict[str, Any],
         raw_request: Optional[Any] = None,
         pre_request_callback: Optional[Any] = None,
     ) -> Any:
@@ -65,7 +66,7 @@ class AnthropicHandler:
         fields and explicit nulls transport verbatim (D4).
         """
 
-        payload = dict(request) if isinstance(request, dict) else dict(getattr(request, "model_dump", dict)())
+        payload = dict(request)
         request_id = f"msg_{uuid.uuid4().hex[:24]}"
         original_model = str(payload.get("model") or "")
         provider = original_model.split("/")[0] if "/" in original_model else "unknown"
@@ -109,10 +110,10 @@ class AnthropicHandler:
             anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
         return anthropic_response
 
-    async def count_tokens(self, request: Any) -> dict[str, int]:
+    async def count_tokens(self, request: Dict[str, Any]) -> dict[str, int]:
         """Count an Anthropic request locally using its canonical Chat projection."""
 
-        payload = dict(request) if isinstance(request, dict) else dict(getattr(request, "model_dump", dict)())
+        payload = dict(request)
         model = str(payload.get("model") or "")
         anthropic = get_protocol("anthropic_messages")
         unified = anthropic.parse_request(
@@ -139,8 +140,6 @@ class AnthropicHandler:
             messages=chat_request.get("messages") or [],
         )
         if chat_request.get("tools"):
-            import json
-
             tools_text = json.dumps(chat_request["tools"])
             total += self._client.token_count(model=model, text=tools_text)
         return {"input_tokens": total}

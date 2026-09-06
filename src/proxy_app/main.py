@@ -590,6 +590,7 @@ async def verify_gemini_api_key(
 
 # Stream wrapping, request overrides, and embedding fan-out live in route_helpers.
 from .route_helpers import (  # noqa: E402
+    SSE_HEADERS,
     apply_temperature_override,
     execute_embeddings,
     streaming_response_wrapper,
@@ -938,7 +939,7 @@ async def anthropic_messages(
         status, content = format_client_protocol_error(
             input_protocol="anthropic_messages",
             error=exc,
-            error_type="invalid_request_error",
+            error_type="invalid_request",
             status_code=400,
         )
         return JSONResponse(status_code=status, content=content)
@@ -946,7 +947,7 @@ async def anthropic_messages(
         status, content = format_client_protocol_error(
             input_protocol="anthropic_messages",
             error=ValueError("request body must be a JSON object"),
-            error_type="invalid_request_error",
+            error_type="invalid_request",
             status_code=400,
         )
         return JSONResponse(status_code=status, content=content)
@@ -981,11 +982,7 @@ async def anthropic_messages(
             return StreamingResponse(
                 result,
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=SSE_HEADERS,
             )
         else:
             # Non-streaming response
@@ -1164,11 +1161,7 @@ async def gemini_stream_generate_content(
         return StreamingResponse(
             streaming_response_wrapper(request, payload, response_stream, input_protocol="gemini"),
             media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
+            headers=SSE_HEADERS,
         )
     except (json.JSONDecodeError, ValueError, litellm.InvalidRequestError) as error:
         status, content = format_client_protocol_error(
@@ -1212,7 +1205,6 @@ async def gemini_count_tokens(
 @app.post("/v1/embeddings")
 async def embeddings(
     request: Request,
-    body: EmbeddingRequest,
     client: RotatingClient = Depends(get_rotating_client),
     batcher: Optional[EmbeddingBatcher] = Depends(get_embedding_batcher),
     _=Depends(verify_api_key),
@@ -1224,7 +1216,20 @@ async def embeddings(
     - False: Passes requests directly to the provider.
     """
     try:
-        request_data = body.model_dump(exclude_none=True)
+        request_data = await request.json()
+        if not isinstance(request_data, dict):
+            raise ValueError("request body must be a JSON object")
+        if not request_data.get("model"):
+            raise ValueError("Field required: 'model'")
+        if "input" not in request_data:
+            raise ValueError("Field required: 'input'")
+    except Exception as e:
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
         log_request_to_console(
             url=str(request.url),
             headers=dict(request.headers),
@@ -1585,55 +1590,16 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
         if not model:
             raise HTTPException(status_code=400, detail="'model' is required.")
 
-        result = {
-            "model": model,
-            "cost": None,
-            "currency": "USD",
-            "pricing": {},
-            "source": None,
-        }
-
-        # Try model info service first
-        if hasattr(request.app.state, "model_info_service"):
-            model_info_service = request.app.state.model_info_service
-            if model_info_service.is_ready:
-                cost = model_info_service.calculate_cost(
-                    model,
-                    prompt_tokens,
-                    completion_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                )
-                if cost is not None:
-                    cost_info = model_info_service.get_cost_info(model)
-                    result["cost"] = cost
-                    result["pricing"] = cost_info or {}
-                    result["source"] = "model_info_service"
-                    return result
-
-        # Fallback to litellm
-        try:
-            import litellm
-
-            # Create a mock response for cost calculation
-            model_info = litellm.get_model_info(model)
-            input_cost = model_info.get("input_cost_per_token", 0)
-            output_cost = model_info.get("output_cost_per_token", 0)
-
-            if input_cost or output_cost:
-                cost = (prompt_tokens * input_cost) + (completion_tokens * output_cost)
-                result["cost"] = cost
-                result["pricing"] = {
-                    "input_cost_per_token": input_cost,
-                    "output_cost_per_token": output_cost,
-                }
-                result["source"] = "litellm_fallback"
-                return result
-        except Exception:
-            pass
-
-        result["source"] = "unknown"
-        result["error"] = "Pricing data not available for this model"
+        result = {"model": model}
+        result.update(
+            request.app.state.model_info_service.estimate_cost(
+                model,
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            )
+        )
         return result
 
     except HTTPException:

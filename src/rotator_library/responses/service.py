@@ -392,7 +392,7 @@ class ResponsesService:
         except Exception as exc:
             # Post-start failures never escape into the transport: the client
             # receives a protocol-valid terminal sequence instead (defect 10).
-            async for frame in await self._terminal_stream_failure(
+            async for frame in self._terminal_stream_failure(
                 stream_request,
                 model,
                 parent,
@@ -444,7 +444,7 @@ class ResponsesService:
         except Exception as exc:
             # Post-start failures never escape into the transport: the client
             # receives a protocol-valid terminal sequence instead (defect 10).
-            async for frame in await self._terminal_stream_failure(
+            async for frame in self._terminal_stream_failure(
                 stream_request,
                 unified.model,
                 parent,
@@ -456,7 +456,7 @@ class ResponsesService:
             return
         if not completed:
             # The stream ended without a terminal event — synthesize one.
-            async for frame in await self._terminal_stream_failure(
+            async for frame in self._terminal_stream_failure(
                 stream_request,
                 unified.model,
                 parent,
@@ -480,35 +480,53 @@ class ResponsesService:
         transaction_logger: Optional[Any],
         session_info: dict[str, Any],
     ) -> AsyncGenerator[str, None]:
-        """Emit the terminal failure frames for a failed native stream."""
+        """Emit the terminal failure frames for a failed native stream.
+
+        Frame emission is isolated from the store attempt: a failing store
+        must never cost the client its terminal frames (double-failure
+        guard).
+        """
 
         error = _stream_failure_error(exc)
         failed = {
-            "id": generate_response_id("resp"),
+            "id": generate_response_id(),
             "object": "response",
             "status": "failed",
             "model": model,
             "output": [],
             "error": error,
         }
-        self._log_transform_error(transaction_logger, "responses_native_stream", exc, stream_request)
-        stored = await self._store_stream_response(
-            stream_request,
-            failed,
-            parent,
-            failed=True,
-            transaction_logger=transaction_logger,
-            session_info=session_info,
-        )
-        self._trace(
-            transaction_logger,
-            "responses_stored_failed_stream_response" if stored else "responses_store_skipped",
-            {"response_id": failed["id"], "status": "failed"},
-            direction="metadata",
-            stage="final",
-        )
+        try:
+            self._log_transform_error(transaction_logger, "responses_native_stream", exc, stream_request)
+            stored = await self._store_stream_response(
+                stream_request,
+                failed,
+                parent,
+                failed=True,
+                transaction_logger=transaction_logger,
+                session_info=session_info,
+            )
+            self._trace(
+                transaction_logger,
+                "responses_stored_failed_stream_response" if stored else "responses_store_skipped",
+                {"response_id": failed["id"], "status": "failed"},
+                direction="metadata",
+                stage="final",
+            )
+        except Exception as store_exc:
+            self._trace(
+                transaction_logger,
+                "responses_store_failed_stream_response_error",
+                {"error": str(store_exc)},
+                direction="metadata",
+                stage="final",
+            )
         formatter = ResponsesSSEFormatter()
-        yield formatter.format_stream_event(ResponsesStreamEvent("response.failed", failed))
+        # Wire convention: the nested {type, response} envelope, matching
+        # provider-emitted terminal frames on the same stream.
+        yield formatter.format_stream_event(
+            ResponsesStreamEvent("response.failed", {"type": "response.failed", "response": failed})
+        )
         yield formatter.format_stream_event(ResponsesStreamEvent("done", {}, terminal=True))
 
     async def validate_stream_request(

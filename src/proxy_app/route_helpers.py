@@ -23,6 +23,13 @@ if TYPE_CHECKING:
     from .detailed_logger import RawIOLogger
 
 
+SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
 def _stream_error_frames(error: BaseException, *, input_protocol: str) -> list[str]:
     """Terminal in-band frames for a failed stream, in the client protocol."""
 

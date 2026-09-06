@@ -255,6 +255,70 @@ async def test_native_responses_stream_uses_agenerate_and_stores_terminal_object
     assert stored.output_items[0]["content"][0]["text"] == "native"
 
 
+class NativeFailingAtCallClient:
+    """Native client whose agenerate raises before the first frame."""
+
+    async def agenerate(self, payload, *, input_protocol, **kwargs):
+        raise RuntimeError("native agenerate exploded")
+        yield  # pragma: no cover
+
+
+class NativeMidStreamRaisingClient:
+    """Native client that yields one frame, then raises mid-stream."""
+
+    async def agenerate(self, payload, *, input_protocol, **kwargs):
+        yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_mid","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+        raise RuntimeError("mid-stream explosion")
+
+
+class NativeTerminalLessClient:
+    """Native client that ends without any terminal event."""
+
+    async def agenerate(self, payload, *, input_protocol, **kwargs):
+        yield 'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_none","object":"response","status":"in_progress","model":"gpt-test","output":[]}}\n\n'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("client_class", [NativeFailingAtCallClient, NativeMidStreamRaisingClient, NativeTerminalLessClient])
+async def test_native_stream_failures_end_in_terminal_frames(client_class) -> None:
+    """Every post-start native failure ends in protocol-valid terminal
+    frames and a failed stored response — never a raised exception."""
+    store = InMemoryResponsesStore()
+    service = ResponsesService(store=store)
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, client_class())]
+
+    event_text = "".join(events)
+    assert "event: response.failed" in event_text
+    assert event_text.rstrip().endswith("data: [DONE]")
+    failed_ids = [
+        line.split('"id": "')[1].split('"')[0]
+        for line in events
+        if '"type": "response.failed"' in line or '"status":"failed"' in line or '"status": "failed"' in line
+    ]
+    assert failed_ids, "failed payload carries a response id"
+    stored = await store.get(failed_ids[0])
+    assert stored is not None
+    assert stored.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_native_stream_failure_survives_store_errors() -> None:
+    """A failing store must never cost the client its terminal frames."""
+
+    class ExplodingStore(InMemoryResponsesStore):
+        async def save(self, stored):
+            raise RuntimeError("store exploded")
+
+    service = ResponsesService(store=ExplodingStore())
+
+    events = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "Hello", "stream": True}, NativeMidStreamRaisingClient())]
+
+    event_text = "".join(events)
+    assert "event: response.failed" in event_text
+    assert event_text.rstrip().endswith("data: [DONE]")
+
+
 @pytest.mark.asyncio
 async def test_native_responses_stream_passes_frames_through_and_stores_terminal_object() -> None:
     store = InMemoryResponsesStore()
