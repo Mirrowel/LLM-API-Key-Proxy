@@ -18,7 +18,7 @@ from rotator_library.protocols.canonical import (
     effort_from_budget_tokens,
 )
 from rotator_library.protocols.streaming import stream_format_state
-from rotator_library.protocols.types import ContentBlock, ProtocolContext, UnifiedResponse, Usage
+from rotator_library.protocols.types import Annotation, ContentBlock, ProtocolContext, UnifiedResponse, Usage
 from rotator_library.protocols.validation import ProtocolError
 
 
@@ -490,18 +490,30 @@ def test_stream_refusal_degrades_to_text_at_anthropic() -> None:
 # stream refusal, builtin bookkeeping, dual instructions)
 
 
-def test_effort_none_normalizes_to_disabled_everywhere() -> None:
+def test_effort_none_maps_exactly_per_target() -> None:
     chat_payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "none"}
 
-    built_chat, _ = _build("anthropic_messages", chat_payload, source="openai_chat")
-    assert built_chat["thinking"] == {"type": "disabled"}
+    # Chat and Responses accept the full effort vocabulary verbatim.
+    built_chat, _ = _build("responses", chat_payload, source="openai_chat")
+    assert built_chat["reasoning"] == {"effort": "none"}
 
-    built_resp, unified = _build("responses", chat_payload, source="openai_chat")
-    assert "reasoning" not in built_resp
-    assert "reasoning_disabled_omitted" in _warnings_of(unified)
+    built_resp, unified_resp = _build("responses", chat_payload, source="openai_chat")
+    assert "reasoning_disabled_omitted" not in _warnings_of(unified_resp)
 
+    # Same-protocol chat passthrough keeps the native spelling untouched.
+    chat = get_protocol("openai_chat")
+    unified = chat.parse_request(dict(chat_payload), _ctx("openai_chat", "openai_chat"))
+    preserved = chat.build_request(unified, _ctx("openai_chat", "openai_chat"))
+    assert preserved["reasoning_effort"] == "none"
+
+    # Anthropic maps "none" exactly to its disabled construct.
+    built_ant, _ = _build("anthropic_messages", chat_payload, source="openai_chat")
+    assert built_ant["thinking"] == {"type": "disabled"}
+
+    # Gemini maps "none" to thinkingBudget 0 with the model-dependence note.
     built_gem, unified_gem = _build("gemini", chat_payload, source="openai_chat")
     assert built_gem["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 0
+    assert "reasoning_disabled_model_dependent" in _warnings_of(unified_gem)
 
 
 def test_responses_summary_round_trip_preserved_and_mapped() -> None:
@@ -664,6 +676,97 @@ def test_url_only_audio_and_video_at_chat_record_drops() -> None:
     chat = get_protocol("openai_chat")
     formatted = chat.format_response(unified, _ctx("gemini", "openai_chat"))
     assert "media_dropped" in {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
+
+
+# ---------------------------------------------------------------------------
+# Round 3: refusal streams at responses, budget-discard disclosure,
+# dual-instruction promotion at chat
+
+
+def test_responses_stream_refusal_emits_refusal_items() -> None:
+    from rotator_library.protocols.streaming import format_canonical_stream_event, stream_format_state
+    from rotator_library.protocols.types import UnifiedMessage, UnifiedStreamEvent
+
+    events = [
+        UnifiedStreamEvent(
+            type="message.delta",
+            source_protocol="openai_chat",
+            native_type="message.delta",
+            delta=UnifiedMessage(role="assistant", content=[ContentBlock(type="refusal", refusal="cannot help")]),
+        ),
+        UnifiedStreamEvent(type="done", source_protocol="openai_chat", native_type="done", stop_reason="refusal", usage=Usage(input_tokens=1, output_tokens=1)),
+    ]
+    ctx = _ctx("openai_chat", "responses")
+    state = stream_format_state(ctx, "responses")
+    frames: list[str] = []
+    for event in events:
+        frames.extend(format_canonical_stream_event(event, "responses", ctx, state=state))
+    joined = "".join(frames)
+    assert "response.refusal.delta" in joined
+    assert "cannot help" in joined
+    assert '"type": "refusal"' in joined  # parts and terminal item carry it
+
+
+def test_refusal_with_annotations_at_responses_no_crash_and_recorded() -> None:
+    chat = get_protocol("openai_chat")
+    unified = chat.parse_response(
+        {
+            "id": "c1",
+            "model": "m",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": None, "refusal": "no can do"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        },
+        None,
+    )
+    unified.messages[0].content = [
+        ContentBlock(type="refusal", refusal="no can do", annotations=[Annotation(type="url_citation", url="https://x", title="t")])
+    ]
+    formatted = get_protocol("responses").format_response(unified, _ctx("openai_chat", "responses"))
+    assert any(
+        item.get("content", [{}])[0].get("type") == "refusal"
+        for item in formatted["output"]
+        if item.get("type") == "message"
+    )
+    assert "annotations_dropped" in {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
+
+
+def test_effort_and_budget_both_disclosure_of_discarded_budget() -> None:
+    payload = {
+        "model": "m",
+        "input": "hi",
+        "reasoning": {"effort": "high", "budget_tokens": 2048, "summary": "auto"},
+    }
+    built, unified = _build("responses", payload, source="responses")
+    assert built["reasoning"]["effort"] == "high"
+    assert "reasoning_control_dropped" in _warnings_of(unified)
+
+
+def test_chat_promotes_dual_instruction_sources() -> None:
+    payload = {
+        "model": "m",
+        "instructions": "INSTR_FIELD",
+        "input": [
+            {"role": "system", "content": [{"type": "input_text", "text": "INSTR_MSG"}]},
+            {"role": "user", "content": [{"type": "input_text", "text": "q1"}]},
+        ],
+    }
+    built, _ = _build("openai_chat", payload, source="responses")
+    roles = [m["role"] for m in built["messages"]]
+    assert roles[0] == "system"
+    system_text = "".join(
+        part.get("text", "") if isinstance(part, dict) else str(part)
+        for message in built["messages"]
+        if message["role"] == "system"
+        for part in (message["content"] if isinstance(message["content"], list) else [message["content"]])
+    )
+    assert "INSTR_FIELD" in system_text and "INSTR_MSG" in system_text
+    assert roles[-1] == "user"
 
 
 def test_gemini_strictness_strengthening_recorded() -> None:

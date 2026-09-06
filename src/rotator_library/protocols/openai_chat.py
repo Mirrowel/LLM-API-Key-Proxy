@@ -153,12 +153,15 @@ class OpenAIChatProtocol(ProtocolAdapter):
         # Chat can express system/developer messages anywhere: canonical
         # message order is preserved verbatim (D7 level 1 — interleaved
         # instructions never hoisted). A separate canonical `system` field
-        # (non-chat sources) is promoted to a leading system message.
+        # (non-chat sources) is promoted to a leading system message —
+        # including when explicit system messages also exist, so neither
+        # instruction source is dropped.
         interleaved, _ = instruction_layout(unified_request)
-        if interleaved or any(m.role in {"system", "developer"} for m in unified_request.messages):
-            wire_messages = list(unified_request.messages)
-        else:
+        has_inline_instructions = any(m.role in {"system", "developer"} for m in unified_request.messages)
+        if unified_request.system or not (interleaved or has_inline_instructions):
             wire_messages = [*instruction_messages(unified_request), *conversation_messages(unified_request)]
+        else:
+            wire_messages = list(unified_request.messages)
         payload: dict[str, Any] = {
             "model": unified_request.model,
             "messages": self._format_request_messages(
@@ -694,7 +697,11 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if "stop_sequences" in params:
             payload["stop"] = params.pop("stop_sequences")
         reasoning = params.pop("reasoning", None)
-        payload.update(format_reasoning_controls(reasoning, self.name, request))
+        if not preserve_source:
+            # Cross-protocol: map canonical controls onto Chat spellings.
+            # Same-protocol passthrough keeps the preserved original verbatim
+            # (no normalization, no warnings — "none" stays "none").
+            payload.update(format_reasoning_controls(reasoning, self.name, request))
         candidate_count = params.pop("candidate_count", None)
         if candidate_count is not None:
             # D9 direct mapping: canonical multiplicity -> Chat `n`.

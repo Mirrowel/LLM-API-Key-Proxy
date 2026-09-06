@@ -251,8 +251,21 @@ def add_conversion_warning(
     field: str | None,
     target_protocol: str,
 ) -> None:
-    """Record a deliberate omission of an optional conversion hint."""
+    """Record a deliberate omission of an optional conversion hint.
 
+    Deduplicated on (code, message, field, target): build_request may run
+    more than once for one request (retry/rotation passes over the same
+    canonical object).
+    """
+
+    for warning in request.warnings:
+        if (
+            warning.code == code
+            and warning.message == message
+            and warning.field == field
+            and warning.target_protocol == target_protocol
+        ):
+            return
     request.warnings.append(
         ConversionWarning(
             code=code,
@@ -326,12 +339,13 @@ def format_reasoning_controls(
         add_conversion_warning(request, code=code, message=message, field=field, target_protocol=target_protocol)
 
     def _effort_or_approximation() -> tuple[Any, bool]:
-        """Return (effort_value, approximated?). Unknown efforts coerce to
-        the table's medium with an explicit disclosure warning."""
+        """Return (effort_value, approximated?). ``none`` and table levels are
+        exact; unknown efforts coerce to the table's medium with an explicit
+        disclosure warning."""
 
         if effort is None:
             return None, False
-        if effort not in _EFFORT_TO_BUDGET_TOKENS:
+        if effort not in _EFFORT_TO_BUDGET_TOKENS and effort != "none":
             _warn(
                 "reasoning_effort_unknown",
                 f"reasoning effort '{effort}' is not a known level; coerced to 'medium' (deterministic table)",
@@ -339,6 +353,14 @@ def format_reasoning_controls(
             )
             return "medium", True
         return effort, False
+
+    def _warn_budget_discarded() -> None:
+        if budget is not None and effort is not None:
+            _warn(
+                "reasoning_control_dropped",
+                "effort takes precedence; budget_tokens discarded",
+                "reasoning.budget_tokens",
+            )
 
     if target_protocol == "openai_chat":
         if enabled is False:
@@ -349,6 +371,8 @@ def format_reasoning_controls(
             )
         else:
             if effort is not None:
+                # Chat accepts the full effort vocabulary verbatim, "none"
+                # included — exact mapping, no inference.
                 value, _ = _effort_or_approximation()
                 emissions["reasoning_effort"] = value
             elif budget is not None:
@@ -359,6 +383,7 @@ def format_reasoning_controls(
                     f"reasoning budget_tokens={budget} approximated as effort '{approximated}' (deterministic table)",
                     "reasoning.budget_tokens",
                 )
+            _warn_budget_discarded()
         if include_thoughts is not None:
             _warn(
                 "reasoning_control_dropped",
@@ -372,8 +397,9 @@ def format_reasoning_controls(
                 "reasoning.summary",
             )
     elif target_protocol == "anthropic_messages":
-        disabled = enabled is False
-        if disabled and (budget is not None or effort is not None):
+        # "none" maps exactly to Anthropic's disabled construct (D7 level 1).
+        disabled = enabled is False or effort == "none"
+        if disabled and (budget is not None or effort not in (None, "none")):
             _warn(
                 "reasoning_control_dropped",
                 "reasoning disabled wins; budget/effort control discarded",
@@ -422,6 +448,8 @@ def format_reasoning_controls(
         else:
             native: dict[str, Any] = {}
             if effort is not None:
+                # Responses accepts the full effort vocabulary verbatim,
+                # "none" included — exact mapping, no inference.
                 value, _ = _effort_or_approximation()
                 native["effort"] = value
             elif budget is not None:
@@ -432,6 +460,7 @@ def format_reasoning_controls(
                     f"reasoning budget_tokens={budget} approximated as effort '{approximated}' (deterministic table)",
                     "reasoning.budget_tokens",
                 )
+            _warn_budget_discarded()
             if include_thoughts is not None:
                 native["summary"] = "auto" if include_thoughts else "none"
             elif summary is not None:
@@ -442,9 +471,16 @@ def format_reasoning_controls(
                 emissions["reasoning"] = native
     elif target_protocol == "gemini":
         thinking_config: dict[str, Any] = {}
-        if enabled is False:
-            # thinkingBudget: 0 IS Gemini's documented off-switch (D7 level 2).
+        if enabled is False or effort == "none":
+            # thinkingBudget: 0 is Gemini's off-switch — model-dependent
+            # (thinking can only be disabled on some models), so the
+            # emission is recorded, never silent.
             thinking_config["thinkingBudget"] = 0
+            _warn(
+                "reasoning_disabled_model_dependent",
+                "thinkingBudget=0 disables thinking only on models that support disabling; verify the target model",
+                "reasoning.enabled",
+            )
         elif budget is not None:
             thinking_config["thinkingBudget"] = budget
         elif effort is not None:
@@ -457,6 +493,7 @@ def format_reasoning_controls(
                     f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
                     "reasoning.effort",
                 )
+        _warn_budget_discarded()
         if include_thoughts is not None:
             thinking_config["includeThoughts"] = bool(include_thoughts)
         elif summary is not None:
@@ -469,18 +506,16 @@ def format_reasoning_controls(
 def normalize_reasoning_controls(reasoning: Any) -> dict[str, Any]:
     """Fold provider spellings into the canonical reasoning shape.
 
-    - ``effort: "none"`` (chat spellings) -> ``enabled: False``
     - Responses ``summary`` -> ``include_thoughts`` (summary preserved verbatim
       for same-protocol rebuild)
-    - Gemini ``thinkingBudget: 0`` (documented OFF) -> ``enabled: False``
+    - ``effort: "none"`` stays a first-class effort value: Chat and Responses
+      accept it natively; Anthropic/Gemini targets map it to their disabled
+      constructs at format time
     """
 
     if not isinstance(reasoning, dict):
         return {}
     normalized = dict(reasoning)
-    if normalized.get("effort") == "none":
-        normalized["enabled"] = False
-        normalized["effort"] = None
     summary = normalized.get("summary")
     if isinstance(summary, str) and "include_thoughts" not in normalized:
         normalized["include_thoughts"] = summary != "none"
@@ -519,7 +554,7 @@ def conversion_summary(
     rendered: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
     for warning in entries:
-        key = (getattr(warning, "code", None), getattr(warning, "message", None), getattr(warning, "field", None))
+        key = (getattr(warning, "code", None), getattr(warning, "message", None), getattr(warning, "field", None), getattr(warning, "target_protocol", None))
         if key in seen:
             continue
         seen.add(key)

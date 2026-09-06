@@ -248,9 +248,9 @@ class ResponsesProtocol(ProtocolAdapter):
                 code="candidates_first_wins",
                 message=f"{len(assistants) - 1} additional candidate(s) dropped: single-response object (first candidate wins)",
             )
-            output = self._format_canonical_output(assistants[0])
+            output = self._format_canonical_output(assistants[0], unified_response)
         else:
-            output = self._format_canonical_output(coalesce_assistant_message(unified_response.messages))
+            output = self._format_canonical_output(coalesce_assistant_message(unified_response.messages), unified_response)
         payload = {
             "id": unified_response.id,
             "object": unified_response.metadata.get("object", "response"),
@@ -524,7 +524,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 return payload
         return {"id": f"msg_{index}", "type": "message", "role": message.role, "content": self._format_content(message.content, role=message.role, output=True, preserve_source=False)}
 
-    def _format_canonical_output(self, message: UnifiedMessage) -> list[dict[str, Any]]:
+    def _format_canonical_output(self, message: UnifiedMessage, unified_response: UnifiedResponse | None = None) -> list[dict[str, Any]]:
         """Build ordered Responses output items from one canonical assistant turn."""
 
         output: list[dict[str, Any]] = []
@@ -575,7 +575,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 item_index += 1
             elif block.type == "refusal" and block.refusal is not None:
                 flush_visible()
-                if block.annotations:
+                if block.annotations and unified_response is not None:
                     # Refusal parts carry no annotations slot (W2 carry-in):
                     # the loss is recorded, never silent.
                     _warn_responses_once(
@@ -795,7 +795,7 @@ def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, messag
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
     for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message:
+        if warning.code == code and warning.message == message and warning.field == field:
             return
     unified_response.warnings.append(
         ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="responses")

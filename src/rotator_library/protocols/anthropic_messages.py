@@ -316,7 +316,9 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         if not block_list:
             return None
         if preserve_source and all(block.type == "text" and not isinstance(block.raw, dict) and not block.extra for block in block_list):
-            return first_text(block_list) or ""
+            # Merged instruction turns keep a paragraph boundary.
+            texts = [block.text for block in block_list if block.text]
+            return "\n\n".join(texts) if texts else ""
         return self._format_content(block_list, preserve_source=preserve_source)
 
     def _parse_message(self, message: dict[str, Any]) -> UnifiedMessage:
@@ -705,7 +707,7 @@ def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, ta
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
     for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message:
+        if warning.code == code and warning.message == message and warning.field == field:
             return
     unified_response.warnings.append(
         ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol=target_protocol)

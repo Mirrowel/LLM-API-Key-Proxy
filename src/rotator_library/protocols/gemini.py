@@ -79,14 +79,14 @@ _REQUEST_CORE_FIELDS = {
 }
 
 
-def _warn_gemini_once(unified_response: UnifiedResponse, *, code: str, message: str) -> None:
+def _warn_gemini_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
     for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message:
+        if warning.code == code and warning.message == message and warning.field == field:
             return
     unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol="gemini")
+        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="gemini")
     )
 
 

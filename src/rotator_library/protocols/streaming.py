@@ -55,6 +55,7 @@ class StreamFormatState:
     item_ids: dict[str, str] = field(default_factory=dict)
     item_kinds: dict[str, str] = field(default_factory=dict)
     builtin_items: dict[str, dict] = field(default_factory=dict)
+    refusal_by_key: dict[str, bool] = field(default_factory=dict)
     text_by_key: dict[str, str] = field(default_factory=dict)
     tool_arguments: dict[str, str] = field(default_factory=dict)
     tool_names: dict[str, str] = field(default_factory=dict)
@@ -592,6 +593,12 @@ def _responses_item_start(block: ContentBlock, key: str, item_id: str, state: St
             _event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}),
             _event_frame("response.reasoning_summary_part.added", {"type": "response.reasoning_summary_part.added", "item_id": item_id, "output_index": state.next_index - 1, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}),
         ]
+    if block.type == "refusal":
+        item = {"id": item_id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}
+        return [
+            _event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}),
+            _event_frame("response.content_part.added", {"type": "response.content_part.added", "item_id": item_id, "output_index": state.next_index - 1, "content_index": 0, "part": {"type": "refusal", "refusal": ""}}),
+        ]
     item = {"id": item_id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}
     return [
         _event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}),
@@ -606,6 +613,15 @@ def _responses_item_delta(block: ContentBlock, key: str, item_id: str, state: St
         fragment = tool_arguments_text(block.tool_call.arguments)
         state.tool_arguments[key] = state.tool_arguments.get(key, "") + fragment
         return [_event_frame("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": output_index, "delta": fragment})] if fragment else []
+    if block.type == "refusal":
+        # Responses refusal parts stream on the refusal variant of the
+        # content delta (never dropped).
+        text = block.refusal or ""
+        if not text:
+            return []
+        state.text_by_key[key] = state.text_by_key.get(key, "") + text
+        state.refusal_by_key[key] = True
+        return [_event_frame("response.refusal.delta", {"type": "response.refusal.delta", "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": text})]
     text = block.reasoning.text if block.reasoning else block.text
     if not text:
         return []
@@ -643,6 +659,14 @@ def _responses_item_done(
             _event_frame("response.reasoning_summary_part.done", {"type": "response.reasoning_summary_part.done", "item_id": item_id, "output_index": output_index, "summary_index": 0, "part": item["summary"][0]}),
             _event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}),
         ]
+    if state.refusal_by_key.get(key):
+        part = {"type": "refusal", "refusal": text}
+        item = {"id": item_id, "type": "message", "role": "assistant", "content": [part], "status": item_status}
+        return [
+            _event_frame("response.refusal.done", {"type": "response.refusal.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "refusal": text}),
+            _event_frame("response.content_part.done", {"type": "response.content_part.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "part": part}),
+            _event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}),
+        ]
     part = {"type": "output_text", "text": text, "annotations": []}
     item = {"id": item_id, "type": "message", "role": "assistant", "content": [part], "status": item_status}
     return [
@@ -663,6 +687,8 @@ def _responses_object(state: StreamFormatState, *, status: str, error: Any = Non
             output.append({"id": item_id, "type": "function_call", "call_id": state.tool_ids.get(key, item_id), "name": state.tool_names.get(key, ""), "arguments": state.tool_arguments.get(key, ""), "status": item_status})
         elif kind == "reasoning":
             output.append({"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": state.text_by_key.get(key, "")}], "status": item_status})
+        elif state.refusal_by_key.get(key):
+            output.append({"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": state.text_by_key.get(key, "")}], "status": item_status})
         else:
             output.append({"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": state.text_by_key.get(key, ""), "annotations": []}], "status": item_status})
     payload: dict[str, Any] = {"id": state.response_id, "object": "response", "status": status, "model": state.model, "output": output}
