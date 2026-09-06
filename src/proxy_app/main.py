@@ -409,155 +409,10 @@ async def lifespan(app: FastAPI):
     cred_manager = CredentialManager(os.environ)
     oauth_credentials = cred_manager.discover_and_prepare()
 
-    if not skip_oauth_init and oauth_credentials:
-        logging.info("Starting OAuth credential validation and deduplication...")
-        processed_emails = {}  # email -> {provider: path}
-        credentials_to_initialize = {}  # provider -> [paths]
-        final_oauth_credentials = {}
-
-        # --- Pass 1: Pre-initialization Scan & Deduplication ---
-        # logging.info("Pass 1: Scanning for existing metadata to find duplicates...")
-        for provider, paths in oauth_credentials.items():
-            if provider not in credentials_to_initialize:
-                credentials_to_initialize[provider] = []
-            for path in paths:
-                # Skip env-based credentials (virtual paths) - they don't have metadata files
-                if path.startswith("env://"):
-                    credentials_to_initialize[provider].append(path)
-                    continue
-
-                try:
-                    with open(path, "r") as f:
-                        data = json.load(f)
-                    metadata = data.get("_proxy_metadata", {})
-                    email = metadata.get("email")
-
-                    if email:
-                        if email not in processed_emails:
-                            processed_emails[email] = {}
-
-                        if provider in processed_emails[email]:
-                            original_path = processed_emails[email][provider]
-                            logging.warning(
-                                f"Duplicate for '{email}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
-                            )
-                            continue
-                        else:
-                            processed_emails[email][provider] = path
-
-                    credentials_to_initialize[provider].append(path)
-
-                except (FileNotFoundError, json.JSONDecodeError) as e:
-                    logging.warning(
-                        f"Could not pre-read metadata from '{path}': {e}. Will process during initialization."
-                    )
-                    credentials_to_initialize[provider].append(path)
-
-        # --- Pass 2: Parallel Initialization of Filtered Credentials ---
-        # logging.info("Pass 2: Initializing unique credentials and performing final check...")
-        async def process_credential(provider: str, path: str, provider_instance):
-            """Process a single credential: initialize and fetch user info."""
-            try:
-                await provider_instance.initialize_token(path)
-
-                if not hasattr(provider_instance, "get_user_info"):
-                    return (provider, path, None, None)
-
-                user_info = await provider_instance.get_user_info(path)
-                email = user_info.get("email")
-                return (provider, path, email, None)
-
-            except Exception as e:
-                logging.error(
-                    f"Failed to process OAuth token for {provider} at '{path}': {e}"
-                )
-                return (provider, path, None, e)
-
-        # Collect all tasks for parallel execution
-        tasks = []
-        for provider, paths in credentials_to_initialize.items():
-            if not paths:
-                continue
-
-            provider_plugin_class = PROVIDER_PLUGINS.get(provider)
-            if not provider_plugin_class:
-                continue
-
-            provider_instance = provider_plugin_class()
-
-            for path in paths:
-                tasks.append(process_credential(provider, path, provider_instance))
-
-        # Execute all credential processing tasks in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # --- Pass 3: Sequential Deduplication and Final Assembly ---
-        for result in results:
-            # Handle exceptions from gather
-            if isinstance(result, Exception):
-                logging.error(f"Credential processing raised exception: {result}")
-                continue
-
-            provider, path, email, error = result
-
-            # Skip if there was an error
-            if error:
-                continue
-
-            # If provider doesn't support get_user_info, add directly
-            if email is None:
-                if provider not in final_oauth_credentials:
-                    final_oauth_credentials[provider] = []
-                final_oauth_credentials[provider].append(path)
-                continue
-
-            # Handle empty email
-            if not email:
-                logging.warning(
-                    f"Could not retrieve email for '{path}'. Treating as unique."
-                )
-                if provider not in final_oauth_credentials:
-                    final_oauth_credentials[provider] = []
-                final_oauth_credentials[provider].append(path)
-                continue
-
-            # Deduplication check
-            if email not in processed_emails:
-                processed_emails[email] = {}
-
-            if (
-                provider in processed_emails[email]
-                and processed_emails[email][provider] != path
-            ):
-                original_path = processed_emails[email][provider]
-                logging.warning(
-                    f"Duplicate for '{email}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
-                )
-                continue
-            else:
-                processed_emails[email][provider] = path
-                if provider not in final_oauth_credentials:
-                    final_oauth_credentials[provider] = []
-                final_oauth_credentials[provider].append(path)
-
-                # Update metadata (skip for env-based credentials - they don't have files)
-                if not path.startswith("env://"):
-                    try:
-                        with open(path, "r+") as f:
-                            data = json.load(f)
-                            metadata = data.get("_proxy_metadata", {})
-                            metadata["email"] = email
-                            metadata["last_check_timestamp"] = time.time()
-                            data["_proxy_metadata"] = metadata
-                            f.seek(0)
-                            json.dump(data, f, indent=2)
-                            f.truncate()
-                    except Exception as e:
-                        logging.error(f"Failed to update metadata for '{path}': {e}")
-
-        logging.info("OAuth credential processing complete.")
-        oauth_credentials = final_oauth_credentials
-
+    oauth_credentials = await bootstrap_oauth_credentials(
+        oauth_credentials,
+        skip=skip_oauth_init,
+    )
     # Provider-specific LiteLLM params. API-key Gemini remains configured through
     # normal provider environment keys.
     litellm_provider_params = {}
@@ -733,184 +588,14 @@ async def verify_gemini_api_key(
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
-async def streaming_response_wrapper(
-    request: Request,
-    request_data: dict,
-    response_stream: AsyncGenerator[str, None],
-    logger: Optional[RawIOLogger] = None,
-) -> AsyncGenerator[str, None]:
-    """
-    Wraps a streaming response to log the full response after completion
-    and ensures any errors during the stream are sent to the client.
-    """
-    response_chunks = []
-    full_response = {}
-
-    try:
-        async for chunk_str in response_stream:
-            if await request.is_disconnected():
-                logging.warning("Client disconnected, stopping stream.")
-                break
-            yield chunk_str
-            if chunk_str.strip() and chunk_str.startswith("data:"):
-                content = chunk_str[len("data:") :].strip()
-                if content != "[DONE]":
-                    try:
-                        chunk_data = json.loads(content)
-                        response_chunks.append(chunk_data)
-                        if logger:
-                            logger.log_stream_chunk(chunk_data)
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as e:
-        logging.error(f"An error occurred during the response stream: {e}")
-        # Yield a final error message to the client to ensure they are not left hanging.
-        error_payload = {
-            "error": {
-                "message": f"An unexpected error occurred during the stream: {str(e)}",
-                "type": "proxy_internal_error",
-                "code": 500,
-            }
-        }
-        yield f"data: {json.dumps(error_payload)}\n\n"
-        yield "data: [DONE]\n\n"
-        # Also log this as a failed request
-        if logger:
-            logger.log_final_response(
-                status_code=500, headers=None, body={"error": str(e)}
-            )
-        return  # Stop further processing
-    finally:
-        if response_chunks:
-            # --- Aggregation Logic ---
-            final_message = {"role": "assistant"}
-            aggregated_tool_calls = {}
-            usage_data = None
-            finish_reason = None
-
-            for chunk in response_chunks:
-                if "choices" in chunk and chunk["choices"]:
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
-
-                    # Dynamically aggregate all fields from the delta
-                    for key, value in delta.items():
-                        if value is None:
-                            continue
-
-                        if key == "content":
-                            if "content" not in final_message:
-                                final_message["content"] = ""
-                            if value:
-                                final_message["content"] += value
-
-                        elif key == "tool_calls":
-                            for tc_chunk in value:
-                                index = tc_chunk["index"]
-                                if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {
-                                        "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }
-                                # Ensure 'function' key exists for this index before accessing its sub-keys
-                                if "function" not in aggregated_tool_calls[index]:
-                                    aggregated_tool_calls[index]["function"] = {
-                                        "name": "",
-                                        "arguments": "",
-                                    }
-                                if tc_chunk.get("id"):
-                                    aggregated_tool_calls[index]["id"] = tc_chunk["id"]
-                                if "function" in tc_chunk:
-                                    if "name" in tc_chunk["function"]:
-                                        if tc_chunk["function"]["name"] is not None:
-                                            aggregated_tool_calls[index]["function"][
-                                                "name"
-                                            ] += tc_chunk["function"]["name"]
-                                    if "arguments" in tc_chunk["function"]:
-                                        if (
-                                            tc_chunk["function"]["arguments"]
-                                            is not None
-                                        ):
-                                            aggregated_tool_calls[index]["function"][
-                                                "arguments"
-                                            ] += tc_chunk["function"]["arguments"]
-
-                        elif key == "function_call":
-                            if "function_call" not in final_message:
-                                final_message["function_call"] = {
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            if "name" in value:
-                                if value["name"] is not None:
-                                    final_message["function_call"]["name"] += value[
-                                        "name"
-                                    ]
-                            if "arguments" in value:
-                                if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += (
-                                        value["arguments"]
-                                    )
-
-                        else:  # Generic key handling for other data like 'reasoning'
-                            # FIX: Role should always replace, never concatenate
-                            if key == "role":
-                                final_message[key] = value
-                            elif key not in final_message:
-                                final_message[key] = value
-                            elif isinstance(final_message.get(key), str) and isinstance(
-                                value, str
-                            ):
-                                final_message[key] += value
-                            elif isinstance(final_message.get(key), list) and isinstance(
-                                value, list
-                            ):
-                                final_message[key].extend(value)
-                            else:
-                                # Provider extension fields can change shape across
-                                # chunks; replacing is safer than crashing the stream.
-                                final_message[key] = value
-
-                    if "finish_reason" in choice and choice["finish_reason"]:
-                        finish_reason = choice["finish_reason"]
-
-                if "usage" in chunk and chunk["usage"]:
-                    usage_data = chunk["usage"]
-
-            # --- Final Response Construction ---
-            if aggregated_tool_calls:
-                final_message["tool_calls"] = list(aggregated_tool_calls.values())
-                # CRITICAL FIX: Override finish_reason when tool_calls exist
-                # This ensures OpenCode and other agentic systems continue the conversation loop
-                finish_reason = "tool_calls"
-
-            # Ensure standard fields are present for consistent logging
-            for field in ["content", "tool_calls", "function_call"]:
-                if field not in final_message:
-                    final_message[field] = None
-
-            first_chunk = response_chunks[0]
-            final_choice = {
-                "index": 0,
-                "message": final_message,
-                "finish_reason": finish_reason,
-            }
-
-            full_response = {
-                "id": first_chunk.get("id"),
-                "object": "chat.completion",
-                "created": first_chunk.get("created"),
-                "model": first_chunk.get("model"),
-                "choices": [final_choice],
-                "usage": usage_data,
-            }
-
-        if logger:
-            logger.log_final_response(
-                status_code=200,
-                headers=None,  # Headers are not available at this stage
-                body=full_response,
-            )
+# Stream wrapping, request overrides, and embedding fan-out live in route_helpers.
+from .route_helpers import (  # noqa: E402
+    apply_temperature_override,
+    execute_embeddings,
+    streaming_response_wrapper,
+)
+# OAuth credential bootstrap lives in startup.
+from .startup import bootstrap_oauth_credentials  # noqa: E402
 
 
 @app.post("/v1/chat/completions")
@@ -940,28 +625,7 @@ async def chat_completions(
             return JSONResponse(status_code=status, content=content)
 
         # Global temperature=0 override (controlled by .env variable, default: OFF)
-        # Low temperature makes models deterministic and prone to following training data
-        # instead of actual schemas, which can cause tool hallucination
-        # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
-        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
-
-        if (
-            override_temp_zero in ("remove", "set", "true", "1", "yes")
-            and "temperature" in request_data
-            and request_data["temperature"] == 0
-        ):
-            if override_temp_zero == "remove":
-                # Remove temperature key entirely
-                del request_data["temperature"]
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request"
-                )
-            else:
-                # Set to 1.0 (for "set", "true", "1", "yes")
-                request_data["temperature"] = 1.0
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
-                )
+        apply_temperature_override(request_data)
 
         # If raw logging is enabled, capture the unmodified request data.
         if raw_logger:
@@ -1498,7 +1162,7 @@ async def gemini_stream_generate_content(
             raw_request=request,
         )
         return StreamingResponse(
-            streaming_response_wrapper(request, payload, response_stream),
+            streaming_response_wrapper(request, payload, response_stream, input_protocol="gemini"),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1567,48 +1231,12 @@ async def embeddings(
             client_info=(request.client.host, request.client.port),
             request_data=request_data,
         )
-        if USE_EMBEDDING_BATCHER and batcher:
-            # --- Server-Side Batching Logic ---
-            request_data = body.model_dump(exclude_none=True)
-            inputs = request_data.get("input", [])
-            if isinstance(inputs, str):
-                inputs = [inputs]
-
-            tasks = []
-            for single_input in inputs:
-                individual_request = request_data.copy()
-                individual_request["input"] = single_input
-                tasks.append(batcher.add_request(individual_request))
-
-            results = await asyncio.gather(*tasks)
-
-            all_data = []
-            total_prompt_tokens = 0
-            total_tokens = 0
-            for i, result in enumerate(results):
-                result["data"][0]["index"] = i
-                all_data.extend(result["data"])
-                total_prompt_tokens += result["usage"]["prompt_tokens"]
-                total_tokens += result["usage"]["total_tokens"]
-
-            final_response_data = {
-                "object": "list",
-                "model": results[0]["model"],
-                "data": all_data,
-                "usage": {
-                    "prompt_tokens": total_prompt_tokens,
-                    "total_tokens": total_tokens,
-                },
-            }
-            response = litellm.EmbeddingResponse(**final_response_data)
-
-        else:
-            # --- Direct Pass-Through Logic ---
-            request_data = body.model_dump(exclude_none=True)
-            if isinstance(request_data.get("input"), str):
-                request_data["input"] = [request_data["input"]]
-
-            response = await client.aembedding(request=request, **request_data)
+        response = await execute_embeddings(
+            batcher if USE_EMBEDDING_BATCHER else None,
+            client,
+            request_data,
+            raw_request=request,
+        )
 
         return response
 
@@ -1620,20 +1248,48 @@ async def embeddings(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="authentication_error", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="rate_limit", status_code=429,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="service_unavailable", status_code=503,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="timeout", status_code=504,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="server_error", status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="internal_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.get("/")
