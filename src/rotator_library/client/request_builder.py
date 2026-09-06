@@ -8,6 +8,8 @@ import time
 from copy import deepcopy
 from typing import Any, Awaitable, Callable, Dict, Optional
 
+from ..routing.profiles import PROFILE_SEPARATOR
+
 from ..core.types import RequestContext
 from ..protocols import ProtocolContext, get_protocol
 from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
@@ -234,6 +236,12 @@ class RequestContextBuilder:
         disable_provider_continuation = bool(kwargs.pop("_disable_provider_continuation", False))
         requested_input_protocol = str(kwargs.pop("_input_protocol", "openai_chat") or "openai_chat")
         input_protocol = get_protocol(requested_input_protocol)
+        # D13 grammar FIRST: provider:profile/model normalizes to the bare
+        # form before ANY snapshot or identity use, so protocol_request,
+        # unified_request, raw fast-path payloads, and every identity sink
+        # (usage pools, cooldowns, classifiers, sessions, cache scopes) see
+        # only provider-level names.
+        requested_profile = _normalize_profile_reference(kwargs)
         protocol_request = deepcopy(kwargs)
         protocol_context = ProtocolContext(
             source_protocol=input_protocol.name,
@@ -260,20 +268,6 @@ class RequestContextBuilder:
             private,
         )
         model = kwargs.get("model", "")
-        # D13 grammar: provider:profile/model addresses a transport profile.
-        # Identity normalizes to the bare provider immediately — usage pools,
-        # cooldowns, classifiers, and session namespaces never see profiles.
-        # Plain provider/model references (and bare model names resolved by
-        # fallback routing) bypass the grammar entirely.
-        requested_profile: Optional[str] = None
-        if ":" in str(model or ""):
-            from ..routing.profiles import ModelReferenceError, parse_model_reference
-
-            reference = parse_model_reference(str(model))
-            requested_profile = reference.profile
-            if requested_profile:
-                model = reference.bare
-                kwargs["model"] = model
         routing_decision = self._resolve_routing_decision(model)
         routing_targets = routing_decision.targets if routing_decision else None
         provider = routing_targets[0].provider if routing_targets else self._provider_from_model(model)
@@ -378,6 +372,10 @@ class RequestContextBuilder:
         pre_request_callback: Optional[Callable],
         kwargs: Dict[str, Any],
     ) -> RequestContext:
+        # Same D13 grammar as completions: normalize addressing before any
+        # identity use. (Embedding providers are single-protocol today, so an
+        # explicit profile fails loudly at transport resolution.)
+        _normalize_profile_reference(kwargs)
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
@@ -433,3 +431,24 @@ class RequestContextBuilder:
             credential_secrets=scope["credential_secrets"],
             classifier=scope["classifier"],
         )
+
+
+def _normalize_profile_reference(kwargs: Dict[str, Any]) -> Optional[str]:
+    """Normalize ``provider:profile/model`` in request kwargs (D13).
+
+    The grammar applies only when the PROVIDER segment (before the first
+    ``/``) contains the separator - model segments keep their colons
+    (OpenRouter ``:free``, Ollama ``model:tag``). Returns the requested
+    profile, or None for plain references.
+    """
+
+    model = str(kwargs.get("model", "") or "")
+    if not model or PROFILE_SEPARATOR not in model.split("/", 1)[0]:
+        return None
+    from ..routing.profiles import parse_model_reference
+
+    reference = parse_model_reference(model)
+    if reference.profile:
+        kwargs["model"] = reference.bare
+        return reference.profile
+    return None

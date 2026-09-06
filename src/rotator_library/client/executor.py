@@ -810,30 +810,36 @@ class RequestExecutor:
         if not plugin:
             raise RoutingExecutionError(f"Provider {provider} has no plugin for native execution")
         profile = getattr(context, "execution_profile", None)
+        declared_profiles = getattr(plugin, "transport_profiles", None)
+        # Profile validation (D13): explicit profiles must exist — on
+        # multi-profile AND single-protocol providers (fail-fast, never a
+        # silent protocol mismatch); bare names resolve fast-path-or-error.
+        from ..routing.profiles import ModelReferenceError, resolve_profile
+
+        try:
+            profile = resolve_profile(
+                declared_profiles=declared_profiles,
+                default_profile=getattr(plugin, "default_profile", None),
+                protocol_name=getattr(plugin, "protocol_name", None),
+                client_protocol=context.input_protocol_name,
+                requested_profile=profile,
+                provider=provider,
+            )
+        except ModelReferenceError as exc:
+            # Addressing errors are client-visible 400s in the client's own
+            # protocol (D1 error contract), fail-fast: no credential
+            # rotation for a bad profile name or unmatched protocol.
+            raise structured_api_response_error(
+                {
+                    "error": {
+                        "type": "invalid_request_error",
+                        "message": str(exc),
+                    }
+                },
+            ) from exc
         protocol_name = _provider_native_protocol(plugin, model, target, profile=profile)
         if not protocol_name:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
-        if getattr(plugin, "transport_profiles", None) and not profile:
-            # Bare-name fast-path-or-error (D13): the profile whose protocol
-            # matches the client's, or an explicit endpoint-does-not-exist
-            # error — never a silent conversion.
-            from ..routing.profiles import ModelReferenceError, resolve_profile
-
-            try:
-                profile = resolve_profile(
-                    declared_profiles=plugin.transport_profiles,
-                    default_profile=getattr(plugin, "default_profile", None),
-                    protocol_name=plugin.protocol_name,
-                    client_protocol=context.input_protocol_name,
-                    requested_profile=None,
-                    provider=provider,
-                )
-            except ModelReferenceError as exc:
-                raise RoutingExecutionError(str(exc)) from exc
-            if profile:
-                # Re-resolve the protocol for the selected profile (the
-                # default-profile protocol was resolved above).
-                protocol_name = _provider_native_protocol(plugin, model, target, profile=profile) or protocol_name
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
         operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
@@ -2966,15 +2972,30 @@ def _current_route_target(context: RequestContext) -> Optional[RouteTarget]:
 
 def _call_profile_aware(plugin: Any, method_name: str, model: str, operation: str, profile: Optional[str]) -> str:
     """Call a provider native hook, passing the profile only when the
-    implementation accepts it (single-protocol providers predate D13)."""
+    implementation accepts it (single-protocol providers predate D13).
+
+    Signature inspection, not exception catching: a TypeError raised INSIDE
+    a profile-aware implementation must propagate, not silently retry
+    without the profile (which would return the wrong endpoint).
+    """
 
     method = getattr(plugin, method_name)
-    if profile:
-        try:
-            return method(model=model, operation=operation, profile=profile)
-        except TypeError:
-            pass
+    if profile and _accepts_profile_param(method):
+        return method(model=model, operation=operation, profile=profile)
     return method(model=model, operation=operation)
+
+
+def _accepts_profile_param(method: Any) -> bool:
+    try:
+        import inspect
+
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    if "profile" in parameters:
+        return True
+    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], profile: Optional[str] = None) -> Optional[str]:
@@ -2983,12 +3004,10 @@ def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTar
     if target and target.protocol:
         return target.protocol
     if plugin and hasattr(plugin, "get_protocol_name"):
-        if profile:
-            try:
-                return plugin.get_protocol_name(model, profile=profile)
-            except TypeError:
-                return plugin.get_protocol_name(model)
-        return plugin.get_protocol_name(model)
+        method = plugin.get_protocol_name
+        if profile and _accepts_profile_param(method):
+            return method(model, profile=profile)
+        return method(model)
     return None
 
 

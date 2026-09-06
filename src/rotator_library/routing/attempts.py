@@ -32,11 +32,17 @@ def clone_context_for_target(
     kwargs: dict[str, Any] = dict(context.kwargs)
     kwargs["model"] = target.prefixed_model
     next_usage_key = usage_manager_key if usage_manager_key is not None else target.provider
+    # Profiles are per-target transport steering, never identity: a target
+    # without its own profile must not inherit another provider's profile.
+    target_profile = target.profile if target.profile is not None else (
+        context.execution_profile if target.provider == context.provider else None
+    )
     return replace(
         context,
         model=target.prefixed_model,
         provider=target.provider,
         kwargs=kwargs,
+        execution_profile=target_profile,
         credentials=list(credentials) if credentials is not None else list(context.credentials),
         usage_manager_key=next_usage_key,
         provider_config=provider_config if provider_config is not None else context.provider_config,

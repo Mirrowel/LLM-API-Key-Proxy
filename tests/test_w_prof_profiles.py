@@ -71,6 +71,24 @@ def test_malformed_references_rejected(reference: str) -> None:
         parse_model_reference(reference)
 
 
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "openrouter/openai/gpt-4:free",
+        "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+        "ollama/llama3:8b",
+        "provider/model:tag",
+    ],
+)
+def test_colons_in_model_segments_are_not_profiles(model_id: str) -> None:
+    """OpenRouter :free variants and Ollama model:tag ids stay intact — the
+    grammar applies only to the provider segment (regression guard)."""
+
+    ref = parse_model_reference(model_id)
+    assert ref.profile is None
+    assert ref.bare == model_id
+
+
 def test_names_may_not_contain_separator_or_slash() -> None:
     assert valid_profile_name("chat") is True
     assert valid_profile_name("a:b") is False
@@ -144,6 +162,65 @@ def test_explicit_profile_wins_and_must_exist() -> None:
         )
 
 
+def test_explicit_profile_on_single_protocol_provider_errors() -> None:
+    """provider:profile on a provider without profiles fails loudly — never
+    a silent protocol mismatch."""
+
+    with pytest.raises(ModelReferenceError, match="has no profiles"):
+        resolve_profile(
+            declared_profiles=None,
+            default_profile=None,
+            protocol_name="openai_chat",
+            client_protocol="openai_chat",
+            requested_profile="responses",
+            provider="openai",
+        )
+
+
+def test_invalid_default_profile_raises() -> None:
+    with pytest.raises(ModelReferenceError, match="default profile"):
+        resolve_profile(
+            declared_profiles=PROFILES,
+            default_profile="nonexistent",
+            protocol_name=None,
+            client_protocol="openai_chat",
+            requested_profile=None,
+            provider="synthetic",
+        )
+
+
+def test_route_target_parses_profile_and_execution() -> None:
+    from rotator_library.routing.config import parse_route_target
+
+    target = parse_route_target("synthetic:responses/m@native")
+    assert (target.provider, target.profile, target.model, target.execution) == (
+        "synthetic",
+        "responses",
+        "m",
+        "native",
+    )
+    plain = parse_route_target("openai/gpt-test")
+    assert plain.profile is None
+    with pytest.raises(ValueError, match="profile name cannot be empty"):
+        parse_route_target("synthetic:/m")
+
+
+def test_profile_endpoint_derivation_guards() -> None:
+    provider = MultiProfileProvider()
+
+    class _NoBase(MultiProfileProvider):
+        default_api_base = None
+
+    with pytest.raises(NotImplementedError, match="transport base"):
+        _NoBase().get_native_endpoint(model="m", operation="chat", profile="chat")
+
+    class _NoPath(MultiProfileProvider):
+        transport_profiles = {"responses": {"protocol": "responses"}}
+
+    endpoint = _NoPath().get_native_endpoint(model="m", operation="chat", profile="responses")
+    assert endpoint.endswith("/responses")
+
+
 # --- Provider interface integration ---
 
 
@@ -167,7 +244,35 @@ def test_single_protocol_providers_ignore_profiles() -> None:
     from rotator_library.providers import PROVIDER_PLUGINS
 
     openai = PROVIDER_PLUGINS["openai"]()
-    assert openai.get_protocol_name("m", profile="ignored-by-single-protocol") == "openai_chat"
+    assert openai.get_protocol_name("m") == "openai_chat"
+
+
+def test_executor_rejects_explicit_profile_on_single_protocol_provider() -> None:
+    """openai:responses/gpt-test must fail loudly (structured 400), not be
+    silently served as chat."""
+
+    from rotator_library.client.executor import RequestExecutor
+    from rotator_library.core.errors import StructuredAPIResponseError
+    from rotator_library.core.types import RequestContext
+    from rotator_library.providers import PROVIDER_PLUGINS
+
+    executor = RequestExecutor.__new__(RequestExecutor)
+    executor._experimental_config = None
+    plugin = PROVIDER_PLUGINS["openai"]()
+    context = RequestContext(
+        model="openai/gpt-test",
+        provider="openai",
+        kwargs={"model": "openai/gpt-test", "messages": []},
+        streaming=False,
+        credentials=[],
+        deadline=0,
+        input_protocol_name="openai_chat",
+        execution_profile="responses",
+    )
+    with pytest.raises(StructuredAPIResponseError, match="has no profiles"):
+        executor._build_native_provider_context(
+            "openai", "openai/gpt-test", plugin, "sk-test", "cred-1", context, None
+        )
 
 
 # --- Executor integration (native context) ---
@@ -208,7 +313,8 @@ def test_native_context_resolves_bare_and_explicit_profiles() -> None:
 
 
 def test_native_context_bare_name_unmatched_protocol_errors() -> None:
-    from rotator_library.client.executor import RequestExecutor, RoutingExecutionError
+    from rotator_library.client.executor import RequestExecutor
+    from rotator_library.core.errors import StructuredAPIResponseError
     from rotator_library.core.types import RequestContext
 
     executor = RequestExecutor.__new__(RequestExecutor)
@@ -223,7 +329,7 @@ def test_native_context_bare_name_unmatched_protocol_errors() -> None:
         deadline=0,
         input_protocol_name="gemini",
     )
-    with pytest.raises(RoutingExecutionError, match="no endpoint"):
+    with pytest.raises(StructuredAPIResponseError, match="no endpoint"):
         executor._build_native_provider_context(
             "synthetic", "synthetic/m", plugin, "sk-test", "cred-1", context, None
         )

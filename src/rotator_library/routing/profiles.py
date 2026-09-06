@@ -57,6 +57,10 @@ def valid_profile_name(name: str) -> bool:
 def parse_model_reference(model: str) -> ModelReference:
     """Parse a model reference into provider, optional profile, and model.
 
+    The grammar applies only to the provider segment (before the first
+    ``/``): ``provider:profile/model``. Model segments may contain anything,
+    including colons (OpenRouter ``:free`` variants, Ollama ``model:tag``).
+
     Raises ``ModelReferenceError`` for empty or malformed references
     (``:profile/model`` without a provider, ``provider:/model`` without a
     profile name, separator-only segments).
@@ -65,23 +69,20 @@ def parse_model_reference(model: str) -> ModelReference:
     text = (model or "").strip()
     if not text:
         raise ModelReferenceError("Empty model reference")
-    provider: str
+    provider_segment, sep, remainder = text.partition("/")
+    if not sep:
+        remainder = ""
     profile: Optional[str] = None
-    remainder: str
-    if PROFILE_SEPARATOR in text:
-        head, _, remainder = text.partition(PROFILE_SEPARATOR)
-        provider = head.strip()
+    provider = provider_segment
+    if PROFILE_SEPARATOR in provider_segment:
+        provider, _, profile_segment = provider_segment.partition(PROFILE_SEPARATOR)
+        profile = profile_segment.strip()
         if not provider:
             raise ModelReferenceError(f"Model reference missing provider: {model!r}")
-        profile_segment = remainder.split("/", 1)[0] if "/" in remainder else remainder
-        profile = profile_segment.strip()
         if not profile or not valid_profile_name(profile):
             raise ModelReferenceError(f"Invalid profile name in model reference: {model!r}")
-        remainder = remainder.split("/", 1)[1] if "/" in remainder else ""
         if not remainder:
             raise ModelReferenceError(f"Model reference missing model after profile: {model!r}")
-    else:
-        provider, _, remainder = text.partition("/")
     if not provider or not valid_profile_name(provider):
         raise ModelReferenceError(f"Invalid provider name in model reference: {model!r}")
     if not remainder:
@@ -116,6 +117,11 @@ def resolve_profile(
             )
         return None
     names = {str(name) for name in declared_profiles}
+    if default_profile and default_profile not in names:
+        raise ModelReferenceError(
+            f"Provider {provider} declares default profile {default_profile!r} "
+            f"but no such profile exists; known: {sorted(names)}"
+        )
     if requested_profile:
         if requested_profile not in names:
             raise ModelReferenceError(

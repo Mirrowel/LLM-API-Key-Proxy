@@ -64,6 +64,9 @@ class RouteTarget:
     model: str
     name: str = ""
     protocol: str | None = None
+    # D13: transport profile addressed as provider:profile/model. Identity
+    # stays provider-level; the profile only steers transport.
+    profile: str | None = None
     execution: ExecutionMode = "auto"
     priority: int | None = None
     weight: float | None = None
@@ -73,7 +76,7 @@ class RouteTarget:
     def __post_init__(self) -> None:
         if not self.provider or not self.model:
             raise ValueError("route targets require provider and model")
-        if self.execution not in {"auto", "native", "custom", "litellm_fallback"}:
+        if self.execution not in {"auto", "custom", "native", "litellm_fallback"}:
             raise ValueError(f"unsupported execution mode: {self.execution}")
         if not self.name:
             object.__setattr__(self, "name", f"{self.provider}/{self.model}")

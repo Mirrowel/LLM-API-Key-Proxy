@@ -17,10 +17,12 @@ class RoutingConfigError(ValueError):
 
 
 def parse_route_target(spec: str) -> RouteTarget:
-    """Parse `provider/model` with optional `@execution` suffix.
+    """Parse `provider/model`, `provider:profile/model`, optional `@execution`.
 
     The suffix is intentionally small because Phase 6 prioritizes ordered
     fallback groups. Rich selector syntax belongs to the config polish phase.
+    Profile addressing (D13) splits on the provider segment only — model
+    segments may contain colons.
     """
 
     text = spec.strip()
@@ -29,10 +31,22 @@ def parse_route_target(spec: str) -> RouteTarget:
     target_text, _, execution = text.partition("@")
     if "/" not in target_text:
         raise RoutingConfigError(f"route target requires provider/model: {spec}")
-    provider, model = target_text.split("/", 1)
+    provider_segment, model = target_text.split("/", 1)
+    profile: str | None = None
+    provider = provider_segment
+    if ":" in provider_segment:
+        provider, _, profile_text = provider_segment.partition(":")
+        profile = profile_text.strip() or None
+        if profile is None:
+            raise RoutingConfigError(f"route target profile name cannot be empty: {spec}")
     if not provider or not model:
         raise RoutingConfigError(f"route target requires provider/model: {spec}")
-    return RouteTarget(provider=provider.strip(), model=model.strip(), execution=(execution.strip() or "auto"))
+    return RouteTarget(
+        provider=provider.strip(),
+        model=model.strip(),
+        profile=profile,
+        execution=(execution.strip() or "auto"),
+    )
 
 
 def load_routing_config_from_env(env: Mapping[str, str] | None = None, config: object | None = None) -> RoutingConfig:

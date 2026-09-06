@@ -477,20 +477,36 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """Return the upstream endpoint for a native operation.
 
         The default derives from the transport base plus the profile's
-        endpoint path (D13), or the class's single-protocol convention via
-        overrides. Single-protocol providers that did not override and have
-        no default_api_base fail loudly here.
+        endpoint path (D13); profiles without an explicit path get the
+        per-protocol conventional path. Single-protocol providers that did
+        not override and have no default_api_base fail loudly here.
         """
 
         if self.transport_profiles and profile:
+            base = self.get_provider_api_base()
+            if not base:
+                raise NotImplementedError(
+                    f"{self.__class__.__name__} declares profiles but has no transport base; "
+                    "set default_api_base or {PROVIDER}_API_BASE"
+                )
             entry = self.transport_profiles.get(profile) or {}
-            path = entry.get("endpoint_path") or self._default_endpoint_path(operation)
-            return f"{self.get_provider_api_base()}{path}"
+            path = entry.get("endpoint_path") or self._default_endpoint_path(
+                str(entry.get("protocol") or self.protocol_name or ""), operation
+            )
+            return f"{base}{path}"
         raise NotImplementedError(f"{self.__class__.__name__} does not define a native endpoint")
 
-    def _default_endpoint_path(self, operation: str = "chat") -> str:
-        """Default per-operation endpoint path (profiles without one)."""
+    def _default_endpoint_path(self, protocol: str = "", operation: str = "chat") -> str:
+        """Conventional per-protocol endpoint path (profiles without one)."""
 
+        if protocol == "responses":
+            return "/responses"
+        if protocol == "anthropic_messages":
+            return "/v1/messages"
+        if protocol == "gemini":
+            raise NotImplementedError(
+                "Gemini endpoints are model-ridden; declare endpoint_path for gemini profiles"
+            )
         return "/chat/completions"
 
     def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
