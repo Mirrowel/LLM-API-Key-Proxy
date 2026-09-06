@@ -246,7 +246,7 @@ def test_transform_converts_chat_reasoning_to_anthropic_thinking() -> None:
     from rotator_library.protocols.transforms import apply_transform
 
     block = apply_transform("chat_reasoning_to_anthropic_thinking", "plain reasoning text")
-    assert block == {"type": "thinking", "thinking": "plain reasoning text", "signature": None}
+    assert block == {"type": "thinking", "thinking": "plain reasoning text"}
     assert apply_transform("anthropic_thinking_to_chat_reasoning", block) == "plain reasoning text"
 
 
@@ -270,7 +270,7 @@ def test_engine_applies_transform_on_inject() -> None:
     asyncio.run(store.set(key, "plain reasoning"))
     updated, ops = asyncio.run(engine.inject("request", {}, _ctx()))
     assert ops[0].changed is True
-    assert updated["thinking_block"] == {"type": "thinking", "thinking": "plain reasoning", "signature": None}
+    assert updated["thinking_block"] == {"type": "thinking", "thinking": "plain reasoning"}
 
 
 def test_bound_rule_rejects_transform_declaration() -> None:
@@ -281,3 +281,122 @@ def test_bound_rule_rejects_transform_declaration() -> None:
             path="signature",
             metadata={"compatibility": "bound", "transform": "identity"},
         )
+    # Implicit class defaults to bound: transform still rejected.
+    with pytest.raises(ValueError, match="never changes shape"):
+        FieldCacheRule(
+            name="sig2",
+            source="response",
+            path="signature",
+            metadata={"transform": "identity"},
+        )
+
+
+def test_inject_auto_preserves_client_value_and_always_overwrites() -> None:
+    """auto (default) adds only when absent; always overwrites — an
+    operator choice honored regardless of field class."""
+
+    store = InMemoryFieldCacheStore()
+    base_rule = FieldCacheRule(
+        name="hint",
+        source="response",
+        path="hint",
+        inject=type(
+            "Inj",
+            (),
+            {"target": "request", "path": "hint", "when_missing_only": True, "insert": False, "as_list": False},
+        )(),
+    )
+    always_rule = FieldCacheRule(
+        name="hint",
+        source="response",
+        path="hint",
+        inject=type(
+            "Inj",
+            (),
+            {"target": "request", "path": "hint", "when_missing_only": False, "insert": False, "as_list": False},
+        )(),
+    )
+    import asyncio
+
+    key = build_cache_key(base_rule, _ctx())
+    asyncio.run(store.set(key, "cached-value"))
+
+    auto_engine = FieldCacheEngine([base_rule], store)
+    updated, ops = asyncio.run(auto_engine.inject("request", {"hint": "client-value"}, _ctx()))
+    assert updated["hint"] == "client-value"
+    assert ops[0].changed is False
+
+    always_engine = FieldCacheEngine([always_rule], store)
+    updated, ops = asyncio.run(always_engine.inject("request", {"hint": "client-value"}, _ctx()))
+    assert updated["hint"] == "cached-value"
+    assert ops[0].changed is True
+
+
+def test_unknown_credential_hit_records_none_provenance() -> None:
+    """D11 provenance: a hit through a missing optional dimension is
+    visible on the operation (no fail-closed, but never silent)."""
+
+    store = InMemoryFieldCacheStore()
+    rule = FieldCacheRule(
+        name="reasoning",
+        source="response",
+        path="reasoning_content",
+        inject=type(
+            "Inj",
+            (),
+            {"target": "request", "path": "reasoning_hint", "when_missing_only": True, "insert": False, "as_list": False},
+        )(),
+    )
+    import asyncio
+
+    engine = FieldCacheEngine([rule], store)
+    asyncio.run(engine.extract("response", {"reasoning_content": "text"}, _ctx(credential=None)))
+    updated, ops = asyncio.run(engine.inject("request", {}, _ctx(credential=None)))
+    assert ops[0].hit is True
+    assert ops[0].reason == "optional_scope_none:credential+session"
+
+
+def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> None:
+    """Same-name env rules replace plugin rules only without weakening
+    isolation; name collisions never crash the engine."""
+
+    from rotator_library.client.executor import _merged_field_cache_rules, RoutingExecutionError
+    from rotator_library.field_cache.types import FieldCacheInjection
+
+    class _Plugin:
+        protocol_name = "openai_chat"
+
+        def get_field_cache_rules(self, model):
+            # Same behavioral shape as the env replacement (the guard
+            # allows identical-behavior swaps; only weakening rejects).
+            return parse_cache_replay_config(
+                '[{"name": "sig", "source": "response", "path": "signature", "keep": "last",'
+                ' "inject": {"path": "sig", "if": "auto"}}]',
+                provider="shadowprov",
+            )
+
+    import os
+
+    # Identical-scope env rule replaces cleanly (no crash, no weakening).
+    os.environ["SHADOWPROV_CACHE_REPLAY"] = (
+        '[{"name": "sig", "source": "response", "path": "signature", "keep": "last",'
+        ' "inject": {"path": "sig", "if": "auto"}}]'
+    )
+    try:
+        rules = _merged_field_cache_rules("shadowprov", "shadowprov/m", _Plugin(), config=None)
+        assert len([r for r in rules if r.name == "sig"]) == 1
+        # Weakened scope (dropping model isolation) is rejected loudly.
+        os.environ["SHADOWPROV_CACHE_REPLAY"] = (
+            '[{"name": "sig", "source": "response", "path": "signature", "keep": "last",'
+            ' "scope": ["provider"], "inject": {"path": "sig", "if": "auto"}}]'
+        )
+        from rotator_library.client.executor import _env_cache_replay_cached
+
+        _env_cache_replay_cached.cache_clear()
+        with pytest.raises(RoutingExecutionError, match="cannot weaken"):
+            _merged_field_cache_rules("shadowprov", "shadowprov/m", _Plugin(), config=None)
+    finally:
+        os.environ.pop("SHADOWPROV_CACHE_REPLAY", None)
+        from rotator_library.client.executor import _env_cache_replay_cached
+
+        _env_cache_replay_cached.cache_clear()

@@ -102,19 +102,21 @@ class CompatibilityRegistry:
             return []
         groups = self.groups_for(ref)
         seen: dict[str, ModelRef] = {}
-        for group in groups:
+        # Deterministic order: declaration order within each group, groups
+        # sorted by name (overlapping groups must not make inheritance
+        # hash-seed dependent).
+        for group in sorted(groups):
             declared = self._groups.get(group)
             if declared:
                 for member in declared:
                     seen.setdefault(member.key, member)
-        identity_group = f"model:{ref.model}"
-        if identity_group in groups:
+        if f"model:{ref.model}" in groups:
             # Identity group: any provider exposing the same model name.
-            for member in self._declared_refs():
+            for member in sorted(self._declared_refs(), key=lambda item: item.key):
                 if member.model == ref.model:
                     seen.setdefault(member.key, member)
         seen.pop(ref.key, None)
-        return list(seen.values())
+        return [seen[key] for key in sorted(seen)]
 
     def _declared_refs(self) -> list[ModelRef]:
         refs: list[ModelRef] = []
@@ -141,9 +143,21 @@ def get_compatibility_registry() -> CompatibilityRegistry:
         groups: dict[str, list[str]] = {}
         raw = os.getenv(COMPATIBILITY_ENV_VAR, "")
         if raw.strip():
-            parsed = json.loads(raw)
-            if not isinstance(parsed, dict):
-                raise ValueError(f"{COMPATIBILITY_ENV_VAR} must be a JSON object of group -> [provider/model]")
-            groups = {str(name): list(members) for name, members in parsed.items()}
+            try:
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    raise ValueError("not an object")
+                groups = {str(name): list(members) for name, members in parsed.items()}
+            except (ValueError, TypeError) as exc:
+                # Malformed group config never crashes requests: no groups
+                # (default-deny) plus a loud warning for the operator.
+                import logging
+
+                logging.getLogger("rotator_library").warning(
+                    "Ignoring malformed %s (%s); compatibility groups disabled",
+                    COMPATIBILITY_ENV_VAR,
+                    exc,
+                )
+                groups = {}
         _REGISTRY = CompatibilityRegistry(groups)
     return _REGISTRY

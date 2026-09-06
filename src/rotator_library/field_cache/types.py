@@ -103,7 +103,7 @@ class FieldCacheRule:
         if transform is not None:
             if not isinstance(transform, str) or not transform:
                 raise ValueError("FieldCacheRule.metadata.transform must be a registered transform name")
-            if compatibility == "bound":
+            if compatibility != "portable":
                 raise ValueError(
                     "Transform-on-inject applies to portable fields only; bound opaque state never changes shape (D8)"
                 )

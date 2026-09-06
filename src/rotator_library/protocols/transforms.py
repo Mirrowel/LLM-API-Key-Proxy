@@ -48,7 +48,13 @@ def apply_transform(name: str, value: Any) -> Any:
 
 @register_transform("chat_reasoning_to_anthropic_thinking")
 def _chat_reasoning_to_anthropic_thinking(value: Any) -> Any:
-    """Chat ``reasoning_content`` string -> Anthropic thinking block."""
+    """Chat ``reasoning_content`` string -> Anthropic thinking block.
+
+    The synthesized block carries no signature (plaintext reasoning has
+    none); upstream signature requirements are the provider's business —
+    this transform is for replay of portable reasoning into
+    thinking-block-shaped payloads.
+    """
 
     if isinstance(value, dict) and "thinking" in value:
         return value
@@ -58,7 +64,7 @@ def _chat_reasoning_to_anthropic_thinking(value: Any) -> Any:
         text = str(value) if value is not None else ""
     if not text:
         return None
-    return {"type": "thinking", "thinking": text, "signature": None}
+    return {"type": "thinking", "thinking": text}
 
 
 @register_transform("anthropic_thinking_to_chat_reasoning")

@@ -110,8 +110,13 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
         if compatibility is not None and str(compatibility) not in {"bound", "portable"}:
             raise ValueError(f"cache_replay rule {name!r} compatibility must be bound or portable")
         transform = entry.get("transform")
-        if transform and str(compatibility or "bound") == "bound":
+        if transform and str(compatibility or "") != "portable":
             raise ValueError(f"cache_replay rule {name!r} transform requires compatibility=portable")
+        if transform:
+            # Fail at compile time (startup/config), never mid-request.
+            from ..protocols.transforms import get_transform
+
+            get_transform(str(transform))
         scope_entry = entry.get("scope")
         scope: tuple[FieldCacheScope, ...]
         if isinstance(scope_entry, list) and scope_entry:

@@ -19,6 +19,7 @@ import os
 import random
 import time
 from copy import deepcopy
+from functools import lru_cache
 from typing import (
     Any,
     AsyncGenerator,
@@ -3248,6 +3249,25 @@ def _redact_trace_leaf_key(value: Any, tokens: tuple[PathToken, ...]) -> None:
             _redact_trace_leaf_key(item, tokens)
 
 
+@lru_cache(maxsize=64)
+def _env_cache_replay_cached(env_value: str, provider: str) -> tuple[Any, ...]:
+    from ..field_cache.replay import parse_cache_replay_config
+
+    return parse_cache_replay_config(env_value, provider=provider)
+
+
+def _provider_env_cache_replay(provider: str) -> tuple[Any, ...]:
+    """Compile ``<NAME>_CACHE_REPLAY`` once per distinct env value (the env
+    is static for the process; per-request JSON parsing is waste)."""
+
+    import os
+
+    raw = os.getenv(f"{provider.upper()}_CACHE_REPLAY", "")
+    if not raw.strip():
+        return ()
+    return _env_cache_replay_cached(raw, provider)
+
+
 def _merged_field_cache_rules(
     provider: str,
     model: str,
@@ -3255,33 +3275,28 @@ def _merged_field_cache_rules(
     *,
     config: Any = None,
 ) -> tuple[Any, ...]:
-    """Merge provider-declared and JSON-configured field-cache rules.
+    """Merge provider-declared and operator-configured field-cache rules.
 
-    Provider declarations are the safe default. Optional JSON config can add or
-    replace rules by name so operators can tune protocol-state preservation per
-    provider/model without editing provider code. The import is local to keep the
-    experimental config layer out of executor module initialization.
+    Precedence per name: JSON runtime config > env ``<NAME>_CACHE_REPLAY``
+    (operator) > class ``cache_replay`` (code author) > provider-declared
+    rules. Every override passes the same behavior-weakening guard — the
+    isolation contract is uniform across surfaces; a name collision never
+    crashes the engine and isolation is never silently narrowed. The import
+    is local to keep the experimental config layer out of executor module
+    initialization.
     """
 
-    declared = list(plugin.get_field_cache_rules(model) if plugin and hasattr(plugin, "get_field_cache_rules") else ())
+    plugin_rules = list(plugin.get_field_cache_rules(model) if plugin and hasattr(plugin, "get_field_cache_rules") else ())
     # Declarative cache-and-replay (W13/D14): <NAME>_CACHE_REPLAY env JSON
     # and the class-level cache_replay declaration compile to ordinary
-    # rules — one surface, one engine, operator is the trust boundary.
+    # rules — one surface, one engine.
     try:
-        import os as _os
-
         from ..field_cache.replay import parse_cache_replay_config
 
-        env_rules = parse_cache_replay_config(
-            _os.getenv(f"{provider.upper()}_CACHE_REPLAY"),
-            provider=provider,
+        env_rules = list(_provider_env_cache_replay(provider))
+        class_rules = list(
+            parse_cache_replay_config(getattr(plugin, "cache_replay", None), provider=provider)
         )
-        class_rules = parse_cache_replay_config(
-            getattr(plugin, "cache_replay", None),
-            provider=provider,
-        )
-        declared.extend(env_rules)
-        declared.extend(class_rules)
     except RoutingExecutionError:
         raise
     except Exception as exc:
@@ -3301,25 +3316,24 @@ def _merged_field_cache_rules(
         )
     except Exception as exc:
         raise RoutingExecutionError(f"Invalid field-cache configuration for {provider}/{model}", error_type="configuration_error") from exc
-    if not configured:
-        return tuple(declared)
-    merged: dict[str, Any] = {getattr(rule, "name", str(index)): rule for index, rule in enumerate(declared)}
-    order = [getattr(rule, "name", str(index)) for index, rule in enumerate(declared)]
-    for rule in configured:
+    merged: dict[str, Any] = {getattr(rule, "name", str(index)): rule for index, rule in enumerate(plugin_rules)}
+    order = [getattr(rule, "name", str(index)) for index, rule in enumerate(plugin_rules)]
+    # Weaker-declaration layers apply first so stronger ones override them;
+    # every same-name replacement passes the guard against the incumbent.
+    for rule in class_rules + env_rules + configured:
         name = getattr(rule, "name", "")
-        if name and name not in merged:
+        if not name:
+            continue
+        if name not in merged:
             order.append(name)
-        if name:
-            declared_rule = merged.get(name)
-            if declared_rule is not None and not _safe_field_cache_override(
-                declared_rule,
-                rule,
-            ):
+        else:
+            incumbent = merged[name]
+            if incumbent is not rule and not _safe_field_cache_override(incumbent, rule):
                 raise RoutingExecutionError(
                     f"Configured field-cache rule {name!r} cannot weaken provider state isolation or injection behavior",
                     error_type="configuration_error",
                 )
-            merged[name] = rule
+        merged[name] = rule
     return tuple(merged[name] for name in order if name in merged)
 
 
