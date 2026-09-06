@@ -537,10 +537,11 @@ class ResponsesProtocol(ProtocolAdapter):
                 if isinstance(builtin.raw, dict):
                     item = deepcopy(builtin.raw)
                 else:
+                    item_type = builtin.kind if builtin.extra.get("synthesized_kind") else f"{builtin.kind}_call"
                     item = {
                         "id": builtin.call_id or f"bc_{item_index}",
                         "call_id": builtin.call_id or f"bc_{item_index}",
-                        "type": f"{builtin.kind}_call",
+                        "type": item_type,
                         "status": builtin.status or "completed",
                     }
                     if builtin.output is not None:
@@ -603,11 +604,12 @@ class ResponsesProtocol(ProtocolAdapter):
                     payload.update({k: deepcopy(v) for k, v in block.extra.items() if k not in {"source_type", "annotations"}})
                 formatted.append(payload)
             elif block.type == "refusal" and block.refusal is not None:
-                if output or role in {"assistant", "model"}:
+                if output:
                     formatted.append({"type": "refusal", "refusal": block.refusal})
                 else:
-                    # Request-side history: Responses input has no refusal part;
-                    # degrade to input_text per D7 (validator admits refusal).
+                    # Request-side history (any role, including assistant
+                    # turns): Responses input has no refusal part; degrade to
+                    # input_text per D7 (validator admits refusal).
                     formatted.append({"type": "input_text", "text": block.refusal})
             elif block.type == "image":
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "input_image"}

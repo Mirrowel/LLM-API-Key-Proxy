@@ -396,7 +396,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             )
         if block_type in {"image", "document"}:
             source = _parse_anthropic_media_source(block.get("source"), kind=block_type)
-            return ContentBlock(type=block_type, source=source, raw=deepcopy(block), extra=_without(block, {"type", "source"}))
+            return ContentBlock(type=block_type, source=source, index=index, raw=deepcopy(block), extra=_without(block, {"type", "source"}))
         if block_type in {"thinking", "redacted_thinking"}:
             reasoning = ReasoningBlock(
                 type=block_type,
@@ -406,11 +406,12 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "thinking", "signature"}),
             )
-            return ContentBlock(type="reasoning", reasoning=reasoning, raw=deepcopy(block))
+            return ContentBlock(type="reasoning", reasoning=reasoning, index=index, raw=deepcopy(block))
         if block_type == "tool_use":
             return ContentBlock(
                 type="tool_call",
                 tool_call=ToolCall(id=block.get("id"), name=block.get("name"), arguments=canonical_tool_arguments(block.get("input")), type="function", raw=deepcopy(block)),
+                index=index,
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "id", "name", "input"}),
             )
@@ -418,10 +419,11 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             return ContentBlock(
                 type="tool_result",
                 tool_result=ToolResult(tool_call_id=block.get("tool_use_id"), content=canonical_tool_arguments(block.get("content")), is_error=block.get("is_error"), raw=deepcopy(block)),
+                index=index,
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "tool_use_id", "content", "is_error"}),
             )
-        return ContentBlock(type=block_type, raw=deepcopy(block), extra=_without(block, {"type"}))
+        return ContentBlock(type=block_type, index=index, raw=deepcopy(block), extra=_without(block, {"type"}))
 
     def _format_content(
         self,

@@ -526,3 +526,72 @@ def test_chat_stream_refusal_delta_parses() -> None:
     event = chat.parse_stream_event({"choices": [{"index": 0, "delta": {"refusal": "no way"}}]})
     assert event.delta is not None
     assert any(block.type == "refusal" for block in event.delta.content)
+
+
+def test_chat_audio_response_round_trips_at_message_level() -> None:
+    chat = get_protocol("openai_chat")
+    parsed = chat.parse_response(
+        {
+            "id": "chatcmpl-a",
+            "model": "model-a",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": None, "audio": {"id": "aud_1", "data": "QUJD", "transcript": "hi", "expires_at": 1}},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+    assert parsed.modalities == ["audio"]
+
+    out = chat.format_response(parsed, _ctx("openai_chat", "openai_chat"))
+    message = out["choices"][0]["message"]
+    # Native shape: audio at message level; content must NOT carry a typeless
+    # or duplicated audio content part.
+    assert message["audio"]["id"] == "aud_1"
+    assert message["audio"]["data"] == "QUJD"
+    content = message.get("content")
+    if isinstance(content, list):
+        assert all(isinstance(part, dict) and part.get("type") for part in content)
+        assert not any("QUJD" in str(part) for part in content)
+
+
+def test_refusal_history_degrades_to_text_across_all_targets() -> None:
+    chat = get_protocol("openai_chat")
+    anthropic = get_protocol("anthropic_messages")
+    gemini = get_protocol("gemini")
+    responses = get_protocol("responses")
+
+    request = chat.parse_request(
+        {
+            "model": "model-a",
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": None, "refusal": "I won't"},
+                {"role": "user", "content": "again"},
+            ],
+        }
+    )
+
+    from rotator_library.protocols.types import ProtocolContext
+
+    def ctx(target: str) -> ProtocolContext:
+        return ProtocolContext(source_protocol="openai_chat", target_protocol=target, input_protocol="openai_chat", client_protocol=target)
+
+    anth = anthropic.build_request(request, ctx("anthropic_messages"))
+    refusal_turn = anth["messages"][1]["content"]
+    assert refusal_turn == [{"type": "text", "text": "I won't"}]
+
+    gem = gemini.build_request(request, ctx("gemini"))
+    assert gem["contents"][1]["parts"] == [{"text": "I won't"}]
+
+    resp = responses.build_request(request, ctx("responses"))
+    assistant_input = [item for item in resp["input"] if item.get("role") == "assistant"][0]
+    assert assistant_input["content"] == [{"type": "input_text", "text": "I won't"}]
+
+    # Chat request history: content is null on the wire for refusal turns.
+    chat_built = chat.build_request(request, ctx("openai_chat"))
+    chat_refusal_turn = [m for m in chat_built["messages"] if m.get("role") == "assistant"][0]
+    assert chat_refusal_turn["content"] is None
+    assert chat_refusal_turn["refusal"] == "I won't"

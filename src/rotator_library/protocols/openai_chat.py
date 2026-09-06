@@ -423,7 +423,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
             content = _tool_result_text({"error": result.content} if result.is_error else result.content)
         else:
             content = self._format_content(message.content, preserve_source=preserve_source)
-        if content is not None:
+        if isinstance(content, list) and not content:
+            if any(block.type == "refusal" and block.refusal for block in message.content):
+                # Refusal-only assistant history: content is null on the wire,
+                # the refusal field carries the meaning.
+                payload["content"] = None
+            elif any(block.type == "audio" for block in message.content):
+                # Audio-only messages carry the payload at message level
+                # (`audio` field); content stays null, no duplicated part.
+                payload["content"] = None
+            else:
+                payload["content"] = content
+        elif content is not None:
             payload["content"] = content
         extra = deepcopy(message.extra) if preserve_source else {}
         legacy_function_call = extra.get("function_call")
@@ -447,7 +458,6 @@ class OpenAIChatProtocol(ProtocolAdapter):
         annotations = [
             annotation
             for block in message.content
-            if block.type in {"text", "output_text"}
             for annotation in block.annotations
         ]
         if annotations:
@@ -537,10 +547,12 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     payload.update(deepcopy(block.extra))
                 formatted.append(payload)
             elif block.type == "audio":
-                if preserve_source and isinstance(block.raw, dict):
-                    # Assistant audio output round-trips its native shape
-                    # (id/data/transcript), never a fabricated input_audio part.
-                    formatted.append(deepcopy(block.raw))
+                if preserve_source:
+                    # Typed request input_audio parts round-trip their native
+                    # shape. Response audio (untyped raw) round-trips at message
+                    # level via the `audio` field — never as a content part.
+                    if isinstance(block.raw, dict) and block.raw.get("type"):
+                        formatted.append(deepcopy(block.raw))
                     continue
                 source = _media_source(block.source)
                 payload = {"type": "input_audio", "input_audio": {"data": source.data or "", "format": _audio_format(source.media_type)}}
@@ -738,6 +750,10 @@ def _format_response_message(payload: dict[str, Any], message: UnifiedMessage) -
         if any(block.type == "refusal" for block in message.content) and not any(
             block.type in {"text", "input_text", "output_text"} and block.text for block in message.content
         ):
+            payload = dict(payload)
+            payload["content"] = None
+        elif any(block.type == "audio" for block in message.content):
+            # Audio-only responses carry the payload at message level.
             payload = dict(payload)
             payload["content"] = None
     return payload
