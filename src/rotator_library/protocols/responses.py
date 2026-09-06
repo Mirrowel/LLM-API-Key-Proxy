@@ -170,6 +170,11 @@ class ResponsesProtocol(ProtocolAdapter):
                 parsed = self._parse_output_item(item)
                 if parsed:
                     parsed.extra["_output_index"] = index
+                    for block in parsed.content:
+                        # Output-item blocks carry the item position as their
+                        # content-block identity.
+                        if block.index is None:
+                            block.index = index
                     messages.append(parsed)
                     items.append(_output_item_from_message(parsed, item))
         stop_reason = canonical_stop_reason(response.get("status"))
