@@ -259,10 +259,6 @@ class NativeFailingAtCallClient:
     """Native client whose agenerate raises before the first frame."""
 
     async def agenerate(self, payload, *, input_protocol, **kwargs):
-        async def stream():
-            raise RuntimeError("native agenerate exploded")
-            yield  # pragma: no cover
-
         raise RuntimeError("native agenerate exploded")
 
 

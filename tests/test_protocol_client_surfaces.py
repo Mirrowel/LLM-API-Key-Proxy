@@ -235,6 +235,16 @@ def test_cost_estimate_degrades_gracefully_without_pricing_service() -> None:
         )
         assert response.status_code == 200
         assert response.json()["model"] == "unknown/model-x"
+        assert response.json()["source"] == "unknown"
+
+        # Missing service entirely: still the graceful unknown shape.
+        del proxy_main.app.state.model_info_service
+        response = TestClient(proxy_main.app).post(
+            "/v1/cost-estimate",
+            json={"model": "unknown/model-x", "prompt_tokens": 10, "completion_tokens": 5},
+        )
+        assert response.status_code == 200
+        assert response.json()["source"] == "unknown"
     finally:
         # The exploding service must not poison later tests.
         proxy_main.app.state.model_info_service = _GracefulPricingService()
@@ -243,6 +253,35 @@ def test_cost_estimate_degrades_gracefully_without_pricing_service() -> None:
 class _GracefulPricingService:
     def estimate_cost(self, *args, **kwargs):
         return {"cost": None, "currency": "USD", "pricing": {}, "source": "unknown", "error": "Pricing data not available for this model"}
+
+
+def test_count_tokens_errors_use_anthropic_error_types() -> None:
+    proxy_main.PROXY_API_KEY = None
+
+    class ExplodingCountClient(FailingSurfaceClient):
+        async def anthropic_count_tokens(self, request):
+            raise ValueError("bad input")
+
+        async def anthropic_count_tokens_auth(self, request):
+            raise __import__("litellm").AuthenticationError("bad key", "prov", "mdl")
+
+    proxy_main.app.state.rotating_client = ExplodingCountClient()
+    response = TestClient(proxy_main.app).post(
+        "/v1/messages/count_tokens",
+        json={"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+    assert "detail" not in response.json()
+
+    # Malformed JSON gets the same anthropic shape.
+    response = TestClient(proxy_main.app).post(
+        "/v1/messages/count_tokens",
+        content="{",
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
 
 
 class GeminiRuntimeClient:

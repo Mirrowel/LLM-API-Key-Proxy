@@ -117,7 +117,7 @@ print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
     import colorlog
     import json
-    from typing import AsyncGenerator, Any, List, Optional, Union
+    from typing import AsyncGenerator, Any, List, Optional
     from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
@@ -1060,7 +1060,7 @@ async def anthropic_count_tokens(
     except Exception as e:
         status, content = format_client_protocol_error(
             input_protocol="anthropic_messages", error=e,
-            error_type="invalid_request_error", status_code=400,
+            error_type="invalid_request", status_code=400,
         )
         return JSONResponse(status_code=status, content=content)
     try:
@@ -1071,13 +1071,13 @@ async def anthropic_count_tokens(
     except (ValueError, litellm.InvalidRequestError) as e:
         status, content = format_client_protocol_error(
             input_protocol="anthropic_messages", error=e,
-            error_type="invalid_request_error", status_code=400,
+            error_type="invalid_request", status_code=400,
         )
         return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
         status, content = format_client_protocol_error(
             input_protocol="anthropic_messages", error=e,
-            error_type="authentication_error", status_code=401,
+            error_type="authentication", status_code=401,
         )
         return JSONResponse(status_code=status, content=content)
     except Exception as e:
@@ -1253,7 +1253,7 @@ async def embeddings(
     except litellm.AuthenticationError as e:
         status, content = format_client_protocol_error(
             input_protocol="openai_chat", error=e,
-            error_type="authentication_error", status_code=401,
+            error_type="authentication", status_code=401,
         )
         return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
@@ -1265,7 +1265,7 @@ async def embeddings(
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
         status, content = format_client_protocol_error(
             input_protocol="openai_chat", error=e,
-            error_type="service_unavailable", status_code=503,
+            error_type="server_error", status_code=503,
         )
         return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
