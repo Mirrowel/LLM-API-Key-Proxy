@@ -880,7 +880,7 @@ def test_assistant_image_output_drops_recorded_not_fabricated() -> None:
     for target in ("anthropic_messages", "responses", "openai_chat"):
         formatted = get_protocol(target).format_response(unified, _ctx("gemini", target))
         payload_str = str(formatted)
-        assert "input_image" not in payload_str or target == "openai_chat"
+        assert "aW1hZ2U=" not in payload_str, target  # actually dropped, not just warned
         warnings = {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
         assert "media_dropped" in warnings, target
 

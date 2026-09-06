@@ -465,6 +465,21 @@ class OpenAIChatProtocol(ProtocolAdapter):
             payload["name"] = message.name
         if message.tool_call_id:
             payload["tool_call_id"] = message.tool_call_id
+        if message.role == "assistant" and not preserve_source:
+            # Standard assistant messages carry no image parts: drop with the
+            # recorded media_dropped summary (never emit against the summary).
+            message = UnifiedMessage(
+                role=message.role,
+                content=[block for block in message.content if block.type != "image"],
+                name=message.name,
+                tool_call_id=message.tool_call_id,
+                tool_calls=message.tool_calls,
+                reasoning=message.reasoning,
+                index=message.index,
+                stop_reason=message.stop_reason,
+                extra=message.extra,
+                raw=message.raw,
+            )
         result_blocks = [block.tool_result for block in message.content if block.tool_result]
         if message.role == "tool" and result_blocks:
             result = result_blocks[0]
