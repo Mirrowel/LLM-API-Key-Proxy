@@ -1,278 +1,28 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""
-Anthropic API compatibility handler for RotatingClient.
+"""Anthropic Messages facade over the canonical protocol runtime.
 
-This module provides Anthropic SDK compatibility methods that allow using
-Anthropic's Messages API format with the credential rotation system.
+The handler owns nothing but facade concerns: the original /v1/messages
+body is transported verbatim through the runtime (D4 raw fast path keeps
+unknown fields, explicit nulls, and Anthropic extensions byte-identical),
+the response id is stamped for non-streaming calls, and transaction
+logging traces the boundary. All translation lives in the
+anthropic_messages protocol adapter.
 """
 
-import json
-import logging
+from __future__ import annotations
+
 import uuid
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from ..anthropic_compat import (
-    AnthropicMessagesRequest,
-    AnthropicCountTokensRequest,
-    translate_anthropic_request,
-    openai_to_anthropic_response,
-    anthropic_streaming_wrapper,
-    anthropic_to_openai_messages,
-    anthropic_to_openai_tools,
-)
+from ..protocols import get_protocol
+from ..protocols.operation import OPERATION_COUNT_TOKENS
+from ..protocols.types import ProtocolContext
 from ..transaction_logger import TransactionLogger
 
 if TYPE_CHECKING:
     from .rotating_client import RotatingClient
-
-lib_logger = logging.getLogger("rotator_library")
-
-
-class AnthropicHandler:
-    """
-    Handler for Anthropic API compatibility methods.
-
-    This class provides methods to handle Anthropic Messages API requests
-    by translating them to OpenAI format, processing through the client's
-    acompletion method, and converting responses back to Anthropic format.
-
-    Example:
-        handler = AnthropicHandler(client)
-        response = await handler.messages(request, raw_request)
-    """
-
-    def __init__(self, client: "RotatingClient"):
-        """
-        Initialize the Anthropic handler.
-
-        Args:
-            client: The RotatingClient instance to use for completions
-        """
-        self._client = client
-
-    async def messages(
-        self,
-        request: AnthropicMessagesRequest,
-        raw_request: Optional[Any] = None,
-        pre_request_callback: Optional[callable] = None,
-    ) -> Any:
-        """
-        Handle Anthropic Messages API requests.
-
-        Non-streaming requests use the shared canonical protocol runtime.
-        Streaming temporarily retains the established Chat wrapper until the
-        canonical stream-lifecycle phase is enabled.
-
-        Args:
-            request: An AnthropicMessagesRequest object
-            raw_request: Optional raw request object for disconnect checks
-            pre_request_callback: Optional async callback before each API request
-
-        Returns:
-            For non-streaming: dict in Anthropic Messages format
-            For streaming: AsyncGenerator yielding Anthropic SSE format strings
-        """
-        request_id = f"msg_{uuid.uuid4().hex[:24]}"
-        original_model = request.model
-
-        # Extract provider from model for logging
-        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
-
-        # Create Anthropic transaction logger if request logging is enabled
-        anthropic_logger = None
-        if self._client.enable_request_logging:
-            anthropic_logger = TransactionLogger(
-                provider,
-                original_model,
-                enabled=True,
-                api_format="ant",
-            )
-            # Log original Anthropic request
-            anthropic_logger.log_request(
-                request.model_dump(exclude_none=True),
-                filename="anthropic_request.json",
-            )
-            _trace_anthropic(
-                anthropic_logger,
-                "anthropic_raw_request",
-                request.model_dump(exclude_none=True),
-                direction="request",
-                stage="client",
-            )
-
-        # The pydantic round-trip keeps unknown/extension fields alive via
-        # extra="allow" on the compat models, and exclude_unset preserves
-        # explicitly-set client nulls (D4 fidelity until the facade retires
-        # in W6+W9).
-        anthropic_request = request.model_dump(exclude_unset=True)
-
-        if hasattr(self._client, "agenerate"):
-            response = await self._client.agenerate(
-                anthropic_request,
-                input_protocol="anthropic_messages",
-                request=raw_request,
-                pre_request_callback=pre_request_callback,
-                _parent_log_dir=anthropic_logger.log_dir if anthropic_logger and anthropic_logger.log_dir else None,
-            )
-            if request.stream:
-                return response
-            anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-            anthropic_response["id"] = request_id
-            _trace_anthropic(
-                anthropic_logger,
-                "anthropic_native_protocol_response",
-                anthropic_response,
-                direction="response",
-                stage="final",
-            )
-            _trace_anthropic(
-                anthropic_logger,
-                "anthropic_final_response",
-                anthropic_response,
-                direction="response",
-                stage="final",
-            )
-            if anthropic_logger:
-                anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
-            return anthropic_response
-
-        # Compatibility fallback for external facades that have not implemented
-        # the protocol-aware agenerate entry point.
-        openai_request = translate_anthropic_request(request)
-        _trace_anthropic(
-            anthropic_logger,
-            "anthropic_to_openai_request",
-            openai_request,
-            direction="request",
-            stage="adapter",
-        )
-
-        # Pass parent log directory to acompletion for nested logging
-        if anthropic_logger and anthropic_logger.log_dir:
-            openai_request["_parent_log_dir"] = anthropic_logger.log_dir
-
-        if request.stream:
-            # Streaming response
-            response_generator = await self._client.acompletion(
-                request=raw_request,
-                pre_request_callback=pre_request_callback,
-                **openai_request,
-            )
-
-            # Create disconnect checker if raw_request provided
-            is_disconnected = None
-            if raw_request is not None and hasattr(raw_request, "is_disconnected"):
-                is_disconnected = raw_request.is_disconnected
-
-            # Return the streaming wrapper
-            # Note: For streaming, the anthropic response logging happens in the wrapper
-            return anthropic_streaming_wrapper(
-                openai_stream=response_generator,
-                original_model=original_model,
-                request_id=request_id,
-                is_disconnected=is_disconnected,
-                transaction_logger=anthropic_logger,
-            )
-        else:
-            # Non-streaming response
-            response = await self._client.acompletion(
-                request=raw_request,
-                pre_request_callback=pre_request_callback,
-                **openai_request,
-            )
-
-            # Convert OpenAI response to Anthropic format
-            openai_response = (
-                response.model_dump()
-                if hasattr(response, "model_dump")
-                else dict(response)
-            )
-            _trace_anthropic(
-                anthropic_logger,
-                "anthropic_openai_response",
-                openai_response,
-                direction="response",
-                stage="provider",
-            )
-            anthropic_response = openai_to_anthropic_response(
-                openai_response, original_model
-            )
-            _trace_anthropic(
-                anthropic_logger,
-                "openai_to_anthropic_response",
-                anthropic_response,
-                direction="response",
-                stage="adapter",
-            )
-
-            # Override the ID with our request ID
-            anthropic_response["id"] = request_id
-
-            # Log Anthropic response
-            if anthropic_logger:
-                anthropic_logger.log_response(
-                    anthropic_response,
-                    filename="anthropic_response.json",
-                )
-                _trace_anthropic(
-                    anthropic_logger,
-                    "anthropic_final_response",
-                    anthropic_response,
-                    direction="response",
-                    stage="final",
-                )
-
-            return anthropic_response
-
-    async def count_tokens(
-        self,
-        request: AnthropicCountTokensRequest,
-    ) -> dict:
-        """
-        Handle Anthropic count_tokens API requests.
-
-        Counts the number of tokens that would be used by a Messages API request.
-        This is useful for estimating costs and managing context windows.
-
-        Args:
-            request: An AnthropicCountTokensRequest object
-
-        Returns:
-            Dict with input_tokens count in Anthropic format
-        """
-        anthropic_request = request.model_dump(exclude_none=True)
-
-        openai_messages = anthropic_to_openai_messages(
-            anthropic_request.get("messages", []), anthropic_request.get("system")
-        )
-
-        # Count tokens for messages
-        message_tokens = self._client.token_count(
-            model=request.model,
-            messages=openai_messages,
-        )
-
-        # Count tokens for tools if present
-        tool_tokens = 0
-        if request.tools:
-            # Tools add tokens based on their definitions
-            # Convert to JSON string and count tokens for tool definitions
-            openai_tools = anthropic_to_openai_tools(
-                [tool.model_dump() for tool in request.tools]
-            )
-            if openai_tools:
-                # Serialize tools to count their token contribution
-                tools_text = json.dumps(openai_tools)
-                tool_tokens = self._client.token_count(
-                    model=request.model,
-                    text=tools_text,
-                )
-
-        total_tokens = message_tokens + tool_tokens
-
-        return {"input_tokens": total_tokens}
 
 
 def _trace_anthropic(
@@ -282,9 +32,8 @@ def _trace_anthropic(
     *,
     direction: str,
     stage: str,
-    transport: Optional[str] = None,
 ) -> None:
-    """Emit an Anthropic compatibility transform trace when logging is enabled."""
+    """Emit an Anthropic transform trace when logging is enabled."""
 
     if not logger:
         return
@@ -294,5 +43,104 @@ def _trace_anthropic(
         direction=direction,
         stage=stage,
         protocol="anthropic_messages",
-        transport=transport,
     )
+
+
+class AnthropicHandler:
+    """Handle Anthropic Messages API traffic through the protocol runtime."""
+
+    def __init__(self, client: "RotatingClient"):
+        self._client = client
+
+    async def messages(
+        self,
+        request: Any,
+        raw_request: Optional[Any] = None,
+        pre_request_callback: Optional[Any] = None,
+    ) -> Any:
+        """Execute one Anthropic Messages request canonically.
+
+        Accepts the raw /v1/messages payload (dict) — validation and any
+        conversion are owned by the anthropic_messages adapter; unknown
+        fields and explicit nulls transport verbatim (D4).
+        """
+
+        payload = dict(request) if isinstance(request, dict) else dict(getattr(request, "model_dump", dict)())
+        request_id = f"msg_{uuid.uuid4().hex[:24]}"
+        original_model = str(payload.get("model") or "")
+        provider = original_model.split("/")[0] if "/" in original_model else "unknown"
+
+        anthropic_logger = None
+        if self._client.enable_request_logging:
+            anthropic_logger = TransactionLogger(
+                provider,
+                original_model,
+                enabled=True,
+                api_format="ant",
+            )
+            anthropic_logger.log_request(payload, filename="anthropic_request.json")
+            _trace_anthropic(
+                anthropic_logger,
+                "anthropic_raw_request",
+                payload,
+                direction="request",
+                stage="client",
+            )
+
+        response = await self._client.agenerate(
+            payload,
+            input_protocol="anthropic_messages",
+            request=raw_request,
+            pre_request_callback=pre_request_callback,
+            _parent_log_dir=anthropic_logger.log_dir if anthropic_logger and anthropic_logger.log_dir else None,
+        )
+        if payload.get("stream"):
+            return response
+        anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+        anthropic_response["id"] = request_id
+        _trace_anthropic(
+            anthropic_logger,
+            "anthropic_native_protocol_response",
+            anthropic_response,
+            direction="response",
+            stage="final",
+        )
+        if anthropic_logger:
+            anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
+        return anthropic_response
+
+    async def count_tokens(self, request: Any) -> dict[str, int]:
+        """Count an Anthropic request locally using its canonical Chat projection."""
+
+        payload = dict(request) if isinstance(request, dict) else dict(getattr(request, "model_dump", dict)())
+        model = str(payload.get("model") or "")
+        anthropic = get_protocol("anthropic_messages")
+        unified = anthropic.parse_request(
+            payload,
+            ProtocolContext(
+                source_protocol="anthropic_messages",
+                target_protocol="anthropic_messages",
+                model=model,
+                metadata={"operation": OPERATION_COUNT_TOKENS},
+            ),
+        )
+        chat_request = get_protocol("openai_chat").build_request(
+            unified,
+            ProtocolContext(
+                source_protocol="anthropic_messages",
+                target_protocol="openai_chat",
+                input_protocol="anthropic_messages",
+                client_protocol="anthropic_messages",
+                model=model,
+            ),
+        )
+        total = self._client.token_count(
+            model=model,
+            messages=chat_request.get("messages") or [],
+        )
+        if chat_request.get("tools"):
+            import json
+
+            tools_text = json.dumps(chat_request["tools"])
+            total += self._client.token_count(model=model, text=tools_text)
+        return {"input_tokens": total}

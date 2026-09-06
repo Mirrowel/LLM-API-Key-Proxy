@@ -228,13 +228,6 @@ class EnrichedModelList(BaseModel):
     data: List[EnrichedModelCard]
 
 
-# --- Anthropic API Models (imported from library) ---
-from rotator_library.anthropic_compat import (
-    AnthropicMessagesRequest,
-    AnthropicCountTokensRequest,
-)
-
-
 # Calculate total loading time
 _elapsed = time.time() - _start_time
 print(
@@ -1263,18 +1256,37 @@ async def responses_input_items(
 @app.post("/v1/messages")
 async def anthropic_messages(
     request: Request,
-    body: AnthropicMessagesRequest,
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_anthropic_api_key),
 ):
     """
     Anthropic-compatible Messages API endpoint.
 
-    Accepts Anthropic requests and returns the selected client protocol through
-    the shared canonical runtime.
+    Accepts the raw /v1/messages payload; the anthropic_messages protocol
+    adapter owns validation and conversion, and the response returns in the
+    request's protocol (unknown fields transport verbatim on the raw path).
 
     This endpoint is compatible with Claude Code and other Anthropic API clients.
     """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages",
+            error=exc,
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(body, dict):
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages",
+            error=ValueError("request body must be a JSON object"),
+            error_type="invalid_request_error",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+
     # Initialize raw I/O logger if enabled (for debugging proxy boundary)
     logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
 
@@ -1282,7 +1294,7 @@ async def anthropic_messages(
     if logger:
         logger.log_request(
             headers=dict(request.headers),
-            body=body.model_dump(exclude_none=True),
+            body=body,
         )
 
     try:
@@ -1294,13 +1306,13 @@ async def anthropic_messages(
                 request.client.host if request.client else "unknown",
                 request.client.port if request.client else 0,
             ),
-            request_data=body.model_dump(exclude_none=True),
+            request_data=body,
         )
 
         # Use the library method to handle the request
         result = await client.anthropic_messages(body, raw_request=request)
 
-        if body.stream:
+        if body.get("stream"):
             # Streaming response
             return StreamingResponse(
                 result,
@@ -1377,7 +1389,6 @@ async def anthropic_messages(
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(
     request: Request,
-    body: AnthropicCountTokensRequest,
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_anthropic_api_key),
 ):
@@ -1390,33 +1401,39 @@ async def anthropic_count_tokens(
     Accepts requests in Anthropic's format and returns token count in Anthropic's format.
     """
     try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+    except Exception as e:
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="invalid_request_error", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
         # Use the library method to handle the request
         result = await client.anthropic_count_tokens(body)
         return JSONResponse(content=result)
 
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=400, detail=error_response)
+    except (ValueError, litellm.InvalidRequestError) as e:
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="invalid_request_error", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "authentication_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=401, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="authentication_error", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Anthropic count_tokens endpoint error: {e}")
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=500, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="api_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1beta/models/{model:path}:generateContent")

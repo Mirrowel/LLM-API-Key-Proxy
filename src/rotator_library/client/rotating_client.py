@@ -58,9 +58,6 @@ from ..failure_logger import configure_failure_logger
 # Import new usage package
 from ..usage import UsageManager as NewUsageManager
 
-if TYPE_CHECKING:
-    from ..anthropic_compat import AnthropicMessagesRequest, AnthropicCountTokensRequest
-
 lib_logger = logging.getLogger("rotator_library")
 
 
@@ -916,26 +913,17 @@ class RotatingClient:
 
     async def anthropic_messages(
         self,
-        request: "AnthropicMessagesRequest",
+        request: Any,
         raw_request: Optional[Any] = None,
-        pre_request_callback: Optional[callable] = None,
+        pre_request_callback: Optional[Any] = None,
     ) -> Any:
+        """Execute an Anthropic Messages request through the protocol runtime.
+
+        Accepts the raw /v1/messages payload (dict); the anthropic_messages
+        adapter owns validation and any conversion, and the response returns
+        in Anthropic Messages format (non-streaming dict or SSE generator).
         """
-        Handle Anthropic Messages API requests.
 
-        This method accepts requests in Anthropic's format, translates them to
-        OpenAI format internally, processes them through the existing acompletion
-        method, and returns responses in Anthropic's format.
-
-        Args:
-            request: An AnthropicMessagesRequest object
-            raw_request: Optional raw request object for disconnect checks
-            pre_request_callback: Optional async callback before each API request
-
-        Returns:
-            For non-streaming: dict in Anthropic Messages format
-            For streaming: AsyncGenerator yielding Anthropic SSE format strings
-        """
         return await self._anthropic_handler.messages(
             request=request,
             raw_request=raw_request,
@@ -944,18 +932,8 @@ class RotatingClient:
 
     async def anthropic_count_tokens(
         self,
-        request: "AnthropicCountTokensRequest",
+        request: Any,
     ) -> dict:
-        """
-        Handle Anthropic count_tokens API requests.
+        """Count tokens for an Anthropic Messages request locally."""
 
-        Counts the number of tokens that would be used by a Messages API request.
-        This is useful for estimating costs and managing context windows.
-
-        Args:
-            request: An AnthropicCountTokensRequest object
-
-        Returns:
-            Dict with input_tokens count in Anthropic format
-        """
         return await self._anthropic_handler.count_tokens(request=request)

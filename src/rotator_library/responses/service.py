@@ -350,41 +350,58 @@ class ResponsesService:
         stream_request = dict(raw_request)
         stream_request["stream"] = True
         resolved_scope = self._resolve_request_scope(stream_request, request_scope)
-        unified = self.protocol.parse_request(
-            stream_request,
-            ProtocolContext(source_protocol="responses", transport=transport),
-        )
-        parent = await self._load_previous_response(
-            unified.previous_response_id,
-            transaction_logger,
-            expected_scope_key=resolved_scope.key,
-            access_token=previous_response_access_token,
-        )
-        parent_lineage = await self._load_response_lineage(
-            parent,
-            expected_scope_key=resolved_scope.key,
-        )
-        native_request = _expanded_responses_request(stream_request, parent_lineage)
-        session_hints = responses_session_hints(unified.previous_response_id)
-        session_info: dict[str, Any] = {
-            "scope_access_hash": resolved_scope.access_token_hash,
-        }
-        self._trace(
-            transaction_logger,
-            "responses_native_protocol_stream_request",
-            _redact_sensitive_fields(native_request),
-            direction="request",
-            stage="protocol",
-            metadata={"lineage_depth": len(parent_lineage)},
-        )
-        response_stream = await client.agenerate(
-            native_request,
-            input_protocol="responses",
-            request=request,
-            _disable_provider_continuation=bool(parent_lineage),
-            **_routing_kwargs(raw_request),
-            **_internal_client_kwargs(client, session_hints, session_info),
-        )
+        parent: Optional[StoredResponse] = None
+        model = str(raw_request.get("model") or "unknown")
+        try:
+            unified = self.protocol.parse_request(
+                stream_request,
+                ProtocolContext(source_protocol="responses", transport=transport),
+            )
+            model = unified.model
+            parent = await self._load_previous_response(
+                unified.previous_response_id,
+                transaction_logger,
+                expected_scope_key=resolved_scope.key,
+                access_token=previous_response_access_token,
+            )
+            parent_lineage = await self._load_response_lineage(
+                parent,
+                expected_scope_key=resolved_scope.key,
+            )
+            native_request = _expanded_responses_request(stream_request, parent_lineage)
+            session_hints = responses_session_hints(unified.previous_response_id)
+            session_info: dict[str, Any] = {
+                "scope_access_hash": resolved_scope.access_token_hash,
+            }
+            self._trace(
+                transaction_logger,
+                "responses_native_protocol_stream_request",
+                _redact_sensitive_fields(native_request),
+                direction="request",
+                stage="protocol",
+                metadata={"lineage_depth": len(parent_lineage)},
+            )
+            response_stream = await client.agenerate(
+                native_request,
+                input_protocol="responses",
+                request=request,
+                _disable_provider_continuation=bool(parent_lineage),
+                **_routing_kwargs(raw_request),
+                **_internal_client_kwargs(client, session_hints, session_info),
+            )
+        except Exception as exc:
+            # Post-start failures never escape into the transport: the client
+            # receives a protocol-valid terminal sequence instead (defect 10).
+            async for frame in await self._terminal_stream_failure(
+                stream_request,
+                model,
+                parent,
+                exc,
+                transaction_logger=transaction_logger,
+                session_info={"scope_access_hash": resolved_scope.access_token_hash},
+            ):
+                yield frame
+            return
         completed = False
         response_context = ProtocolContext(
             model=unified.model,
@@ -396,39 +413,103 @@ class ResponsesService:
             transport=transport,
             provider_state_compatible=False,
         )
-        async for raw_frame in response_stream:
-            if isinstance(raw_frame, str) and raw_frame.lstrip().startswith(":"):
+        try:
+            async for raw_frame in response_stream:
+                if isinstance(raw_frame, str) and raw_frame.lstrip().startswith(":"):
+                    yield raw_frame
+                    continue
+                event = self.protocol.parse_stream_event(raw_frame, response_context)
+                payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
+                response_payload = payload.get("response") if isinstance(payload, dict) and isinstance(payload.get("response"), dict) else None
+                if response_payload and event.type in {"response.completed", "response.failed", "response.incomplete"}:
+                    completed = True
+                    _record_responses_session_anchor(session_info, response_payload)
+                    self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_stream")
+                    stored = await self._store_stream_response(
+                        stream_request,
+                        response_payload,
+                        parent,
+                        failed=event.type == "response.failed",
+                        transaction_logger=transaction_logger,
+                        session_info=session_info,
+                    )
+                    self._trace(
+                        transaction_logger,
+                        "responses_stored_stream_response" if stored else "responses_store_skipped",
+                        response_payload if stored else {"response_id": response_payload.get("id")},
+                        direction="metadata",
+                        stage="final",
+                    )
                 yield raw_frame
-                continue
-            event = self.protocol.parse_stream_event(raw_frame, response_context)
-            payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
-            response_payload = payload.get("response") if isinstance(payload, dict) and isinstance(payload.get("response"), dict) else None
-            if response_payload and event.type in {"response.completed", "response.failed", "response.incomplete"}:
-                completed = True
-                _record_responses_session_anchor(session_info, response_payload)
-                self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_stream")
-                stored = await self._store_stream_response(
-                    stream_request,
-                    response_payload,
-                    parent,
-                    failed=event.type == "response.failed",
-                    transaction_logger=transaction_logger,
-                    session_info=session_info,
-                )
-                self._trace(
-                    transaction_logger,
-                    "responses_stored_stream_response" if stored else "responses_store_skipped",
-                    response_payload if stored else {"response_id": response_payload.get("id")},
-                    direction="metadata",
-                    stage="final",
-                )
-            yield raw_frame
+        except Exception as exc:
+            # Post-start failures never escape into the transport: the client
+            # receives a protocol-valid terminal sequence instead (defect 10).
+            async for frame in await self._terminal_stream_failure(
+                stream_request,
+                unified.model,
+                parent,
+                exc,
+                transaction_logger=transaction_logger,
+                session_info=session_info,
+            ):
+                yield frame
+            return
         if not completed:
-            raise ResponsesServiceError(
-                "Responses stream ended without a terminal response event",
-                status_code=502,
-                error_type="upstream_error",
-            )
+            # The stream ended without a terminal event — synthesize one.
+            async for frame in await self._terminal_stream_failure(
+                stream_request,
+                unified.model,
+                parent,
+                ResponsesServiceError(
+                    "Responses stream ended without a terminal response event",
+                    status_code=502,
+                    error_type="upstream_error",
+                ),
+                transaction_logger=transaction_logger,
+                session_info=session_info,
+            ):
+                yield frame
+
+    async def _terminal_stream_failure(
+        self,
+        stream_request: dict[str, Any],
+        model: str,
+        parent: Optional[StoredResponse],
+        exc: Exception,
+        *,
+        transaction_logger: Optional[Any],
+        session_info: dict[str, Any],
+    ) -> AsyncGenerator[str, None]:
+        """Emit the terminal failure frames for a failed native stream."""
+
+        error = _stream_failure_error(exc)
+        failed = {
+            "id": generate_response_id("resp"),
+            "object": "response",
+            "status": "failed",
+            "model": model,
+            "output": [],
+            "error": error,
+        }
+        self._log_transform_error(transaction_logger, "responses_native_stream", exc, stream_request)
+        stored = await self._store_stream_response(
+            stream_request,
+            failed,
+            parent,
+            failed=True,
+            transaction_logger=transaction_logger,
+            session_info=session_info,
+        )
+        self._trace(
+            transaction_logger,
+            "responses_stored_failed_stream_response" if stored else "responses_store_skipped",
+            {"response_id": failed["id"], "status": "failed"},
+            direction="metadata",
+            stage="final",
+        )
+        formatter = ResponsesSSEFormatter()
+        yield formatter.format_stream_event(ResponsesStreamEvent("response.failed", failed))
+        yield formatter.format_stream_event(ResponsesStreamEvent("done", {}, terminal=True))
 
     async def validate_stream_request(
         self,
