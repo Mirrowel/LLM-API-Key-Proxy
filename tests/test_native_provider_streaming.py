@@ -196,7 +196,11 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
         supported_stages = ("stream_event",)
 
         async def transform_stream_event(self, payload, context):
-            payload.delta.content[0].text = "adapted"
+            # W7 contract: stream adapters see the provider's RAW chunk
+            # (wire dialect), applied before parsing. String sentinel
+            # frames (e.g. "[DONE]") pass through untouched.
+            if isinstance(payload, dict) and payload.get("choices"):
+                payload["choices"][0]["delta"]["content"] = "adapted"
             return payload
 
     register_adapter(StreamTextAdapter, replace=True)
@@ -219,6 +223,7 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
         )
     ]
 
+    # The wire-level edit landed BEFORE parse — the neutral event carries it.
     assert events[0].delta.content[0].text == "adapted"
     pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
     assert "after_stream_event_adapter_chain" in pass_names

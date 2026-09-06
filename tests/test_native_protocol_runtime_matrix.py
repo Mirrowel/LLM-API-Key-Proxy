@@ -400,33 +400,59 @@ async def test_structured_error_variants_are_normalized_before_success_parsing(
 
 
 @pytest.mark.asyncio
-async def test_response_adapters_run_on_selected_client_protocol_payload() -> None:
-    context = NativeProviderContext(
-        provider="provider",
-        model="model-test",
-        protocol_name="anthropic_messages",
-        endpoint="https://provider.test/messages",
-        operation="messages",
-        input_protocol_name="openai_chat",
-        client_protocol_name="openai_chat",
-        adapter_names=("reasoning_content",),
-        adapter_config={
-            "reasoning_content": {
-                "source_fields": ["reasoning_content"],
-                "output_field": "analysis",
-            }
-        },
-    )
+async def test_response_adapters_run_on_provider_native_payload() -> None:
+    """W7: response adapters are wire adapters — they see the provider's
+    native response BEFORE parsing (never the formatted client payload),
+    so their effect is identical for every client protocol."""
+
+    seen_shapes: list[str] = []
+
+    from rotator_library.adapters import PayloadAdapter, register_adapter
+
+    class RecordingWireAdapter(PayloadAdapter):
+        name = "recording_wire_adapter"
+        supported_stages = ("response",)
+
+        async def transform_response(self, payload, context):
+            seen_shapes.append("choices" if "choices" in payload else "content")
+            # Edit in the PROVIDER dialect (anthropic content blocks).
+            for block in payload.get("content", []):
+                if block.get("type") == "text":
+                    block["text"] = f"adapted::{block['text']}"
+            return payload
+
+    register_adapter(RecordingWireAdapter, replace=True)
     response = deepcopy(RESPONSES["anthropic_messages"])
     response["content"].insert(0, {"type": "thinking", "thinking": "provider reasoning"})
 
-    result = await NativeProviderExecutor().execute(
-        deepcopy(REQUESTS["openai_chat"]),
-        context,
-        RecordingTransport(response),
-    )
+    results = {}
+    for client_protocol in ("openai_chat", "gemini"):
+        context = NativeProviderContext(
+            provider="provider",
+            model="model-test",
+            protocol_name="anthropic_messages",
+            endpoint="https://provider.test/messages",
+            operation="messages",
+            input_protocol_name=client_protocol,
+            client_protocol_name=client_protocol,
+            adapter_names=("recording_wire_adapter",),
+        )
+        results[client_protocol] = await NativeProviderExecutor().execute(
+            deepcopy(REQUESTS["openai_chat"]),
+            context,
+            RecordingTransport(deepcopy(response)),
+        )
 
-    assert result["choices"][0]["message"]["analysis"] == "provider reasoning"
+    # The adapter saw the provider-native anthropic shape (content blocks),
+    # never a chat/gemini client payload.
+    assert seen_shapes == ["content", "content"]
+    # And both clients received the adapted text through their own formats.
+    chat_content = results["openai_chat"]["choices"][0]["message"]["content"]
+    chat_text = chat_content if isinstance(chat_content, str) else "".join(
+        part.get("text", "") for part in chat_content if isinstance(part, dict)
+    )
+    assert chat_text.startswith("adapted::")
+    assert "adapted::" in str(results["gemini"]["candidates"])
 
 
 @pytest.mark.asyncio

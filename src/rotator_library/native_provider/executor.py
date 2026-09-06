@@ -141,6 +141,14 @@ class NativeProviderExecutor:
             structured_error = structured_api_response_error(raw_response)
             if structured_error:
                 raise structured_error
+            # W7 contract: response adapters are WIRE adapters — they run on
+            # the provider's native response payload BEFORE parsing, exactly
+            # once, in the provider's own dialect (never on the formatted
+            # client payload, which varies by client protocol).
+            adapter_context = context.adapter_context()
+            adapter_context.transaction_logger = None
+            raw_response = await run_adapter_chain(adapters, raw_response, adapter_context, stage="response")
+            self._trace(context, "after_response_adapter_chain", raw_response, direction="response", stage="adapter")
             await cache_engine.extract("response", raw_response, context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_response_field_cache_extraction", {"source": "response", "payload": "raw_provider_response"}, direction="response", stage="adapter", snapshot=False)
             response_context = context.protocol_context(
@@ -159,29 +167,20 @@ class NativeProviderExecutor:
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
-            response_stage_adapters = [a for a in adapters if "response" in getattr(a, "supported_stages", ("request", "response"))]
-            if (
-                raw_basis_used
-                and not response_stage_adapters
-                and client_protocol.name == provider_protocol.name
-            ):
+            if raw_basis_used and client_protocol.name == provider_protocol.name:
                 # D4 raw response passthrough: same protocol (request AND
                 # response — D1 makes these identical in production; the
                 # explicit check is defense-in-depth for hand-built contexts),
-                # no response-stage adapters, no proxy semantic edits — the
-                # provider's response IS the client's response, byte-for-byte
-                # (sidecar observation above feeds usage/session/accounting).
-                # Request-stage adapters do not touch responses and do not
-                # disable the passthrough.
+                # no proxy semantic edits — the provider's (adapted) response
+                # IS the client's response, byte-for-byte (sidecar observation
+                # above feeds usage/session/accounting). Response-stage wire
+                # adapters already applied upstream of this gate, so they no
+                # longer disable the passthrough.
                 client_response = deepcopy(raw_response)
                 self._trace(context, "raw_fast_path_response", client_response, direction="response", stage="protocol")
             else:
                 client_response = client_protocol.format_response(unified_response, response_context)
                 self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
-            adapter_context = context.adapter_context()
-            adapter_context.transaction_logger = None
-            client_response = await run_adapter_chain(adapters, client_response, adapter_context, stage="response")
-            self._trace(context, "after_response_adapter_chain", client_response, direction="response", stage="adapter")
             usage_record = extract_usage_record(
                 client_response,
                 provider=context.provider,
@@ -303,6 +302,17 @@ class NativeProviderExecutor:
             )
             async for raw_chunk in transport.stream_json_lines(context.endpoint, headers=context.headers, payload=provider_request):
                 self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
+                # W7 contract: stream adapters are WIRE adapters — they run on
+                # the provider's raw stream chunk BEFORE parsing, in the
+                # provider's dialect (never on the neutral event, which is
+                # client-agnostic meaning, not provider wire).
+                adapter_context = context.adapter_context()
+                # Native stream traces apply field-cache path redaction below.
+                # Suppress generic adapter-chain snapshots here so provider state
+                # cannot leak before rule-aware redaction runs.
+                adapter_context.transaction_logger = None
+                raw_chunk = await run_adapter_chain(adapters, raw_chunk, adapter_context, stage="stream_event")
+                self._trace(context, "after_stream_event_adapter_chain", raw_chunk, direction="stream", stage="adapter", snapshot=False)
                 event = protocol.parse_stream_event(raw_chunk, response_context)
                 self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
                 if event.type == "error" or event.error is not None:
@@ -324,13 +334,6 @@ class NativeProviderExecutor:
                     context.stream_usage_record = usage_record
                     yield event
                     break
-                adapter_context = context.adapter_context()
-                # Native stream traces apply field-cache path redaction below.
-                # Suppress generic adapter-chain snapshots here so provider state
-                # cannot leak before rule-aware redaction runs.
-                adapter_context.transaction_logger = None
-                event = await run_adapter_chain(adapters, event, adapter_context, stage="stream_event")
-                self._trace(context, "after_stream_event_adapter_chain", event, direction="stream", stage="adapter", snapshot=False)
                 await cache_engine.extract("unified_stream_event", serialize_value(event), context.field_cache_context(), transaction_logger=logger)
                 self._trace(context, "after_unified_stream_event_field_cache_extraction", {"source": "unified_stream_event"}, direction="stream", stage="adapter", snapshot=False)
                 event_payload = stream_event_payload(event)
