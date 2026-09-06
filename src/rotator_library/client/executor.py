@@ -608,6 +608,7 @@ class RequestExecutor:
             )
             response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
             _raise_for_structured_response_error(response)
+            self._record_litellm_fallback_identity(context, provider, plugin, model, stream=False)
             return self._format_execution_response(response, "openai_chat", context)
 
         if execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
@@ -694,13 +695,20 @@ class RequestExecutor:
                 )
             except Exception:
                 lib_logger.debug("litellm fallback identity recording failed", exc_info=True)
-        lib_logger.warning(
-            "litellm_fallback: %s/%s executed via LiteLLM while native protocol '%s' was available%s",
-            provider,
-            model,
-            protocol,
-            " (streaming)" if stream else "",
-        )
+        if not getattr(context, "_litellm_fallback_warned", False):
+            # One warning per request, even when the retry loop re-records
+            # the per-attempt identity.
+            try:
+                context._litellm_fallback_warned = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+            lib_logger.warning(
+                "litellm_fallback: %s/%s executed via LiteLLM while native protocol '%s' was available%s",
+                provider,
+                model,
+                protocol,
+                " (streaming)" if stream else "",
+            )
 
     def _get_native_executor(self) -> NativeProviderExecutor:
         """Return the shared native executor for process-local field-cache state."""
@@ -1801,6 +1809,10 @@ class RequestExecutor:
                                             metadata={"execution": "litellm_stream", "provider": provider, "model": model},
                                         )
                                         stream = await litellm.acompletion(**kwargs)
+                                        # Fall-through streaming (declared provider whose
+                                        # streaming was disabled by runtime config) is still
+                                        # a fallback — record it, never silent.
+                                        self._record_litellm_fallback_identity(context, provider, plugin, model, stream=True)
 
                                     self._log_executor_trace(
                                         context,
@@ -2982,8 +2994,10 @@ def _should_use_native_streaming(plugin: Any, model: str, target: Optional[Route
     Explicit ``@native`` routing is still constrained by provider capability.
     Since W5 the native stream path yields neutral events through the
     operational pipeline, so declared protocols stream natively by default
-    (W11); undeclared providers fall back to LiteLLM with a logged fallback
-    identity instead of silently claiming native support.
+    (W11); undeclared providers fall back to LiteLLM as their normal path
+    (silent by design), while declared-but-fallback executions are recorded
+    via the litellm fallback identity instead of silently claiming native
+    support.
     """
 
     if execution == "native":

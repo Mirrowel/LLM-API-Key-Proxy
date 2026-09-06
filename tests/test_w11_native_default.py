@@ -145,3 +145,204 @@ def test_litellm_identity_silent_for_undeclared_providers() -> None:
     plugin = _plugin("deepseek")
     executor._record_litellm_fallback_identity(_Context(), "deepseek", plugin, "deepseek/chat", stream=False)
     assert recorder == []
+
+
+def test_litellm_identity_fires_on_explicit_fallback_branch() -> None:
+    """Explicit @litellm routing on a declared provider records the fallback
+    identity (both execution modes stay visible, never silent)."""
+
+    import asyncio
+
+    from rotator_library.client.executor import RequestExecutor, _current_route_target
+
+    executor = RequestExecutor.__new__(RequestExecutor)
+    recorder = []
+
+    class _Logger:
+        def record_attempt(self, record):
+            recorder.append(record)
+
+        def update_metadata(self, **fields):
+            recorder.append(fields)
+
+    class _Context:
+        transaction_logger = _Logger()
+        input_protocol_name = "openai_chat"
+        input_provider = "openai"
+        protocol_request = None
+        unified_request = None
+        usage_manager_key = "test"
+        classifier = None
+        session_id = None
+        disable_provider_continuation = False
+
+    class _Target:
+        execution = "litellm_fallback"
+        provider = "openai"
+        protocol = "openai_chat"
+        name = "openai"
+        prefixed_model = "openai/gpt-test"
+
+    import rotator_library.client.executor as executor_module
+
+    original = executor_module._current_route_target
+    executor_module._current_route_target = lambda ctx: _Target()
+    try:
+        plugin = _plugin("openai")
+
+        async def _fake_litellm(*args, **kwargs):
+            return {"choices": [{"message": {"role": "assistant", "content": "ok"}}]}
+
+        executor._execute_litellm_request = _fake_litellm  # type: ignore[method-assign]
+        executor._log_routing_trace = lambda *a, **k: None  # type: ignore[method-assign]
+        executor._log_executor_trace = lambda *a, **k: None  # type: ignore[method-assign]
+        executor._format_execution_response = lambda response, protocol, ctx: response  # type: ignore[method-assign]
+
+        asyncio.run(
+            executor._execute_provider_request(  # type: ignore[arg-type]
+                "openai",
+                "openai/gpt-test",
+                plugin,
+                "sk-test",
+                "cred-1",
+                {"model": "openai/gpt-test", "messages": []},
+                _Context(),
+            )
+        )
+    finally:
+        executor_module._current_route_target = original
+    assert any(
+        isinstance(entry, dict) and entry.get("execution") == "litellm_fallback"
+        for entry in recorder
+    )
+
+
+def test_native_chat_stream_requests_terminal_usage() -> None:
+    """OpenAI-compatible native streams must ask for include_usage: without
+    it the provider omits usage from the final chunk and accounting zeros."""
+
+    import asyncio
+
+    from rotator_library.native_provider.context import NativeProviderContext
+    from rotator_library.native_provider.executor import NativeProviderExecutor
+
+    sent = {}
+
+    class _Transport:
+        async def stream_json_lines(self, endpoint, *, headers, payload):
+            sent.update(payload)
+
+            async def _frames():
+                yield {"id": "chatcmpl-1", "choices": [{"index": 0, "delta": {"content": "hi"}}]}
+                yield {
+                    "id": "chatcmpl-1",
+                    "choices": [],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }
+
+            yield_frame = _frames()
+            while True:
+                try:
+                    yield await yield_frame.__anext__()
+                except StopAsyncIteration:
+                    return
+
+    context = NativeProviderContext(
+        provider="openai",
+        model="gpt-test",
+        protocol_name="openai_chat",
+        endpoint="https://api.openai.test/v1/chat/completions",
+        operation="chat",
+        input_protocol_name="openai_chat",
+        client_protocol_name="openai_chat",
+        raw_client_request={"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        headers={},
+        credential_id="cred-1",
+        transport="sse",
+    )
+    context.unified_request = None
+    executor = NativeProviderExecutor()
+
+    async def _consume():
+        async for _event in executor.stream({"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}], "stream": True}, context, _Transport()):
+            pass
+
+    # The unified request must exist for the native stream path; build one.
+    from rotator_library.protocols import get_protocol
+
+    unified = get_protocol("openai_chat").parse_request(
+        {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+        None,
+    )
+
+    async def _consume_with_unified():
+        context.unified_request = unified
+        async for _event in executor.stream(
+            {"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            context,
+            _Transport(),
+        ):
+            pass
+
+    asyncio.run(_consume_with_unified())
+    assert sent.get("stream_options", {}).get("include_usage") is True
+    assert any(
+        overlay.get("field") == "stream_options.include_usage"
+        for overlay in (context.request_transport_overlays or [])
+    )
+
+
+def test_native_gemini_stream_injects_no_chat_stream_options() -> None:
+    """Gemini streams always carry usageMetadata — no chat-wire field is
+    injected into the gemini payload."""
+
+    from rotator_library.native_provider.context import NativeProviderContext
+    from rotator_library.native_provider.executor import NativeProviderExecutor
+
+    sent = {}
+
+    class _Transport:
+        async def stream_json_lines(self, endpoint, *, headers, payload):
+            sent.update(payload)
+
+            async def _frames():
+                yield {"candidates": [{"content": {"parts": [{"text": "hi"}]}, "finishReason": "STOP"}], "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2}}
+
+            frame_iter = _frames()
+            while True:
+                try:
+                    yield await frame_iter.__anext__()
+                except StopAsyncIteration:
+                    return
+
+    from rotator_library.protocols import get_protocol
+
+    unified = get_protocol("gemini").parse_request(
+        {"contents": [{"role": "user", "parts": [{"text": "hi"}]}]},
+        None,
+    )
+    unified.stream = True
+    context = NativeProviderContext(
+        provider="gemini",
+        model="gemini-test",
+        protocol_name="gemini",
+        endpoint="https://gemini.test/v1beta/models/gemini-test:streamGenerateContent?alt=sse",
+        operation="stream_generate",
+        input_protocol_name="openai_chat",
+        client_protocol_name="openai_chat",
+        headers={},
+        credential_id="cred-1",
+        transport="sse",
+    )
+    context.unified_request = unified
+    executor = NativeProviderExecutor()
+
+    import asyncio
+
+    async def _consume():
+        async for _event in executor.stream({"contents": []}, context, _Transport()):
+            pass
+
+    asyncio.run(_consume())
+    assert "stream_options" not in sent

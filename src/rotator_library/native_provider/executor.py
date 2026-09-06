@@ -290,6 +290,7 @@ class NativeProviderExecutor:
             self._trace(context, "after_field_cache_injection", provider_request, direction="request", stage="adapter")
             await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
+            provider_request = self._request_stream_usage(context, provider_request)
             await self._validate_provider_request(provider_request, context)
             self._trace(context, "native_provider_stream_request", provider_request, direction="request", stage="provider")
             usage_record = extract_usage_record(None, provider=context.provider, model=context.model, source="native_provider_stream")
@@ -371,6 +372,40 @@ class NativeProviderExecutor:
                     metadata={"provider": context.provider, "model": context.model},
                 )
             raise
+
+    def _request_stream_usage(self, context: NativeProviderContext, provider_request: Dict[str, Any]) -> Dict[str, Any]:
+        """Ask chat-wire streams for terminal usage (accounting integrity).
+
+        OpenAI-compatible providers only include token usage in the final
+        chunk when ``stream_options.include_usage`` is requested; without it
+        the stream completes with zero-token accounting. This is a
+        provider-required default (finalizer concern), applied after the
+        transport basis is chosen and recorded as a traced overlay.
+        """
+
+        if context.protocol_name != "openai_chat" or not isinstance(provider_request, dict):
+            return provider_request
+        stream_options = provider_request.get("stream_options")
+        if isinstance(stream_options, dict) and stream_options.get("include_usage"):
+            return provider_request
+        request = dict(provider_request)
+        merged = dict(stream_options) if isinstance(stream_options, dict) else {}
+        merged["include_usage"] = True
+        request["stream_options"] = merged
+        if context.request_transport_overlays is None:
+            context.request_transport_overlays = []
+        context.request_transport_overlays.append(
+            {"field": "stream_options.include_usage", "reason": "stream_usage_accounting"}
+        )
+        self._trace(
+            context,
+            "native_stream_usage_overlay",
+            {"stream_options": request["stream_options"]},
+            direction="request",
+            stage="provider",
+            snapshot=False,
+        )
+        return request
 
     @staticmethod
     def _prepare_provider_request(
