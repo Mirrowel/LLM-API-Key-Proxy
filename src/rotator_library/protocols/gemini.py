@@ -703,10 +703,15 @@ def _parse_gemini_generation_params(generation: dict[str, Any], tool_config: dic
         )
     thinking = generation.get("thinkingConfig")
     if isinstance(thinking, dict):
+        budget = thinking.get("thinkingBudget")
         params["reasoning"] = {
-            "budget_tokens": thinking.get("thinkingBudget"),
+            # thinkingBudget: 0 is Gemini's documented OFF switch — canonical
+            # folds it to enabled: False (never an "enabled with 0" inversion).
+            **({"enabled": False} if budget == 0 else {}),
+            **({} if budget == 0 else {"budget_tokens": budget}),
             "include_thoughts": thinking.get("includeThoughts"),
         }
+        params["reasoning"] = {k: v for k, v in params["reasoning"].items() if v is not None}
     if tool_config:
         params["tool_choice"] = _parse_gemini_tool_choice(tool_config)
     return params

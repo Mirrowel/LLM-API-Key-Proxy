@@ -18,6 +18,7 @@ from .base import ProtocolAdapter
 from .canonical import (
     record_instruction_merge,
     format_reasoning_controls,
+    normalize_reasoning_controls,
     attach_conversion_summary,
     add_conversion_warning,
     canonical_stop_reason,
@@ -574,6 +575,15 @@ class ResponsesProtocol(ProtocolAdapter):
                 item_index += 1
             elif block.type == "refusal" and block.refusal is not None:
                 flush_visible()
+                if block.annotations:
+                    # Refusal parts carry no annotations slot (W2 carry-in):
+                    # the loss is recorded, never silent.
+                    _warn_responses_once(
+                        unified_response,
+                        code="annotations_dropped",
+                        message="annotations on a refusal part have no Responses refusal representation; dropped",
+                        field="content[refusal]",
+                    )
                 output.append(
                     {
                         "id": f"msg_{item_index}",
@@ -934,7 +944,9 @@ def _parse_responses_generation_params(source: dict[str, Any]) -> dict[str, Any]
         params["structured_output"] = canonical_structured_output(text["format"], "responses")
     reasoning = params.get("reasoning")
     if isinstance(reasoning, dict):
-        params["reasoning"] = deepcopy(reasoning)
+        # Source-native dict preserved verbatim for same-protocol rebuild;
+        # normalized (summary -> include_thoughts) for cross-protocol mapping.
+        params["reasoning"] = normalize_reasoning_controls(deepcopy(reasoning))
     return params
 
 

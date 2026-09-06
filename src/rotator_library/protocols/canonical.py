@@ -169,14 +169,16 @@ def may_emit_opaque_provider_state(
 def instruction_messages(request: UnifiedRequest) -> list[UnifiedMessage]:
     """Return ordered canonical system/developer instructions.
 
-    Older parsers store a separate ``system`` block list. That field remains a
-    compatibility carrier until all non-generative consumers migrate, but it is
-    promoted only when no explicit system message already exists.
+    Older parsers store a separate ``system`` block list. That field is
+    promoted as a LEADING instruction turn — including when explicit system
+    messages also exist (both sources are legal together; dropping either
+    would silently lose Required instruction content).
     """
 
-    instructions = [message for message in request.messages if message.role in {"system", "developer"}]
-    if request.system and not any(message.role == "system" for message in instructions):
-        instructions.insert(0, UnifiedMessage(role="system", content=deepcopy(request.system)))
+    instructions: list[UnifiedMessage] = []
+    if request.system:
+        instructions.append(UnifiedMessage(role="system", content=deepcopy(request.system)))
+    instructions.extend(message for message in request.messages if message.role in {"system", "developer"})
     return instructions
 
 
@@ -203,7 +205,7 @@ def instruction_layout(request: UnifiedRequest) -> tuple[bool, int]:
     position cannot survive a merge into a single instruction field).
     """
 
-    instruction_count = 0
+    instruction_count = 1 if request.system else 0
     interleaved = False
     seen_conversation = False
     for message in request.messages:
@@ -213,8 +215,6 @@ def instruction_layout(request: UnifiedRequest) -> tuple[bool, int]:
                 interleaved = True
         else:
             seen_conversation = True
-    if request.system and instruction_count == 0:
-        instruction_count = 1
     return interleaved, instruction_count
 
 
@@ -302,7 +302,10 @@ def format_reasoning_controls(
 ) -> dict[str, Any]:
     """Map canonical reasoning controls to a target protocol (D7 level 3).
 
-    Canonical shape: ``{"effort", "budget_tokens", "enabled", "include_thoughts"}``.
+    Canonical shape: ``{"effort", "budget_tokens", "enabled",
+    "include_thoughts", "summary"}``. Parse-side normalization
+    (:func:`normalize_reasoning_controls`) folds ``effort:"none"``,
+    Responses ``summary``, and Gemini ``thinkingBudget: 0`` into this shape.
     Every inference (effort <-> budget) is deterministic via the documented
     table and recorded as a warning; every drop is recorded — nothing silent
     (defect 7). Responses gets a normalized native dict — never foreign keys.
@@ -312,57 +315,102 @@ def format_reasoning_controls(
     if not isinstance(reasoning, dict) or not reasoning:
         return emissions
 
-    effort = reasoning.get("effort")
-    budget = reasoning.get("budget_tokens")
-    enabled = reasoning.get("enabled")
-    include_thoughts = reasoning.get("include_thoughts")
+    normalized = normalize_reasoning_controls(reasoning)
+    effort = normalized.get("effort")
+    budget = normalized.get("budget_tokens")
+    enabled = normalized.get("enabled")
+    include_thoughts = normalized.get("include_thoughts")
+    summary = normalized.get("summary")
 
     def _warn(code: str, message: str, field: str) -> None:
         add_conversion_warning(request, code=code, message=message, field=field, target_protocol=target_protocol)
 
-    if target_protocol == "openai_chat":
-        if effort is not None:
-            emissions["reasoning_effort"] = effort
-        elif budget is not None:
-            approximated = effort_from_budget_tokens(budget)
-            emissions["reasoning_effort"] = approximated
+    def _effort_or_approximation() -> tuple[Any, bool]:
+        """Return (effort_value, approximated?). Unknown efforts coerce to
+        the table's medium with an explicit disclosure warning."""
+
+        if effort is None:
+            return None, False
+        if effort not in _EFFORT_TO_BUDGET_TOKENS:
             _warn(
-                "reasoning_budget_approximated",
-                f"reasoning budget_tokens={budget} approximated as effort '{approximated}' (deterministic table)",
-                "reasoning.budget_tokens",
+                "reasoning_effort_unknown",
+                f"reasoning effort '{effort}' is not a known level; coerced to 'medium' (deterministic table)",
+                "reasoning.effort",
             )
+            return "medium", True
+        return effort, False
+
+    if target_protocol == "openai_chat":
         if enabled is False:
             _warn(
                 "reasoning_disabled_omitted",
                 "reasoning disabled has no OpenAI Chat control; effort omitted",
                 "reasoning.enabled",
             )
-            emissions.pop("reasoning_effort", None)
+        else:
+            if effort is not None:
+                value, _ = _effort_or_approximation()
+                emissions["reasoning_effort"] = value
+            elif budget is not None:
+                approximated = effort_from_budget_tokens(budget)
+                emissions["reasoning_effort"] = approximated
+                _warn(
+                    "reasoning_budget_approximated",
+                    f"reasoning budget_tokens={budget} approximated as effort '{approximated}' (deterministic table)",
+                    "reasoning.budget_tokens",
+                )
         if include_thoughts is not None:
             _warn(
                 "reasoning_control_dropped",
                 "include_thoughts has no OpenAI Chat representation",
                 "reasoning.include_thoughts",
             )
-    elif target_protocol == "anthropic_messages":
-        if budget is not None:
-            emissions["thinking"] = {"type": "enabled", "budget_tokens": budget}
-        elif effort is not None and effort != "none":
-            approximated = budget_tokens_from_effort(effort)
-            emissions["thinking"] = {"type": "enabled", "budget_tokens": approximated}
+        if summary is not None:
             _warn(
-                "reasoning_effort_approximated",
-                f"reasoning effort '{effort}' approximated as budget_tokens={approximated} (deterministic table)",
-                "reasoning.effort",
+                "reasoning_control_dropped",
+                "reasoning summary preference has no OpenAI Chat representation",
+                "reasoning.summary",
             )
-        if enabled is False or effort == "none":
-            emissions.pop("thinking", None)
+    elif target_protocol == "anthropic_messages":
+        disabled = enabled is False
+        if disabled and (budget is not None or effort is not None):
+            _warn(
+                "reasoning_control_dropped",
+                "reasoning disabled wins; budget/effort control discarded",
+                "reasoning",
+            )
+        if disabled:
             emissions["thinking"] = {"type": "disabled"}
+        elif budget is not None:
+            if isinstance(budget, int) and budget < 1024:
+                _warn(
+                    "reasoning_budget_invalid",
+                    f"thinking budget_tokens={budget} is below Anthropic's 1024 minimum; thinking omitted",
+                    "reasoning.budget_tokens",
+                )
+            else:
+                emissions["thinking"] = {"type": "enabled", "budget_tokens": budget}
+        elif effort is not None:
+            value, coerced = _effort_or_approximation()
+            approximated = budget_tokens_from_effort(value)
+            emissions["thinking"] = {"type": "enabled", "budget_tokens": approximated}
+            if not coerced:
+                _warn(
+                    "reasoning_effort_approximated",
+                    f"reasoning effort '{effort}' approximated as budget_tokens={approximated} (deterministic table)",
+                    "reasoning.effort",
+                )
         if include_thoughts is not None:
             _warn(
                 "reasoning_control_dropped",
                 "include_thoughts has no Anthropic Messages control (summaries follow the thinking setting)",
                 "reasoning.include_thoughts",
+            )
+        if summary is not None:
+            _warn(
+                "reasoning_control_dropped",
+                "reasoning summary preference has no Anthropic Messages representation",
+                "reasoning.summary",
             )
     elif target_protocol == "responses":
         if enabled is False:
@@ -374,7 +422,8 @@ def format_reasoning_controls(
         else:
             native: dict[str, Any] = {}
             if effort is not None:
-                native["effort"] = effort
+                value, _ = _effort_or_approximation()
+                native["effort"] = value
             elif budget is not None:
                 approximated = effort_from_budget_tokens(budget)
                 native["effort"] = approximated
@@ -385,34 +434,57 @@ def format_reasoning_controls(
                 )
             if include_thoughts is not None:
                 native["summary"] = "auto" if include_thoughts else "none"
+            elif summary is not None:
+                native["summary"] = summary
             if native:
                 # Normalized native dict only — foreign spellings never leak
                 # onto the Responses wire (no hybrid payloads).
                 emissions["reasoning"] = native
     elif target_protocol == "gemini":
         thinking_config: dict[str, Any] = {}
-        if budget is not None:
+        if enabled is False:
+            # thinkingBudget: 0 IS Gemini's documented off-switch (D7 level 2).
+            thinking_config["thinkingBudget"] = 0
+        elif budget is not None:
             thinking_config["thinkingBudget"] = budget
-        elif effort is not None and effort != "none":
-            approximated = budget_tokens_from_effort(effort)
+        elif effort is not None:
+            value, coerced = _effort_or_approximation()
+            approximated = budget_tokens_from_effort(value)
             thinking_config["thinkingBudget"] = approximated
-            _warn(
-                "reasoning_effort_approximated",
-                f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
-                "reasoning.effort",
-            )
+            if not coerced:
+                _warn(
+                    "reasoning_effort_approximated",
+                    f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
+                    "reasoning.effort",
+                )
         if include_thoughts is not None:
             thinking_config["includeThoughts"] = bool(include_thoughts)
-        if enabled is False:
-            _warn(
-                "reasoning_disabled_omitted",
-                "reasoning disabled has no Gemini off-switch; includeThoughts=false only",
-                "reasoning.enabled",
-            )
-            thinking_config = {"includeThoughts": False}
+        elif summary is not None:
+            thinking_config["includeThoughts"] = summary != "none"
         if thinking_config:
             emissions["generation_config"] = {"thinkingConfig": thinking_config}
     return emissions
+
+
+def normalize_reasoning_controls(reasoning: Any) -> dict[str, Any]:
+    """Fold provider spellings into the canonical reasoning shape.
+
+    - ``effort: "none"`` (chat spellings) -> ``enabled: False``
+    - Responses ``summary`` -> ``include_thoughts`` (summary preserved verbatim
+      for same-protocol rebuild)
+    - Gemini ``thinkingBudget: 0`` (documented OFF) -> ``enabled: False``
+    """
+
+    if not isinstance(reasoning, dict):
+        return {}
+    normalized = dict(reasoning)
+    if normalized.get("effort") == "none":
+        normalized["enabled"] = False
+        normalized["effort"] = None
+    summary = normalized.get("summary")
+    if isinstance(summary, str) and "include_thoughts" not in normalized:
+        normalized["include_thoughts"] = summary != "none"
+    return {key: value for key, value in normalized.items() if value is not None or key in {"enabled", "include_thoughts"}}
 
 
 def attach_conversion_summary(payload: dict[str, Any], unified_response: Any) -> dict[str, Any]:

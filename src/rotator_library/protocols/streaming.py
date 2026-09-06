@@ -54,6 +54,7 @@ class StreamFormatState:
     block_order: list[str] = field(default_factory=list)
     item_ids: dict[str, str] = field(default_factory=dict)
     item_kinds: dict[str, str] = field(default_factory=dict)
+    builtin_items: dict[str, dict] = field(default_factory=dict)
     text_by_key: dict[str, str] = field(default_factory=dict)
     tool_arguments: dict[str, str] = field(default_factory=dict)
     tool_names: dict[str, str] = field(default_factory=dict)
@@ -252,12 +253,20 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
         if block.type == "builtin_tool" and block.builtin_tool is not None:
             # Provider-executed tool records stream as native output items
             # (raw item round-trip; synthesized shape only when raw missing).
+            # Registered in item_ids so downstream index derivation and the
+            # terminal response object include them (no index collisions,
+            # no identity collapse with interleaved text items).
             raw_item = block.builtin_tool.raw if isinstance(block.builtin_tool.raw, dict) else None
             item = raw_item or {
                 "type": f"{str(block.builtin_tool.kind).replace('-', '_')}_call",
                 "id": block.builtin_tool.call_id or _responses_item_id("builtin", state.next_index),
                 "status": block.builtin_tool.status or "completed",
             }
+            builtin_key = f"builtin:{item.get('id') or state.next_index}"
+            state.item_ids[builtin_key] = item.get("id") or _responses_item_id("builtin", state.next_index)
+            state.item_kinds[builtin_key] = "builtin"
+            state.builtin_items[builtin_key] = deepcopy(item)
+            state.last_family = "builtin"
             frames.append(_event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index, "item": deepcopy(item)}))
             frames.append(_event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": state.next_index, "item": deepcopy(item)}))
             state.next_index += 1
@@ -319,6 +328,10 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             state.emitted_tools.add(key)
         elif block.reasoning:
             parts.append({"text": block.reasoning.text or "", "thought": True})
+        elif block.type == "refusal":
+            # Gemini has no refusal part: the text survives as a plain part
+            # (same degradation as the non-stream path).
+            parts.append({"text": block.refusal or ""})
         elif block.type == "text":
             parts.append({"text": block.text or ""})
 
@@ -453,10 +466,14 @@ def _openai_delta(message: UnifiedMessage | None) -> dict[str, Any]:
     delta: dict[str, Any] = {}
     text = "".join(block.text or "" for block in ordered_message_blocks(message) if block.type == "text" and not block.reasoning)
     reasoning = "".join(block.reasoning.text or "" for block in ordered_message_blocks(message) if block.reasoning)
+    refusal = "".join(block.refusal or "" for block in ordered_message_blocks(message) if block.type == "refusal")
     if text:
         delta["content"] = text
     if reasoning:
         delta["reasoning_content"] = reasoning
+    if refusal:
+        # Chat natively carries refusals on the delta (exact mapping).
+        delta["refusal"] = refusal
     calls = [block.tool_call for block in ordered_message_blocks(message) if block.tool_call]
     if calls:
         delta["tool_calls"] = [
@@ -607,6 +624,9 @@ def _responses_item_done(
     item_status: str,
 ) -> list[str]:
     kind = state.item_kinds[key]
+    if kind == "builtin":
+        # added+done were already emitted back-to-back at registration.
+        return []
     output_index = list(state.item_ids).index(key)
     if kind == "tool":
         arguments = state.tool_arguments.get(key, "")
@@ -637,7 +657,9 @@ def _responses_object(state: StreamFormatState, *, status: str, error: Any = Non
     item_status = "completed" if status == "completed" else "in_progress" if status == "in_progress" else "incomplete"
     for key, item_id in state.item_ids.items():
         kind = state.item_kinds[key]
-        if kind == "tool":
+        if kind == "builtin":
+            output.append(deepcopy(state.builtin_items.get(key) or {"id": item_id, "type": "builtin_call", "status": item_status}))
+        elif kind == "tool":
             output.append({"id": item_id, "type": "function_call", "call_id": state.tool_ids.get(key, item_id), "name": state.tool_names.get(key, ""), "arguments": state.tool_arguments.get(key, ""), "status": item_status})
         elif kind == "reasoning":
             output.append({"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": state.text_by_key.get(key, "")}], "status": item_status})

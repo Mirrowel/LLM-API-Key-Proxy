@@ -11,6 +11,7 @@ different stream semantics.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from copy import deepcopy
 from typing import Any, ClassVar, Iterable, Optional
@@ -30,6 +31,7 @@ from .canonical import (
     conversation_messages,
     instruction_layout,
     instruction_messages,
+    normalize_reasoning_controls,
     is_same_protocol,
     retain_supported_generation_params,
     resolve_tool_result_names,
@@ -255,6 +257,25 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         pass_name="format_response",
                         payload={"dropped_blocks": ["builtin_tool"]},
                     )
+                unsynthesizable_audio = any(
+                    block.type == "audio" and not getattr(block.source, "data", None)
+                    for block in message.content
+                )
+                if unsynthesizable_audio and message.role == "assistant":
+                    _warn_chat_once(
+                        unified_response,
+                        code="media_dropped",
+                        message="audio without inline data cannot synthesize the Chat message-level audio field; dropped",
+                        field="content[audio]",
+                    )
+                has_video = any(block.type == "video" for block in message.content)
+                if has_video:
+                    _warn_chat_once(
+                        unified_response,
+                        code="media_dropped",
+                        message="video output has no Chat Completions representation; dropped",
+                        field="content[video]",
+                    )
         choices = []
         for position, message in enumerate(messages):
             per_choice_reason = message.stop_reason or unified_response.stop_reason
@@ -451,20 +472,23 @@ class OpenAIChatProtocol(ProtocolAdapter):
         extra = deepcopy(message.extra) if preserve_source else {}
         if not preserve_source:
             audio_blocks = [block for block in message.content if block.type == "audio"]
-            if audio_blocks and "audio" not in extra:
-                # Synthesize the Chat message-level audio field from a
-                # cross-protocol (e.g. Gemini inlineData) audio block.
+            if audio_blocks and message.role == "assistant" and "audio" not in extra:
+                # Response-direction only: synthesize the Chat message-level
+                # audio field from a cross-protocol (e.g. Gemini inlineData)
+                # audio block. Deterministic content digest id (W12
+                # reconstruction parity); unsynthesizable audio records
+                # media_dropped via the response handle (never silent).
                 synthesized: dict[str, Any] | None = None
                 for block in audio_blocks:
                     source = block.source
                     data = getattr(source, "data", None)
                     if data:
+                        digest = hashlib.sha256(str(data).encode("utf-8", "replace")).hexdigest()[:8]
                         synthesized = {
-                            "id": (getattr(source, "file_id", None) or f"audio_{abs(hash(data)) & 0xFFFFFFFF:x}"),
+                            "id": (getattr(source, "file_id", None) or f"audio_{digest}"),
                             "data": data,
+                            "format": _audio_format(getattr(source, "media_type", None)),
                         }
-                        if getattr(source, "media_type", None):
-                            synthesized["format"] = str(source.media_type).split("/")[-1]
                         break
                 if synthesized is not None:
                     extra["audio"] = synthesized
@@ -811,6 +835,8 @@ def _parse_openai_generation_params(source: dict[str, Any]) -> dict[str, Any]:
     reasoning_effort = params.pop("reasoning_effort", None)
     if reasoning_effort is not None:
         params["reasoning"] = {"effort": reasoning_effort}
+    if params.get("reasoning") is not None:
+        params["reasoning"] = normalize_reasoning_controls(params["reasoning"])
     # D9 multiplicity: Chat `n` and Gemini `candidateCount` share one
     # canonical control.
     n = params.pop("n", None)
@@ -841,14 +867,14 @@ def _format_openai_annotations(annotations: list[Annotation]) -> list[dict[str, 
     return [{k: v for k, v in entry.items() if v is not None} for entry in formatted]
 
 
-def _warn_chat_once(unified_response: UnifiedResponse, *, code: str, message: str) -> None:
+def _warn_chat_once(unified_response: UnifiedResponse, *, code: str, message: str, field: Optional[str] = None) -> None:
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
     for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message:
+        if warning.code == code and warning.message == message and warning.field == field:
             return
     unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, source_protocol=unified_response.source_protocol, target_protocol="openai_chat")
+        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="openai_chat")
     )
 
 

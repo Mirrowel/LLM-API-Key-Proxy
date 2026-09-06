@@ -442,10 +442,19 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 raw=deepcopy(block),
                 extra=_without(block, {"type", "tool_use_id", "content", "is_error"}),
             )
-        if block_type in {"server_tool_use", "web_search_tool_result"} or str(block.get("type", "")).endswith("_tool_result"):
-            # Anthropic server-side tool invocations normalize into canonical
-            # builtin records (Responses-native shape); same-protocol
-            # formatting round-trips the raw block.
+        # Anthropic server-side tool invocations normalize into canonical
+        # builtin records (Responses-native shape); same-protocol formatting
+        # round-trips the raw block. Whitelist exactly the documented server
+        # tool types — a user block that merely ends in "_tool_result" stays
+        # a passthrough content block, never a fabricated builtin.
+        _SERVER_TOOL_TYPES = {
+            "server_tool_use",
+            "web_search_tool_result",
+            "code_execution_tool_result",
+            "text_editor_tool_result",
+            "bash_tool_result",
+        }
+        if block_type in _SERVER_TOOL_TYPES:
             from ..protocols.types import BuiltinToolCall
 
             builtin = BuiltinToolCall(
