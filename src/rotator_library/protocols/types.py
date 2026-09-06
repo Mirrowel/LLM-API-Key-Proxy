@@ -140,16 +140,22 @@ class Usage(ProtocolSerializable):
 
 @dataclass
 class ReasoningBlock(ProtocolSerializable):
-    """Reasoning/thinking content and signatures preserved across protocols."""
+    """Reasoning/thinking content and signatures preserved across protocols.
+
+    ``encrypted_content`` carries provider-encrypted reasoning (Responses
+    API). It is BOUND opaque state (D8): same-protocol round-trips preserve it
+    byte-for-byte; foreign formatters never translate or emit it.
+    """
 
     type: str = "reasoning"
     text: Optional[str] = None
     signature: Optional[str] = None
+    encrypted_content: Optional[str] = None
     redacted: bool = False
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
-    _fields: ClassVar[tuple[str, ...]] = ("type", "text", "signature", "redacted", "raw", "extra")
+    _fields: ClassVar[tuple[str, ...]] = ("type", "text", "signature", "encrypted_content", "redacted", "raw", "extra")
 
 
 @dataclass

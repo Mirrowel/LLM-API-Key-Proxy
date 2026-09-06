@@ -70,8 +70,46 @@ class NativeProviderExecutor:
                 target_provider=context.provider,
                 provider_state_compatible=provider_state_compatible,
             )
-            provider_request = provider_protocol.build_request(unified_request, provider_context)
-            self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
+            # D4 raw fast path: when client and provider speak the same
+            # protocol and no semantic edits are pending, the ORIGINAL client
+            # payload is the transport basis — no canonical rebuild can strip
+            # source-native fields. Every deviation is a traced overlay.
+            same_protocol = input_protocol.name == provider_protocol.name
+            raw_wire = context.raw_client_request if same_protocol and isinstance(context.raw_client_request, dict) else None
+            overlays: list[dict[str, Any]] = []
+            raw_basis_used = False
+            if raw_wire is not None and unified_request is request_before_injection:
+                wire_view = input_protocol.parse_request(deepcopy(raw_wire), input_context)
+                if _wire_view_matches_unified(wire_view, unified_request):
+                    provider_request = deepcopy(raw_wire)
+                    raw_basis_used = True
+                    if "model" in provider_request and provider_request.get("model") != context.model:
+                        overlays.append({"field": "model", "from": provider_request.get("model"), "to": context.model})
+                        provider_request["model"] = context.model
+                else:
+                    provider_request = provider_protocol.build_request(unified_request, provider_context)
+                    overlays.append({"kind": "canonical_rebuild", "reason": "attempt_mutations"})
+            else:
+                provider_request = provider_protocol.build_request(unified_request, provider_context)
+                if not same_protocol:
+                    overlays.append({"kind": "canonical_rebuild", "reason": "cross_protocol"})
+                elif provider_state_compatible:
+                    overlays.append({"kind": "canonical_rebuild", "reason": "unified_state_injection"})
+                else:
+                    overlays.append({"kind": "canonical_rebuild", "reason": "no_wire_payload"})
+            context.request_transport_overlays = overlays
+            self._trace(
+                context,
+                "request_transport_overlays",
+                {"basis": "raw" if raw_basis_used else "rebuild", "overlays": overlays},
+                direction="metadata",
+                stage="protocol",
+                snapshot=False,
+            )
+            if not raw_basis_used:
+                self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
+            else:
+                self._trace(context, "raw_fast_path_request", provider_request, direction="request", stage="protocol")
             provider_request = self._prepare_provider_request(provider_request, context)
             self._trace(context, "provider_native_request_prepared", provider_request, direction="request", stage="provider")
             adapters = [get_adapter(name) for name in context.adapter_names]
@@ -110,8 +148,16 @@ class NativeProviderExecutor:
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
-            client_response = client_protocol.format_response(unified_response, response_context)
-            self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
+            if raw_basis_used and not adapters:
+                # D4 raw response passthrough: same protocol, no response
+                # adapters, no proxy semantic edits — the provider's response
+                # IS the client's response, byte-for-byte (sidecar observation
+                # above feeds usage/session/accounting).
+                client_response = deepcopy(raw_response)
+                self._trace(context, "raw_fast_path_response", client_response, direction="response", stage="protocol")
+            else:
+                client_response = client_protocol.format_response(unified_response, response_context)
+                self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
             client_response = await run_adapter_chain(adapters, client_response, adapter_context, stage="response")
@@ -428,6 +474,28 @@ class NativeProviderExecutor:
         if injected == serialized:
             return unified_request
         return _hydrate_unified_request(unified_request, injected)
+
+
+def _wire_view_matches_unified(wire_view: Any, unified_request: Any) -> bool:
+    """D4 gate: the pristine wire payload still matches the request we would send.
+
+    Compares the semantic core (messages, system, tools, structured output,
+    stream flag — model is overlaid separately). Any divergence means attempt
+    mutations or transforms edited the request and the canonical rebuild (an
+    explicit, traced overlay) must run instead of the raw basis.
+    """
+
+    if wire_view.messages != unified_request.messages:
+        return False
+    if wire_view.system != unified_request.system:
+        return False
+    if wire_view.tools != unified_request.tools:
+        return False
+    if wire_view.response_format != unified_request.response_format:
+        return False
+    if bool(wire_view.stream) != bool(unified_request.stream):
+        return False
+    return True
 
 
 def _merge_stream_usage_records(base: Any, event_record: Any, raw_record: Any) -> Any:

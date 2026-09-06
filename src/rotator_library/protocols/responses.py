@@ -350,7 +350,12 @@ class ResponsesProtocol(ProtocolAdapter):
                 raw=deepcopy(item),
             )
         if item_type == "reasoning":
-            reasoning = ReasoningBlock(type="reasoning", text=_reasoning_text(item), raw=deepcopy(item))
+            reasoning = ReasoningBlock(
+                type="reasoning",
+                text=_reasoning_text(item),
+                encrypted_content=item.get("encrypted_content") if isinstance(item.get("encrypted_content"), str) else None,
+                raw=deepcopy(item),
+            )
             return UnifiedMessage(
                 role="assistant",
                 content=[ContentBlock(type="reasoning", reasoning=reasoning, raw=deepcopy(item))],
@@ -380,7 +385,13 @@ class ResponsesProtocol(ProtocolAdapter):
                 if block.reasoning:
                     flush_visible()
                     if block.reasoning.text:
-                        items.append({"type": "reasoning", "summary": [{"type": "summary_text", "text": block.reasoning.text}]})
+                        reasoning_item: dict[str, Any] = {"type": "reasoning", "summary": [{"type": "summary_text", "text": block.reasoning.text}]}
+                        if block.reasoning.encrypted_content:
+                            # Bound opaque state (D8): survives same-protocol
+                            # rebuilds byte-for-byte; never emitted by foreign
+                            # formatters.
+                            reasoning_item["encrypted_content"] = block.reasoning.encrypted_content
+                        items.append(reasoning_item)
                 elif block.tool_call:
                     flush_visible()
                     items.append(self._format_function_call(block.tool_call, preserve_source=preserve_source))
@@ -417,7 +428,12 @@ class ResponsesProtocol(ProtocolAdapter):
                 extra={k: deepcopy(v) for k, v in item.items() if k not in {"type", "role", "content"}},
             )
         if item_type == "reasoning":
-            reasoning = ReasoningBlock(type="reasoning", text=_reasoning_text(item), extra={k: deepcopy(v) for k, v in item.items() if k not in {"type", "summary"}})
+            reasoning = ReasoningBlock(
+                type="reasoning",
+                text=_reasoning_text(item),
+                encrypted_content=item.get("encrypted_content") if isinstance(item.get("encrypted_content"), str) else None,
+                extra={k: deepcopy(v) for k, v in item.items() if k not in {"type", "summary", "encrypted_content"}},
+            )
             reasoning.raw = deepcopy(item)
             return UnifiedMessage(role="assistant", content=[ContentBlock(type="reasoning", reasoning=reasoning, raw=deepcopy(item))], reasoning=[reasoning], raw=deepcopy(item))
         if item_type in {"function_call", "custom_tool_call"}:
@@ -504,14 +520,15 @@ class ResponsesProtocol(ProtocolAdapter):
             if block.reasoning:
                 flush_visible()
                 if block.reasoning.text:
-                    output.append(
-                        {
-                            "id": f"rs_{item_index}",
-                            "type": "reasoning",
-                            "summary": [{"type": "summary_text", "text": block.reasoning.text}],
-                            "status": "completed",
-                        }
-                    )
+                    reasoning_output: dict[str, Any] = {
+                        "id": f"rs_{item_index}",
+                        "type": "reasoning",
+                        "summary": [{"type": "summary_text", "text": block.reasoning.text}],
+                        "status": "completed",
+                    }
+                    if block.reasoning.encrypted_content:
+                        reasoning_output["encrypted_content"] = block.reasoning.encrypted_content
+                    output.append(reasoning_output)
                     item_index += 1
             elif block.tool_call:
                 flush_visible()

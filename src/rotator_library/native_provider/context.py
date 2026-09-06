@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ..adapters import AdapterContext
 from ..field_cache import FieldCacheContext, FieldCacheRule
@@ -29,6 +29,13 @@ class NativeProviderContext:
     operation: str = "chat"
     input_protocol_name: Optional[str] = None
     client_protocol_name: Optional[str] = None
+    # Pristine same-protocol client wire payload (D4 raw fast path). When the
+    # client protocol equals the provider protocol and no semantic edits are
+    # required, this payload is the transport basis instead of a rebuild.
+    raw_client_request: Optional[Dict[str, Any]] = None
+    # Traceable overlay record for the chosen transport basis (W3; the
+    # transaction-log reconstruction consumes this).
+    request_transport_overlays: Optional[List[Dict[str, Any]]] = None
     # Authoritative stream usage assembled by the native executor from events
     # AND raw provider chunks (including provider-reported cost frames). The
     # operational stream layer adopts this record on completion.

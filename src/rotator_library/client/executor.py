@@ -763,6 +763,9 @@ class RequestExecutor:
             # response (D1); native streams yield neutral events that the
             # operational pipeline formats exactly once (W5).
             client_protocol_name=context.input_protocol_name,
+            # D4 raw fast path: same-protocol requests carry the pristine
+            # client payload as the transport basis.
+            raw_client_request=deepcopy(context.protocol_request) if (context.input_protocol_name == protocol_name and context.protocol_request) else None,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,
