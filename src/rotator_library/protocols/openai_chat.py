@@ -1107,14 +1107,12 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 if formatted_output is not None:
                     payload["response_format"] = formatted_output
                 else:
-                    request.warnings.append(
-                        ConversionWarning(
-                            code="unsupported_optional_control",
-                            message=f"structured output type {structured.get('type')!r} has no Chat representation; dropped",
-                            field="response_format",
-                            source_protocol=request.source_protocol,
-                            target_protocol=self.name,
-                        )
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message=f"structured output type {structured.get('type')!r} has no Chat representation; dropped",
+                        field="response_format",
+                        target_protocol=self.name,
                     )
         if "tool_choice" in params:
             choice = params.pop("tool_choice")
@@ -1136,7 +1134,9 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 if isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True:
                     # Exact native sibling (D7 level 1): the parallelism
                     # constraint survives as parallel_tool_calls:false.
-                    if payload.get("parallel_tool_calls") is True:
+                    # The conflict guard reads the CANONICAL param — the
+                    # payload's explicit value merges later (retain pass).
+                    if params.get("parallel_tool_calls") is True:
                         add_conversion_warning(
                             request,
                             code="generation_control_conflict",
@@ -1152,14 +1152,12 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     and choice.get("allowed_tools") is None
                     and isinstance(payload["tool_choice"], str)
                 ):
-                    request.warnings.append(
-                        ConversionWarning(
-                            code="unsupported_optional_control",
-                            message="tool-choice allowlist has no Chat mode-only representation; constraint narrowed to the mode",
-                            field="tool_choice",
-                            source_protocol=request.source_protocol,
-                            target_protocol=self.name,
-                        )
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message="tool-choice allowlist has no Chat mode-only representation; constraint narrowed to the mode",
+                        field="tool_choice",
+                        target_protocol=self.name,
                     )
         if "audio_output" in params:
             payload["audio"] = deepcopy(params.pop("audio_output"))
@@ -1167,15 +1165,13 @@ class OpenAIChatProtocol(ProtocolAdapter):
             # — absent or audio-less modalities get the pairing synthesized
             # with a recorded warning (never a silently reject-able build).
             if "audio" not in (request.modalities or []):
-                request.warnings.append(
-                    ConversionWarning(
+                add_conversion_warning(
+                        request,
                         code="unsupported_optional_control",
                         message="audio output requested without modalities including audio; added",
                         field="modalities",
-                        source_protocol=request.source_protocol,
                         target_protocol=self.name,
                     )
-                )
                 base_modalities = [m for m in (request.modalities or []) if m in {"text", "audio"}] or ["text"]
                 payload["modalities"] = [*base_modalities, "audio"]
         supported = {
@@ -1214,15 +1210,13 @@ class OpenAIChatProtocol(ProtocolAdapter):
             # stream_options is only legal alongside stream:true; a stored
             # value without streaming is client error, never forwarded.
             payload.pop("stream_options")
-            request.warnings.append(
-                ConversionWarning(
-                    code="unsupported_optional_control",
-                    message="stream_options dropped: only legal when stream is true",
-                    field="stream_options",
-                    source_protocol=request.source_protocol,
-                    target_protocol=self.name,
-                )
-            )
+            add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message="stream_options dropped: only legal when stream is true",
+                        field="stream_options",
+                        target_protocol=self.name,
+                    )
         if "top_logprobs" in payload and not payload.get("logprobs"):
             # The pair is required by the API: logprobs gates top_logprobs.
             payload["logprobs"] = True
