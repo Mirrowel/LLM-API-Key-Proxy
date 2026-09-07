@@ -1224,8 +1224,12 @@ class ResponsesService:
 
     @staticmethod
     def _raise_response_not_found(response_id: str) -> NoReturn:
+        # previous_response_id must reference a response created through
+        # this proxy with store enabled (foreign/typo'd ids 404 by design:
+        # the store is capability-gated per credential domain — forwarding
+        # unknown ids would allow cross-tenant continuation injection).
         raise ResponsesServiceError(
-            f"Response not found: {response_id}",
+            f"Response not found: {response_id} (previous_response_id must reference a response created through this proxy with store enabled)",
             status_code=404,
             error_type="not_found_error",
         )

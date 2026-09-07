@@ -722,3 +722,31 @@ async def test_previous_response_trace_payload_skipped_without_logger() -> None:
     )
 
     assert parent.id == "resp_parent"
+
+
+@pytest.mark.asyncio
+async def test_failed_non_stream_create_honors_store_failed_policy() -> None:
+    """Regression: failed non-streaming creates must not crash on the
+    store policy check (store.settings vs store_settings) and honor it."""
+
+    class FailingClient:
+        async def agenerate(self, *args, **kwargs):
+            return {
+                "id": "resp_fail",
+                "object": "response",
+                "status": "failed",
+                "model": "gpt-test",
+                "output": [],
+                "error": {"type": "server_error", "message": "boom"},
+            }
+
+    strict_store = InMemoryResponsesStore()
+    strict = ResponsesService(store=strict_store, store_settings=ResponsesStoreSettings(store_failed=False))
+    payload = await strict.create_response({"model": "gpt-test", "input": "x"}, FailingClient())
+    assert payload["status"] == "failed"
+    assert await strict_store.get("resp_fail") is None
+
+    keep_store = InMemoryResponsesStore()
+    keep = ResponsesService(store=keep_store, store_settings=ResponsesStoreSettings(store_failed=True))
+    await keep.create_response({"model": "gpt-test", "input": "x"}, FailingClient())
+    assert await keep_store.get("resp_fail") is not None
