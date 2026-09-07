@@ -47,8 +47,6 @@ from .canonical import (
 )
 from .operation import OPERATION_COUNT_TOKENS, OPERATION_GENERATE, OPERATION_MESSAGES, OPERATION_UNKNOWN, normalize_operation
 from .validation import validate_generative_request, validate_generative_response
-
-lib_logger = logging.getLogger("rotator_library.protocols.anthropic_messages")
 from .types import (
     Annotation,
     ContentBlock,
@@ -86,6 +84,8 @@ _REQUEST_CORE_FIELDS = {"model", "messages", "system", "tools", "stream", *_GENE
 
 # Documented Anthropic server/hosted content-block types (hoisted so rule
 # sets stay single-sourced).
+lib_logger = logging.getLogger("rotator_library.protocols.anthropic_messages")
+
 _SERVER_TOOL_TYPES = {
     "server_tool_use",
     "web_search_tool_result",
@@ -795,7 +795,13 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             # Cross-protocol: map canonical controls onto Anthropic spellings.
             # Same-protocol passthrough keeps the preserved original verbatim
             # (no normalization, no warnings).
-            payload.update(format_reasoning_controls(reasoning, self.name, request))
+            reasoning_emissions = format_reasoning_controls(reasoning, self.name, request)
+            effort_config = reasoning_emissions.pop("output_config", None)
+            if effort_config and isinstance(payload.get("output_config"), dict):
+                # Adaptive effort merges into an existing structured-output
+                # envelope — never replaces the format requirement.
+                payload["output_config"] = {**deepcopy(effort_config), **payload["output_config"]}
+            payload.update(reasoning_emissions)
         supported = {"temperature", "top_k", "top_p"}
         payload.update(
             retain_supported_generation_params(
