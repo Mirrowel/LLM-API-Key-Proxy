@@ -356,10 +356,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 formatted_reason = "stop"
             choice_entry: dict[str, Any] = {
                 "index": message.index if message.index is not None else position,
-                "message": _format_response_message(
-                    self._format_message(message, preserve_source=preserve_source, direction="response"),
-                    message,
-                ),
+                    "message": _format_response_message(
+                        self._format_message(message, preserve_source=preserve_source, direction="response", warnings=unified_response.warnings),
+                        message,
+                    ),
                 "finish_reason": formatted_reason,
             }
             choice_logprobs = (message.extra or {}).get("logprobs")

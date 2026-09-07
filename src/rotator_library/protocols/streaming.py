@@ -819,6 +819,10 @@ def _openai_usage(usage: Usage | None) -> dict[str, Any] | None:
         completion_details["reasoning_tokens"] = usage.reasoning_tokens
     if usage.output_audio_tokens:
         completion_details["audio_tokens"] = usage.output_audio_tokens
+    if usage.accepted_prediction_tokens:
+        completion_details["accepted_prediction_tokens"] = usage.accepted_prediction_tokens
+    if usage.rejected_prediction_tokens:
+        completion_details["rejected_prediction_tokens"] = usage.rejected_prediction_tokens
     if completion_details:
         payload["completion_tokens_details"] = completion_details
     return payload
