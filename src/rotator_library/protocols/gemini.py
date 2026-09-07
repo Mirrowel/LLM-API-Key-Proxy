@@ -137,7 +137,7 @@ class GeminiProtocol(ProtocolAdapter):
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
         payload: dict[str, Any] = {
             "contents": [
-                self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state)
+                self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_request.warnings)
                 for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)))
             ],
         }
@@ -359,7 +359,7 @@ class GeminiProtocol(ProtocolAdapter):
         for index, message in enumerate(kept_messages):
             candidate: dict[str, Any] = {"index": message.index if message.index is not None else index}
             if message.content or message.reasoning or message.tool_calls:
-                candidate["content"] = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state)
+                candidate["content"] = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_response.warnings)
             per_candidate_reason = message.stop_reason or unified_response.stop_reason
             if per_candidate_reason:
                 candidate["finishReason"] = format_stop_reason(per_candidate_reason, self.name)
@@ -484,6 +484,7 @@ class GeminiProtocol(ProtocolAdapter):
         *,
         preserve_source: bool = True,
         emit_opaque_state: bool = True,
+        warnings: list | None = None,
     ) -> dict[str, Any]:
         role = message.extra.get("gemini_role") if preserve_source else None
         role = role or ("model" if message.role in {"assistant", "model"} else "user")
@@ -496,6 +497,7 @@ class GeminiProtocol(ProtocolAdapter):
             ordered_message_blocks(message),
             preserve_source=preserve_source,
             emit_opaque_state=emit_opaque_state,
+            warnings=warnings,
         )
         payload = {"role": role, "parts": parts}
         if preserve_source:
@@ -568,6 +570,7 @@ class GeminiProtocol(ProtocolAdapter):
             # responses have none (identity is the name), and fabricating
             # one from the name on rebuild is a wire violation.
             had_id = response.get("id") is not None
+            part_signature = part.get("thoughtSignature") or part.get("thought_signature")
             return ContentBlock(
                 type="tool_result",
                 tool_result=ToolResult(
@@ -575,7 +578,11 @@ class GeminiProtocol(ProtocolAdapter):
                     name=response.get("name"),
                     content=result_content,
                     raw=deepcopy(part),
-                    extra={**_without(part, {"functionResponse", "function_response"}), "had_function_response_id": had_id},
+                    extra={
+                        **_without(part, {"functionResponse", "function_response"}),
+                        "had_function_response_id": had_id,
+                        **({"thought_signature": part_signature} if part_signature else {}),
+                    },
                 ),
                 raw=deepcopy(part),
                 extra=_without(part, {"functionResponse", "function_response"}),
@@ -597,6 +604,7 @@ class GeminiProtocol(ProtocolAdapter):
         *,
         preserve_source: bool = True,
         emit_opaque_state: bool = True,
+        warnings: list | None = None,
     ) -> list[dict[str, Any]]:
         parts = []
         for block in blocks:
@@ -605,7 +613,9 @@ class GeminiProtocol(ProtocolAdapter):
             elif block.tool_result:
                 parts.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source))
             elif block.type in {"image", "audio", "video", "file", "document"}:
-                parts.append(_format_gemini_media(block, preserve_source=preserve_source))
+                part = _format_gemini_media(block, preserve_source=preserve_source, warnings=warnings)
+                if part is not None:
+                    parts.append(part)
             elif block.reasoning:
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {}
                 payload["text"] = block.reasoning.text or ""
@@ -705,8 +715,9 @@ class GeminiProtocol(ProtocolAdapter):
                     ungrouped.append({hosted_kind: {}})
                 continue
             server_type = tool.extra.get("server_tool_type")
-            if server_type and str(server_type).startswith("web_search"):
-                # Cross-protocol hosted web search maps onto googleSearch.
+            if (server_type and str(server_type).startswith("web_search")) or tool.type == "web_search":
+                # Cross-protocol hosted web search maps onto googleSearch
+                # (Anthropic web_search_* and Responses web_search alike).
                 ungrouped.append({"googleSearch": {}})
                 continue
             raw_container = tool.extra.get("raw_container")
@@ -775,6 +786,11 @@ class GeminiProtocol(ProtocolAdapter):
         if had_wire_id or genuine_foreign_id:
             response["id"] = result.tool_call_id
         payload["functionResponse"] = response
+        part_signature = result.extra.get("thought_signature")
+        if part_signature:
+            # Part-level signatures ride the outer part (Gemini contract),
+            # same as functionCall parts.
+            payload["thoughtSignature"] = part_signature
         return payload
 
     def _format_generation_params(self, request: UnifiedRequest, *, preserve_source: bool) -> tuple[dict[str, Any], list[Any], dict[str, Any]]:
@@ -1063,13 +1079,28 @@ def _coerce_media_source(value: Any) -> MediaSource:
     )
 
 
-def _format_gemini_media(block: ContentBlock, *, preserve_source: bool) -> dict[str, Any]:
-    """Format canonical media as a Gemini content part."""
+def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings: list | None = None) -> dict[str, Any] | None:
+    """Format canonical media as a Gemini content part (None = dropped)."""
 
     source = _coerce_media_source(block.source)
     payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {}
     if source.data:
-        payload["inlineData"] = {"mimeType": source.media_type or "application/octet-stream", "data": source.data}
+        if source.media_type:
+            payload["inlineData"] = {"mimeType": source.media_type, "data": source.data}
+        else:
+            # inlineData.mimeType is required: mime-less inline data drops
+            # with a recorded warning rather than an invented type.
+            if warnings is not None:
+                warnings.append(
+                    ConversionWarning(
+                        code="media_dropped",
+                        message="inline media without a mimeType has no Gemini representation; dropped",
+                        field="content[media]",
+                        source_protocol=None,
+                        target_protocol="gemini",
+                    )
+                )
+            return None
     else:
         # URL/fileId-only media: fileData carries what exists — a missing
         # mimeType key is legal (the API resolves it), an invented

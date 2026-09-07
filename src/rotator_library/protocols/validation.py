@@ -9,6 +9,7 @@ from typing import Any
 
 from .canonical import (
     STOP_REASON_ERROR,
+    add_conversion_warning,
     canonical_tool_arguments,
     is_same_protocol,
     message_tool_calls,
@@ -48,6 +49,50 @@ def validate_generative_request(
 
     if is_same_protocol(context, target_protocol, request.source_protocol):
         return
+    # Gemini-source envelope fields and unmapped generationConfig controls
+    # dropping at FOREIGN targets are recorded here (symmetric with the
+    # gemini-target build-time warnings; parse cannot know the target).
+    if request.source_protocol == "gemini" and target_protocol != "gemini":
+        for bound_field in ("cachedContent", "labels", "serviceTier", "store"):
+            if request.extra.get(bound_field) is not None:
+                add_conversion_warning(
+                    request,
+                    code="unsupported_optional_control",
+                    message=f"{bound_field} is Gemini-provider-bound state; dropped cross-protocol",
+                    field=bound_field,
+                    target_protocol=target_protocol,
+                )
+        source_generation = request.extensions.get("gemini", {}).get("generationConfig")
+        if isinstance(source_generation, dict):
+            mapped = {
+                "maxOutputTokens", "stopSequences", "topP", "topK", "temperature",
+                "candidateCount", "seed", "frequencyPenalty", "presencePenalty",
+                "responseMimeType", "responseSchema", "responseJsonSchema",
+                "thinkingConfig", "thinkingLevel", "responseModalities",
+            }
+            for key in source_generation:
+                if key not in mapped:
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message=f"generationConfig.{key} has no cross-protocol representation; dropped",
+                        field=f"generationConfig.{key}",
+                        target_protocol=target_protocol,
+                    )
+    # Opaque function-call signatures (Gemini thought signatures) dropping
+    # at foreign boundaries are disclosed — never silent (Gemini 3 rejects
+    # unsigned current-turn calls on the way back).
+    if request.source_protocol == "gemini" and target_protocol != "gemini":
+        for message in request.messages:
+            for call in message_tool_calls(message):
+                if getattr(call, "signature", None):
+                    add_conversion_warning(
+                        request,
+                        code="opaque_state_dropped",
+                        message="function-call thought signature has no cross-protocol representation; dropped (same-protocol replay keeps it)",
+                        field="tool_call.signature",
+                        target_protocol=target_protocol,
+                    )
     if request.previous_response_id and target_protocol != "responses":
         raise ProtocolError(
             "A provider-bound previous_response_id cannot be translated safely",
@@ -128,11 +173,11 @@ def validate_generative_request(
         # Gemini hosts googleSearch/codeExecution/urlContext natively and
         # maps web_search server tools onto googleSearch; other hosted
         # families (bash, text_editor, computer) have no Gemini home.
-        supported_tool_types = {"function"}
+        supported_tool_types = {"function", "server"}
         for tool in request.tools:
             if tool.type == "server":
                 server_type = str(tool.extra.get("server_tool_type") or tool.extra.get("gemini_hosted_tool") or "")
-                if server_type.startswith(
+                if not server_type.startswith(
                     (
                         "web_search",
                         "googleSearch",
@@ -144,13 +189,15 @@ def validate_generative_request(
                         "googleMaps",
                     )
                 ):
-                    continue
-                raise ProtocolError(
-                    f"Cannot safely translate hosted tool '{server_type or tool.name}' into {target_protocol}",
-                    protocol=target_protocol,
-                    pass_name="validate_request",
-                    payload={"tool_type": tool.type, "tool_name": tool.name},
-                )
+                    raise ProtocolError(
+                        f"Cannot safely translate hosted tool '{server_type or tool.name}' into {target_protocol}",
+                        protocol=target_protocol,
+                        pass_name="validate_request",
+                        payload={"tool_type": tool.type, "tool_name": tool.name},
+                    )
+            elif tool.type == "web_search":
+                # Responses hosted web_search maps onto googleSearch too.
+                continue
     else:
         supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):

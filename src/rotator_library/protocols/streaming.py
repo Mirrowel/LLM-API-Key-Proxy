@@ -462,9 +462,12 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             key, _ = _block_key(block, state, event)
             call = block.tool_call
             state.tool_names[key] = call.name or state.tool_names.get(key, "")
-            state.tool_ids[key] = call.id or state.tool_ids.get(key, "")
             if getattr(call, "signature", None):
                 state.tool_signatures[key] = call.signature
+            # Synthetic correlation ids never reach the wire (same rule as
+            # the non-stream path — the call_ prefix alone is NOT the test).
+            if call.id and not call.extra.get("synthetic_id"):
+                state.tool_ids[key] = call.id
             fragment = tool_arguments_text(call.arguments)
             if key in state.emitted_tools:
                 if fragment:
@@ -572,9 +575,8 @@ def _gemini_function_call_part(
         "args": arguments,
     }
     tool_id = state.tool_ids.get(key)
-    if tool_id and not str(tool_id).startswith("call_"):
-        # `id` is Gemini-3+ only; synthetic call_N correlation ids never
-        # reach the wire (name-based pairing).
+    if tool_id:
+        # `id` is Gemini-3+ only; synthetic ids are filtered at record time.
         function_call["id"] = tool_id
     signature = state.tool_signatures.get(key)
     if signature and state.source_protocol == "gemini":
