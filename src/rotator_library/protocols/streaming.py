@@ -381,10 +381,14 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
     if event.type == "error" or event.error is not None:
         frames = _responses_start(state)
         error = _error_payload(event.error)
-        frames.append(_event_frame("response.failed", {
+        # Open items close before the failure terminal (grammar parity with
+        # the completed path).
+        for key, item_id in state.item_ids.items():
+            frames.extend(_responses_item_done(key, item_id, state, item_status="incomplete"))
+        frames.append(_responses_frame("response.failed", {
             "type": "response.failed",
             "response": _responses_object(state, status="failed", error=error),
-        }))
+        }, state))
         frames.append("data: [DONE]\n\n")
         state.terminal = True
         return frames
@@ -411,8 +415,8 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
             state.item_kinds[builtin_key] = "builtin"
             state.builtin_items[builtin_key] = deepcopy(item)
             state.last_family = "builtin"
-            frames.append(_event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index, "item": deepcopy(item)}))
-            frames.append(_event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": state.next_index, "item": deepcopy(item)}))
+            frames.append(_responses_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index, "item": deepcopy(item)}, state))
+            frames.append(_responses_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": state.next_index, "item": deepcopy(item)}, state))
             state.next_index += 1
             continue
         key, kind = _block_key(block, state, event)
@@ -430,10 +434,10 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
         for key, item_id in state.item_ids.items():
             frames.extend(_responses_item_done(key, item_id, state, item_status=item_status))
         event_name = "response.failed" if status == "failed" else "response.completed" if status == "completed" else "response.incomplete"
-        frames.append(_event_frame(event_name, {
+        frames.append(_responses_frame(event_name, {
             "type": event_name,
             "response": _responses_object(state, status=status),
-        }))
+        }, state))
         frames.append("data: [DONE]\n\n")
         state.terminal = True
     return frames
@@ -815,7 +819,7 @@ def _responses_item_delta(block: ContentBlock, key: str, item_id: str, state: St
     event_name = "response.reasoning_summary_text.delta" if kind == "reasoning" else "response.output_text.delta"
     payload = {"type": event_name, "item_id": item_id, "output_index": output_index, "delta": text}
     payload["summary_index" if kind == "reasoning" else "content_index"] = 0
-    return [_event_frame(event_name, payload)]
+    return [_responses_frame(event_name, payload, state)]
 
 
 def _responses_item_done(

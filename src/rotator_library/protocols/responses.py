@@ -342,7 +342,10 @@ class ResponsesProtocol(ProtocolAdapter):
                     call.index = data.get("output_index")
                     if call.arguments in ({}, ""):
                         call.arguments = None
-            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, message=message, raw=deepcopy(raw_event), extra={"payload": data})
+            # Item events carry their output position — following deltas join
+            # the same block identity instead of minting a second item.
+            item_index = data.get("output_index") if isinstance(data.get("output_index"), int) else None
+            return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, message=message, output_index=item_index, raw=deepcopy(raw_event), extra={"payload": data})
         return UnifiedStreamEvent(type=event_type, operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, raw=deepcopy(raw_event), extra={"payload": data})
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:

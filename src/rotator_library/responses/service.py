@@ -283,7 +283,7 @@ class ResponsesService:
         # Store parity with the stream path: failed responses honor
         # store_failed=False (the operator's explicit policy).
         should_store = raw_request.get("store", True) and (
-            response_payload.get("status") != "failed" or self.store.settings.store_failed
+            response_payload.get("status") != "failed" or self.store_settings.store_failed
         )
         if should_store:
             stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
@@ -953,11 +953,20 @@ class ResponsesService:
                         entry["name"] += function_fragment["name"]
                     if function_fragment.get("arguments"):
                         entry["arguments"] += function_fragment["arguments"]
+                        item_output_index = _bridge_tool_output_index(bridge_tools, has_reasoning=bool(bridge_reasoning), call_index=call_index)
+                        if not entry.get("added"):
+                            entry["added"] = True
+                            yield ResponsesStreamEvent("response.output_item.added", {
+                                "type": "response.output_item.added",
+                                "sequence_number": next_sequence_value(),
+                                "output_index": item_output_index,
+                                "item": {"id": f"fc_{call_index}", "type": "function_call", "call_id": entry.get("id") or f"fc_{call_index}", "name": entry.get("name") or "", "arguments": "", "status": "in_progress"},
+                            })
                         arguments_event = {
                             "type": "response.function_call_arguments.delta",
                             "sequence_number": next_sequence_value(),
                             "item_id": f"fc_{call_index}",
-                            "output_index": 1 + call_index,
+                            "output_index": item_output_index,
                             "delta": function_fragment["arguments"],
                         }
                         yield ResponsesStreamEvent("response.function_call_arguments.delta", arguments_event)
@@ -1020,9 +1029,10 @@ class ResponsesService:
             done_item = output_item_done_payload(state)
             self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("response.output_item.done", done_item)
-            completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             # Bridge-side non-text items (tool calls, refusal, reasoning)
-            # flush as native output items before the terminal.
+            # flush as native output items before the terminal. The
+            # completed frame is built AFTER the flush so its sequence
+            # number stays monotonic (it yields last, it sequences last).
             extra_output: list[dict[str, Any]] = []
             if bridge_reasoning:
                 reasoning_item = {"id": "rs_0", "type": "reasoning", "summary": [{"type": "summary_text", "text": bridge_reasoning}], "status": "completed"}
@@ -1030,20 +1040,28 @@ class ResponsesService:
                 yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": 1, "item": reasoning_item})
                 extra_output.append(reasoning_item)
             for tool_index, entry in sorted(bridge_tools.items()):
+                item_output_index = _bridge_tool_output_index(bridge_tools, has_reasoning=bool(bridge_reasoning), call_index=tool_index)
                 tool_item = {"id": f"fc_{tool_index}", "type": "function_call", "call_id": entry.get("id") or f"fc_{tool_index}", "name": entry.get("name") or "", "arguments": entry.get("arguments") or "", "status": "completed"}
-                yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": 2 + tool_index, "item": dict(tool_item, status="in_progress")})
-                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": 2 + tool_index, "item": tool_item})
+                if not entry.get("added"):
+                    yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": item_output_index, "item": dict(tool_item, status="in_progress")})
+                yield ResponsesStreamEvent("response.function_call_arguments.done", {"type": "response.function_call_arguments.done", "sequence_number": next_sequence_value(), "item_id": f"fc_{tool_index}", "output_index": item_output_index, "arguments": entry.get("arguments") or ""})
+                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": item_output_index, "item": tool_item})
                 extra_output.append(tool_item)
             if bridge_refusal:
-                completed["response"]["output"].append({"id": state.output_item_id + "_r", "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": bridge_refusal}], "status": "completed"})
+                refusal_item = {"id": state.output_item_id + "_r", "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": bridge_refusal}], "status": "completed"}
+                refusal_index = 1 + (1 if bridge_reasoning else 0) + len(bridge_tools)
+                yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": refusal_index, "item": dict(refusal_item, status="in_progress")})
+                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": refusal_index, "item": refusal_item})
+                extra_output.append(refusal_item)
+            completed = response_completed_payload(state, _usage_to_responses_stream(usage))
             completed["response"]["output"].extend(extra_output)
-            _record_responses_session_anchor(session_info, completed)
+            _record_responses_session_anchor(session_info, completed.get("response", completed))
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
             stored = await self._store_stream_response(stream_request, completed, parent, transaction_logger=transaction_logger, session_info=session_info)
             if stored:
                 self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
             else:
-                self._trace(transaction_logger, "responses_store_skipped", {"response_id": completed.get("id")}, direction="metadata", stage="final")
+                self._trace(transaction_logger, "responses_store_skipped", {"response_id": completed.get("response", completed).get("id")}, direction="metadata", stage="final")
             monitor.complete()
             if transaction_logger:
                 self._trace(
@@ -1077,7 +1095,7 @@ class ResponsesService:
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
             stored = await self._store_stream_response(stream_request, failed, parent, failed=True, transaction_logger=transaction_logger, session_info=session_info)
             if stored:
-                self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("id"), "status": "failed"}, direction="metadata", stage="final")
+                self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("response", failed).get("id"), "status": "failed"}, direction="metadata", stage="final")
             self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": transport}, scrub_strings=True)
             if transaction_logger:
                 self._trace(
@@ -1745,6 +1763,13 @@ def _chunk_delta_payload(chunk: dict[str, Any]) -> dict[str, Any]:
         return {}
     delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
     return delta if isinstance(delta, dict) else {}
+
+
+def _bridge_tool_output_index(bridge_tools: dict[int, dict[str, Any]], *, has_reasoning: bool, call_index: int = 0) -> int:
+    """Single index authority for bridge tool items: text=0, reasoning=1,
+    tools follow in call-index order."""
+
+    return 1 + (1 if has_reasoning else 0) + call_index
 
 
 def _usage_to_responses_stream(usage: Any) -> Any:
