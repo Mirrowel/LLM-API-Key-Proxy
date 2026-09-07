@@ -1007,6 +1007,17 @@ def _parse_gemini_generation_params(generation: dict[str, Any], tool_config: dic
                 "include_thoughts": thinking.get("includeThoughts"),
             }
         params["reasoning"] = {k: v for k, v in params["reasoning"].items() if v is not None}
+    thinking_level = generation.get("thinkingLevel") or generation.get("thinking_level")
+    if isinstance(thinking_level, str) and thinking_level.strip():
+        # Gemini-3 effort lever (minimal/low/medium/high; "dynamic" is the
+        # string form of the model-decides mode): canonicalizes to effort so
+        # foreign targets map through the deterministic table.
+        level = thinking_level.strip().lower()
+        if level == "dynamic":
+            params["reasoning"] = {"enabled": True, "dynamic": True, **params.get("reasoning", {})}
+        else:
+            params["reasoning"] = {"effort": level, **params.get("reasoning", {})}
+        params["reasoning"] = {k: v for k, v in params["reasoning"].items() if v is not None}
     if tool_config:
         params["tool_choice"] = _parse_gemini_tool_choice(tool_config)
     return params
