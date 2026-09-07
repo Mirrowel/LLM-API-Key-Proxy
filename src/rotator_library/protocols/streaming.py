@@ -40,11 +40,31 @@ from .types import (
 # adapter's whitelist; streaming emits these verbatim for anthropic clients).
 _ANTHROPIC_SERVER_TOOL_BLOCK_TYPES = {
     "server_tool_use",
+    # Current server-tool catalog result families; unknown *_tool_result /
+    # *_tool_result_error shapes pass through as raw-union blocks (the
+    # suffix grammar is stable across versioned tool names).
     "web_search_tool_result",
+    "web_fetch_tool_result",
     "code_execution_tool_result",
     "text_editor_tool_result",
     "bash_tool_result",
+    "bash_code_execution_tool_result",
+    "text_editor_code_execution_tool_result",
+    "memory_tool_result",
+    "tool_search_tool_result",
+    "advisor_tool_result",
+    "mcp_toolset_tool_result",
 }
+
+
+def _is_anthropic_server_tool_block(raw_type: str) -> bool:
+    """Known families + versioned spellings of the same stems (see the
+    adapter's _is_server_tool_result_type — a user's own *_tool_result
+    block never fabricates a server builtin)."""
+
+    from .anthropic_messages import _is_server_tool_result_type
+
+    return _is_server_tool_result_type(raw_type)
 
 
 @dataclass
@@ -313,7 +333,7 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
                     frames.extend(_anthropic_close_block(open_key, state))
             if block.type == "builtin_tool":
                 raw_type = str(block.raw.get("type") or "") if isinstance(block.raw, dict) else ""
-                if raw_type in _ANTHROPIC_SERVER_TOOL_BLOCK_TYPES:
+                if _is_anthropic_server_tool_block(raw_type):
                     # Anthropic-native server-tool blocks arrive complete:
                     # the full payload rides content_block_start, then closes
                     # (no delta phase exists for them).
@@ -393,9 +413,17 @@ def _anthropic_close_block(key: str, state: StreamFormatState) -> list[str]:
     if index is None:
         return frames
     signature = state.block_signatures.get(key)
-    if signature and key not in state.emitted_signatures and state.source_protocol == "anthropic_messages":
+    if (
+        signature
+        and signature != "__redacted__"
+        and key not in state.emitted_signatures
+        and state.source_protocol == "anthropic_messages"
+    ):
         # signature_delta flushes before content_block_stop — same-protocol
         # clients only (foreign-source signatures stay cache-owned, D8).
+        # The "__redacted__" sentinel is an internal marker for
+        # redacted_thinking blocks, NEVER a signature value: emitting it
+        # would fabricate a cryptographic claim clients replay upstream.
         frames.append(_event_frame("content_block_delta", {
             "type": "content_block_delta",
             "index": index,

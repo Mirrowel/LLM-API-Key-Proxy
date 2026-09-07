@@ -89,11 +89,61 @@ lib_logger = logging.getLogger("rotator_library.protocols.anthropic_messages")
 
 _SERVER_TOOL_TYPES = {
     "server_tool_use",
+    # Result families of the current server-tool catalog: versioned tool
+    # names share the *_tool_result suffix grammar — matched by suffix
+    # below, this set pins the KNOWN families (web_search, web_fetch,
+    # code_execution incl. bash/text-editor variants, memory,
+    # tool_search, advisor, mcp_toolset).
     "web_search_tool_result",
+    "web_fetch_tool_result",
     "code_execution_tool_result",
     "text_editor_tool_result",
     "bash_tool_result",
+    "bash_code_execution_tool_result",
+    "text_editor_code_execution_tool_result",
+    "memory_tool_result",
+    "tool_search_tool_result",
+    "advisor_tool_result",
+    "mcp_toolset_tool_result",
 }
+
+
+_SERVER_TOOL_STEMS = (
+    "web_search",
+    "web_fetch",
+    "code_execution",
+    "text_editor",
+    "bash",
+    "memory",
+    "tool_search_tool_regex",
+    "tool_search_tool_bm25",
+    "tool_search",
+    "advisor",
+    "mcp_toolset",
+)
+
+
+def _is_server_tool_result_type(block_type: str) -> bool:
+    """Server-tool result grammar: the known families, plus versioned
+    spellings (stem + YYYYMMDD) of the same families. A user's OWN tool
+    that happens to end in ``_tool_result`` (e.g. my_custom_tool_result)
+    stays a passthrough block — never a fabricated builtin."""
+
+    if block_type in _SERVER_TOOL_TYPES:
+        return True
+    for suffix in ("_tool_result", "_tool_result_error"):
+        if not block_type.endswith(suffix):
+            continue
+        stem = block_type[: -len(suffix)]
+        for known in _SERVER_TOOL_STEMS:
+            if stem == known:
+                return True
+            # Versioned: stem_YYYYMMDD (and _error variants nest fine).
+            if stem.startswith(known + "_"):
+                tail = stem[len(known) + 1 :]
+                if tail.isdigit() and len(tail) == 8:
+                    return True
+    return False
 
 
 class AnthropicMessagesProtocol(ProtocolAdapter):
@@ -393,6 +443,8 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             extras["server_tool_use"] = deepcopy(usage["server_tool_use"])
         if usage.get("service_tier") is not None:
             extras["service_tier"] = usage.get("service_tier")
+        output_details = usage.get("output_tokens_details") if isinstance(usage.get("output_tokens_details"), dict) else {}
+        thinking_tokens = int(output_details.get("thinking_tokens") or 0)
         return Usage(
             # Canonical input_tokens is INCLUSIVE of cache reads/writes (the
             # OpenAI/Gemini convention, H2): Anthropic reports them as
@@ -402,6 +454,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             total_tokens=int(usage.get("total_tokens") or input_tokens + cache_read + cache_write_flat + output_tokens),
             cache_read_tokens=cache_read,
             cache_write_tokens=cache_write_flat,
+            # The documented observability field (final message_delta on
+            # streams): thinking billing maps onto the canonical reasoning
+            # bucket so chat/responses render it in their native spellings.
+            reasoning_tokens=thinking_tokens,
             raw=deepcopy(usage),
             extra=extras,
         )
@@ -477,11 +533,14 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         """Format reasoning, visible content, and tool calls in Anthropic order."""
 
         blocks = ordered_message_blocks(message)
+        dropped = False
         if not preserve_source:
             # Assistant content is text/thinking/tool_use only: assistant
             # images are dropped with a recorded media_dropped summary
             # (never fabricated as image blocks in assistant output).
-            blocks = [block for block in blocks if block.type != "image"]
+            remaining = [block for block in blocks if block.type != "image"]
+            dropped = len(remaining) != len(blocks)
+            blocks = remaining
         # Extended-thinking contract: thinking blocks must precede text and
         # tool_use in the passed-back payload (stable — relative order of
         # thinking blocks themselves is preserved).
@@ -489,26 +548,22 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         if thinking_blocks:
             reordered = thinking_blocks + [block for block in blocks if block.reasoning is None]
             if reordered != blocks and warnings is not None:
-                warnings.append(
-                    ConversionWarning(
-                        code="thinking_order_normalized",
-                        message="thinking blocks reordered to precede text/tool_use (Anthropic contract)",
-                        field="content",
-                        source_protocol=None,
-                        target_protocol="anthropic_messages",
-                    )
+                _warn_list_once(
+                    warnings,
+                    code="thinking_order_normalized",
+                    message="thinking blocks reordered to precede text/tool_use (Anthropic contract)",
+                    field="content",
                 )
             blocks = reordered
         if not blocks:
-            if warnings is not None:
-                warnings.append(
-                    ConversionWarning(
-                        code="media_dropped",
-                        message="assistant content empty after conversion drops; message omitted",
-                        field="content",
-                        source_protocol=None,
-                        target_protocol="anthropic_messages",
-                    )
+            if dropped and warnings is not None:
+                # Only warn when drops actually emptied the message — a
+                # natively-empty content array never "dropped" anything.
+                _warn_list_once(
+                    warnings,
+                    code="media_dropped",
+                    message="assistant content empty after conversion drops; message omitted",
+                    field="content",
                 )
             return []
         return self._format_content(
@@ -599,7 +654,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         # round-trips the raw block. Whitelist exactly the documented server
         # tool types — a user block that merely ends in "_tool_result" stays
         # a passthrough content block, never a fabricated builtin.
-        if block_type in _SERVER_TOOL_TYPES:
+        if _is_server_tool_result_type(block_type):
             from ..protocols.types import BuiltinToolCall
 
             builtin = BuiltinToolCall(
@@ -649,7 +704,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                     # payload; never emit a mutilated variant.
                     if not emit_opaque_state:
                         if warnings is not None:
-                            warnings.append(ConversionWarning(code="thinking_dropped_opaque", message="redacted thinking dropped: opaque state suppressed for this provider pair", field="content[redacted_thinking]", source_protocol=None, target_protocol="anthropic_messages"))
+                            _warn_list_once(warnings, code="thinking_dropped_opaque", message="redacted thinking dropped: opaque state suppressed for this provider pair", field="content[redacted_thinking]")
                         continue
                     payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "redacted_thinking"}
                     payload["type"] = "redacted_thinking"
@@ -671,7 +726,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                     # text with the foreign signature stripped; client
                     # responses always keep thinking text.
                     if warnings is not None:
-                        warnings.append(ConversionWarning(code="thinking_dropped_opaque", message="thinking block dropped: signature cannot be emitted for this provider pair", field="content[thinking]", source_protocol=None, target_protocol="anthropic_messages"))
+                        _warn_list_once(warnings, code="thinking_dropped_opaque", message="thinking block dropped: signature cannot be emitted for this provider pair", field="content[thinking]")
                     continue
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "thinking"}
                 payload["type"] = "thinking"
@@ -781,15 +836,35 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                         field="tool_choice",
                         target_protocol=self.name,
                     )
+                exact_narrowed = False
                 if isinstance(choice, dict) and choice.get("allowed_names"):
-                    add_conversion_warning(
-                        request,
-                        code="unsupported_optional_control",
-                        message="tool-choice allowlist has no Anthropic representation; narrowed to the mode (declare allowed tools as separate tool definitions)",
-                        field="tool_choice",
-                        target_protocol=self.name,
-                    )
-                formatted_choice = format_tool_choice(choice, self.name)
+                    allowed = choice["allowed_names"]
+                    declared = {tool.name for tool in request.tools}
+                    if (
+                        choice.get("mode") == "required"
+                        and len(allowed) == 1
+                        and str(allowed[0]) in declared
+                    ):
+                        # Exact narrowing: one allowed name that IS a declared
+                        # tool equals the native single-tool force — emit it
+                        # exactly, no warning, no widening.
+                        payload["tool_choice"] = {"type": "tool", "name": str(allowed[0])}
+                        if choice.get("disable_parallel_tool_use") is True:
+                            payload["tool_choice"]["disable_parallel_tool_use"] = True
+                        params.pop("tool_choice", None)
+                        exact_narrowed = True
+                    else:
+                        add_conversion_warning(
+                            request,
+                            code="unsupported_optional_control",
+                            message="tool-choice allowlist has no Anthropic representation; narrowed to the mode (declare allowed tools as separate tool definitions)",
+                            field="tool_choice",
+                            target_protocol=self.name,
+                        )
+                if not exact_narrowed:
+                    formatted_choice = format_tool_choice(choice, self.name)
+                else:
+                    formatted_choice = None
                 if formatted_choice is None and isinstance(choice, dict) and choice.get("mode") == "none":
                     # Anthropic disables tools by omitting them entirely.
                     payload.pop("tool_choice", None)
@@ -830,6 +905,8 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 # Adaptive effort merges into an existing structured-output
                 # envelope — never replaces the format requirement.
                 payload["output_config"] = {**deepcopy(effort_config), **payload["output_config"]}
+            elif effort_config:
+                payload["output_config"] = effort_config
             payload.update(reasoning_emissions)
         supported = {"temperature", "top_k", "top_p"}
         payload.update(
@@ -1019,6 +1096,17 @@ def _anthropic_output_modalities(blocks: list[ContentBlock]) -> list[str]:
     if any(block.type == "image" for block in blocks):
         modalities.append("image")
     return modalities
+
+
+def _warn_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
+    """Append a deduplicated ConversionWarning to a plain list sink."""
+
+    if warnings is None:
+        return
+    for warning in warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="anthropic_messages"))
 
 
 def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, target_protocol: str, field: str | None = None) -> None:

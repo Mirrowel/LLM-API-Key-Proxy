@@ -100,7 +100,10 @@ def test_effort_to_anthropic_budget_table(effort: str, expected_budget: int) -> 
         {"model": "m", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": effort},
         source="openai_chat",
     )
-    assert built["thinking"] == {"type": "enabled", "budget_tokens": expected_budget}
+    # Documented migration: effort steers adaptive thinking via
+    # output_config.effort (enabled+budget is rejected on current flagships).
+    assert built["thinking"] == {"type": "adaptive"}
+    assert built["output_config"]["effort"] == effort
     assert "reasoning_effort_approximated" in _warnings_of(unified)
 
 
@@ -541,7 +544,8 @@ def test_unknown_effort_disclosed_not_silent_medium() -> None:
     payload = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "ultra"}
 
     built, unified = _build("anthropic_messages", payload, source="openai_chat")
-    assert built["thinking"]["budget_tokens"] == 8192
+    assert built["thinking"] == {"type": "adaptive"}
+    assert built["output_config"]["effort"] == "medium"
     assert "reasoning_effort_unknown" in _warnings_of(unified)
 
 
@@ -551,8 +555,10 @@ def test_anthropic_subminimum_budget_omitted_with_warning() -> None:
         {"model": "m", "input": "hi", "reasoning": {"effort": "high", "summary": "auto", "budget_tokens": 0}},
         source="responses",
     )
-    assert "thinking" not in built
+    assert built["thinking"] == {"type": "adaptive"}
+    assert built["output_config"]["effort"] == "high"
     assert "reasoning_budget_invalid" in _warnings_of(unified)
+    assert "reasoning_effort_model_dependent" in _warnings_of(unified)
 
 
 def test_stream_refusal_emits_at_chat_and_gemini() -> None:
@@ -783,8 +789,9 @@ def test_anthropic_budget_clamped_below_max_tokens() -> None:
         {"model": "m", "max_tokens": 4096, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"},
         source="openai_chat",
     )
-    assert built["thinking"] == {"type": "enabled", "budget_tokens": 4095}
-    assert "reasoning_budget_coerced" in _warnings_of(unified)
+    assert built["thinking"] == {"type": "adaptive"}
+    assert built["output_config"]["effort"] == "high"
+    assert "reasoning_effort_approximated" in _warnings_of(unified)
 
 
 def test_anthropic_no_headroom_omits_thinking() -> None:
@@ -793,8 +800,11 @@ def test_anthropic_no_headroom_omits_thinking() -> None:
         {"model": "m", "max_tokens": 900, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"},
         source="openai_chat",
     )
-    assert "thinking" not in built
-    assert "reasoning_budget_invalid" in _warnings_of(unified)
+    # Adaptive thinking (no explicit budget): the provider arbitrates the
+    # budget against max_tokens — the proxy never fabricates an omission.
+    assert built["thinking"] == {"type": "adaptive"}
+    assert built["output_config"]["effort"] == "high"
+    assert "reasoning_effort_approximated" in _warnings_of(unified)
 
 
 def test_gemini_disabled_forces_include_thoughts_false() -> None:

@@ -540,6 +540,24 @@ def format_reasoning_controls(
             _emit_thinking({"type": "adaptive"})
             if effort is not None:
                 emissions["output_config"] = {"effort": effort}
+        elif budget is not None and effort is not None:
+            # Combined budget+effort: effort (adaptive steering) wins — the
+            # enabled+budget shape combined with effort is rejected on
+            # current flagships; disclosed, never silent.
+            value, _coerced = _effort_or_approximation()
+            _emit_thinking({"type": "adaptive"})
+            emissions["output_config"] = {"effort": value}
+            if isinstance(budget, int) and budget < 1024:
+                _warn(
+                    "reasoning_budget_invalid",
+                    f"thinking budget_tokens={budget} is below Anthropic's 1024 minimum; effort steering kept",
+                    "reasoning.budget_tokens",
+                )
+            _warn(
+                "reasoning_effort_model_dependent",
+                "thinking budget_tokens combined with effort: effort (adaptive steering) wins — current flagships reject the budget shape",
+                "reasoning",
+            )
         elif budget is not None:
             if isinstance(budget, int) and budget < 1024:
                 _warn(
@@ -552,21 +570,24 @@ def format_reasoning_controls(
                 if clamped is not None:
                     _emit_thinking({"type": "enabled", "budget_tokens": clamped})
         elif effort is not None:
+            # The documented migration: effort steers ADAPTIVE thinking via
+            # output_config.effort — enabled+budget_tokens is deprecated on
+            # 4.6 and rejected on current flagships, so adaptive is the
+            # default cross-protocol target (disclosed).
             value, coerced = _effort_or_approximation()
-            approximated = _anthropic_budget(budget_tokens_from_effort(value), (request.generation_params or {}).get("max_output_tokens"))
-            if approximated is not None:
-                _emit_thinking({"type": "enabled", "budget_tokens": approximated})
+            if budget is not None:
                 _warn(
                     "reasoning_effort_model_dependent",
-                    "effort mapped to thinking{enabled,budget_tokens}; current flagships (adaptive-only models) reject this shape — verify the target model accepts enabled thinking",
-                    "reasoning.effort",
+                    "thinking{enabled,budget_tokens} combined with output_config effort: effort (adaptive steering) wins — current flagships reject the budget shape",
+                    "reasoning",
                 )
-            if not coerced:
-                _warn(
-                    "reasoning_effort_approximated",
-                    f"reasoning effort '{effort}' approximated as budget_tokens={budget_tokens_from_effort(value)} (deterministic table)",
-                    "reasoning.effort",
-                )
+            _emit_thinking({"type": "adaptive"})
+            emissions["output_config"] = {"effort": value}
+            _warn(
+                "reasoning_effort_approximated",
+                f"reasoning effort '{effort}' steers adaptive thinking via output_config.effort (the documented shape; enabled+budget is rejected on current flagships)",
+                "reasoning.effort",
+            )
         if include_thoughts is not None:
             _warn(
                 "reasoning_control_dropped",
@@ -716,6 +737,15 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
             "stop_sequence_dropped",
             "stop_sequence (the matched sequence text) has no representation outside Anthropic; only the stop reason survives",
             "stop_reason",
+        )
+    if target_protocol != "anthropic_messages" and isinstance(extra.get("stop_details"), dict):
+        # Refusal stop_details (category: cyber/bio/reasoning_extraction/
+        # frontier_llm) qualify the refusal semantics — dropped elsewhere
+        # with disclosure, never silent.
+        _disclose(
+            "stop_details_dropped",
+            "refusal stop_details (category/explanation) has no representation outside Anthropic; only the refusal stop survives",
+            "stop_details",
         )
     usage = getattr(unified_response, "usage", None)
     usage_extra = getattr(usage, "extra", None) if usage is not None else None

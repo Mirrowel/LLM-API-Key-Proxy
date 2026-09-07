@@ -138,9 +138,21 @@ class AnthropicHandler:
                 model=model,
             ),
         )
+        projected_messages = chat_request.get("messages") or []
+        # Prior-turn thinking is ignored by the upstream counter (only the
+        # current turn's thinking bills as input): strip reasoning content
+        # from history turns so the estimate does not overcount.
+        for projected in projected_messages[:-1]:
+            if isinstance(projected.get("content"), str):
+                continue
+            blocks = projected.get("content")
+            if isinstance(blocks, list):
+                filtered = [b for b in blocks if not (isinstance(b, dict) and b.get("type") == "reasoning")]
+                if len(filtered) != len(blocks):
+                    projected["content"] = filtered or None
         total = self._client.token_count(
             model=model,
-            messages=chat_request.get("messages") or [],
+            messages=projected_messages,
         )
         if chat_request.get("tools"):
             tools_text = json.dumps(chat_request["tools"])
