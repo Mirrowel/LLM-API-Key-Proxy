@@ -11,6 +11,74 @@ def test_openai_chat_protocol_is_discovered_with_aliases() -> None:
     assert get_protocol("chat_completions") is get_protocol("openai_chat")
 
 
+def test_openai_audio_output_request_builds_with_modalities_pairing() -> None:
+    """Regression: the documented audio parameter must build (a NameError
+    here once killed every audio request) and pair modalities."""
+
+    adapter = get_protocol("openai_chat")
+    raw = {
+        "model": "gpt-4o-audio-preview",
+        "modalities": ["text"],
+        "audio": {"voice": "alloy", "format": "wav"},
+        "messages": [{"role": "user", "content": "sing"}],
+    }
+    unified = adapter.parse_request(raw)
+    built = adapter.build_request(unified)
+    assert built["audio"] == {"voice": "alloy", "format": "wav"}
+    assert "audio" in built["modalities"]
+
+
+def test_openai_allowed_tools_tool_choice_round_trips_both_spellings() -> None:
+    """The allowed_tools constraint survives verbatim same-protocol (dict
+    and list spellings) instead of collapsing to bare auto."""
+
+    adapter = get_protocol("openai_chat")
+    for raw_choice in (
+        {"type": "allowed_tools", "allowed_tools": {"mode": "required", "tools": ["a", "b"]}},
+        {"type": "allowed_tools", "allowed_tools": ["a", "b"]},
+    ):
+        raw = {"model": "m", "messages": [{"role": "user", "content": "x"}], "tool_choice": raw_choice}
+        unified = adapter.parse_request(raw)
+        built = adapter.build_request(unified)
+        assert built["tool_choice"]["type"] == "allowed_tools"
+        assert "a" in json.dumps(built["tool_choice"]) and "b" in json.dumps(built["tool_choice"])
+
+
+def test_openai_usage_details_parse_into_correct_buckets() -> None:
+    """Prediction tokens live in completion_tokens_details; audio tokens
+    stay per-side (prompt vs completion) instead of collapsing."""
+
+    adapter = get_protocol("openai_chat")
+    raw = {
+        "id": "chatcmpl-1",
+        "object": "chat.completion",
+        "created": 1,
+        "model": "m",
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+        "usage": {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+            "prompt_tokens_details": {"audio_tokens": 3, "cached_tokens": 2},
+            "completion_tokens_details": {
+                "audio_tokens": 4,
+                "reasoning_tokens": 1,
+                "accepted_prediction_tokens": 7,
+                "rejected_prediction_tokens": 2,
+            },
+        },
+    }
+    unified = adapter.parse_response(raw)
+    assert unified.usage.audio_tokens == 3
+    assert unified.usage.output_audio_tokens == 4
+    assert unified.usage.accepted_prediction_tokens == 7
+    assert unified.usage.rejected_prediction_tokens == 2
+    formatted = adapter.format_response(unified)
+    assert formatted["usage"]["prompt_tokens_details"]["audio_tokens"] == 3
+    assert formatted["usage"]["completion_tokens_details"]["audio_tokens"] == 4
+    assert formatted["usage"]["completion_tokens_details"]["accepted_prediction_tokens"] == 7
+
+
 def test_litellm_fallback_protocol_preserves_raw_payload() -> None:
     adapter = get_protocol("litellm_fallback")
     raw = {"model": "custom/model", "messages": [{"role": "user", "content": "hi"}], "vendor_flag": True}

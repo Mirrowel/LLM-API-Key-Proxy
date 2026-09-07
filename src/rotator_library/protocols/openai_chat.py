@@ -507,15 +507,27 @@ class OpenAIChatProtocol(ProtocolAdapter):
             reasoning_tokens=int(completion_details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0),
             audio_tokens=int(
                 prompt_details.get("audio_tokens")
-                or completion_details.get("audio_tokens")
                 or usage.get("audio_tokens")
                 or 0
             ),
+            output_audio_tokens=int(
+                completion_details.get("audio_tokens")
+                or usage.get("output_audio_tokens")
+                or 0
+            ),
+            # Prediction tokens live in completion_tokens_details (spec
+            # placement); prompt-side reads stay as a lenient fallback.
             accepted_prediction_tokens=int(
-                prompt_details.get("accepted_prediction_tokens") or usage.get("accepted_prediction_tokens") or 0
+                completion_details.get("accepted_prediction_tokens")
+                or prompt_details.get("accepted_prediction_tokens")
+                or usage.get("accepted_prediction_tokens")
+                or 0
             ),
             rejected_prediction_tokens=int(
-                prompt_details.get("rejected_prediction_tokens") or usage.get("rejected_prediction_tokens") or 0
+                completion_details.get("rejected_prediction_tokens")
+                or prompt_details.get("rejected_prediction_tokens")
+                or usage.get("rejected_prediction_tokens")
+                or 0
             ),
             cost=cost,
             raw=deepcopy(usage),
@@ -818,6 +830,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
         block_list = list(blocks)
         if not block_list:
             return None
+        warnings_before = len(warnings) if warnings is not None else 0
         if all(block.type == "text" and (not preserve_source or not isinstance(block.raw, dict)) and (not preserve_source or not block.extra) for block in block_list):
             return first_text(block_list) or ""
         formatted = []
@@ -860,6 +873,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
                             )
                         )
                     continue
+                if str(source.media_type or "").strip().lower() == "audio/ogg" and warnings is not None:
+                    # Container-to-codec guess: opus dominates ogg deliveries,
+                    # but the container may hold Vorbis — disclose the label.
+                    warnings.append(
+                        ConversionWarning(
+                            code="media_approximated",
+                            message="audio/ogg container labeled 'opus' (dominant codec in ogg deliveries; Vorbis content would decode incorrectly)",
+                            field="content[audio]",
+                            source_protocol=None,
+                            target_protocol="openai_chat",
+                        )
+                    )
                 payload = {"type": "input_audio", "input_audio": {"data": source.data or "", "format": audio_format}}
                 formatted.append(payload)
             elif block.type in {"file", "document"}:
@@ -869,9 +894,9 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     file_obj["file_id"] = source.file_id
                 elif source.data:
                     file_obj["file_data"] = source.data
-                    if source.filename:
-                        file_obj["filename"] = source.filename
-                if not file_obj and source.url:
+                if source.filename:
+                    file_obj["filename"] = source.filename
+                if not file_obj or ("file_id" not in file_obj and "file_data" not in file_obj):
                     # No documented Chat home for URL-only files: record the
                     # drop honestly rather than invent a non-spec key.
                     if warnings is not None:
@@ -883,6 +908,13 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 formatted.append(payload)
             elif preserve_source and isinstance(block.raw, dict):
                 formatted.append(deepcopy(block.raw))
+        if not formatted and block_list and warnings is not None and len(warnings) > warnings_before:
+            # Every part was DROPPED with a recorded warning (e.g. URL-only
+            # files): an empty parts array is illegal wire — degrade to an
+            # empty string (legal for every role). Audio/refusal-only
+            # messages that intentionally produce no parts (message-level
+            # fields carry them) keep their [] -> None handling.
+            return ""
         return formatted
 
     def _parse_tool_definition(self, tool: dict[str, Any]) -> ToolDefinition:
@@ -936,6 +968,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
         payload["type"] = "function"
         function = payload.get("function") if isinstance(payload.get("function"), dict) else {}
         function.update({"name": tool.name, "description": tool.description, "parameters": deepcopy(tool.input_schema)})
+        if "strict" in tool.extra:
+            # Strictness changes enforcement semantics — carried on every
+            # rebuild (Chat function tools honor it), never dropped silently.
+            function["strict"] = deepcopy(tool.extra["strict"])
         payload["function"] = {k: v for k, v in function.items() if v is not None}
         return payload
 
@@ -1049,35 +1085,41 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     )
         if "tool_choice" in params:
             choice = params.pop("tool_choice")
-            payload["tool_choice"] = format_tool_choice(choice, self.name)
-            if (
-                isinstance(choice, dict)
-                and choice.get("allowed_names")
-                and choice.get("allowed_tools") is None
-                and isinstance(payload["tool_choice"], str)
-            ):
-                request.warnings.append(
-                    ConversionWarning(
-                        code="unsupported_optional_control",
-                        message="tool-choice allowlist has no Chat mode-only representation; constraint narrowed to the mode",
-                        field="tool_choice",
-                        source_protocol=request.source_protocol,
-                        target_protocol=self.name,
+            if preserve_source and "tool_choice" in payload:
+                # Same-protocol: the client's original spelling (including
+                # the allowed_tools variant) is already restored verbatim —
+                # never clobber it with the canonical re-format.
+                pass
+            else:
+                payload["tool_choice"] = format_tool_choice(choice, self.name)
+                if (
+                    isinstance(choice, dict)
+                    and choice.get("allowed_names")
+                    and choice.get("allowed_tools") is None
+                    and isinstance(payload["tool_choice"], str)
+                ):
+                    request.warnings.append(
+                        ConversionWarning(
+                            code="unsupported_optional_control",
+                            message="tool-choice allowlist has no Chat mode-only representation; constraint narrowed to the mode",
+                            field="tool_choice",
+                            source_protocol=request.source_protocol,
+                            target_protocol=self.name,
+                        )
                     )
-                )
         if "audio_output" in params:
             payload["audio"] = deepcopy(params.pop("audio_output"))
-            if unified_request.modalities and "audio" not in unified_request.modalities:
+            if request.modalities and "audio" not in request.modalities:
                 request.warnings.append(
                     ConversionWarning(
                         code="unsupported_optional_control",
                         message="audio output requested without modalities including audio; added",
                         field="modalities",
-                        source_protocol=unified_request.source_protocol,
+                        source_protocol=request.source_protocol,
                         target_protocol=self.name,
                     )
                 )
-                payload["modalities"] = [*unified_request.modalities, "audio"]
+                payload["modalities"] = [*request.modalities, "audio"]
         supported = {
             "frequency_penalty",
             "logit_bias",
@@ -1091,6 +1133,9 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "safety_identifier",
             "seed",
             "service_tier",
+            # NOTE: "store" is deliberately absent — provider persistence is
+            # OpenAI-bound state; cross-protocol targets drop it WITH a
+            # recorded warning, same-protocol replays it via extensions.
             "stream_options",
             "temperature",
             "top_logprobs",
@@ -1168,11 +1213,19 @@ def _format_openai_usage(usage: Usage | None) -> dict[str, Any] | None:
         prompt_details["cached_tokens"] = usage.cache_read_tokens
     if usage.cache_write_tokens:
         prompt_details["cache_creation_tokens"] = usage.cache_write_tokens
+    if usage.audio_tokens:
+        prompt_details["audio_tokens"] = usage.audio_tokens
     if prompt_details:
         payload["prompt_tokens_details"] = prompt_details
     completion_details: dict[str, Any] = {}
     if usage.reasoning_tokens:
         completion_details["reasoning_tokens"] = usage.reasoning_tokens
+    if usage.output_audio_tokens:
+        completion_details["audio_tokens"] = usage.output_audio_tokens
+    if usage.accepted_prediction_tokens:
+        completion_details["accepted_prediction_tokens"] = usage.accepted_prediction_tokens
+    if usage.rejected_prediction_tokens:
+        completion_details["rejected_prediction_tokens"] = usage.rejected_prediction_tokens
     if completion_details:
         payload["completion_tokens_details"] = completion_details
     if usage.cost:

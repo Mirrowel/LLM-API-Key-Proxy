@@ -205,6 +205,9 @@ def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         # Documented include_usage grammar: one terminal usage chunk with an
         # EMPTY choices array, after the finish chunk, before [DONE] — the
         # usage may legitimately arrive after finish (never swallow it).
+        # Intermediate chunks stay usage:null even if a provider sends
+        # running per-chunk totals (non-standard): the spec reserves
+        # non-null usage for the terminal frame only.
         if not state.usage_emitted:
             frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=event.usage, empty_choices=True)))
             state.usage_emitted = True
@@ -801,9 +804,19 @@ def _openai_usage(usage: Usage | None) -> dict[str, Any] | None:
         "total_tokens": usage.total_tokens,
     }
     if usage.cache_read_tokens or usage.cache_write_tokens:
-        payload["prompt_tokens_details"] = {"cached_tokens": usage.cache_read_tokens, "cache_creation_tokens": usage.cache_write_tokens}
+        details: dict[str, Any] = {}
+        if usage.cache_read_tokens:
+            details["cached_tokens"] = usage.cache_read_tokens
+        if usage.cache_write_tokens:
+            details["cache_creation_tokens"] = usage.cache_write_tokens
+        payload["prompt_tokens_details"] = details
+    completion_details: dict[str, Any] = {}
     if usage.reasoning_tokens:
-        payload["completion_tokens_details"] = {"reasoning_tokens": usage.reasoning_tokens}
+        completion_details["reasoning_tokens"] = usage.reasoning_tokens
+    if usage.output_audio_tokens:
+        completion_details["audio_tokens"] = usage.output_audio_tokens
+    if completion_details:
+        payload["completion_tokens_details"] = completion_details
     return payload
 
 

@@ -683,14 +683,23 @@ def canonical_tool_choice(value: Any, source_protocol: str) -> dict[str, Any] | 
     if value_type in {"required", "any"}:
         return {"mode": "required", "allowed_names": deepcopy(value.get("allowed_names") or [])}
     if value_type == "allowed_tools":
-        # Chat allowed-tools constraint: {"type":"allowed_tools","allowed_tools":{"mode":auto|required,"tools":[...]}}.
-        allowed = value.get("allowed_tools") if isinstance(value.get("allowed_tools"), dict) else {}
+        # Chat allowed-tools constraint. Variant spellings: {"type":"allowed_tools",
+        # "allowed_tools": {"mode":auto|required, "tools":[...]}} or a bare list.
+        raw_allowed = value.get("allowed_tools")
+        if isinstance(raw_allowed, dict):
+            allowed = raw_allowed
+        elif isinstance(raw_allowed, list):
+            allowed = {"mode": "auto", "tools": raw_allowed}
+        else:
+            allowed = {}
         mode = str(allowed.get("mode") or "auto").lower()
         if mode not in {"auto", "required"}:
             mode = "auto"
         result: dict[str, Any] = {"mode": mode, "allowed_names": deepcopy(allowed.get("tools") or [])}
-        if isinstance(value.get("allowed_tools"), dict):
-            result["allowed_tools"] = deepcopy(value["allowed_tools"])
+        if isinstance(raw_allowed, dict):
+            result["allowed_tools"] = deepcopy(raw_allowed)
+        elif isinstance(raw_allowed, list):
+            result["allowed_tools"] = {"mode": mode, "tools": deepcopy(raw_allowed)}
         return result
     if value_type in {"function", "tool", "named"}:
         function = value.get("function") if isinstance(value.get("function"), dict) else {}

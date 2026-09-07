@@ -115,6 +115,7 @@ class Usage(ProtocolSerializable):
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
     audio_tokens: int = 0
+    output_audio_tokens: int = 0
     accepted_prediction_tokens: int = 0
     rejected_prediction_tokens: int = 0
     cost: Optional[CostDetails] = None
@@ -129,6 +130,7 @@ class Usage(ProtocolSerializable):
         "cache_write_tokens",
         "reasoning_tokens",
         "audio_tokens",
+        "output_audio_tokens",
         "accepted_prediction_tokens",
         "rejected_prediction_tokens",
         "cost",

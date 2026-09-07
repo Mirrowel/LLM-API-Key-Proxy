@@ -263,8 +263,10 @@ class ChatWireStreamAdapter:
             return []
         event = events[0]
         delta_message = event.delta
-
-        if delta_message is not None and getattr(delta_message, "tool_calls", None):
+        if any(
+            item.delta is not None and getattr(item.delta, "tool_calls", None)
+            for item in events
+        ):
             self._seen_tool_calls = True
 
         if _is_terminal_event(event):
@@ -276,8 +278,10 @@ class ChatWireStreamAdapter:
         if finish_seen:
             self._held_reason_canonical = event.stop_reason
             if not meaningful_usage:
-                # Intermediate finish frame: hold back, emit without reason.
-                return [replace(event, stop_reason=None)] if delta_message is not None else []
+                # Intermediate finish frame: hold back the reason, keep every
+                # candidate's delta flowing (never drop sibling choices).
+                kept = [replace(item, stop_reason=None) for item in events if item.delta is not None]
+                return kept or []
 
         if meaningful_usage and (delta_message is None or finish_seen):
             return [self._with_final_reason(event)]
