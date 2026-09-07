@@ -49,19 +49,32 @@ def validate_generative_request(
 
     if is_same_protocol(context, target_protocol, request.source_protocol):
         return
+    # Cross-protocol extension fields have no foreign representation by
+    # definition (each target replays only its own extensions verbatim):
+    # every extra key dropping at a foreign target is disclosed (D7).
+    for extra_key in sorted(request.extra):
+        add_conversion_warning(
+            request,
+            code="unsupported_optional_control",
+            message=f"{extra_key} has no {target_protocol} representation; dropped cross-protocol",
+            field=extra_key,
+            target_protocol=target_protocol,
+        )
+    # Metadata dictionaries ride only where a target has a metadata field.
+    if request.metadata and target_protocol == "gemini":
+        add_conversion_warning(
+            request,
+            code="unsupported_optional_control",
+            message="metadata has no Gemini representation; dropped cross-protocol",
+            field="metadata",
+            target_protocol=target_protocol,
+        )
     # Gemini-source envelope fields and unmapped generationConfig controls
     # dropping at FOREIGN targets are recorded here (symmetric with the
     # gemini-target build-time warnings; parse cannot know the target).
+    # Bound envelope fields (cachedContent/labels/...) ride request.extra —
+    # covered by the generic extra disclosure above.
     if request.source_protocol == "gemini" and target_protocol != "gemini":
-        for bound_field in ("cachedContent", "labels", "serviceTier", "store"):
-            if request.extra.get(bound_field) is not None:
-                add_conversion_warning(
-                    request,
-                    code="unsupported_optional_control",
-                    message=f"{bound_field} is Gemini-provider-bound state; dropped cross-protocol",
-                    field=bound_field,
-                    target_protocol=target_protocol,
-                )
         source_generation = request.extensions.get("gemini", {}).get("generationConfig")
         if isinstance(source_generation, dict):
             mapped = {

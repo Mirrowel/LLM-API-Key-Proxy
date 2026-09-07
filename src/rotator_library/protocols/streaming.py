@@ -26,6 +26,7 @@ from .canonical import (
 )
 from .types import (
     ContentBlock,
+    ConversionWarning,
     ProtocolContext,
     ProtocolError,
     ToolCall,
@@ -58,6 +59,10 @@ class StreamFormatState:
     completion_emitted: bool = False
     role_emitted: bool = False
     finish_emitted: bool = False
+    # Stream-side conversion drops are SILENT on the wire by construction
+    # (in-band frames have no summary header): they accumulate here for the
+    # pipeline tail to trace/log — never lost, never in-band.
+    warnings: list["ConversionWarning"] = field(default_factory=list)
     created: int = field(default_factory=lambda: int(time.time()))
     finished_choices: set[int] = field(default_factory=set)
     block_signatures: dict[str, str] = field(default_factory=dict)
@@ -223,6 +228,23 @@ def format_canonical_stream_event(
     )
 
 
+def _stream_warn(state: "StreamFormatState", code: str, message: str, field: str) -> None:
+    """Record a stream-side conversion drop (traced at the pipeline tail)."""
+
+    if state.warnings is None:
+        state.warnings = []
+    if not any(w.code == code and w.message == message for w in state.warnings):
+        state.warnings.append(
+            ConversionWarning(
+                code=code,
+                message=message,
+                field=field,
+                source_protocol=state.source_protocol,
+                target_protocol=state.protocol,
+            )
+        )
+
+
 def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[str]:
     if event.type == "error" or event.error is not None:
         state.terminal = True
@@ -249,11 +271,6 @@ def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             logprobs=choice_logprobs,
         )))
         state.finished_choices.add(choice_index)
-    if event.usage is not None and not delta and not state.terminal:
-        # Non-terminal usage sightings (e.g. Anthropic message_start input
-        # accounting) merge into state — the wire usage chunk emits exactly
-        # once at the terminal frame with the FINAL cumulative values.
-        pass
     if _is_terminal(event):
         if state.usage is not None:
             frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=state.usage, empty_choices=True)))
@@ -314,6 +331,12 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
                     }))
                 # Foreign-shaped builtin records stay omitted entirely (no
                 # legal anthropic wire shape, no fabricated empty blocks).
+                _stream_warn(
+                    state,
+                    "builtin_tool_output_dropped",
+                    f"builtin tool record ({getattr(getattr(block, 'tool_call', None), 'name', '') or 'unknown'}) has no Anthropic stream shape; omitted",
+                    "content",
+                )
                 continue
             index = state.next_index
             state.next_index += 1
@@ -498,6 +521,12 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         elif block.type == "refusal":
             # Gemini has no refusal part: the text survives as a plain part
             # (same degradation as the non-stream path).
+            _stream_warn(
+                state,
+                "refusal_downgraded",
+                "refusal has no Gemini stream part; degraded to plain text",
+                "content",
+            )
             parts.append({"text": block.refusal or ""})
         elif block.type == "text":
             text_part: dict[str, Any] = {"text": block.text or ""}

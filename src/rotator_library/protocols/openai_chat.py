@@ -21,6 +21,7 @@ from typing import Any, ClassVar, Iterable, Optional
 from .base import ProtocolAdapter
 from .canonical import (
     add_conversion_warning,
+    disclose_response_drops,
     attach_conversion_summary,
     canonical_stop_reason,
     canonical_structured_output,
@@ -284,6 +285,8 @@ class OpenAIChatProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+
+        disclose_response_drops(unified_response, self.name)
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
         # Chat natively supports alternatives: candidate multiplicity is
@@ -674,6 +677,20 @@ class OpenAIChatProtocol(ProtocolAdapter):
             payload["tool_call_id"] = result.tool_call_id or message.tool_call_id
             if result.name:
                 payload["name"] = result.name
+            if result.is_error and not preserve_source and warnings is not None:
+                # Chat has no error flag on tool results: the degrade to an
+                # {"error": ...} content object is disclosed, never silent
+                # (the spelling is deliberately NOT parsed back — legitimate
+                # payloads may carry an "error" field without being errors).
+                warnings.append(
+                    ConversionWarning(
+                        code="tool_result_is_error_downgraded",
+                        message="tool result error flag has no Chat field; degraded to an {'error': ...} content object",
+                        field="content",
+                        source_protocol=None,
+                        target_protocol="openai_chat",
+                    )
+                )
             content = _tool_result_text({"error": result.content} if result.is_error else result.content)
         else:
             content = self._format_content(message.content, preserve_source=preserve_source, warnings=warnings)
@@ -742,7 +759,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
         refusal_text = "".join(
             block.refusal or "" for block in message.content if block.type == "refusal" and block.refusal
         )
-        if refusal_text:
+        if refusal_text and direction == "response":
+            # Responses carry refusal at message level (the spec's primary
+            # home for assistant refusals); request-side history keeps the
+            # content-part form only — never both (no double emission).
             payload["refusal"] = refusal_text
         annotations = [
             annotation
@@ -1048,6 +1068,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if preserve_source:
             original = request.extensions.get(self.name, {}).get("generation_params")
             payload = deepcopy(original) if isinstance(original, dict) else {}
+            # store replays verbatim via extensions on this path — popping
+            # it from params avoids the spurious unsupported-control warning
+            # (same pattern as max_output_tokens / stop / reasoning).
+            params.pop("store", None)
             # response_format rides in its own extensions slot (verbatim
             # original, unknown/custom types included).
             original_format = request.extensions.get(self.name, {}).get("response_format")
@@ -1115,6 +1139,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         target_protocol=self.name,
                     )
                 payload["tool_choice"] = format_tool_choice(choice, self.name)
+                if isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True:
+                    # Exact native sibling (D7 level 1): the parallelism
+                    # constraint survives as parallel_tool_calls:false.
+                    payload["parallel_tool_calls"] = False
                 if (
                     isinstance(choice, dict)
                     and choice.get("allowed_names")

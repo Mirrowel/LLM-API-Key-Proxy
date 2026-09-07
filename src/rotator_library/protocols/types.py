@@ -192,7 +192,9 @@ class MediaSource(ProtocolSerializable):
         "url",
         "data",
         "file_id",
+        "filename",
         "detail",
+        "transcript",
         "raw",
         "extra",
     )
@@ -395,6 +397,15 @@ class UnifiedMessage(ProtocolSerializable):
 
 @dataclass
 class UnifiedRequest(ProtocolSerializable):
+    """Canonical generative request.
+
+    Field ownership note: ``input`` and ``files`` belong to the
+    non-generative operations (embeddings/audio/images/ollama/mcp) — the
+    four generative protocols exchange messages only. ``previous_response_id``
+    is first-class (not sniffed from ``extra``) because Responses
+    continuation is validated explicitly — a hard reject beats heuristic
+    detection for a Required continuation identity.
+    """
     """A request after parsing from a client or provider protocol."""
 
     operation: str = OPERATION_UNKNOWN
@@ -521,6 +532,10 @@ class UnifiedStreamEvent(ProtocolSerializable):
 
     Future SSE and WebSocket transports should consume this type instead of raw
     provider chunks so transport code can stay independent from protocol parsing.
+
+    ``tool_call``/``item_id`` are parse-side correlation aids only — the
+    formatters key stream identity on ``delta``/``message`` block families
+    (stable block keys), never on these fields.
     """
 
     type: str

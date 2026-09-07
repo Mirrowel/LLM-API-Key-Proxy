@@ -599,6 +599,26 @@ class NeutralStreamPipeline:
                 if usage_provider is not None:
                     self.usage.adopt(usage_provider())
 
+                # Stream-side conversion drops (foreign builtins omitted,
+                # refusal degradations, media drops) accumulate on the
+                # formatter state — traced once at the tail (streams carry
+                # no in-band summary header by construction).
+                if state.warnings:
+                    for warning in state.warnings:
+                        lib_logger.info(
+                            "stream conversion warning: [%s] %s (field=%s, target=%s)",
+                            warning.code,
+                            warning.message,
+                            warning.field,
+                            warning.target_protocol,
+                        )
+                    self._log_lifecycle(
+                        "stream_conversion_warnings",
+                        monitor,
+                        "completed",
+                        {"warnings": [vars(w) for w in state.warnings]},
+                    )
+
                 if self.cred_context:
                     cost_breakdown = self._cost_breakdown(self.usage.usage_record)
                     self._log_usage_accounting(self.usage.usage_record, cost_breakdown)

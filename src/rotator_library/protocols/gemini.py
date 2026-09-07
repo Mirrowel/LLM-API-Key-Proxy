@@ -16,6 +16,7 @@ from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
 from .canonical import (
+    disclose_response_drops,
     format_reasoning_controls,
     attach_conversion_summary,
     add_conversion_warning,
@@ -302,6 +303,7 @@ class GeminiProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        disclose_response_drops(unified_response, self.name)
         if unified_response.operation == OPERATION_COUNT_TOKENS:
             usage = unified_response.usage
             payload = deepcopy(unified_response.extra)
@@ -830,6 +832,11 @@ class GeminiProtocol(ProtocolAdapter):
                 )
             formatted_structure = format_structured_output(structured, self.name)
             if formatted_structure is not None:
+                if preserve_source and "responseMimeType" in generation and generation["responseMimeType"] != "application/json":
+                    # D4 identity: text/x.enum (or any non-JSON mime the
+                    # client chose alongside a schema) survives verbatim —
+                    # the canonical rebuild must not fold it to JSON.
+                    formatted_structure.pop("responseMimeType", None)
                 generation.update(
                     {
                         key: value
@@ -1115,6 +1122,10 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings
         # mimeType key is legal (the API resolves it), an invented
         # octet-stream is not a declaration the source made.
         file_data: dict[str, Any] = {"fileUri": source.url or source.file_id or ""}
+        if source.url and source.file_id and source.file_id != source.url:
+            # Both identities present on the source: fileId rides alongside
+            # fileUri verbatim (same-protocol identity for File API refs).
+            file_data["fileId"] = source.file_id
         if source.media_type:
             file_data["mimeType"] = source.media_type
         payload["fileData"] = file_data

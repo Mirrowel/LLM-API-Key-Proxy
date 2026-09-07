@@ -19,6 +19,7 @@ from .base import ProtocolAdapter
 from .canonical import (
     record_instruction_merge,
     add_conversion_warning,
+    disclose_response_drops,
     format_reasoning_controls,
     attach_conversion_summary,
     STOP_REASON_CONTENT_FILTER,
@@ -240,6 +241,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        disclose_response_drops(unified_response, self.name)
         if unified_response.operation == OPERATION_COUNT_TOKENS:
             usage = unified_response.usage
             payload = deepcopy(unified_response.extra)
@@ -779,6 +781,14 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                         field="tool_choice",
                         target_protocol=self.name,
                     )
+                if isinstance(choice, dict) and choice.get("allowed_names"):
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message="tool-choice allowlist has no Anthropic representation; narrowed to the mode (declare allowed tools as separate tool definitions)",
+                        field="tool_choice",
+                        target_protocol=self.name,
+                    )
                 formatted_choice = format_tool_choice(choice, self.name)
                 if formatted_choice is None and isinstance(choice, dict) and choice.get("mode") == "none":
                     # Anthropic disables tools by omitting them entirely.
@@ -795,6 +805,17 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             else:
                 formatted_output = format_structured_output(structured, self.name)
                 if formatted_output is not None:
+                    if structured.get("type") == "json_object":
+                        # json_object carries NO schema; the Anthropic shape
+                        # requires one — the {"type":"object"} placeholder is
+                        # a documented approximation, never silent.
+                        add_conversion_warning(
+                            request,
+                            code="structured_output_approximated",
+                            message="json_object has no Anthropic spelling without a schema; synthesized {type: object}",
+                            field="structured_output",
+                            target_protocol=self.name,
+                        )
                     # The canonical helper already returns the full
                     # output_config envelope shape — assign directly.
                     payload["output_config"] = formatted_output
@@ -1052,10 +1073,14 @@ def _format_anthropic_citation(annotation: Annotation) -> dict[str, Any]:
             citation["end_char_index"] = annotation.end_index
         return {k: v for k, v in citation.items() if v is not None}
     return {
-        "type": "web_search_result_location",
-        "url": annotation.url,
-        "title": annotation.title,
-        "cited_text": annotation.citation,
+        key: value
+        for key, value in {
+            "type": "web_search_result_location",
+            "url": annotation.url,
+            "title": annotation.title,
+            "cited_text": annotation.citation,
+        }.items()
+        if value is not None
     }
 
 
@@ -1149,6 +1174,11 @@ def _format_anthropic_media(block: ContentBlock, *, preserve_source: bool, warni
         payload["source"] = {"type": "text", "media_type": media_type or "text/plain", "data": source.data}
     else:
         payload["source"] = {"type": source.kind, "data": source.data or ""}
+    if preserve_source and isinstance(source.extra, dict) and source.extra:
+        # D4 identity: source-inner extension fields (e.g. future subfields,
+        # source-scoped cache_control) ride back verbatim — the typed rebuild
+        # must not clobber what the raw replay preserved.
+        payload["source"] = {**deepcopy(source.extra), **payload["source"]}
     payload["type"] = block.type
     # Cache/citation/transform hints on the block extras are provider
     # policy, not portable semantics — cross-protocol drops are recorded.

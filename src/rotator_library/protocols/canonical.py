@@ -294,6 +294,7 @@ def add_conversion_warning(
             code=code,
             message=message,
             field=field,
+            source_protocol=request.source_protocol,
             target_protocol=target_protocol,
         )
     )
@@ -366,6 +367,31 @@ def format_reasoning_controls(
     summary = normalized.get("summary")
     thinking_type = normalized.get("thinking_type")
     normalized_display = normalized.get("display")
+
+    if normalized.get("dynamic") is True and target_protocol != "gemini":
+        # Dynamic thinking (thinkingBudget: -1, the model decides) is
+        # Gemini-exclusive. Anthropic's adaptive thinking is the closest
+        # equivalent construct (the model steers its own budget) — disclosed
+        # as an approximation; every other target drops the flag disclosed.
+        add_conversion_warning(
+            request,
+            code="reasoning_control_approximated" if target_protocol == "anthropic_messages" else "reasoning_control_dropped",
+            message=(
+                "dynamic thinking approximated as Anthropic adaptive thinking (the model steers its own budget)"
+                if target_protocol == "anthropic_messages"
+                else "dynamic thinking has no representation outside Gemini; dropped (the model-decides flag does not carry)"
+            ),
+            field="reasoning.dynamic",
+            target_protocol=target_protocol,
+        )
+    if normalized_display is not None and target_protocol != "anthropic_messages":
+        add_conversion_warning(
+            request,
+            code="reasoning_control_dropped",
+            message="thinking display control has no representation outside Anthropic; dropped",
+            field="reasoning.display",
+            target_protocol=target_protocol,
+        )
 
     def _warn(code: str, message: str, field: str) -> None:
         add_conversion_warning(request, code=code, message=message, field=field, target_protocol=target_protocol)
@@ -636,6 +662,59 @@ def normalize_reasoning_controls(reasoning: Any) -> dict[str, Any]:
     return {key: value for key, value in normalized.items() if value is not None or key in {"enabled", "include_thoughts"}}
 
 
+def disclose_response_drops(unified_response: Any, target_protocol: str) -> None:
+    """Disclose response-side conversions that cannot carry a warning at
+    their emission point (stop-reason approximations, usage detail drops).
+
+    Called once per format_response pass; appends to the response warnings
+    (deduplicated downstream by attach_conversion_summary rendering).
+    """
+
+    from .types import ConversionWarning  # local import: avoid cycles
+
+    stop_reason = getattr(unified_response, "stop_reason", None)
+    if stop_reason == "pause_turn" and target_protocol != "anthropic_messages":
+        unified_response.warnings.append(
+            ConversionWarning(
+                code="stop_reason_approximated",
+                message="pause_turn has no representation outside Anthropic; approximated (the server-tool loop semantics do not carry)",
+                field="stop_reason",
+                source_protocol=getattr(unified_response, "source_protocol", None),
+                target_protocol=target_protocol,
+            )
+        )
+    metadata = getattr(unified_response, "metadata", None) or {}
+    if stop_reason == "stop_sequence" and target_protocol != "anthropic_messages":
+        unified_response.warnings.append(
+            ConversionWarning(
+                code="stop_sequence_dropped",
+                message="stop_sequence (the matched sequence text) has no representation outside Anthropic; only the stop reason survives",
+                field="stop_reason",
+                source_protocol=getattr(unified_response, "source_protocol", None),
+                target_protocol=target_protocol,
+            )
+        )
+    usage = getattr(unified_response, "usage", None)
+    usage_extra = getattr(usage, "extra", None) if usage is not None else None
+    if isinstance(usage_extra, dict) and usage_extra:
+        anthropic_native = {"cache_creation", "server_tool_use", "service_tier"}
+        keys = [
+            key
+            for key in sorted(usage_extra)
+            if not (target_protocol == "anthropic_messages" and key in anthropic_native)
+        ]
+        if keys:
+            unified_response.warnings.append(
+                ConversionWarning(
+                    code="usage_detail_dropped",
+                    message=f"usage detail buckets have no {target_protocol} spelling; dropped: {', '.join(keys)}",
+                    field="usage",
+                    source_protocol=getattr(unified_response, "source_protocol", None),
+                    target_protocol=target_protocol,
+                )
+            )
+
+
 def attach_conversion_summary(payload: dict[str, Any], unified_response: Any) -> dict[str, Any]:
     """Attach the recorded conversion summary to a client response payload.
 
@@ -788,6 +867,8 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
         # canonical record (mode stays "auto").
         pass
     if target_protocol == "openai_chat":
+        # disable_parallel_tool_use has an exact native sibling here:
+        # parallel_tool_calls:false — the caller merges it into the payload.
         if mode == "named":
             return {"type": "function", "function": {"name": name or ""}}
         if allowed_names and choice.get("allowed_tools") is None:
@@ -948,10 +1029,10 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
             return None
         if output_type not in {"json_schema", "json_object"}:
             return None
-        return {
-            "responseMimeType": "application/json",
-            "responseJsonSchema": deepcopy(value.get("schema")) if output_type != "json_object" else None,
-        }
+        result: dict[str, Any] = {"responseMimeType": "application/json"}
+        if output_type != "json_object":
+            result["responseJsonSchema"] = deepcopy(value.get("schema"))
+        return result
     return deepcopy(value)
 
 

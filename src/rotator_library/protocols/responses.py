@@ -17,6 +17,7 @@ from typing import Any, ClassVar, Iterable
 from .base import ProtocolAdapter
 from .canonical import (
     record_instruction_merge,
+    disclose_response_drops,
     format_reasoning_controls,
     normalize_reasoning_controls,
     attach_conversion_summary,
@@ -149,21 +150,35 @@ class ResponsesProtocol(ProtocolAdapter):
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
         payload: dict[str, Any] = {
             "model": unified_request.model,
-            "input": self._format_input(conversation_messages(unified_request), preserve_source=preserve_source),
+            "input": self._format_input(
+                # D4 identity: same-protocol keeps role:system input messages
+                # in the input array; cross-protocol promotes them into the
+                # single instructions field below.
+                list(unified_request.messages) if preserve_source else conversation_messages(unified_request),
+                preserve_source=preserve_source,
+            ),
         }
-        instruction_parts = instruction_blocks(unified_request)
-        instructions = "\n\n".join(block.text or "" for block in instruction_parts if block.text)
-        if instructions:
-            payload["instructions"] = instructions
-        dropped_non_text = [block for block in instruction_parts if block.text is None]
-        if dropped_non_text:
-            add_conversion_warning(
-                unified_request,
-                code="instruction_block_dropped",
-                message=f"{len(dropped_non_text)} non-text instruction block(s) have no Responses instructions representation",
-                field="system",
-                target_protocol=self.name,
-            )
+        if preserve_source:
+            # D4 identity: the instructions field and role:system input
+            # messages are BOTH legal on this wire and stay exactly where
+            # the client put them — no merge, no promotion, no warning.
+            instructions_text = "\n\n".join(block.text or "" for block in unified_request.system if block.text)
+            if instructions_text:
+                payload["instructions"] = instructions_text
+        else:
+            instruction_parts = instruction_blocks(unified_request)
+            instructions = "\n\n".join(block.text or "" for block in instruction_parts if block.text)
+            if instructions:
+                payload["instructions"] = instructions
+            dropped_non_text = [block for block in instruction_parts if block.text is None]
+            if dropped_non_text:
+                add_conversion_warning(
+                    unified_request,
+                    code="instruction_block_dropped",
+                    message=f"{len(dropped_non_text)} non-text instruction block(s) have no Responses instructions representation",
+                    field="system",
+                    target_protocol=self.name,
+                )
         record_instruction_merge(unified_request, self.name)
         if unified_request.previous_response_id:
             payload["previous_response_id"] = unified_request.previous_response_id
@@ -210,6 +225,13 @@ class ResponsesProtocol(ProtocolAdapter):
         stop_reason = canonical_stop_reason(response.get("status"))
         if stop_reason == "stop" and any(message_tool_calls(message) for message in messages):
             stop_reason = "tool_use"
+        if stop_reason == "incomplete":
+            # incomplete_details.reason is authoritative: content_filter
+            # incompletions are safety stops, not token-budget stops.
+            details = response.get("incomplete_details")
+            reason = details.get("reason") if isinstance(details, dict) else None
+            if reason == "content_filter":
+                stop_reason = "content_filter"
         return UnifiedResponse(
             operation=OPERATION_RESPONSES,
             logical_operation=OPERATION_GENERATE,
@@ -228,6 +250,7 @@ class ResponsesProtocol(ProtocolAdapter):
         )
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        disclose_response_drops(unified_response, self.name)
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
         assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
@@ -898,6 +921,15 @@ class ResponsesProtocol(ProtocolAdapter):
         elif verbosity is not None:
             payload.setdefault("text", {})["verbosity"] = verbosity
         if "tool_choice" in params:
+            choice = params.get("tool_choice")
+            if isinstance(choice, dict) and choice.get("allowed_names"):
+                add_conversion_warning(
+                    request,
+                    code="unsupported_optional_control",
+                    message="tool-choice allowlist has no Responses representation; narrowed to the mode",
+                    field="tool_choice",
+                    target_protocol=self.name,
+                )
             payload["tool_choice"] = format_tool_choice(params.pop("tool_choice"), self.name)
         supported = {
             "background",
