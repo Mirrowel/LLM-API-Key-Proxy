@@ -821,7 +821,10 @@ class GeminiProtocol(ProtocolAdapter):
             if canonical in params:
                 generation[wire] = params.pop(canonical)
         structured = params.pop("structured_output", None)
-        if isinstance(structured, dict):
+        if isinstance(structured, dict) and not preserve_source:
+            # Same-protocol keeps generationConfig verbatim from extensions
+            # (schema key spelling, mime, everything) — the canonical
+            # rebuild is a CROSS-PROTOCOL concern only.
             if structured.get("strict") is False:
                 add_conversion_warning(
                     request,

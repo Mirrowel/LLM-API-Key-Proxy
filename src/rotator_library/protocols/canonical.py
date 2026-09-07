@@ -133,10 +133,11 @@ def canonical_stop_reason(value: Any) -> Optional[str]:
 def format_stop_reason(value: Optional[str], target_protocol: str) -> Optional[str]:
     """Return the target protocol's public completion reason.
 
-    Unknown values pass through verbatim by design (same-protocol native
-    spellings the tables have not met yet); known alias spellings map
-    defensively so a hand-built canonical value (e.g. ``pause_turn`` where
-    the canonical is ``pause``) never emits an illegal wire value.
+    Canonical keys map through the target table; alias spellings map
+    defensively via :func:`canonical_stop_reason` so a hand-built value
+    never emits an illegal wire value; anything the canonicalizer itself
+    does not recognize lands on the table's unknown entry (the closest
+    honest value each protocol defines — never an invented spelling).
     """
 
     if value is None:
