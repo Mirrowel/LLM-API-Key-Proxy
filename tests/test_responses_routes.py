@@ -113,7 +113,7 @@ def test_responses_provider_error_uses_responses_protocol() -> None:
 
     assert response.status_code == 429
     assert response.json() == {
-        "error": {"code": 429, "message": "provider busy", "type": "rate_limit"}
+        "error": {"code": "429", "message": "provider busy", "type": "rate_limit"}
     }
 
 
