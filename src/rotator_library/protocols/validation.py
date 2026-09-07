@@ -123,7 +123,8 @@ def validate_generative_request(
                 if isinstance(tool.extra, dict) and "cache_control" in tool.extra:
                     hinted = True
                     break
-                if isinstance(tool.raw, dict) and "cache_control" in tool.raw:
+                raw_definition = getattr(tool, "raw", None)
+                if isinstance(raw_definition, dict) and "cache_control" in raw_definition:
                     hinted = True
                     break
         if not hinted:
