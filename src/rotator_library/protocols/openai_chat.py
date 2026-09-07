@@ -682,15 +682,12 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 # {"error": ...} content object is disclosed, never silent
                 # (the spelling is deliberately NOT parsed back — legitimate
                 # payloads may carry an "error" field without being errors).
-                warnings.append(
-                    ConversionWarning(
+                _warn_once(
+                        warnings,
                         code="tool_result_is_error_downgraded",
                         message="tool result error flag has no Chat field; degraded to an {'error': ...} content object",
                         field="content",
-                        source_protocol=None,
-                        target_protocol="openai_chat",
                     )
-                )
             content = _tool_result_text({"error": result.content} if result.is_error else result.content)
         else:
             content = self._format_content(message.content, preserve_source=preserve_source, warnings=warnings)
@@ -702,6 +699,11 @@ class OpenAIChatProtocol(ProtocolAdapter):
             elif any(block.type == "audio" for block in message.content):
                 # Audio-only messages carry the payload at message level
                 # (`audio` field); content stays null, no duplicated part.
+                payload["content"] = None
+            elif _message_tool_calls(message) or any(block.reasoning is not None for block in message.content):
+                # Tool-call-only / reasoning-only assistant turns: content is
+                # OPTIONAL when tool_calls is present, and OpenAI itself sends
+                # null — an empty parts array fails strict client validation.
                 payload["content"] = None
             else:
                 payload["content"] = content
@@ -884,27 +886,21 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     # Unmappable MIME type: drop with a recorded warning
                     # instead of emitting an illegal format label.
                     if warnings is not None:
-                        warnings.append(
-                            ConversionWarning(
-                                code="media_dropped",
-                                message=f"audio part with MIME type {source.media_type!r} has no legal Chat audio format label; dropped",
-                                field="content[audio]",
-                                source_protocol=None,
-                                target_protocol="openai_chat",
-                            )
-                        )
+                        _warn_once(
+                        warnings,
+                        code="media_dropped",
+                        message=f"audio part with MIME type {source.media_type!r} has no legal Chat audio format label; dropped",
+                        field="content[audio]",
+                    )
                     continue
                 if str(source.media_type or "").strip().lower() == "audio/ogg" and warnings is not None:
                     # Container-to-codec guess: opus dominates ogg deliveries,
                     # but the container may hold Vorbis — disclose the label.
-                    warnings.append(
-                        ConversionWarning(
-                            code="media_approximated",
-                            message="audio/ogg container labeled 'opus' (dominant codec in ogg deliveries; Vorbis content would decode incorrectly)",
-                            field="content[audio]",
-                            source_protocol=None,
-                            target_protocol="openai_chat",
-                        )
+                    _warn_once(
+                        warnings,
+                        code="media_approximated",
+                        message="audio/ogg container labeled 'opus' (dominant codec in ogg deliveries; Vorbis content would decode incorrectly)",
+                        field="content[audio]",
                     )
                 payload = {"type": "input_audio", "input_audio": {"data": source.data or "", "format": audio_format}}
                 formatted.append(payload)
@@ -921,7 +917,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     # No documented Chat home for URL-only files: record the
                     # drop honestly rather than invent a non-spec key.
                     if warnings is not None:
-                        warnings.append(ConversionWarning(code="media_dropped", message=f"file without file_id/file_data cannot be represented as a Chat file part (url={source.url})", field="file", source_protocol=None, target_protocol="openai_chat"))
+                        _warn_once(warnings, code="media_dropped", message=f"file without file_id/file_data cannot be represented as a Chat file part (url={source.url})", field="file")
                     continue
                 formatted.append({"type": "file", "file": file_obj})
             elif block.type == "refusal":
@@ -929,18 +925,16 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 formatted.append(payload)
             elif preserve_source and isinstance(block.raw, dict):
                 formatted.append(deepcopy(block.raw))
-            elif block.type not in {"text", "image", "audio", "file", "document", "refusal", "tool_call", "tool_result", "reasoning", "builtin_tool", "unknown"} and block.raw is None:
-                # Unknown block type with no raw replay: record the drop
-                # (response paths have no fail-fast validation).
+            elif block.type not in {"text", "image", "audio", "file", "document", "refusal", "tool_call", "tool_result", "reasoning", "builtin_tool"}:
+                # Unknown block type that will NOT be raw-replayed: record
+                # the drop (response paths have no fail-fast validation) —
+                # never silent, raw-carrying or not.
                 if warnings is not None:
-                    warnings.append(
-                        ConversionWarning(
-                            code="unsupported_optional_control",
-                            message=f"content block type '{block.type}' has no Chat representation; dropped",
-                            field="content",
-                            source_protocol=None,
-                            target_protocol="openai_chat",
-                        )
+                    _warn_once(
+                        warnings,
+                        code="unsupported_optional_control",
+                        message=f"content block type '{block.type}' has no Chat representation; dropped",
+                        field="content",
                     )
                 continue
         if not formatted and block_list and warnings is not None and len(warnings) > warnings_before:
@@ -1142,7 +1136,16 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 if isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True:
                     # Exact native sibling (D7 level 1): the parallelism
                     # constraint survives as parallel_tool_calls:false.
-                    payload["parallel_tool_calls"] = False
+                    if payload.get("parallel_tool_calls") is True:
+                        add_conversion_warning(
+                            request,
+                            code="generation_control_conflict",
+                            message="client-explicit parallel_tool_calls=true overrides tool_choice.disable_parallel_tool_use; parallelism stays enabled",
+                            field="parallel_tool_calls",
+                            target_protocol=self.name,
+                        )
+                    else:
+                        payload["parallel_tool_calls"] = False
                 if (
                     isinstance(choice, dict)
                     and choice.get("allowed_names")
@@ -1223,8 +1226,22 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if "top_logprobs" in payload and not payload.get("logprobs"):
             # The pair is required by the API: logprobs gates top_logprobs.
             payload["logprobs"] = True
+            add_conversion_warning(
+                request,
+                code="generation_control_synthesized",
+                message="logprobs=true synthesized (top_logprobs requires its logprobs gate)",
+                field="logprobs",
+                target_protocol=self.name,
+            )
         if payload.get("logprobs") is True and "top_logprobs" not in payload:
             payload["top_logprobs"] = 0
+            add_conversion_warning(
+                request,
+                code="generation_control_synthesized",
+                message="top_logprobs=0 synthesized (logprobs=true requires its pair)",
+                field="top_logprobs",
+                target_protocol=self.name,
+            )
         return payload
 
 
@@ -1372,6 +1389,28 @@ def _format_openai_annotations(annotations: list[Annotation]) -> list[dict[str, 
     return [{k: v for k, v in entry.items() if v is not None} for entry in formatted]
 
 
+def _warn_once(
+    warnings: Optional[list],
+    *,
+    code: str,
+    message: str,
+    field: Optional[str] = None,
+) -> None:
+    """Append a deduplicated ConversionWarning to a plain list sink.
+
+    Retry/rotation rebuild the same request more than once — direct appends
+    clone identical warnings on every pass (the rendered summary dedupes,
+    the internal list must too).
+    """
+
+    if warnings is None:
+        return
+    for warning in warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="openai_chat"))
+
+
 def _warn_chat_once(unified_response: UnifiedResponse, *, code: str, message: str, field: Optional[str] = None) -> None:
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
@@ -1451,6 +1490,11 @@ def _openai_media_source(value: Any, *, kind: str) -> MediaSource:
         data = encoded
         url = None
     file_id = payload.get("file_id")
+    if file_id is None and kind == "audio" and isinstance(payload.get("id"), str):
+        # Response audio objects carry their multi-turn chain handle as `id`
+        # — it maps onto the canonical file identity so cross-protocol
+        # rebuilds keep the chain instead of minting a digest.
+        file_id = payload["id"]
     source_kind = "file" if file_id else "base64" if data else "url"
     return MediaSource(
         kind=source_kind,
