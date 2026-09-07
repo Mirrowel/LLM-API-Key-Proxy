@@ -26,6 +26,9 @@ class GeminiProvider(ProviderInterface):
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
         base = self.get_provider_api_base()
+        if operation == "count_tokens":
+            # Token counting is its own action (never :generateContent).
+            return f"{base}/v1beta/models/{model}:countTokens"
         action = "streamGenerateContent?alt=sse" if operation == "stream_generate" else "generateContent"
         return f"{base}/v1beta/models/{model}:{action}"
 

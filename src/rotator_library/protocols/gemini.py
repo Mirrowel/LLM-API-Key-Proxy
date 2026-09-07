@@ -27,6 +27,7 @@ from .canonical import (
     format_stop_reason,
     format_structured_output,
     format_tool_choice,
+    STOP_REASON_CONTENT_FILTER,
     instruction_blocks,
     record_instruction_merge,
     is_same_protocol,
@@ -116,7 +117,7 @@ class GeminiProtocol(ProtocolAdapter):
             logical_operation=OPERATION_GENERATE,
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=resolve_tool_result_names(
-                normalize_tool_result_messages([self._parse_content(content) for content in request.get("contents") or []])
+                normalize_tool_result_messages([self._parse_content(content, default_role="user") for content in request.get("contents") or []])
             ),
             system=self._parse_system(request.get("systemInstruction") or request.get("system_instruction")),
             tools=self._parse_tools(request.get("tools") or []),
@@ -164,6 +165,41 @@ class GeminiProtocol(ProtocolAdapter):
             payload["toolConfig"] = deepcopy(tool_config)
         if unified_request.tools:
             payload["tools"] = self._format_tools(unified_request.tools, preserve_source=preserve_source)
+        if not preserve_source:
+            # Provider-bound envelope fields dropping at foreign targets is
+            # RECORDED (cachedContent/labels/serviceTier/store ride extra;
+            # same-protocol replay restores them via source_extensions).
+            for bound_field in ("cachedContent", "labels", "serviceTier", "store"):
+                if unified_request.extra.get(bound_field) is not None:
+                    add_conversion_warning(
+                        unified_request,
+                        code="unsupported_optional_control",
+                        message=f"{bound_field} is Gemini-provider-bound state; dropped cross-protocol",
+                        target_protocol=self.name,
+                        field=bound_field,
+                    )
+            system_blocks = unified_request.system if isinstance(unified_request.system, list) else None
+            if system_blocks and any(
+                getattr(block, "type", "text") not in {"text"} or getattr(block, "source", None) is not None
+                for block in system_blocks
+            ):
+                add_conversion_warning(
+                    unified_request,
+                    code="unsupported_optional_control",
+                    message="systemInstruction supports text parts only; non-text instruction blocks dropped",
+                    target_protocol=self.name,
+                    field="systemInstruction",
+                )
+        if not payload.get("contents") and not instructions:
+            # Contents are required by the API: surface the malformed shape
+            # loudly (recorded) without hard-failing minimal/synthetic flows.
+            add_conversion_warning(
+                unified_request,
+                code="unsupported_optional_control",
+                message="Gemini generateContent requires non-empty contents; request carries none",
+                target_protocol=self.name,
+                field="contents",
+            )
         payload.update(source_extensions(unified_request.extra, context, self.name, unified_request.source_protocol))
         # Defensive: neither key is ever legal in the body (belt for raw
         # fast-path replays and extension leakage).
@@ -237,6 +273,19 @@ class GeminiProtocol(ProtocolAdapter):
         canonical_reason = canonical_stop_reason(stop_reason)
         if canonical_reason == "stop" and any(message_tool_calls(message) for message in messages):
             canonical_reason = "tool_use"
+        if not messages:
+            # Blocked prompt (promptFeedback.blockReason, no candidates): a
+            # structured refusal outcome, never an empty success — the block
+            # reason maps to the content-filter stop so every destination
+            # observes the failure.
+            block_reason = (response.get("promptFeedback") or {}).get("blockReason") if isinstance(response.get("promptFeedback"), dict) else None
+            if block_reason:
+                canonical_reason = STOP_REASON_CONTENT_FILTER
+                metadata_block_reason = block_reason
+            else:
+                metadata_block_reason = None
+        else:
+            metadata_block_reason = None
         return UnifiedResponse(
             operation=_response_operation(response, context),
             logical_operation=OPERATION_GENERATE,
@@ -246,7 +295,7 @@ class GeminiProtocol(ProtocolAdapter):
             stop_reason=canonical_reason,
             usage=self.extract_usage(response, context),
             modalities=modalities,
-            metadata={"promptFeedback": deepcopy(response.get("promptFeedback")), "modelVersion": response.get("modelVersion"), "native_stop_reason": stop_reason},
+            metadata={"promptFeedback": deepcopy(response.get("promptFeedback")), "modelVersion": response.get("modelVersion"), "native_stop_reason": stop_reason, "block_reason": metadata_block_reason},
             source_protocol=self.name,
             raw=deepcopy(response),
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"responseId", "id", "modelVersion", "candidates", "usageMetadata", "promptFeedback"}},
@@ -302,14 +351,25 @@ class GeminiProtocol(ProtocolAdapter):
                         payload={"dropped_blocks": ["builtin_tool"]},
                     )
         candidates = []
-        for index, message in enumerate(message for message in messages if message.content or message.reasoning or message.tool_calls):
-            candidate = {"index": message.index if message.index is not None else index, "content": self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state)}
+        kept_messages = [
+            message
+            for message in messages
+            if message.content or message.reasoning or message.tool_calls or message.stop_reason or unified_response.stop_reason
+        ]
+        for index, message in enumerate(kept_messages):
+            candidate: dict[str, Any] = {"index": message.index if message.index is not None else index}
+            if message.content or message.reasoning or message.tool_calls:
+                candidate["content"] = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state)
             per_candidate_reason = message.stop_reason or unified_response.stop_reason
             if per_candidate_reason:
                 candidate["finishReason"] = format_stop_reason(per_candidate_reason, self.name)
             if preserve_source:
                 candidate.update(deepcopy(message.extra.get("candidate") or {}))
             candidates.append(candidate)
+        if not candidates and unified_response.stop_reason:
+            # Blocked/filtered outcomes with no content: the candidate
+            # carries the finish reason (never an empty 200 envelope).
+            candidates.append({"index": 0, "finishReason": format_stop_reason(unified_response.stop_reason, self.name)})
         payload = {
             "responseId": unified_response.id,
             "modelVersion": unified_response.model,
@@ -320,27 +380,53 @@ class GeminiProtocol(ProtocolAdapter):
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
         return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
-    def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
+    def parse_stream_events(self, raw_event: Any, context: ProtocolContext | None = None) -> list[UnifiedStreamEvent]:
+        """One canonical event per candidate — candidateCount>1 streams carry
+        several candidates in one chunk and every one must survive (the
+        usage rides the first event)."""
+
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))
+            return [UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))]
         data = _as_dict(event)
         if data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="error", error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})
+            return [UnifiedStreamEvent(type="error", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="error", error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})]
         response = self.parse_response(data, context)
-        message = response.messages[0] if response.messages else None
-        return UnifiedStreamEvent(
-            type="message_delta" if message else "chunk",
-            operation=response.operation,
-            logical_operation=OPERATION_GENERATE,
-            source_protocol=self.name,
-            native_type="gemini.chunk",
-            delta=message,
-            usage=response.usage,
-            stop_reason=response.stop_reason,
-            raw=deepcopy(raw_event),
-            extra={"payload": data, "finish_reason": response.stop_reason},
-        )
+        if not response.messages:
+            return [
+                UnifiedStreamEvent(
+                    type="chunk",
+                    operation=response.operation,
+                    logical_operation=OPERATION_GENERATE,
+                    source_protocol=self.name,
+                    native_type="gemini.chunk",
+                    usage=response.usage,
+                    stop_reason=response.stop_reason,
+                    raw=deepcopy(raw_event),
+                    extra={"payload": data, "finish_reason": response.stop_reason},
+                )
+            ]
+        events: list[UnifiedStreamEvent] = []
+        for position, message in enumerate(response.messages):
+            events.append(
+                UnifiedStreamEvent(
+                    type="message_delta",
+                    operation=response.operation,
+                    logical_operation=OPERATION_GENERATE,
+                    source_protocol=self.name,
+                    native_type="gemini.chunk",
+                    delta=message,
+                    usage=response.usage if position == 0 else None,
+                    stop_reason=(response.stop_reason if position == 0 else message.stop_reason),
+                    output_index=message.index if message.index is not None else position,
+                    raw=deepcopy(raw_event),
+                    extra={"payload": data, "finish_reason": response.stop_reason if position == 0 else message.stop_reason},
+                )
+            )
+        return events
+
+    def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
+        return self.parse_stream_events(raw_event, context)[0]
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
         if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):
@@ -352,12 +438,16 @@ class GeminiProtocol(ProtocolAdapter):
         input_tokens = int(usage.get("promptTokenCount") or 0)
         output_tokens = int(usage.get("candidatesTokenCount") or 0)
         reasoning_tokens = int(usage.get("thoughtsTokenCount") or 0)
+        tool_prompt_tokens = int(usage.get("toolUsePromptTokenCount") or 0)
         return Usage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=int(usage.get("totalTokenCount") or usage.get("totalTokens") or input_tokens + output_tokens + reasoning_tokens),
             cache_read_tokens=int(usage.get("cachedContentTokenCount") or 0),
             reasoning_tokens=reasoning_tokens,
+            # Tool-prompt accounting rides extra (Gemini-only bucket; the
+            # detail lists stay in raw for same-protocol replay).
+            extra={"tool_use_prompt_tokens": tool_prompt_tokens} if tool_prompt_tokens else {},
             raw=deepcopy(usage),
         )
 
@@ -370,9 +460,9 @@ class GeminiProtocol(ProtocolAdapter):
             return self._parse_parts(system.get("parts") or [])
         return []
 
-    def _parse_content(self, content: dict[str, Any]) -> UnifiedMessage:
+    def _parse_content(self, content: dict[str, Any], *, default_role: str = "model") -> UnifiedMessage:
         payload = dict(content or {})
-        role = str(payload.get("role") or "model")
+        role = str(payload.get("role") or default_role)
         # Gemini uses "model" where chat protocols usually say "assistant".
         normalized_role = "assistant" if role == "model" else role
         message = UnifiedMessage(
@@ -397,6 +487,11 @@ class GeminiProtocol(ProtocolAdapter):
     ) -> dict[str, Any]:
         role = message.extra.get("gemini_role") if preserve_source else None
         role = role or ("model" if message.role in {"assistant", "model"} else "user")
+        if role not in {"user", "model"}:
+            # Content.role is a user|model enum: unknown roles (foreign
+            # sources or malformed input) degrade to user — the only legal
+            # alternative — never leak to the wire.
+            role = "user"
         parts = self._format_parts(
             ordered_message_blocks(message),
             preserve_source=preserve_source,
@@ -469,6 +564,10 @@ class GeminiProtocol(ProtocolAdapter):
         if "functionResponse" in part or "function_response" in part:
             response = part.get("functionResponse") or part.get("function_response") or {}
             result_content = canonical_tool_arguments(response.get("response"))
+            # Track whether the wire actually carried an id: Gemini 2.x
+            # responses have none (identity is the name), and fabricating
+            # one from the name on rebuild is a wire violation.
+            had_id = response.get("id") is not None
             return ContentBlock(
                 type="tool_result",
                 tool_result=ToolResult(
@@ -476,7 +575,7 @@ class GeminiProtocol(ProtocolAdapter):
                     name=response.get("name"),
                     content=result_content,
                     raw=deepcopy(part),
-                    extra=_without(part, {"functionResponse", "function_response"}),
+                    extra={**_without(part, {"functionResponse", "function_response"}), "had_function_response_id": had_id},
                 ),
                 raw=deepcopy(part),
                 extra=_without(part, {"functionResponse", "function_response"}),
@@ -547,6 +646,19 @@ class GeminiProtocol(ProtocolAdapter):
         parsed: list[ToolDefinition] = []
         for container_index, tool in enumerate(tools):
             payload = dict(tool or {})
+            # Hosted Gemini tools (googleSearch, codeExecution, urlContext,
+            # ...): identity is the single-key envelope; no declarations.
+            hosted_key = next((k for k in ("googleSearch", "google_search", "codeExecution", "code_execution", "urlContext", "url_context", "googleMaps") if k in payload), None)
+            if hosted_key and not payload.get("functionDeclarations"):
+                parsed.append(
+                    ToolDefinition(
+                        name=hosted_key,
+                        type="server",
+                        input_schema={},
+                        extra={"raw": deepcopy(tool), "gemini_hosted_tool": hosted_key},
+                    )
+                )
+                continue
             declarations = payload.get("functionDeclarations") or payload.get("function_declarations") or []
             if declarations:
                 for index, declaration in enumerate(declarations):
@@ -556,7 +668,14 @@ class GeminiProtocol(ProtocolAdapter):
                         ToolDefinition(
                             name=str(declaration.get("name") or ""),
                             description=declaration.get("description"),
-                            input_schema=deepcopy(declaration.get("parameters") or {}),
+                            # parametersJsonSchema is the Gemini-3 spelling of
+                            # the same object schema; either is accepted.
+                            input_schema=deepcopy(
+                                declaration.get("parameters")
+                                or declaration.get("parametersJsonSchema")
+                                or declaration.get("parameters_json_schema")
+                                or {}
+                            ),
                             type="function",
                             extra={"raw_container": deepcopy(tool), "container_index": container_index, "declaration_index": index},
                         )
@@ -577,6 +696,19 @@ class GeminiProtocol(ProtocolAdapter):
         grouped: dict[int, dict[str, Any]] = {}
         ungrouped: list[dict[str, Any]] = []
         for tool in tools:
+            hosted_kind = tool.extra.get("gemini_hosted_tool")
+            if hosted_kind:
+                raw = tool.extra.get("raw")
+                if preserve_source and isinstance(raw, dict):
+                    ungrouped.append(deepcopy(raw))
+                else:
+                    ungrouped.append({hosted_kind: {}})
+                continue
+            server_type = tool.extra.get("server_tool_type")
+            if server_type and str(server_type).startswith("web_search"):
+                # Cross-protocol hosted web search maps onto googleSearch.
+                ungrouped.append({"googleSearch": {}})
+                continue
             raw_container = tool.extra.get("raw_container")
             container_index = tool.extra.get("container_index")
             declaration_index = tool.extra.get("declaration_index")
@@ -599,7 +731,11 @@ class GeminiProtocol(ProtocolAdapter):
         raw = tool.extra.get("raw")
         if preserve_source and isinstance(raw, dict):
             return deepcopy(raw)
-        return {"functionDeclarations": [{"name": tool.name, "description": tool.description, "parameters": deepcopy(tool.input_schema)}]}
+        declaration: dict[str, Any] = {"name": tool.name}
+        if tool.description is not None:
+            declaration["description"] = tool.description
+        declaration["parameters"] = deepcopy(tool.input_schema)
+        return {"functionDeclarations": [declaration]}
 
     def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, emit_opaque_state: bool = True) -> dict[str, Any]:
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
@@ -609,7 +745,9 @@ class GeminiProtocol(ProtocolAdapter):
         payload.pop("thoughtSignature", None)
         payload.pop("thought_signature", None)
         function_call = {"name": call.name or "", "args": tool_arguments_object(call.arguments)}
-        if call.id and not (preserve_source and call.extra.get("synthetic_id")):
+        # `id` is Gemini-3+ only; synthetic correlation ids never reach the
+        # wire (Gemini 2.x rejects them, pairing is name-based).
+        if call.id and not call.extra.get("synthetic_id"):
             function_call["id"] = call.id
         payload["functionCall"] = function_call
         signature = call.signature or (call.raw.get("thoughtSignature") if isinstance(call.raw, dict) else None) or (call.raw.get("thought_signature") if isinstance(call.raw, dict) else None)
@@ -625,7 +763,16 @@ class GeminiProtocol(ProtocolAdapter):
         payload.pop("function_response", None)
         result_content = {"error": result.content} if result.is_error else result.content
         response = {"name": result.name or result.tool_call_id or "", "response": tool_result_object(result_content)}
-        if result.tool_call_id and result.name and not (preserve_source and result.extra.get("synthetic_tool_call_id")):
+        # `id` is Gemini-3+ only and never fabricated: emit only when the
+        # source wire carried one, or when a genuine foreign correlation id
+        # exists (never the name-derived fallback, never synthetics).
+        had_wire_id = result.extra.get("had_function_response_id") is True
+        genuine_foreign_id = (
+            result.tool_call_id
+            and result.tool_call_id != result.name
+            and not result.extra.get("synthetic_tool_call_id")
+        )
+        if had_wire_id or genuine_foreign_id:
             response["id"] = result.tool_call_id
         payload["functionResponse"] = response
         return payload
@@ -665,13 +812,23 @@ class GeminiProtocol(ProtocolAdapter):
                     target_protocol=self.name,
                     field="structured_output.strict",
                 )
-            generation.update(
-                {
-                    key: value
-                    for key, value in format_structured_output(structured, self.name).items()
-                    if value is not None
-                }
-            )
+            formatted_structure = format_structured_output(structured, self.name)
+            if formatted_structure is not None:
+                generation.update(
+                    {
+                        key: value
+                        for key, value in formatted_structure.items()
+                        if value is not None
+                    }
+                )
+            elif structured.get("type") not in {"json_schema", "json_object"}:
+                add_conversion_warning(
+                    request,
+                    code="unsupported_optional_control",
+                    message=f"structured output type {structured.get('type')!r} has no Gemini representation; dropped",
+                    target_protocol=self.name,
+                    field="structured_output",
+                )
             # responseSchema and responseJsonSchema are mutually exclusive
             # (the docs mandate omitting the counterpart) — never both.
             if "responseJsonSchema" in generation:
@@ -686,13 +843,40 @@ class GeminiProtocol(ProtocolAdapter):
             generation.update(reasoning_emissions.get("generation_config", {}))
         tool_choice = params.pop("tool_choice", None)
         if tool_choice is not None:
-            tool_config = format_tool_choice(tool_choice, self.name)
+            if preserve_source and tool_config:
+                # Same-protocol: the original toolConfig (any mode +
+                # allowlist combination) is restored verbatim.
+                pass
+            else:
+                tool_config = format_tool_choice(tool_choice, self.name)
         retain_supported_generation_params(
             request,
             params,
             supported=set(),
             target_protocol=self.name,
         )
+        if not preserve_source:
+            # Unmapped generationConfig controls (logprobs, mediaResolution,
+            # speechConfig, imageConfig, ...) dropping at foreign targets is
+            # RECORDED — never silent (they never enter canonical params, so
+            # the retain-warn above cannot see them).
+            source_generation = request.extensions.get(self.name, {}).get("generationConfig")
+            if isinstance(source_generation, dict):
+                handled = set(generation) | {
+                    "maxOutputTokens", "stopSequences", "topP", "topK", "temperature",
+                    "candidateCount", "seed", "frequencyPenalty", "presencePenalty",
+                    "responseMimeType", "responseSchema", "responseJsonSchema",
+                    "thinkingConfig", "thinkingLevel",
+                }
+                for key in source_generation:
+                    if key not in handled:
+                        add_conversion_warning(
+                            request,
+                            code="unsupported_optional_control",
+                            message=f"generationConfig.{key} has no cross-protocol representation; dropped",
+                            target_protocol=self.name,
+                            field=f"generationConfig.{key}",
+                        )
         return generation, safety, tool_config
 
     def _format_usage(self, usage: Usage | None) -> dict[str, int] | None:
@@ -707,6 +891,9 @@ class GeminiProtocol(ProtocolAdapter):
             payload["thoughtsTokenCount"] = usage.reasoning_tokens
         if usage.cache_read_tokens:
             payload["cachedContentTokenCount"] = usage.cache_read_tokens
+        tool_prompt = (usage.extra or {}).get("tool_use_prompt_tokens")
+        if tool_prompt:
+            payload["toolUsePromptTokenCount"] = int(tool_prompt)
         return payload
 
 
@@ -791,13 +978,18 @@ def _parse_gemini_generation_params(generation: dict[str, Any], tool_config: dic
     thinking = generation.get("thinkingConfig")
     if isinstance(thinking, dict):
         budget = thinking.get("thinkingBudget")
-        params["reasoning"] = {
-            # thinkingBudget: 0 is Gemini's documented OFF switch — canonical
-            # folds it to enabled: False (never an "enabled with 0" inversion).
-            **({"enabled": False} if budget == 0 else {}),
-            **({} if budget == 0 else {"budget_tokens": budget}),
-            "include_thoughts": thinking.get("includeThoughts"),
-        }
+        if budget == -1:
+            # -1 = DYNAMIC thinking (the model decides) — a distinct mode,
+            # never an absent control and never an inverted effort.
+            params["reasoning"] = {"enabled": True, "dynamic": True, "include_thoughts": thinking.get("includeThoughts")}
+        else:
+            params["reasoning"] = {
+                # thinkingBudget: 0 is Gemini's documented OFF switch — canonical
+                # folds it to enabled: False (never an "enabled with 0" inversion).
+                **({"enabled": False} if budget == 0 else {}),
+                **({} if budget == 0 else {"budget_tokens": budget}),
+                "include_thoughts": thinking.get("includeThoughts"),
+            }
         params["reasoning"] = {k: v for k, v in params["reasoning"].items() if v is not None}
     if tool_config:
         params["tool_choice"] = _parse_gemini_tool_choice(tool_config)
@@ -818,6 +1010,10 @@ def _parse_gemini_tool_choice(tool_config: dict[str, Any]) -> Any:
         return {"mode": "named", "name": names[0]}
     if mode == "any":
         return {"mode": "required", "allowed_names": names}
+    # AUTO with an allowlist is a legal distinct shape (free choice within
+    # the list) — the list survives, never silently dropped.
+    if names:
+        return {"mode": "auto", "allowed_names": names}
     return {"mode": "auto"}
 
 
@@ -875,9 +1071,11 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool) -> dict[
     if source.data:
         payload["inlineData"] = {"mimeType": source.media_type or "application/octet-stream", "data": source.data}
     else:
-        file_data: dict[str, Any] = {
-            "mimeType": source.media_type or "application/octet-stream",
-            "fileUri": source.url or source.file_id or "",
-        }
+        # URL/fileId-only media: fileData carries what exists — a missing
+        # mimeType key is legal (the API resolves it), an invented
+        # octet-stream is not a declaration the source made.
+        file_data: dict[str, Any] = {"fileUri": source.url or source.file_id or ""}
+        if source.media_type:
+            file_data["mimeType"] = source.media_type
         payload["fileData"] = file_data
     return payload

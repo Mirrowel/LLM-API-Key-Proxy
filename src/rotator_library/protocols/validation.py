@@ -124,6 +124,33 @@ def validate_generative_request(
             "mcp",
             "local_shell",
         }
+    elif target_protocol == "gemini":
+        # Gemini hosts googleSearch/codeExecution/urlContext natively and
+        # maps web_search server tools onto googleSearch; other hosted
+        # families (bash, text_editor, computer) have no Gemini home.
+        supported_tool_types = {"function"}
+        for tool in request.tools:
+            if tool.type == "server":
+                server_type = str(tool.extra.get("server_tool_type") or tool.extra.get("gemini_hosted_tool") or "")
+                if server_type.startswith(
+                    (
+                        "web_search",
+                        "googleSearch",
+                        "google_search",
+                        "codeExecution",
+                        "code_execution",
+                        "urlContext",
+                        "url_context",
+                        "googleMaps",
+                    )
+                ):
+                    continue
+                raise ProtocolError(
+                    f"Cannot safely translate hosted tool '{server_type or tool.name}' into {target_protocol}",
+                    protocol=target_protocol,
+                    pass_name="validate_request",
+                    payload={"tool_type": tool.type, "tool_name": tool.name},
+                )
     else:
         supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):

@@ -59,6 +59,19 @@ _STOP_REASON_ALIASES = {
     "error": STOP_REASON_ERROR,
     "incomplete": STOP_REASON_INCOMPLETE,
     "pause_turn": STOP_REASON_PAUSE,
+    # Gemini payload-shape failures (LANGUAGE/SPII = malformed candidate
+    # text; MALFORMED_FUNCTION_CALL/TOO_MANY_TOOL_CALLS = malformed tool
+    # traffic): retryable signal, distinct from clean completion.
+    "language": STOP_REASON_INCOMPLETE,
+    "spii": STOP_REASON_INCOMPLETE,
+    "malformed_function_call": STOP_REASON_INCOMPLETE,
+    "too_many_tool_calls": STOP_REASON_INCOMPLETE,
+    "malformed_response": STOP_REASON_INCOMPLETE,
+    # Gemini image-generation refusals are content-filter outcomes.
+    "image_safety": STOP_REASON_CONTENT_FILTER,
+    "image_prohibited_content": STOP_REASON_CONTENT_FILTER,
+    "image_other": STOP_REASON_CONTENT_FILTER,
+    "model_armor": STOP_REASON_CONTENT_FILTER,
 }
 
 
@@ -584,6 +597,9 @@ def format_reasoning_controls(
                     f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
                     "reasoning.effort",
                 )
+        elif enabled is True and normalized.get("dynamic") is True:
+            # Gemini dynamic thinking (thinkingBudget: -1): the model decides.
+            thinking_config["thinkingBudget"] = -1
         elif enabled is True and include_thoughts is None and summary is None:
             _warn(
                 "reasoning_control_dropped",
@@ -814,6 +830,9 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
             config = {"mode": "ANY", "allowedFunctionNames": [name] if name else []}
         else:
             config = {"mode": "AUTO"}
+            if allowed_names:
+                # AUTO within an allowlist is a legal Gemini shape.
+                config["allowedFunctionNames"] = allowed_names
         return {"functionCallingConfig": config}
     return deepcopy(value)
 
@@ -923,6 +942,12 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
             }
         }
     if target_protocol == "gemini":
+        if output_type == "text":
+            # Text is Gemini's default output — an explicit text constraint
+            # is the absence of a response schema, never application/json.
+            return None
+        if output_type not in {"json_schema", "json_object"}:
+            return None
         return {
             "responseMimeType": "application/json",
             "responseJsonSchema": deepcopy(value.get("schema")) if output_type != "json_object" else None,

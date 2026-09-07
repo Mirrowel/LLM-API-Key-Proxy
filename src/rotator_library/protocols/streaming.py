@@ -78,6 +78,8 @@ class StreamFormatState:
     tool_arguments: dict[str, str] = field(default_factory=dict)
     tool_names: dict[str, str] = field(default_factory=dict)
     tool_ids: dict[str, str] = field(default_factory=dict)
+    tool_signatures: dict[str, str] = field(default_factory=dict)
+    source_protocol: str | None = None
     emitted_tools: set[str] = field(default_factory=set)
     # Block-identity bookkeeping (defect 8): events that carry explicit
     # content/output indexes use them directly; identity-less wires (chat
@@ -167,6 +169,10 @@ def format_canonical_stream_event(
     state = state or stream_format_state(context, target_protocol)
     if state.terminal:
         return []
+    if state.source_protocol is None and getattr(event, "source_protocol", None):
+        # Same-protocol signature replay gating (D8): opaque provider state
+        # streams only back to its own protocol.
+        state.source_protocol = event.source_protocol
     if event.usage is not None:
         # Cumulative stream usage semantics (Anthropic message_delta and
         # friends): later events refine, they never erase earlier facts —
@@ -362,7 +368,9 @@ def _anthropic_close_block(key: str, state: StreamFormatState) -> list[str]:
     if index is None:
         return frames
     signature = state.block_signatures.get(key)
-    if signature and signature != "__redacted__" and key not in state.emitted_signatures:
+    if signature and key not in state.emitted_signatures and state.source_protocol == "anthropic_messages":
+        # signature_delta flushes before content_block_stop — same-protocol
+        # clients only (foreign-source signatures stay cache-owned, D8).
         frames.append(_event_frame("content_block_delta", {
             "type": "content_block_delta",
             "index": index,
@@ -455,6 +463,8 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             call = block.tool_call
             state.tool_names[key] = call.name or state.tool_names.get(key, "")
             state.tool_ids[key] = call.id or state.tool_ids.get(key, "")
+            if getattr(call, "signature", None):
+                state.tool_signatures[key] = call.signature
             fragment = tool_arguments_text(call.arguments)
             if key in state.emitted_tools:
                 if fragment:
@@ -475,13 +485,35 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             parts.append(_gemini_function_call_part(key, arguments, state))
             state.emitted_tools.add(key)
         elif block.reasoning:
-            parts.append({"text": block.reasoning.text or "", "thought": True})
+            thought_part: dict[str, Any] = {"text": block.reasoning.text or "", "thought": True}
+            if block.reasoning.signature and event.source_protocol == "gemini":
+                # thoughtSignature rides the thought part for SAME-PROTOCOL
+                # clients (multi-turn replay contract); foreign-source
+                # signatures stay suppressed (cache-owned, D8).
+                thought_part["thoughtSignature"] = block.reasoning.signature
+            parts.append(thought_part)
         elif block.type == "refusal":
             # Gemini has no refusal part: the text survives as a plain part
             # (same degradation as the non-stream path).
             parts.append({"text": block.refusal or ""})
         elif block.type == "text":
-            parts.append({"text": block.text or ""})
+            text_part: dict[str, Any] = {"text": block.text or ""}
+            signature_on_text = (block.extra or {}).get("thoughtSignature") or (block.extra or {}).get("thought_signature")
+            if signature_on_text and event.source_protocol == "gemini":
+                text_part["thoughtSignature"] = signature_on_text
+            parts.append(text_part)
+        elif block.type in {"image", "audio", "video", "file", "document"}:
+            # Media parts stream as inlineData/fileData exactly like the
+            # non-stream path — never silently dropped.
+            source = getattr(block, "source", None)
+            media_part = _gemini_media_part(block, source)
+            if media_part is not None:
+                parts.append(media_part)
+        elif block.type == "builtin_tool":
+            # Native union members (executableCode, server toolCall, ...)
+            # replay their raw part verbatim on the stream.
+            if isinstance(block.raw, dict) and any(k in block.raw for k in ("executableCode", "codeExecutionResult", "toolCall", "toolResponse")):
+                parts.append(deepcopy(block.raw))
 
     if _is_terminal(event):
         for key in state.tool_names:
@@ -509,7 +541,7 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         # never re-emit the finish reason.
         finish_reason = None
     if parts or finish_reason or event.usage is not None:
-        candidate: dict[str, Any] = {"index": 0}
+        candidate: dict[str, Any] = {"index": event.output_index or 0}
         if parts:
             candidate["content"] = {"role": "model", "parts": parts}
         if finish_reason:
@@ -539,9 +571,43 @@ def _gemini_function_call_part(
         "name": state.tool_names.get(key, ""),
         "args": arguments,
     }
-    if state.tool_ids.get(key):
-        function_call["id"] = state.tool_ids[key]
+    tool_id = state.tool_ids.get(key)
+    if tool_id and not str(tool_id).startswith("call_"):
+        # `id` is Gemini-3+ only; synthetic call_N correlation ids never
+        # reach the wire (name-based pairing).
+        function_call["id"] = tool_id
+    signature = state.tool_signatures.get(key)
+    if signature and state.source_protocol == "gemini":
+        function_call_payload = {"functionCall": function_call}
+        function_call_payload["thoughtSignature"] = signature
+        return function_call_payload
     return {"functionCall": function_call}
+
+
+def _gemini_media_part(block: Any, source: Any) -> dict[str, Any] | None:
+    """Render a canonical media block as a Gemini inlineData/fileData part."""
+
+    if source is None:
+        return None
+    data = getattr(source, "data", None)
+    if data:
+        mime = getattr(source, "media_type", None)
+        if not mime:
+            # Fabricating a mimeType the source never declared is a guess —
+            # plain data without mime never reaches the wire (Gemini requires
+            # a concrete inlineData.mimeType).
+            return None
+        return {"inlineData": {"mimeType": mime, "data": data}}
+    file_uri = getattr(source, "file_uri", None) or getattr(source, "url", None)
+    file_id = getattr(source, "file_id", None)
+    if file_uri or file_id:
+        file_data: dict[str, Any] = {}
+        if file_uri:
+            file_data["fileUri"] = file_uri
+        if file_id:
+            file_data["fileId"] = file_id
+        return {"fileData": file_data}
+    return None
 
 
 def _event_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
@@ -1032,13 +1098,18 @@ def _gemini_usage(usage: Usage | None) -> dict[str, int] | None:
         return None
     # Canonical input_tokens is cache-INCLUSIVE (H2) — matching Gemini's own
     # convention (promptTokenCount includes cachedContentTokenCount).
-    return {
+    # Detail keys emit only when non-zero (symmetric with the non-stream
+    # formatter; zero-valued detail counts are not wire facts).
+    payload: dict[str, int] = {
         "promptTokenCount": usage.input_tokens,
         "candidatesTokenCount": usage.output_tokens,
         "totalTokenCount": usage.total_tokens,
-        "cachedContentTokenCount": usage.cache_read_tokens,
-        "thoughtsTokenCount": usage.reasoning_tokens,
     }
+    if usage.cache_read_tokens:
+        payload["cachedContentTokenCount"] = usage.cache_read_tokens
+    if usage.reasoning_tokens:
+        payload["thoughtsTokenCount"] = usage.reasoning_tokens
+    return payload
 
 
 def _is_json(value: str) -> bool:
