@@ -46,7 +46,7 @@ def test_create_frame_strips_transport_fields_and_reads_lane() -> None:
 
 
 def test_background_and_conversation_conflicts_rejected_pre_flight() -> None:
-    background = parse_client_frame(json.dumps({"type": "response.create", "model": "m", "background": False}))
+    background = parse_client_frame(json.dumps({"type": "response.create", "model": "m", "background": True}))
     assert background["error"]["param"] == "background"
     conflict = parse_client_frame(
         json.dumps({"type": "response.create", "model": "m", "conversation": "c1", "previous_response_id": "resp_1"})
@@ -409,9 +409,62 @@ async def test_multi_turn_connection_chains_sequentially() -> None:
     assert service.turn_requests[1]["previous_response_id"] == "resp_a"
 
 
-# ---------------------------------------------------------------------------
-# Connection lifetime
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_send_failure_mid_turn_closes_upstream_before_return() -> None:
+    """F1: a send failure mid-turn must close the service stream
+    cooperatively before run() returns — never deferred to GC."""
+
+    import asyncio
+
+    closed = {"events": False}
+
+    class SlowService:
+        # Production shape: an async GENERATOR method (calling it yields
+        # the generator directly — never a coroutine).
+        async def stream_turn_events(self, raw_request, client, *, transaction_logger=None, local_cache=None, **kwargs):
+            try:
+                yield _event("response.created", {"response": {"id": "resp_leak", "status": "in_progress"}})
+                await asyncio.sleep(60)
+            finally:
+                closed["events"] = True
+
+    class FailingSocket:
+        async def receive_text(self):
+            await asyncio.sleep(0)
+            return json.dumps({"type": "response.create", "model": "m"})
+
+        async def send_json(self, payload):
+            # First send fails: the send-failure path (RuntimeError, not
+            # cancellation) must unwind the aclose chain synchronously.
+            raise RuntimeError("client went away")
+
+        async def close(self, code=1000):
+            pass
+
+    session = ResponsesWebSocketSession(service=SlowService(), client=object())
+    await asyncio.wait_for(session.run(FailingSocket()), timeout=5)
+    assert closed["events"] is True
+
+
+def test_warmup_input_items_never_raise_on_odd_shapes() -> None:
+    from rotator_library.responses.websocket import _warmup_input_items
+
+    assert _warmup_input_items("text") == ["text"]
+    assert _warmup_input_items({"type": "message", "role": "user"}) == [{"type": "message", "role": "user"}]
+    assert _warmup_input_items(123) == [123]
+    assert _warmup_input_items(["a", "b"]) == ["a", "b"]
+    assert _warmup_input_items(None) == []
+
+
+def test_background_false_strips_but_truthy_rejects() -> None:
+    falsy = parse_client_frame(json.dumps({"type": "response.create", "model": "m", "background": False}))
+    assert not isinstance(falsy, dict), falsy
+    assert "background" not in falsy.payload
+    truthy = parse_client_frame(json.dumps({"type": "response.create", "model": "m", "background": True}))
+    assert truthy["error"]["param"] == "background"
+
+
+
 
 
 class FakeWebSocket:

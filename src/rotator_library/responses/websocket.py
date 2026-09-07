@@ -162,9 +162,11 @@ def parse_client_frame(raw: str | bytes | dict[str, Any]) -> ClientFrame | dict[
             f"frame type {frame_type!r} is not part of the Responses WebSocket vocabulary (only response.create is supported)",
             err_type="invalid_request_error",
         )
-    if "background" in payload:
+    if "background" in payload and payload["background"]:
         # The events reference pins background as unsupported on this
-        # transport — reject instead of silently dropping the lifecycle.
+        # transport — a TRUTHY background (the requested lifecycle) is
+        # rejected; explicit `background: false` is a no-op mirroring the
+        # HTTP body and strips like every other unused transport field.
         return error_frame(
             "invalid_request_error",
             "background mode is not supported on the WebSocket transport",
@@ -251,6 +253,20 @@ class _LocalResponsesCache(OrderedDict):
         super().__setitem__(key, value)
         while len(self) > _LOCAL_CACHE_MAX_ENTRIES:
             self.popitem(last=False)
+
+
+def _warmup_input_items(raw_input: Any) -> list[Any]:
+    """Normalize warmup input for lineage replay — never raises.
+
+    Mirrors the service's ``_input_items`` semantics: lists pass through,
+    anything else wraps atomically (strings included); absent -> empty.
+    """
+
+    if isinstance(raw_input, list):
+        return list(raw_input)
+    if raw_input is None:
+        return []
+    return [raw_input]
 
 
 def _is_previous_response_failure(exc: BaseException) -> bool:
@@ -366,8 +382,15 @@ class ResponsesWebSocketSession:
             async for frame in self._warmup(parsed):
                 yield frame
             return
-        async for frame in self._turn(parsed):
-            yield frame
+        # GeneratorExit at OUR yield must unwind the turn generator too —
+        # without this try/finally, closing this chain abandons _turn one
+        # level down and its upstream aclose is deferred to GC.
+        turn_gen = self._turn(parsed)
+        try:
+            async for frame in turn_gen:
+                yield frame
+        finally:
+            await turn_gen.aclose()
 
     async def _warmup(self, frame: ClientFrame) -> AsyncGenerator[dict[str, Any], None]:
         """``generate: false`` — prepare request state, return a chainable id.
@@ -395,9 +418,7 @@ class ResponsesWebSocketSession:
                 "output": [],
             },
             request=dict(frame.payload),
-            input_items=(
-                [raw_input] if isinstance(raw_input := frame.payload.get("input"), str) else list(raw_input or [])
-            ),
+            input_items=_warmup_input_items(frame.payload.get("input")),
             scope_key="public",
         )
         self.local_cache[response_id] = stored
@@ -501,7 +522,6 @@ class ResponsesWebSocketSession:
         """Serve the connection until close or the lifetime limit."""
 
         started = self._clock()
-        limit_error_sent = False
         while True:
             elapsed = self._clock() - started
             remaining = self._max_connection_seconds - elapsed
@@ -511,7 +531,6 @@ class ResponsesWebSocketSession:
                     f"Responses websocket connection limit reached ({_human_duration(self._max_connection_seconds)}). Create a new websocket connection to continue.",
                     err_type="invalid_request_error",
                 ))
-                limit_error_sent = True
                 break
             try:
                 raw = await asyncio.wait_for(websocket.receive_text(), timeout=remaining)
