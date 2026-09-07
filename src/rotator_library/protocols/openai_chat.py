@@ -356,10 +356,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 formatted_reason = "stop"
             choice_entry: dict[str, Any] = {
                 "index": message.index if message.index is not None else position,
-                    "message": _format_response_message(
-                        self._format_message(message, preserve_source=preserve_source, direction="response", warnings=unified_response.warnings),
-                        message,
-                    ),
+                "message": _format_response_message(
+                    self._format_message(message, preserve_source=preserve_source, direction="response", warnings=unified_response.warnings),
+                    message,
+                ),
                 "finish_reason": formatted_reason,
             }
             choice_logprobs = (message.extra or {}).get("logprobs")
@@ -908,6 +908,20 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 formatted.append(payload)
             elif preserve_source and isinstance(block.raw, dict):
                 formatted.append(deepcopy(block.raw))
+            elif block.type not in {"text", "image", "audio", "file", "document", "refusal", "tool_call", "tool_result", "reasoning", "builtin_tool", "unknown"} and block.raw is None:
+                # Unknown block type with no raw replay: record the drop
+                # (response paths have no fail-fast validation).
+                if warnings is not None:
+                    warnings.append(
+                        ConversionWarning(
+                            code="unsupported_optional_control",
+                            message=f"content block type '{block.type}' has no Chat representation; dropped",
+                            field="content",
+                            source_protocol=None,
+                            target_protocol="openai_chat",
+                        )
+                    )
+                continue
         if not formatted and block_list and warnings is not None and len(warnings) > warnings_before:
             # Every part was DROPPED with a recorded warning (e.g. URL-only
             # files): an empty parts array is illegal wire — degrade to an
