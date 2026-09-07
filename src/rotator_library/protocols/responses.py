@@ -262,6 +262,8 @@ class ResponsesProtocol(ProtocolAdapter):
             output = self._format_canonical_output(assistants[0], unified_response)
         else:
             output = self._format_canonical_output(coalesce_assistant_message(unified_response.messages), unified_response)
+        native_status = unified_response.metadata.get("native_status")
+        non_terminal = native_status in {"in_progress", "queued", "cancelled"}
         payload = {
             "id": unified_response.id,
             "object": unified_response.metadata.get("object", "response"),
@@ -269,7 +271,9 @@ class ResponsesProtocol(ProtocolAdapter):
             "model": unified_response.model,
             # First-wins keeps the FIRST candidate's stop status (D9), never
             # the response-level reason that parse derived from the LAST one.
-            "status": format_stop_reason(
+            # Non-terminal native statuses (queued/in_progress/cancelled)
+            # replay verbatim — they are not incompletions.
+            "status": native_status if (preserve_source and non_terminal) else format_stop_reason(
                 (assistants[0].stop_reason or unified_response.stop_reason)
                 if candidate_backed and assistants
                 else unified_response.stop_reason,
@@ -278,6 +282,10 @@ class ResponsesProtocol(ProtocolAdapter):
             "output": output,
             "usage": _format_responses_usage(unified_response.usage),
         }
+        if unified_response.metadata.get("incomplete_details"):
+            payload["incomplete_details"] = deepcopy(unified_response.metadata["incomplete_details"])
+        elif payload["status"] == "incomplete" and not preserve_source:
+            payload["incomplete_details"] = {"reason": "max_output_tokens" if unified_response.stop_reason == "max_tokens" else "content_filter"}
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
         return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
@@ -299,6 +307,26 @@ class ResponsesProtocol(ProtocolAdapter):
         if event_type == "response.output_text.delta":
             message = UnifiedMessage(role="assistant", content=text_blocks(data.get("delta") or ""))
             return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, output_index=data.get("output_index"), content_index=data.get("content_index"), raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type in {"response.reasoning_summary_text.delta", "response.reasoning_text.delta"}:
+            # Reasoning deltas (summary AND full-text families) stream into
+            # canonical reasoning blocks — never silently dropped.
+            reasoning = ReasoningBlock(type="reasoning", text=data.get("delta") or "")
+            message = UnifiedMessage(role="assistant", content=[ContentBlock(type="reasoning", reasoning=reasoning)])
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, output_index=data.get("output_index"), raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type == "response.refusal.delta":
+            message = UnifiedMessage(role="assistant", content=[ContentBlock(type="refusal", refusal=data.get("delta") or "")])
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, output_index=data.get("output_index"), content_index=data.get("content_index"), raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type == "response.output_text.annotation.added":
+            annotation_payload = data.get("annotation")
+            if isinstance(annotation_payload, dict):
+                annotation = Annotation(type=str(annotation_payload.get("type") or "citation"), url=annotation_payload.get("url"), title=annotation_payload.get("title"), raw=deepcopy(annotation_payload))
+                message = UnifiedMessage(role="assistant", content=[ContentBlock(type="citations_delta", annotations=[annotation])])
+                return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, output_index=data.get("output_index"), raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type in {"response.web_search_call.in_progress", "response.web_search_call.searching", "response.web_search_call.completed"}:
+            item = data.get("item") if isinstance(data.get("item"), dict) else {"type": "web_search_call", "id": data.get("item_id"), "status": "in_progress"}
+            builtin = BuiltinToolCall(kind="web_search", call_id=item.get("id"), status=str(item.get("status") or "in_progress"), raw=deepcopy(item))
+            message = UnifiedMessage(role="assistant", content=[ContentBlock(type="builtin_tool", builtin_tool=builtin)])
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_RESPONSES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, delta=message, output_index=data.get("output_index"), raw=deepcopy(raw_event), extra={"payload": data})
         if event_type == "response.function_call_arguments.delta":
             call = ToolCall(id=data.get("call_id") or data.get("item_id"), arguments=data.get("delta") or "", index=data.get("output_index"))
             message = UnifiedMessage(role="assistant", content=[ContentBlock(type="tool_call", tool_call=call)], tool_calls=[call])

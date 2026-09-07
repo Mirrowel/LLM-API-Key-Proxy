@@ -62,6 +62,8 @@ class StreamFormatState:
     finished_choices: set[int] = field(default_factory=set)
     block_signatures: dict[str, str] = field(default_factory=dict)
     emitted_signatures: set[str] = field(default_factory=set)
+    reasoning_encrypted: dict[str, str] = field(default_factory=dict)
+    sequence: int = 0
     stop_reason: str | None = None
     stop_sequence: str | None = None
     usage: Usage | None = None
@@ -734,10 +736,25 @@ def _responses_start(state: StreamFormatState) -> list[str]:
     if state.started:
         return []
     state.started = True
-    return [_event_frame("response.created", {
-        "type": "response.created",
-        "response": _responses_object(state, status="in_progress"),
-    })]
+    # Documented lifecycle: created -> in_progress -> items -> terminal.
+    return [
+        _responses_frame("response.created", {
+            "type": "response.created",
+            "response": _responses_object(state, status="in_progress"),
+        }, state),
+        _responses_frame("response.in_progress", {
+            "type": "response.in_progress",
+            "response": _responses_object(state, status="in_progress"),
+        }, state),
+    ]
+
+
+def _responses_frame(event_name: str, payload: dict[str, Any], state: StreamFormatState) -> str:
+    """SSE frame with the spec-mandated monotonic sequence_number."""
+    payload = dict(payload)
+    payload.setdefault("sequence_number", state.sequence)
+    state.sequence += 1
+    return _event_frame(event_name, payload)
 
 
 def _responses_item_id(kind: str, index: int) -> str:
@@ -751,23 +768,23 @@ def _responses_item_start(block: ContentBlock, key: str, item_id: str, state: St
         state.tool_names[key] = call.name or ""
         state.tool_ids[key] = call.id or item_id
         item = {"id": item_id, "type": "function_call", "call_id": state.tool_ids[key], "name": state.tool_names[key], "arguments": "", "status": "in_progress"}
-        return [_event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item})]
+        return [_responses_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}, state)]
     if kind == "reasoning":
         item = {"id": item_id, "type": "reasoning", "summary": [], "status": "in_progress"}
         return [
-            _event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}),
-            _event_frame("response.reasoning_summary_part.added", {"type": "response.reasoning_summary_part.added", "item_id": item_id, "output_index": state.next_index - 1, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}),
+            _responses_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}, state),
+            _responses_frame("response.reasoning_summary_part.added", {"type": "response.reasoning_summary_part.added", "item_id": item_id, "output_index": state.next_index - 1, "summary_index": 0, "part": {"type": "summary_text", "text": ""}}, state),
         ]
     if block.type == "refusal":
         item = {"id": item_id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}
         return [
-            _event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}),
-            _event_frame("response.content_part.added", {"type": "response.content_part.added", "item_id": item_id, "output_index": state.next_index - 1, "content_index": 0, "part": {"type": "refusal", "refusal": ""}}),
+            _responses_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}, state),
+            _responses_frame("response.content_part.added", {"type": "response.content_part.added", "item_id": item_id, "output_index": state.next_index - 1, "content_index": 0, "part": {"type": "refusal", "refusal": ""}}, state),
         ]
     item = {"id": item_id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"}
     return [
-        _event_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}),
-        _event_frame("response.content_part.added", {"type": "response.content_part.added", "item_id": item_id, "output_index": state.next_index - 1, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}),
+        _responses_frame("response.output_item.added", {"type": "response.output_item.added", "output_index": state.next_index - 1, "item": item}, state),
+        _responses_frame("response.content_part.added", {"type": "response.content_part.added", "item_id": item_id, "output_index": state.next_index - 1, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}, state),
     ]
 
 
@@ -777,7 +794,7 @@ def _responses_item_delta(block: ContentBlock, key: str, item_id: str, state: St
     if kind == "tool" and block.tool_call:
         fragment = tool_arguments_text(block.tool_call.arguments)
         state.tool_arguments[key] = state.tool_arguments.get(key, "") + fragment
-        return [_event_frame("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": output_index, "delta": fragment})] if fragment else []
+        return [_responses_frame("response.function_call_arguments.delta", {"type": "response.function_call_arguments.delta", "item_id": item_id, "output_index": output_index, "delta": fragment}, state)] if fragment else []
     if block.type == "refusal":
         # Responses refusal parts stream on the refusal variant of the
         # content delta (never dropped).
@@ -786,8 +803,12 @@ def _responses_item_delta(block: ContentBlock, key: str, item_id: str, state: St
             return []
         state.text_by_key[key] = state.text_by_key.get(key, "") + text
         state.refusal_by_key[key] = True
-        return [_event_frame("response.refusal.delta", {"type": "response.refusal.delta", "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": text})]
+        return [_responses_frame("response.refusal.delta", {"type": "response.refusal.delta", "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": text}, state)]
     text = block.reasoning.text if block.reasoning else block.text
+    if block.reasoning and block.reasoning.encrypted_content:
+        # D8: bound opaque reasoning state rides the streamed item for
+        # continuation replay (output_item.done + terminal object).
+        state.reasoning_encrypted[key] = block.reasoning.encrypted_content
     if not text:
         return []
     state.text_by_key[key] = state.text_by_key.get(key, "") + text
@@ -813,31 +834,34 @@ def _responses_item_done(
         arguments = state.tool_arguments.get(key, "")
         item = {"id": item_id, "type": "function_call", "call_id": state.tool_ids.get(key, item_id), "name": state.tool_names.get(key, ""), "arguments": arguments, "status": item_status}
         return [
-            _event_frame("response.function_call_arguments.done", {"type": "response.function_call_arguments.done", "item_id": item_id, "output_index": output_index, "arguments": arguments}),
-            _event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}),
+            _responses_frame("response.function_call_arguments.done", {"type": "response.function_call_arguments.done", "item_id": item_id, "output_index": output_index, "arguments": arguments}, state),
+            _responses_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}, state),
         ]
     text = state.text_by_key.get(key, "")
     if kind == "reasoning":
         item = {"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": text}], "status": item_status}
+        encrypted = state.reasoning_encrypted.get(key)
+        if encrypted:
+            item["encrypted_content"] = encrypted
         return [
-            _event_frame("response.reasoning_summary_text.done", {"type": "response.reasoning_summary_text.done", "item_id": item_id, "output_index": output_index, "summary_index": 0, "text": text}),
-            _event_frame("response.reasoning_summary_part.done", {"type": "response.reasoning_summary_part.done", "item_id": item_id, "output_index": output_index, "summary_index": 0, "part": item["summary"][0]}),
-            _event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}),
+            _responses_frame("response.reasoning_summary_text.done", {"type": "response.reasoning_summary_text.done", "item_id": item_id, "output_index": output_index, "summary_index": 0, "text": text}, state),
+            _responses_frame("response.reasoning_summary_part.done", {"type": "response.reasoning_summary_part.done", "item_id": item_id, "output_index": output_index, "summary_index": 0, "part": item["summary"][0]}, state),
+            _responses_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}, state),
         ]
     if state.refusal_by_key.get(key):
         part = {"type": "refusal", "refusal": text}
         item = {"id": item_id, "type": "message", "role": "assistant", "content": [part], "status": item_status}
         return [
-            _event_frame("response.refusal.done", {"type": "response.refusal.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "refusal": text}),
-            _event_frame("response.content_part.done", {"type": "response.content_part.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "part": part}),
-            _event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}),
+            _responses_frame("response.refusal.done", {"type": "response.refusal.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "refusal": text}, state),
+            _responses_frame("response.content_part.done", {"type": "response.content_part.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "part": part}, state),
+            _responses_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}, state),
         ]
     part = {"type": "output_text", "text": text, "annotations": []}
     item = {"id": item_id, "type": "message", "role": "assistant", "content": [part], "status": item_status}
     return [
-        _event_frame("response.output_text.done", {"type": "response.output_text.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "text": text}),
-        _event_frame("response.content_part.done", {"type": "response.content_part.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "part": part}),
-        _event_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}),
+        _responses_frame("response.output_text.done", {"type": "response.output_text.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "text": text}, state),
+        _responses_frame("response.content_part.done", {"type": "response.content_part.done", "item_id": item_id, "output_index": output_index, "content_index": 0, "part": part}, state),
+        _responses_frame("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item}, state),
     ]
 
 
@@ -851,12 +875,19 @@ def _responses_object(state: StreamFormatState, *, status: str, error: Any = Non
         elif kind == "tool":
             output.append({"id": item_id, "type": "function_call", "call_id": state.tool_ids.get(key, item_id), "name": state.tool_names.get(key, ""), "arguments": state.tool_arguments.get(key, ""), "status": item_status})
         elif kind == "reasoning":
-            output.append({"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": state.text_by_key.get(key, "")}], "status": item_status})
+            reasoning_item: dict[str, Any] = {"id": item_id, "type": "reasoning", "summary": [{"type": "summary_text", "text": state.text_by_key.get(key, "")}], "status": item_status}
+            encrypted = state.reasoning_encrypted.get(key)
+            if encrypted:
+                reasoning_item["encrypted_content"] = encrypted
+            output.append(reasoning_item)
         elif state.refusal_by_key.get(key):
             output.append({"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": state.text_by_key.get(key, "")}], "status": item_status})
         else:
             output.append({"id": item_id, "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": state.text_by_key.get(key, ""), "annotations": []}], "status": item_status})
     payload: dict[str, Any] = {"id": state.response_id, "object": "response", "status": status, "model": state.model, "output": output}
+    if status == "incomplete":
+        # Documented reason field on incomplete terminals.
+        payload["incomplete_details"] = {"reason": "max_output_tokens" if state.stop_reason == "max_tokens" else "content_filter" if state.stop_reason == "content_filter" else "max_output_tokens"}
     usage = _responses_usage(state.usage)
     if usage:
         payload["usage"] = usage

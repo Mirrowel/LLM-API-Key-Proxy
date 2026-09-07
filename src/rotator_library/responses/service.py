@@ -43,21 +43,30 @@ from .types import generate_response_id
 
 
 _STORED_REQUEST_FIELDS = {
+    "background",
+    "conversation",
     "include",
     "input",
     "instructions",
     "max_output_tokens",
+    "max_tool_calls",
     "metadata",
     "model",
     "parallel_tool_calls",
     "previous_response_id",
+    "prompt",
+    "prompt_cache_key",
     "reasoning",
+    "safety_identifier",
+    "service_tier",
     "store",
     "stream",
+    "stream_options",
     "temperature",
     "text",
     "tool_choice",
     "tools",
+    "top_logprobs",
     "top_p",
     "truncation",
     "user",
@@ -95,7 +104,8 @@ class ResponsesServiceError(ValueError):
                 "error": {
                     "message": str(self),
                     "type": self.error_type,
-                    "code": self.status_code,
+                    # OpenAI error codes are strings or null — never ints.
+                    "code": str(self.status_code),
                 }
             }
         normalized = {
@@ -197,6 +207,7 @@ class ResponsesService:
             raise ResponsesServiceError("'model' is required", status_code=400)
         if raw_request.get("stream"):
             raise ResponsesServiceError("Use stream_response for streaming requests", status_code=400)
+        _reject_unsupported_lifecycles(raw_request)
 
         resolved_scope = self._resolve_request_scope(raw_request, request_scope)
         isolation_key = resolved_scope.key
@@ -264,7 +275,12 @@ class ResponsesService:
         self._trace(transaction_logger, "responses_parsed_response", response_payload, direction="response", stage="protocol")
         self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_response")
 
-        if raw_request.get("store", True):
+        # Store parity with the stream path: failed responses honor
+        # store_failed=False (the operator's explicit policy).
+        should_store = raw_request.get("store", True) and (
+            response_payload.get("status") != "failed" or self.store.settings.store_failed
+        )
+        if should_store:
             stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
             try:
                 await self.store.save(stored)
@@ -572,6 +588,7 @@ class ResponsesService:
 
         if not raw_request.get("model"):
             raise ResponsesServiceError("'model' is required", status_code=400)
+        _reject_unsupported_lifecycles(raw_request)
         previous_response_id = raw_request.get("previous_response_id")
         if previous_response_id:
             resolved_scope = self._resolve_request_scope(raw_request, request_scope)
@@ -597,6 +614,7 @@ class ResponsesService:
 
         if not raw_request.get("model"):
             raise ResponsesServiceError("'model' is required", status_code=400)
+        _reject_unsupported_lifecycles(raw_request)
         stream_request = dict(raw_request)
         stream_request["stream"] = True
         resolved_scope = self._resolve_request_scope(stream_request, request_scope)
@@ -1342,6 +1360,25 @@ def _input_items(raw_request: dict[str, Any]) -> list[Any]:
     return deepcopy(value if isinstance(value, list) else [value])
 
 
+def _reject_unsupported_lifecycles(raw_request: dict[str, Any]) -> None:
+    """Clear local rejections for spec conflicts this proxy cannot honor."""
+
+    if raw_request.get("previous_response_id") and raw_request.get("conversation"):
+        # Spec: previous_response_id and conversation are mutually exclusive.
+        raise ResponsesServiceError(
+            "previous_response_id cannot be used in conjunction with conversation",
+            status_code=400,
+        )
+    if raw_request.get("background"):
+        # Background mode needs the queued/polling lifecycle; executed
+        # synchronously it silently breaks the contract — reject explicitly
+        # until implemented.
+        raise ResponsesServiceError(
+            "background mode is not supported by this proxy (no queued/polling lifecycle); omit 'background'",
+            status_code=400,
+        )
+
+
 def _expanded_responses_request(
     raw_request: dict[str, Any],
     lineage: list[StoredResponse],
@@ -1359,7 +1396,13 @@ def _expanded_responses_request(
         input_items.extend(deepcopy(stored.output_items))
     input_items.extend(_input_items(raw_request))
     expanded["input"] = input_items
-    expanded.pop("previous_response_id", None)
+    if lineage:
+        # Local lineage replayed inline: the upstream continuation pointer
+        # must not ALSO reference the provider's own chain (double context).
+        expanded.pop("previous_response_id", None)
+    # Empty lineage: the provider's own continuation is the ONLY chain —
+    # preserve previous_response_id so server-side state, caching, and the
+    # encrypted-reasoning fast path stay on the provider-native path.
     return expanded
 
 

@@ -132,7 +132,11 @@ class ProviderCacheResponsesStore:
             raw = await self._cache.retrieve_async(legacy_key)
         if raw is None:
             return None
-        response = StoredResponse.from_dict(json.loads(raw))
+        try:
+            response = StoredResponse.from_dict(json.loads(raw))
+        except (ValueError, TypeError, KeyError):
+            # Corrupt cache rows are cache misses, never 500s.
+            return None
         response_scope = response.scope_key or "public"
         if response.id != response_id or response_scope != scope_key:
             return None
