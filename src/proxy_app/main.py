@@ -932,7 +932,7 @@ async def responses_websocket(websocket: WebSocket):
     rotating_client = getattr(websocket.app.state, "rotating_client", None)
     if service is None or rotating_client is None:
         await websocket.accept()
-        await websocket.send_json({"type": "error", "status": 503, "error": {"code": "server_error", "message": "Responses service unavailable"}})
+        await websocket.send_json({"type": "error", "status": 503, "error": {"type": "server_error", "code": "responses_service_unavailable", "message": "Responses service unavailable"}})
         await websocket.close(code=1011)
         return
     try:

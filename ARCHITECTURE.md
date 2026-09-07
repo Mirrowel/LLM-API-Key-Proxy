@@ -6,6 +6,7 @@
 
 **Key Characteristics:**
 - Two-layer separation: FastAPI proxy (`proxy_app`) provides the API surface; `rotator_library` provides all resilience logic
+- Protocol-neutral execution: every wire protocol parses once into the neutral canonical model (`src/rotator_library/protocols/`); providers receive only their declared native format, the client response protocol always equals the client request protocol, and same-protocol requests use the pristine client payload as the raw transport basis (`src/rotator_library/native_provider/`) — native execution is the default for providers that declare a native protocol (`auto` mode); LiteLLM is an explicit, logged fallback (`litellm_fallback`), never a silent one
 - Plugin-based provider discovery: providers auto-register from `src/rotator_library/providers/` files plus dynamic `*_API_BASE` environment variables
 - Singleton providers via `SingletonABCMeta` metaclass — one instance per provider class shared across all components
 - Lazy imports at package boundaries (`__getattr__`) to keep startup fast
@@ -17,21 +18,42 @@
 **Proxy Application Layer:**
 - Purpose: Expose OpenAI Chat Completions, OpenAI Responses, and Anthropic-compatible HTTP endpoints, handle auth, logging, TUI
 - Location: `src/proxy_app/`
-- Contains: FastAPI app, route handlers, Pydantic request/response models, launcher TUI, quota viewer
+- Contains: FastAPI app, route handlers, Pydantic request/response models, launcher TUI, quota viewer; `main.py` stays a thin route surface — OAuth credential bootstrap lives in `startup.py` and route-support behaviors (stream framing with in-band terminal error frames, request overrides, embedding fan-out) in `route_helpers.py`
 - Depends on: `rotator_library`, `litellm`, `fastapi`, `uvicorn`
 - Used by: External API clients (Claude Code, Gemini CLI, OpenAI SDK, curl)
 
 **Client Facade Layer:**
 - Purpose: Provide a single `RotatingClient` entry point that orchestrates retries, rotation, and streaming
 - Location: `src/rotator_library/client/`
-- Contains: `RotatingClient` (facade), `RequestExecutor`, `CredentialFilter`, `ModelResolver`, `ProviderTransforms`, `StreamingHandler`, `AnthropicHandler`, `RequestContextBuilder` (resolves provider hints for session evidence)
-- Depends on: `rotator_library.usage`, `rotator_library.providers`, `rotator_library.core`
+- Contains: `RotatingClient` (facade — `agenerate()` is the protocol-aware entry point, `acompletion()` the raw chat-kwargs seam), `RequestExecutor`, `CredentialFilter`, `ModelResolver`, `ProviderTransforms`, `NeutralStreamPipeline` / `ChatWireStreamAdapter` / `StreamUsageTracker` (`stream_ops.py`), `StreamingHandler` (legacy SSE parsing helpers), `AnthropicHandler` (thin facade — routes the raw `/v1/messages` body through the protocol runtime, stamps the response id for non-streaming calls, traces the boundary, counts tokens locally via the adapter parse → Chat projection), `GeminiHandler`, `RequestContextBuilder` (resolves env-configured routing targets and provider hints for session evidence)
+- Depends on: `rotator_library.usage`, `rotator_library.providers`, `rotator_library.protocols`, `rotator_library.core`
 - Used by: `proxy_app` via `from rotator_library import RotatingClient`
+
+**Routing & Fallback Layer:**
+- Purpose: Resolve model names to ordered execution targets — direct `provider/model` references, env-configured fallback groups, and `provider:profile/model` transport-profile addressing; identity stays provider-level (usage pools, cooldowns, classifiers, session namespaces, and cache provenance key on the bare provider name — the profile only steers transport)
+- Location: `src/rotator_library/routing/`
+- Contains: `RouteTarget` / `FallbackGroup` / `RoutingDecision` with failover/stop error vocabularies (`types.py`), env parser `parse_route_target()` (`provider/model[@execution]`) and `load_routing_config_from_env()` (`config.py`), `FallbackResolver` (model routes, `group:` aliases, requested-target promotion), `FallbackAttemptRunner` + `FallbackPolicy` (ordered attempts with failover/stop decisions on classified error types), `clone_context_for_target()` (`attempts.py` — per-target context copies that preserve the original for traceability), profile grammar (`profiles.py` — `parse_model_reference()` splits only the provider segment so model names keep their colons; `resolve_profile()` requires explicit profiles to exist and resolves bare names to the default profile or the unique profile matching the client protocol, else fails fast — never silent conversion)
+- Depends on: `rotator_library.core` (`RequestContext`)
+- Used by: `RequestContextBuilder` (`_resolve_routing_decision()` stamps `routing_targets` on `RequestContext`); `RequestExecutor` executes each target with its `execution` mode
+
+**Protocol Layer:**
+- Purpose: Convert between client wire protocols (OpenAI Chat Completions, OpenAI Responses, Anthropic Messages, Gemini, Ollama, audio/embeddings/images, MCP) and the provider-neutral canonical model — parse once into `UnifiedRequest` / `UnifiedMessage` / `UnifiedResponse` / `UnifiedStreamEvent`, build and format any client protocol from it; the client response protocol always equals the client request protocol
+- Location: `src/rotator_library/protocols/`
+- Contains: `ProtocolAdapter` base (`base.py`, override-friendly defaults), per-protocol adapters auto-registered in `PROTOCOL_PLUGINS` (`registry.py`), cross-protocol canonical semantics (`canonical.py` — stop reasons (extended Gemini finishReason vocabulary: payload-shape failures map to incomplete, image/model-armor refusals to content_filter), instruction placement and merge records, reasoning-control vocabulary with effort ↔ budget-token mapping plus dynamic thinking (`thinkingBudget: -1`), source-aware passthrough, namespaced tool-choice round-trips (Responses-native variants replay verbatim; foreign targets narrow to the mode with a recorded warning), cache-inclusive usage totals: canonical `input_tokens` already includes cached tokens, so every destination formatter emits the same prompt total from one canonical `Usage` and never adds cached tokens on top — Anthropic folds/unfolds its sibling reporting), destination capability validation (`validation.py` — per-destination hosted-tool allowlists: `responses` accepts its native ToolParam union, `gemini` maps hosted web-search/googleSearch/codeExecution/urlContext/googleMaps server tools and rejects unmapped families), neutral-event stream formatting (`streaming.py` — stable block identity across deltas, refusal deltas, per-stream `sequence` numbers on Responses frames, and same-protocol opaque-state replay gating: `thoughtSignature`/signatures stream back only to the source protocol), operation vocabulary (`operation.py`), shared types (`types.py` — `ToolCall.signature` carries provider thought signatures as D8 opaque state), `litellm_fallback.py` passthrough for LiteLLM-shaped payloads
+- Depends on: `rotator_library.core`, `rotator_library.streaming`
+- Used by: Client layer (`request_builder.py`, `executor.py`, `stream_ops.py`), native provider executor, Responses layer, proxy error formatting
+
+**Native Provider Execution Layer:**
+- Purpose: Execute requests against provider-native HTTP endpoints through protocol adapters; native execution is the default for providers that declare a native protocol (`auto` mode) — LiteLLM remains an explicit, logged fallback. When the client protocol equals the provider protocol and no semantic edits are required, the pristine client wire payload is the transport basis (same-protocol raw fast path) instead of a canonical rebuild
+- Location: `src/rotator_library/native_provider/`
+- Contains: `NativeProviderExecutor` (`executor.py` — runs protocol/adapter/field-cache passes: adapter chains run on the raw provider wire before field-cache extraction, and cached provider state is injected before the raw payload is sent), `NativeProviderContext` (`context.py` — carries `raw_client_request`, transport overlay records, and the wire-exhaustive `stream_usage_record`), `NativeHTTPTransport` (`http.py`)
+- Depends on: `rotator_library.protocols`, `rotator_library.adapters`, `rotator_library.field_cache`
+- Used by: Client layer's `RequestExecutor` for the `native` execution mode and for `auto`-mode requests where the provider declares a native protocol
 
 **Provider Plugin Layer:**
 - Purpose: Abstract provider-specific behavior (model discovery, auth, transforms, quota tracking, background jobs, session evidence)
 - Location: `src/rotator_library/providers/`
-- Contains: `ProviderInterface` (ABC) and one file per provider (`*_provider.py`)
+- Contains: `ProviderInterface` (ABC) and one file per provider (`*_provider.py`); providers declare native transport as class-level runtime config attributes (`protocol_name`, `adapter_names`, `field_cache_rules`, `native_streaming_supported`, `transport_profiles`, `default_profile`, `cache_replay`) merged with the JSON provider config through `bind_runtime_config()` / `_get_runtime_config()` so operator overrides beat code defaults
 - Depends on: `litellm`, provider utility modules
 - Used by: Client layer via `PROVIDER_PLUGINS` dict, auto-discovered at import time
 
@@ -42,17 +64,10 @@
 - Depends on: `rotator_library.core`, provider config
 - Used by: Client layer for credential selection and usage recording
 
-**Anthropic Compatibility Layer:**
-- Purpose: Translate between Anthropic Messages API and OpenAI Chat Completions API formats
-- Location: `src/rotator_library/anthropic_compat/`
-- Contains: Data models (`models.py`), request/response translator (`translator.py`), streaming wrapper (`streaming.py`)
-- Depends on: `rotator_library.core`
-- Used by: Client layer's `AnthropicHandler`, proxy routes `/v1/messages`, `/v1/messages/count_tokens`
-
 **Responses API Layer:**
 - Purpose: OpenAI Responses API compatibility — create, store, retrieve, and stream response objects with `previous_response_id` continuation
 - Location: `src/rotator_library/responses/`
-- Contains: `ResponsesService` (orchestrator + `ResponsesServiceError`), `ResponsesBridge` (Responses ↔ chat-completions translation via `ResponsesProtocol`), `ResponsesStore` protocol with `InMemoryResponsesStore` / `ProviderCacheResponsesStore` backends and `create_configured_responses_store` factory, `ResponsesSSEFormatter` / `ResponsesWebSocketFormatter` / `ResponsesStreamEvent` (streaming), `StoredResponse` / `ResponsesStoreSettings` / `generate_response_id` (types)
+- Contains: `ResponsesService` (orchestrator + `ResponsesServiceError` with string error codes), `ResponsesBridge` (Responses ↔ chat-completions translation via `ResponsesProtocol`; fallback seam for clients without `agenerate` — structured output survives the bridge as a legal chat `response_format`), `ResponsesStore` protocol with `InMemoryResponsesStore` / `ProviderCacheResponsesStore` backends (corrupt cache rows are cache misses, never 500s) and `create_configured_responses_store` factory, `ResponsesSSEFormatter` / `ResponsesWebSocketFormatter` / `ResponsesStreamEvent` (streaming — monotonic `sequence_number` on every event), `StoredResponse` / `ResponsesStoreSettings` (incl. `store_failed` policy) / `generate_response_id` (types)
 - Depends on: `rotator_library.protocols`, `rotator_library.streaming`, `rotator_library.usage` (costs/accounting), `rotator_library.client` via injected `RotatingClient`
 - Used by: Proxy routes `/v1/responses`, `/v1/responses/{response_id}`, `/v1/responses/{response_id}/input_items`
 
@@ -68,32 +83,32 @@
 **Chat Completion Request:**
 
 1. Client sends POST to `/v1/chat/completions` — `src/proxy_app/main.py`
-2. FastAPI handler calls `client.chat_completions()` — `src/rotator_library/client/rotating_client.py`
-3. `RequestContextBuilder` resolves provider hints, runs session inference, builds a `RequestContext` with session affinity key and namespace — `src/rotator_library/client/request_builder.py`
+2. FastAPI handler calls `client.agenerate()` with `input_protocol="openai_chat"` — `src/proxy_app/main.py`, `src/rotator_library/client/rotating_client.py`
+3. `RequestContextBuilder` resolves the input protocol, env-configured routing decision (fallback targets, `provider:profile/model` transport profile), provider hints, and session inference, and builds a `RequestContext` with session affinity key and namespace — `src/rotator_library/client/request_builder.py`
 4. `ModelResolver` resolves model name to provider + litellm format — `src/rotator_library/client/models.py`
 5. `UsageManager.acquire_credential()` selects best credential via `SelectionEngine` — `src/rotator_library/usage/manager.py`
-6. `RequestExecutor` executes with retry/rotation logic, calling litellm — `src/rotator_library/client/executor.py`
-7. For streaming, `StreamingHandler` processes chunks and tracks usage — `src/rotator_library/client/streaming.py`
+6. `RequestExecutor` executes with retry/rotation logic, dispatching on the routing target's execution mode: `native` (`NativeProviderExecutor` executes the canonical request against the provider's native protocol — same-protocol requests use the raw client payload as transport basis; under `auto` this is the default whenever the provider declares a native protocol), `custom` (provider plugin `acompletion()`), and `litellm_fallback` (explicit, logged fallback — `_record_litellm_fallback_identity()` stamps the fallback identity in metadata and warns once per request when a native protocol was available); `provider:profile/model` addressing steers the transport profile without changing provider identity — `src/rotator_library/client/executor.py`
+7. For streaming, `NeutralStreamPipeline` runs timing/disconnect/heartbeat/usage/session-evidence gates on neutral `UnifiedStreamEvent`s and formats the client-protocol stream exactly once at the tail; `ChatWireStreamAdapter` parses LiteLLM/custom chat-wire chunks into neutral events — `src/rotator_library/client/stream_ops.py`
 8. On completion, `UsageManager` records success/failure, `SessionTracker.record_response()` records response-derived anchors — `src/rotator_library/usage/manager.py`, `src/rotator_library/session_tracking.py`
 
 **Anthropic Messages Request:**
 
 1. Client sends POST to `/v1/messages` — `src/proxy_app/main.py`
-2. Proxy translates Anthropic format to OpenAI format via `anthropic_compat.translator` — `src/rotator_library/anthropic_compat/translator.py`
-3. Standard chat completion flow follows (steps 2–8 above)
-4. Response is translated back to Anthropic format — `src/rotator_library/anthropic_compat/translator.py`
-5. For streaming, `anthropic_streaming_wrapper` wraps the SSE stream — `src/rotator_library/anthropic_compat/streaming.py`
+2. `AnthropicHandler.messages()` routes the raw `/v1/messages` body through `client.agenerate()` with `input_protocol="anthropic_messages"`; the `anthropic_messages` adapter owns validation, and unknown fields plus explicit nulls transport verbatim on the raw fast path — `src/rotator_library/client/anthropic.py`
+3. Standard execution flow follows (protocol parse → neutral canonical → provider protocol, execution-mode selection, steps 3–8 above)
+4. Response is formatted back to Anthropic Messages format by the `anthropic_messages` protocol adapter — `src/rotator_library/protocols/anthropic_messages.py`
+5. `POST /v1/messages/count_tokens` counts locally: the `anthropic_messages` adapter parses the payload, `openai_chat.build_request()` projects it, and `RotatingClient.token_count()` tallies messages plus tools; the route returns protocol-formatted errors, not FastAPI detail envelopes, and marks the result `x-proxy-estimate: local-projection` since the local projection approximates images/PDFs and may count prior-turn thinking the upstream counter ignores — `src/rotator_library/client/anthropic.py`, `src/proxy_app/main.py`
 
 **Responses API Request:**
 
 1. Client sends POST to `/v1/responses` (streaming or non-streaming) — `src/proxy_app/main.py`
-2. `ResponsesService.create_response()` / `stream_response()` parses the payload via `ResponsesProtocol` — `src/rotator_library/responses/service.py`
-3. `previous_response_id` resolves the parent `StoredResponse` and its lineage from the scoped `ResponsesStore` for continuation — `src/rotator_library/responses/service.py`, `src/rotator_library/responses/store.py`
-4. `ResponsesBridge.to_chat_kwargs()` translates the Responses payload into chat-completions kwargs and emits session-tracking hints — `src/rotator_library/responses/bridge.py`
-5. Execution flows through `RotatingClient.acompletion()`, reusing the standard retry/rotation/session-tracking path — `src/rotator_library/client/rotating_client.py`
-6. `ResponsesBridge.from_chat_response()` shapes the chat result back into Responses format; usage is recorded via `extract_usage_record` and cost via `CostCalculator` — `src/rotator_library/responses/bridge.py`, `src/rotator_library/usage/`
-7. When `store` is true, a `StoredResponse` is persisted scoped by the session isolation key for later retrieval and continuation — `src/rotator_library/responses/store.py`
-8. Streaming requests emit Responses SSE events (`response.created`, `response.output_item.added`, `response.output_text.delta`, `response.output_item.done`, `response.completed`) from the chat SSE stream via `ResponsesSSEFormatter` — `src/rotator_library/responses/streaming.py`
+2. `ResponsesService.create_response()` / `stream_response()` parses the payload via `ResponsesProtocol`; `_reject_unsupported_lifecycles()` rejects `previous_response_id` + `conversation` (mutually exclusive) and `background` mode (no queued/polling lifecycle) with clear 400s — `src/rotator_library/responses/service.py`
+3. `previous_response_id` resolves the parent `StoredResponse` and its lineage from the scoped `ResponsesStore` for continuation; unresolved ids 404 with a hint that continuation must reference responses created through this proxy with store enabled — `src/rotator_library/responses/service.py`, `src/rotator_library/responses/store.py`
+4. The request is expanded with parent-lineage items (`_expanded_responses_request()`) and executed through `RotatingClient.agenerate()` with `input_protocol="responses"`; the response returns already in Responses format (client protocol equals request protocol) — `src/rotator_library/responses/service.py`
+5. Execution reuses the standard retry/rotation/session-tracking path; usage is recorded via `extract_usage_record` and cost via `CostCalculator` — `src/rotator_library/client/executor.py`, `src/rotator_library/usage/`
+6. `ResponsesBridge.to_chat_kwargs()` remains as the fallback seam for clients without `agenerate` (`stream_events()` runs the chat-kwargs path through `client.acompletion()`) — `src/rotator_library/responses/bridge.py`
+7. When `store` is true, a `StoredResponse` is persisted scoped by the session isolation key for later retrieval and continuation; failed responses honor the `store_failed` policy on both the create and stream paths — `src/rotator_library/responses/store.py`
+8. Streaming requests stream through the canonical runtime while retaining Responses storage, emitting Responses SSE events with monotonic `sequence_number`s (`response.created`, `response.in_progress`, `response.output_item.added`, `response.content_part.added`, `response.output_text.delta`, `response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`) via `ResponsesSSEFormatter`; the bridge fallback path buffers non-text deltas (tool calls, refusal, reasoning) and flushes them as native output items with stable output indexes before the terminal; post-start failures (lineage/parse errors, terminal-less streams) never escape into the transport — the stream ends in a protocol-valid `response.failed` + `[DONE]` sequence (open items close as incomplete first) with a failed `StoredResponse` via `_terminal_stream_failure()` — `src/rotator_library/responses/service.py`, `src/rotator_library/responses/streaming.py`
 
 **Provider Discovery:**
 
@@ -129,12 +144,12 @@
 - Purpose: Abstract base class defining the contract for all provider plugins
 - Location: `src/rotator_library/providers/provider_interface.py`
 - Pattern: Abstract base class with singleton metaclass (`SingletonABCMeta`), template method pattern
-- Key methods: `get_models()`, `get_model_options()`, `has_custom_logic()`, `get_auth_header()`, `initialize_token()`, `get_background_job_config()`, `get_session_tracking_hints()`
+- Key methods: `get_models()`, `get_model_options()`, `has_custom_logic()`, `acompletion()`, `get_auth_header()`, `get_background_job_config()`, `get_session_tracking_hints()`, native hooks (`get_protocol_name()`, `should_use_native_protocol()`, `supports_native_operation()`, `get_native_operation()`, `get_native_endpoint()`, `prepare_native_request()`, `supports_native_streaming()`), adapter and field-cache declarations (`get_adapter_names()`, `get_adapter_config()`, `get_field_cache_rules()`), multi-profile transport (`transport_profiles` / `default_profile` class attributes)
 
 **RotatingClient:**
 - Purpose: Slim facade that delegates to modular components for request execution
 - Location: `src/rotator_library/client/rotating_client.py`
-- Pattern: Facade pattern — ~300 lines delegating to `RequestExecutor`, `CredentialFilter`, `ModelResolver`, `ProviderTransforms`, `StreamingHandler`
+- Pattern: Facade pattern — ~300 lines delegating to `RequestExecutor`, `CredentialFilter`, `ModelResolver`, `ProviderTransforms`, `NeutralStreamPipeline`; `agenerate()` is the protocol-aware entry (records `_input_protocol`), `acompletion()` executes raw chat kwargs
 
 **UsageManager:**
 - Purpose: Facade for usage tracking, credential selection, and persistence
@@ -159,7 +174,7 @@
 **Proxy Server:**
 - Location: `src/proxy_app/main.py`
 - Triggers: `python src/proxy_app/main.py` (no args = TUI mode), `--host`, `--port`, `--enable-request-logging`, `--add-credential`
-- Responsibilities: Parse args, load `.env` files, configure logging, initialize `RotatingClient`, mount FastAPI routes, start `BackgroundRefresher` and `ModelInfoService`
+- Responsibilities: Parse args, load `.env` files, configure logging, initialize `RotatingClient` (OAuth credential bootstrap via `startup.py`), mount FastAPI routes, start `BackgroundRefresher` and `ModelInfoService`
 
 **TUI Launcher:**
 - Location: `src/proxy_app/launcher_tui.py`
@@ -190,9 +205,9 @@
 
 **Logging:** Dual-sink approach — colorized console (INFO+) via `colorlog`, file logging to `logs/proxy.log` (INFO+) and `logs/proxy_debug.log` (DEBUG from `rotator_library` only). LiteLLM logger silenced on console.
 
-**Caching:** Provider instances are singletons via `SingletonABCMeta`. Provider-level HTTP caching via `provider_cache.py`. Model info cached by `ModelInfoService` with async refresh.
+**Caching:** Provider instances are singletons via `SingletonABCMeta`. Provider-level HTTP caching via `provider_cache.py`. Model info cached by `ModelInfoService` with async refresh. Provider-protocol state (reasoning content, thought signatures, prompt-cache keys, response IDs) is cached and re-injected by the field cache (`src/rotator_library/field_cache/`) on the native execution path only — declarative `cache_replay` rules compile to ordinary `FieldCacheRule`s, bound fields restore only to the exact provider+model that produced them while portable fields inherit within declared compatibility groups, and cross-format restores run through named transforms (`src/rotator_library/protocols/transforms.py`); rules are identity-normalized to the bare provider but every `FieldCacheOperation` records the transport profile that served the request so cross-profile sharing stays visible per operation and trace.
 
-**Storage:** JSON file persistence for usage data (`usage/usage_*.json`), OAuth credentials in `oauth_creds/`, transaction logs in `logs/transactions/` written by `TransactionLogger` (`src/rotator_library/transaction_logger.py`) with per-request directories containing client/provider I/O and a JSON-safe payload converter (`_make_json_safe`) for Pydantic/dataclass/timestamp objects. Session state persisted to JSON via `ResilientStateWriter` when disk persistence is enabled. Config via `.env` files and environment variables.
+**Storage:** JSON file persistence for usage data (`usage/usage_*.json`), OAuth credentials in `oauth_creds/`, transaction logs in `logs/transactions/` written by `TransactionLogger` (`src/rotator_library/transaction_logger.py`) with per-request directories containing client/provider I/O and a JSON-safe payload converter (`_make_json_safe`) for Pydantic/dataclass/timestamp objects. Transaction logging is leveled by `TRANSACTION_LOG_LEVEL` (1 = boundaries + metadata, default; 2 = + intermediates; 3 = verbose per-frame) with artifacts zstd-compressed via `utils/zstd_io.py` when `zstandard` is installed (plain files with a metadata flag otherwise), L1 disk usage bounded by `TRANSACTION_LOG_RETENTION` (newest N directories kept), request-related failures archiving buffered intermediates to `capture/captured_trace.json` while rotation-class failures (rate-limit, quota, auth, timeout) do not, and `tools/reconstruct_traces.py` regenerating L2-style intermediates offline from L1 artifacts. Session state persisted to JSON via `ResilientStateWriter` when disk persistence is enabled. Config via `.env` files and environment variables.
 
 **Background Tasks:** `BackgroundRefresher` manages periodic OAuth token refresh (default 10 min) and provider-specific background jobs (quota refresh, etc.) with independent timers.
 

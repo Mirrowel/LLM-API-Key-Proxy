@@ -31,7 +31,6 @@ def test_create_frame_strips_transport_fields_and_reads_lane() -> None:
                 "type": "response.create",
                 "model": "gpt-test",
                 "stream": True,
-                "background": False,
                 "generate": True,
                 "stream_id": "agent.lane_1",
                 "input": [{"type": "message", "role": "user", "content": "hi"}],
@@ -44,6 +43,20 @@ def test_create_frame_strips_transport_fields_and_reads_lane() -> None:
         assert stripped not in frame.payload
     assert frame.payload["model"] == "gpt-test"
     assert frame.warmup is False
+
+
+def test_background_and_conversation_conflicts_rejected_pre_flight() -> None:
+    background = parse_client_frame(json.dumps({"type": "response.create", "model": "m", "background": False}))
+    assert background["error"]["param"] == "background"
+    conflict = parse_client_frame(
+        json.dumps({"type": "response.create", "model": "m", "conversation": "c1", "previous_response_id": "resp_1"})
+    )
+    assert conflict["error"]["param"] == "conversation"
+
+
+def test_explicit_null_stream_id_rejected() -> None:
+    null_lane = parse_client_frame(json.dumps({"type": "response.create", "model": "m", "stream_id": None}))
+    assert null_lane["error"]["param"] == "stream_id"
 
 
 def test_warmup_flag_detected_from_generate_false() -> None:
@@ -233,6 +246,12 @@ async def test_store_false_chain_continues_via_connection_local_cache() -> None:
     assert second[-1]["type"] == "response.completed", second
     # Lineage expansion replayed turn 1's input ahead of turn 2's.
     assert len(captured) == 2
+    import json as _json
+
+    second_input = captured[1].get("input")
+    second_text = _json.dumps(second_input)
+    assert "first turn" in second_text
+    assert "second turn" in second_text
 
     # A FRESH connection (cache died with the session) 404s per the guide.
     fresh = ResponsesWebSocketSession(service=service, client=ChainClient())
@@ -304,6 +323,74 @@ async def test_failed_turn_evicts_referenced_parent() -> None:
     )
     assert frames[-1]["type"] == "response.failed"
     assert "resp_parent" not in session.local_cache
+
+
+@pytest.mark.asyncio
+async def test_warmup_chains_into_next_turn_via_real_service() -> None:
+    """Warmup ids must chain through the REAL lineage walk (scope + items)."""
+
+    captured: list[dict] = []
+
+    class ChainClient:
+        async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
+            captured.append(dict(payload))
+
+            async def frames():
+                yield 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_after_warmup","object":"response","status":"completed","model":"m","output":[]}}\n\n'
+
+            return frames()
+
+    service = ResponsesService(store=InMemoryResponsesStore())
+    session = ResponsesWebSocketSession(service=service, client=ChainClient())
+    warmup = await _collect(
+        session.handle_frame(
+            json.dumps({"type": "response.create", "model": "m", "generate": False, "input": "warm context"})
+        )
+    )
+    warmup_id = warmup[0]["response"]["id"]
+    turn = await _collect(
+        session.handle_frame(
+            json.dumps({"type": "response.create", "model": "m", "previous_response_id": warmup_id, "input": "real question"})
+        )
+    )
+    assert turn[-1]["type"] == "response.completed", turn
+    # The warmup input replayed ahead of the real question.
+    import json as _json
+
+    text = _json.dumps(captured[0].get("input"))
+    assert "warm context" in text
+    assert "real question" in text
+
+
+@pytest.mark.asyncio
+async def test_local_cache_eviction_under_churn_keeps_most_recent() -> None:
+    session = ResponsesWebSocketSession(service=FakeService(), client=object())
+    from rotator_library.responses.websocket import _LOCAL_CACHE_MAX_ENTRIES
+
+    for i in range(_LOCAL_CACHE_MAX_ENTRIES + 5):
+        session.local_cache[f"resp_{i}"] = StoredResponse(id=f"resp_{i}", model="m", status="completed", response={})
+    assert len(session.local_cache) == _LOCAL_CACHE_MAX_ENTRIES
+    assert "resp_0" not in session.local_cache
+    assert f"resp_{_LOCAL_CACHE_MAX_ENTRIES + 4}" in session.local_cache
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_containing_not_found_phrase_stays_response_failed() -> None:
+    """R1 guard: 'DB response not found for query' is an ordinary failure."""
+
+    service = FakeService(
+        events=[
+            _event("response.created", {"response": {"id": "resp_x", "status": "in_progress"}}),
+            _event(
+                "response.failed",
+                {"response": {"id": "resp_x", "status": "failed", "error": {"type": "server_error", "message": "DB response not found for query"}}},
+            ),
+        ]
+    )
+    session = ResponsesWebSocketSession(service=service, client=object())
+    frames = await _collect(session.handle_frame(json.dumps({"type": "response.create", "model": "m", "previous_response_id": "resp_parent"})))
+    assert frames[-1]["type"] == "response.failed"
+    assert frames[-1]["type"] != "error"
 
 
 @pytest.mark.asyncio

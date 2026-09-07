@@ -398,6 +398,7 @@ class ResponsesService:
             transport="websocket",
             request_scope=request_scope,
             previous_response_access_token=previous_response_access_token,
+            local_cache=local_cache,
         ):
             yield event
 
@@ -688,6 +689,7 @@ class ResponsesService:
         transport: str = "sse",
         request_scope: Optional[ResponsesRequestScope] = None,
         previous_response_access_token: Optional[str] = None,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
     ) -> AsyncGenerator[ResponsesStreamEvent, None]:
         """Yield transport-neutral Responses events for streaming transports."""
 
@@ -712,11 +714,13 @@ class ResponsesService:
             transaction_logger,
             expected_scope_key=isolation_key,
             access_token=previous_response_access_token,
+            local_cache=local_cache,
         )
         try:
             parent_lineage = await self._load_response_lineage(
                 parent,
                 expected_scope_key=isolation_key,
+                local_cache=local_cache,
             )
             chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
         except Exception as exc:
@@ -1132,7 +1136,7 @@ class ResponsesService:
             completed["response"]["output"].extend(extra_output)
             _record_responses_session_anchor(session_info, completed.get("response", completed))
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
-            stored = await self._store_stream_response(stream_request, completed, parent, transaction_logger=transaction_logger, session_info=session_info)
+            stored = await self._store_stream_response(stream_request, completed, parent, transaction_logger=transaction_logger, session_info=session_info, local_cache=local_cache)
             if stored:
                 self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
             else:
@@ -1168,7 +1172,7 @@ class ResponsesService:
                 # nests the response object).
                 failed["response"]["output"] = [output_item_done_payload(state)["item"]]
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
-            stored = await self._store_stream_response(stream_request, failed, parent, failed=True, transaction_logger=transaction_logger, session_info=session_info)
+            stored = await self._store_stream_response(stream_request, failed, parent, failed=True, transaction_logger=transaction_logger, session_info=session_info, local_cache=local_cache)
             if stored:
                 self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("response", failed).get("id"), "status": "failed"}, direction="metadata", stage="final")
             self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": transport}, scrub_strings=True)

@@ -49,6 +49,15 @@ Deliberately NOT implemented (rejected or deferred, never silent):
 - Application-level keepalive frames — none exist in the spec; deployments
   behind idle-timeout proxies must rely on WebSocket protocol pings
   (uvicorn's ``ws_ping_interval``, default 20s).
+- Binary frames — this transport is text-only (every documented frame is a
+  JSON object); binary messages terminate the connection.
+- Lifetime-limit interruption mid-turn — the limit fires between turns: an
+  in-flight turn always runs to its terminal event, then the error frame
+  and close arrive (sequential turns cannot be preempted without
+  cancelling provider work mid-flight).
+- Warmup inheritance of tools/instructions — clients resend tools each
+  turn (the guide's own continuation examples do); warmup replays input
+  items only.
 """
 
 from __future__ import annotations
@@ -126,7 +135,7 @@ class LaneState:
     latest_response_id: Optional[str] = None
 
 
-def parse_client_frame(raw: str | bytes | dict[str, Any], *, stream_id: Optional[str] = None) -> ClientFrame | dict[str, Any]:
+def parse_client_frame(raw: str | bytes | dict[str, Any]) -> ClientFrame | dict[str, Any]:
     """Parse one client frame into a turn request.
 
     Returns :class:`ClientFrame` on success or a spec-shaped error frame
@@ -153,9 +162,34 @@ def parse_client_frame(raw: str | bytes | dict[str, Any], *, stream_id: Optional
             f"frame type {frame_type!r} is not part of the Responses WebSocket vocabulary (only response.create is supported)",
             err_type="invalid_request_error",
         )
+    if "background" in payload:
+        # The events reference pins background as unsupported on this
+        # transport — reject instead of silently dropping the lifecycle.
+        return error_frame(
+            "invalid_request_error",
+            "background mode is not supported on the WebSocket transport",
+            param="background",
+            err_type="invalid_request_error",
+        )
+    if payload.get("conversation") is not None and payload.get("previous_response_id") is not None:
+        return error_frame(
+            "invalid_request_error",
+            "conversation and previous_response_id are mutually exclusive",
+            param="conversation",
+            err_type="invalid_request_error",
+        )
     # Transport-specific fields never apply on this transport.
     body = {k: v for k, v in payload.items() if k not in {"type", "stream", "background", "generate"}}
-    lane = body.pop("stream_id", stream_id)
+    lane = body.pop("stream_id", None)
+    if lane is None and "stream_id" in payload and payload["stream_id"] is None:
+        # Explicit null is not omission — reject rather than silently
+        # coercing to the default lane.
+        return error_frame(
+            "invalid_request_error",
+            "stream_id must not be null; omit the field for the default lane",
+            param="stream_id",
+            err_type="invalid_request_error",
+        )
     if lane == "":
         return error_frame(
             "invalid_request_error",
@@ -220,12 +254,43 @@ class _LocalResponsesCache(OrderedDict):
 
 
 def _is_previous_response_failure(exc: BaseException) -> bool:
+    """Structured detection of continuation misses — never loose substrings.
+
+    The service raises ``not_found_error`` ResponsesServiceErrors with
+    "Previous/Response not found: <id>" messages (strict prefixes);
+    provider-side failures that merely CONTAIN the phrase stay ordinary
+    failures because their ``error_type`` differs.
+    """
+
+    if getattr(exc, "error_type", None) != "not_found_error":
+        return False
     message = str(exc).lower()
-    return "previous response" in message or "response not found" in message
+    return message.startswith("previous response") or message.startswith("response not found")
+
+
+def _failed_event_is_continuation_miss(response_obj: dict[str, Any]) -> bool:
+    """Terminal response.failed miss detection (structured type + prefix)."""
+
+    error = response_obj.get("error")
+    if not isinstance(error, dict):
+        return False
+    code = str(error.get("code") or "")
+    if code == "previous_response_not_found":
+        return True
+    if str(error.get("type") or "") != "not_found_error":
+        return False
+    message = str(error.get("message") or "").lower()
+    return message.startswith("previous response") or message.startswith("response not found")
 
 
 def _service_error_frame(exc: BaseException, stream_id: Optional[str]) -> dict[str, Any]:
-    """Map a ResponsesServiceError to its spec-shaped frame."""
+    """Map a ResponsesServiceError to its spec-shaped frame.
+
+    ``error.type`` mirrors the service's own classification verbatim (a
+    502 upstream error stays an upstream error; only the guide-pinned
+    examples carry fixed inner types). The continuation-miss frame matches
+    the guide example exactly: no inner ``type``.
+    """
 
     status = int(getattr(exc, "status_code", 400) or 400)
     err_type = str(getattr(exc, "error_type", None) or "invalid_request_error")
@@ -237,9 +302,8 @@ def _service_error_frame(exc: BaseException, stream_id: Optional[str]) -> dict[s
             status=400,
             param="previous_response_id",
             stream_id=stream_id,
-            err_type="invalid_request_error",
         )
-    return error_frame(err_type, message, status=status, stream_id=stream_id, err_type="invalid_request_error")
+    return error_frame(err_type, message, status=status, stream_id=stream_id)
 
 
 class ResponsesWebSocketSession:
@@ -309,9 +373,13 @@ class ResponsesWebSocketSession:
         """``generate: false`` — prepare request state, return a chainable id.
 
         State is connection-local ONLY (the guide's in-memory cache): the
-        warmup body's input/tools/instructions persist in this session's
-        cache so the next turn chaining from the returned id replays them.
-        Nothing is written to the global store or disk.
+        warmup body's input items persist in this session's cache with the
+        scope the service resolves for this connection (``public`` — the
+        WS transport carries no scope headers), so the next turn chaining
+        from the returned id replays them through the standard lineage
+        expansion. Tools/instructions are NOT inherited — the guide's own
+        continuation examples resend tools every turn; clients do the same
+        after warmup. Nothing is written to the global store or disk.
         """
 
         response_id = generate_response_id()
@@ -327,6 +395,10 @@ class ResponsesWebSocketSession:
                 "output": [],
             },
             request=dict(frame.payload),
+            input_items=(
+                [raw_input] if isinstance(raw_input := frame.payload.get("input"), str) else list(raw_input or [])
+            ),
+            scope_key="public",
         )
         self.local_cache[response_id] = stored
         lane = self._lane(frame.stream_id)
@@ -353,6 +425,7 @@ class ResponsesWebSocketSession:
         )
         events: Optional[AsyncGenerator[ResponsesStreamEvent, None]] = None
         terminal_seen = False
+        turn_error_status: Optional[int] = None
         try:
             events = self._service.stream_turn_events(
                 body,
@@ -375,7 +448,7 @@ class ResponsesWebSocketSession:
                 if (
                     event.event_name == "response.failed"
                     and isinstance(response_obj, dict)
-                    and _is_previous_response_failure(str((response_obj.get("error") or {}).get("message") or ""))
+                    and _failed_event_is_continuation_miss(response_obj)
                 ):
                     # The service converts pre-stream failures into terminal
                     # response.failed events; the guide documents
@@ -388,14 +461,15 @@ class ResponsesWebSocketSession:
                         status=400,
                         param="previous_response_id",
                         stream_id=frame.stream_id,
-                        err_type="invalid_request_error",
                     )
                     terminal_seen = True
+                    turn_error_status = 400
                     break
                 yield payload
                 if event.event_name in _TERMINAL_EVENT_TYPES:
                     terminal_seen = True
                     if event.event_name == "response.failed":
+                        turn_error_status = 500
                         # Failed turns evict the referenced parent from the
                         # connection-local cache (never reuse stale state).
                         if isinstance(previous_id, str):
@@ -405,6 +479,7 @@ class ResponsesWebSocketSession:
             frame_out = _service_error_frame(exc, frame.stream_id)
             if _is_previous_response_failure(exc) and isinstance(previous_id, str):
                 self.local_cache.pop(previous_id, None)
+            turn_error_status = int(frame_out.get("status") or 500)
             yield frame_out
         finally:
             if events is not None:
@@ -414,7 +489,9 @@ class ResponsesWebSocketSession:
                     pass
             if transaction_logger is not None and hasattr(transaction_logger, "finalize_metadata"):
                 try:
-                    transaction_logger.finalize_metadata(status_code=200 if terminal_seen else 500)
+                    transaction_logger.finalize_metadata(
+                        status_code=turn_error_status if turn_error_status is not None else (200 if terminal_seen else 500)
+                    )
                 except Exception:
                     pass
 
@@ -445,13 +522,22 @@ class ResponsesWebSocketSession:
                 # cooperatively by handle_frame's finally paths.
                 break
             turn_failed = False
+            handle_gen = None
             try:
-                async for server_frame in self.handle_frame(raw):
+                handle_gen = self.handle_frame(raw)
+                async for server_frame in handle_gen:
                     await websocket.send_json(server_frame)
             except Exception:
-                # Send failures terminate the connection; the turn generator
-                # chain is closed by _turn's finally on unwind.
+                # Send failures terminate the connection; closing the frame
+                # handler chain unwinds _turn's finally, which acloses the
+                # service event stream (and the upstream generator).
                 turn_failed = True
+            finally:
+                if handle_gen is not None:
+                    try:
+                        await handle_gen.aclose()
+                    except Exception:
+                        pass
             if turn_failed:
                 break
         try:
