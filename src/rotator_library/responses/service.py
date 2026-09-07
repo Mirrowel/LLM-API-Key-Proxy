@@ -1043,14 +1043,14 @@ class ResponsesService:
                 yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": item_output_index, "item": tool_item})
                 extra_output.append(tool_item)
             if bridge_reasoning:
-                reasoning_index = 1 + len(bridge_tools)
+                reasoning_index = 1 + (max(bridge_tools) + 1 if bridge_tools else 0)
                 reasoning_item = {"id": "rs_0", "type": "reasoning", "summary": [{"type": "summary_text", "text": bridge_reasoning}], "status": "completed"}
                 yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": reasoning_index, "item": dict(reasoning_item, status="in_progress")})
                 yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": reasoning_index, "item": reasoning_item})
                 extra_output.append(reasoning_item)
             if bridge_refusal:
                 refusal_item = {"id": state.output_item_id + "_r", "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": bridge_refusal}], "status": "completed"}
-                refusal_index = 1 + len(bridge_tools) + (1 if bridge_reasoning else 0)
+                refusal_index = 1 + (max(bridge_tools) + 1 if bridge_tools else 0) + (1 if bridge_reasoning else 0)
                 yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": refusal_index, "item": dict(refusal_item, status="in_progress")})
                 yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": refusal_index, "item": refusal_item})
                 extra_output.append(refusal_item)
