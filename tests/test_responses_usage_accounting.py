@@ -81,5 +81,7 @@ async def test_responses_stream_preserves_usage_details_in_completed_event() -> 
     chunks = [chunk async for chunk in service.stream_response({"model": "gpt-test", "input": "hello", "stream": True}, FakeStreamingUsageClient())]
     completed = [chunk for chunk in chunks if "response.completed" in chunk][0]
     payload = json.loads(completed.split("data: ", 1)[1])
+    # Completed events nest the response object under "response".
+    response_obj = payload.get("response", payload)
 
-    assert payload["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}
+    assert response_obj["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}

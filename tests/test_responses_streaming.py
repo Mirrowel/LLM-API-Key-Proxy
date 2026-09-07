@@ -240,9 +240,13 @@ async def test_stream_response_emits_responses_sse_events_and_stores_final_respo
     event_text = "".join(events)
     assert _event_names(events) == [
         "response.created",
+        "response.in_progress",
         "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
         "response.output_item.done",
         "response.completed",
     ]
@@ -526,7 +530,7 @@ async def test_stream_events_can_store_in_progress_state() -> None:
     stream = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, FakeStreamingClient())
 
     created = await anext(stream)
-    stored = await store.get(created.payload["id"])
+    stored = await store.get(created.payload["response"]["id"])
     await stream.aclose()
 
     assert stored is not None
@@ -556,7 +560,7 @@ async def test_scoped_in_progress_state_is_immediately_capability_accessible() -
 
     created = await anext(stream)
     stored = await service.get_response_with_access_token(
-        created.payload["id"],
+        created.payload["response"]["id"],
         request_scope.access_token,
     )
     await stream.aclose()
@@ -734,15 +738,19 @@ async def test_stream_response_heartbeat_does_not_drop_completed_first_chunk(mon
     events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))
 
     created = await anext(events)
+    in_progress = await anext(events)
     heartbeat = await anext(events)
     await asyncio.sleep(0.06)
     added = await anext(events)
+    part_added = await anext(events)
     delta = await anext(events)
     await events.aclose()
 
     assert created.event_name == "response.created"
+    assert in_progress.event_name == "response.in_progress"
     assert heartbeat.heartbeat is True
     assert added.event_name == "response.output_item.added"
+    assert part_added.event_name == "response.content_part.added"
     assert delta.event_name == "response.output_text.delta"
     assert delta.payload["delta"] == "kept"
 
@@ -755,6 +763,7 @@ async def test_stream_events_aclose_cancels_pending_read_after_heartbeat(monkeyp
     events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream))
 
     assert (await anext(events)).event_name == "response.created"
+    assert (await anext(events)).event_name == "response.in_progress"
     assert (await anext(events)).heartbeat is True
     await events.aclose()
 
@@ -769,6 +778,7 @@ async def test_stream_events_aclose_cancels_pending_acquire_after_heartbeat(monk
     events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, client)
 
     assert (await anext(events)).event_name == "response.created"
+    assert (await anext(events)).event_name == "response.in_progress"
     assert (await anext(events)).heartbeat is True
     await events.aclose()
 
@@ -784,6 +794,7 @@ async def test_stream_events_aclose_closes_completed_acquire_stream_after_heartb
     events = service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, client)
 
     assert (await anext(events)).event_name == "response.created"
+    assert (await anext(events)).event_name == "response.in_progress"
     assert (await anext(events)).heartbeat is True
     await asyncio.sleep(0.02)
     await events.aclose()
@@ -822,7 +833,7 @@ async def test_stream_events_disconnect_closes_upstream(monkeypatch) -> None:
 
     events = [event async for event in service.stream_events({"model": "gpt-test", "input": "Hello", "stream": True}, DelayedStreamingClient(stream), request=DisconnectAfterAcquireRequest())]
 
-    assert [event.event_name for event in events] == ["response.created"]
+    assert [event.event_name for event in events] == ["response.created", "response.in_progress"]
     assert stream.closed is True
 
 
@@ -857,9 +868,13 @@ async def test_stream_events_are_transport_neutral_and_sse_wraps_them() -> None:
 
     assert [event.event_name for event in events if not event.terminal] == [
         "response.created",
+        "response.in_progress",
         "response.output_item.added",
+        "response.content_part.added",
         "response.output_text.delta",
         "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
         "response.output_item.done",
         "response.completed",
     ]

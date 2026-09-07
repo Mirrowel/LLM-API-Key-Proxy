@@ -119,21 +119,54 @@ def parse_chat_sse_chunk(chunk: Any) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+# Monotonic event ordering counter (spec: every stream event carries
+# sequence_number). Module-level for the service/bridge path; the protocol
+# converter keeps its own per-stream counter in StreamFormatState.sequence.
+_sequence_counter = {"value": 0}
+
+
+def _next_sequence() -> int:
+    value = _sequence_counter["value"]
+    _sequence_counter["value"] += 1
+    return value
+
+
+def reset_stream_sequence() -> None:
+    _sequence_counter["value"] = 0
+
+
 def response_created_payload(response_id: str, model: str) -> dict[str, Any]:
-    return {"id": response_id, "object": "response", "status": "in_progress", "model": model, "output": []}
+    return {"type": "response.created", "sequence_number": _next_sequence(), "response": {"id": response_id, "object": "response", "status": "in_progress", "model": model, "output": []}}
+
+
+def response_in_progress_payload(response_id: str, model: str) -> dict[str, Any]:
+    return {"type": "response.in_progress", "sequence_number": _next_sequence(), "response": {"id": response_id, "object": "response", "status": "in_progress", "model": model, "output": []}}
 
 
 def output_item_added_payload(state: ResponsesStreamState) -> dict[str, Any]:
     return {
-        "response_id": state.response_id,
+        "type": "response.output_item.added",
+        "sequence_number": _next_sequence(),
         "output_index": 0,
-        "item": {"id": state.output_item_id, "type": "message", "role": "assistant", "content": []},
+        "item": {"id": state.output_item_id, "type": "message", "role": "assistant", "content": [], "status": "in_progress"},
+    }
+
+
+def content_part_added_payload(state: ResponsesStreamState) -> dict[str, Any]:
+    return {
+        "type": "response.content_part.added",
+        "sequence_number": _next_sequence(),
+        "item_id": state.output_item_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": "", "annotations": []},
     }
 
 
 def output_text_delta_payload(state: ResponsesStreamState, delta: str) -> dict[str, Any]:
     return {
-        "response_id": state.response_id,
+        "type": "response.output_text.delta",
+        "sequence_number": _next_sequence(),
         "item_id": state.output_item_id,
         "output_index": 0,
         "content_index": 0,
@@ -141,31 +174,63 @@ def output_text_delta_payload(state: ResponsesStreamState, delta: str) -> dict[s
     }
 
 
+def output_text_done_payload(state: ResponsesStreamState) -> dict[str, Any]:
+    return {
+        "type": "response.output_text.done",
+        "sequence_number": _next_sequence(),
+        "item_id": state.output_item_id,
+        "output_index": 0,
+        "content_index": 0,
+        "text": state.output_text,
+    }
+
+
+def content_part_done_payload(state: ResponsesStreamState) -> dict[str, Any]:
+    return {
+        "type": "response.content_part.done",
+        "sequence_number": _next_sequence(),
+        "item_id": state.output_item_id,
+        "output_index": 0,
+        "content_index": 0,
+        "part": {"type": "output_text", "text": state.output_text, "annotations": []},
+    }
+
+
 def output_item_done_payload(state: ResponsesStreamState) -> dict[str, Any]:
     return {
-        "response_id": state.response_id,
+        "type": "response.output_item.done",
+        "sequence_number": _next_sequence(),
         "output_index": 0,
         "item": {
             "id": state.output_item_id,
             "type": "message",
             "role": "assistant",
-            "content": [{"type": "output_text", "text": state.output_text}],
+            "content": [{"type": "output_text", "text": state.output_text, "annotations": []}],
+            "status": "completed",
         },
     }
 
 
 def response_completed_payload(state: ResponsesStreamState, usage: Any = None) -> dict[str, Any]:
     payload = {
-        "id": state.response_id,
-        "object": "response",
-        "status": "completed",
-        "model": state.model,
-        "output": [output_item_done_payload(state)["item"]],
+        "type": "response.completed",
+        "sequence_number": _next_sequence(),
+        "response": {
+            "id": state.response_id,
+            "object": "response",
+            "status": "completed",
+            "model": state.model,
+            "output": [output_item_done_payload(state)["item"]],
+        },
     }
     if usage is not None:
-        payload["usage"] = usage
+        payload["response"]["usage"] = usage
     return payload
 
 
 def response_failed_payload(response_id: str, model: str, error: Any) -> dict[str, Any]:
-    return {"id": response_id, "object": "response", "status": "failed", "model": model, "error": serialize_value(error)}
+    return {
+        "type": "response.failed",
+        "sequence_number": _next_sequence(),
+        "response": {"id": response_id, "object": "response", "status": "failed", "model": model, "output": [], "error": serialize_value(error)},
+    }

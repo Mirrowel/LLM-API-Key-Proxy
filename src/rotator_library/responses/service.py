@@ -36,6 +36,10 @@ from .streaming import (
     parse_chat_sse_chunk,
     response_completed_payload,
     response_created_payload,
+    response_in_progress_payload,
+    content_part_added_payload,
+    content_part_done_payload,
+    output_text_done_payload,
     response_failed_payload,
 )
 from .types import ResponsesStoreSettings, StoredResponse
@@ -876,6 +880,9 @@ class ResponsesService:
             session_info=session_info,
         )
         yield ResponsesStreamEvent("response.created", created)
+        # Documented lifecycle: created -> in_progress -> items -> terminal.
+        in_progress = response_in_progress_payload(response_id, unified.model)
+        yield ResponsesStreamEvent("response.in_progress", in_progress)
         try:
             while chat_stream is None:
                 marker, acquired = await acquire_upstream_stream()
@@ -933,6 +940,8 @@ class ResponsesService:
                     added = output_item_added_payload(state)
                     self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": transport})
                     yield ResponsesStreamEvent("response.output_item.added", added)
+                    part_added = content_part_added_payload(state)
+                    yield ResponsesStreamEvent("response.content_part.added", part_added)
                 state = ResponsesStreamState(
                     response_id=state.response_id,
                     model=state.model,
@@ -967,6 +976,12 @@ class ResponsesService:
                 added = output_item_added_payload(state)
                 self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": transport})
                 yield ResponsesStreamEvent("response.output_item.added", added)
+                part_added = content_part_added_payload(state)
+                yield ResponsesStreamEvent("response.content_part.added", part_added)
+            text_done = output_text_done_payload(state)
+            yield ResponsesStreamEvent("response.output_text.done", text_done)
+            part_done = content_part_done_payload(state)
+            yield ResponsesStreamEvent("response.content_part.done", part_done)
             done_item = output_item_done_payload(state)
             self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("response.output_item.done", done_item)
@@ -1005,7 +1020,9 @@ class ResponsesService:
             monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
             failed = response_failed_payload(response_id, unified.model, _stream_failure_error(exc))
             if state.output_text:
-                failed["output"] = [output_item_done_payload(state)["item"]]
+                # Partial output survives the failure record (event shape
+                # nests the response object).
+                failed["response"]["output"] = [output_item_done_payload(state)["item"]]
             self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
             stored = await self._store_stream_response(stream_request, failed, parent, failed=True, transaction_logger=transaction_logger, session_info=session_info)
             if stored:
@@ -1208,10 +1225,14 @@ class ResponsesService:
         self,
         raw_request: dict[str, Any],
         response_payload: dict[str, Any],
-        parent: Optional[StoredResponse],
+        parent: Optional[StoredResponse] = None,
         *,
         session_info: Optional[dict[str, Any]] = None,
     ) -> StoredResponse:
+        # Stream-event payloads nest the response object under "response";
+        # direct response payloads are flat. Normalize both.
+        if isinstance(response_payload.get("response"), dict):
+            response_payload = response_payload["response"]
         session_info = session_info or {}
         return StoredResponse(
             id=str(response_payload["id"]),
@@ -1288,7 +1309,9 @@ class ResponsesService:
 
         if not transaction_logger:
             return
-        usage = response_payload.get("usage") if isinstance(response_payload, dict) else None
+        # Event-shaped payloads nest usage under "response".
+        source_payload = response_payload.get("response") if isinstance(response_payload.get("response"), dict) else response_payload
+        usage = source_payload.get("usage") if isinstance(source_payload, dict) else None
         if not usage:
             return
         record = extract_usage_record(usage, provider="responses", model=model, source=source)
@@ -1464,8 +1487,12 @@ def _current_stream_payload(state: ResponsesStreamState) -> dict[str, Any]:
     """Return a retrievable in-progress Responses object for stream state."""
 
     payload = response_completed_payload(state)
-    payload["status"] = "in_progress"
-    return payload
+    # response_completed_payload nests the response object under "response"
+    # (event shape); stored objects are flat response objects.
+    response_obj = payload.get("response") if isinstance(payload.get("response"), dict) else payload
+    response_obj = deepcopy(response_obj)
+    response_obj["status"] = "in_progress"
+    return response_obj
 
 
 def _expires_at(settings: ResponsesStoreSettings) -> Optional[float]:
