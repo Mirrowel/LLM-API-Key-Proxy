@@ -167,8 +167,19 @@ class ResponsesProtocol(ProtocolAdapter):
             payload["tools"] = [self._format_tool(tool, preserve_source=preserve_source) for tool in unified_request.tools]
         if unified_request.stream:
             payload["stream"] = True
-        if unified_request.modalities:
-            payload["modalities"] = deepcopy(unified_request.modalities)
+        # NOTE: Responses has NO modalities field — the canonical concept
+        # never leaks into upstream payloads (foreign requests carrying it
+        # drop with a recorded warning).
+        if unified_request.modalities and not preserve_source:
+            unified_request.warnings.append(
+                ConversionWarning(
+                    code="unsupported_optional_control",
+                    message="modalities has no Responses representation; dropped",
+                    field="modalities",
+                    source_protocol=unified_request.source_protocol,
+                    target_protocol=self.name,
+                )
+            )
         if unified_request.metadata:
             payload["metadata"] = deepcopy(unified_request.metadata)
         payload.update(self._format_generation_params(unified_request, preserve_source=preserve_source))
@@ -326,8 +337,17 @@ class ResponsesProtocol(ProtocolAdapter):
             output_tokens=int(usage.get("output_tokens") or 0),
             total_tokens=int(usage.get("total_tokens") or 0),
             cache_read_tokens=int(input_details.get("cached_tokens") or 0),
-            cache_write_tokens=int(input_details.get("cache_creation_tokens") or usage.get("cache_creation_tokens") or 0),
+            # Official spelling is cache_write_tokens; the creation_tokens
+            # variant is retained as a lenient fallback.
+            cache_write_tokens=int(
+                input_details.get("cache_write_tokens")
+                or input_details.get("cache_creation_tokens")
+                or usage.get("cache_creation_tokens")
+                or 0
+            ),
             reasoning_tokens=int(output_details.get("reasoning_tokens") or 0),
+            audio_tokens=int(input_details.get("audio_tokens") or 0),
+            output_audio_tokens=int(output_details.get("audio_tokens") or 0),
             cost=cost,
             raw=deepcopy(usage),
         )
@@ -383,6 +403,12 @@ class ResponsesProtocol(ProtocolAdapter):
                 type="reasoning",
                 text=_reasoning_text(item),
                 encrypted_content=item.get("encrypted_content") if isinstance(item.get("encrypted_content"), str) else None,
+                # SDK requires id+summary on replay: the item id/status ride
+                # extra for canonical rebuilds; content[] rides raw.
+                extra={
+                    "reasoning_item_id": item.get("id") if isinstance(item.get("id"), str) else None,
+                    **{k: deepcopy(v) for k, v in item.items() if k not in {"type", "summary", "encrypted_content", "id"}},
+                },
                 raw=deepcopy(item),
             )
             return UnifiedMessage(
@@ -415,6 +441,13 @@ class ResponsesProtocol(ProtocolAdapter):
                     flush_visible()
                     if block.reasoning.text or block.reasoning.encrypted_content:
                         reasoning_item: dict[str, Any] = {"type": "reasoning"}
+                        # SDK ResponseReasoningItemParam requires id +
+                        # summary; id/status/content[] ride extra on
+                        # same-protocol replay (verbatim when present).
+                        if isinstance(block.reasoning.extra.get("reasoning_item_id"), str):
+                            reasoning_item["id"] = block.reasoning.extra["reasoning_item_id"]
+                        elif preserve_source and isinstance(message.raw, dict) and isinstance(message.raw.get("id"), str):
+                            reasoning_item["id"] = message.raw["id"]
                         if block.reasoning.text:
                             reasoning_item["summary"] = [{"type": "summary_text", "text": block.reasoning.text}]
                         if block.reasoning.encrypted_content:
@@ -422,7 +455,26 @@ class ResponsesProtocol(ProtocolAdapter):
                             # rebuilds byte-for-byte; never emitted by foreign
                             # formatters.
                             reasoning_item["encrypted_content"] = block.reasoning.encrypted_content
+                        if preserve_source and isinstance(block.raw, dict):
+                            # Full-shape replay: content[] (full reasoning
+                            # text items) + status ride the raw item.
+                            for raw_key in ("content", "status"):
+                                if raw_key in block.raw and raw_key not in reasoning_item:
+                                    reasoning_item[raw_key] = deepcopy(block.raw[raw_key])
                         items.append(reasoning_item)
+                elif block.builtin_tool is not None and isinstance(block.builtin_tool.raw, dict):
+                    # Hosted-tool input items (web_search_call, mcp_list_tools,
+                    # computer_call, ...) are top-level items with their own
+                    # shapes — verbatim replay, never a message envelope.
+                    flush_visible()
+                    items.append(deepcopy(block.builtin_tool.raw))
+                elif block.type not in {"text", "image", "audio", "file", "document", "refusal", "tool_call", "tool_result", "reasoning", "builtin_tool"} and isinstance(block.raw, dict) and block.raw.get("type"):
+                    # Native Responses input item of an unrecognized type
+                    # (item_reference, apply_patch_call, mcp_approval_request,
+                    # ...): verbatim passthrough, never wrapped in
+                    # {role, content}.
+                    flush_visible()
+                    items.append(deepcopy(block.raw))
                 elif block.tool_call:
                     flush_visible()
                     items.append(self._format_function_call(block.tool_call, preserve_source=preserve_source))
@@ -442,6 +494,11 @@ class ResponsesProtocol(ProtocolAdapter):
                 result = message.content[0].tool_result if message.content and message.content[0].tool_result else None
                 if result:
                     payload["output"] = deepcopy(result.content)
+                return payload
+            if payload.get("type") not in (None, "message"):
+                # Non-message raw items (item_reference, hosted-tool calls,
+                # approvals, ...) replay verbatim — role/content are not
+                # members of their shapes.
                 return payload
             payload["role"] = message.role
             payload["content"] = self._format_content(message.content, role=message.role, preserve_source=preserve_source)
@@ -702,15 +759,35 @@ class ResponsesProtocol(ProtocolAdapter):
     def _parse_tool(self, tool: dict[str, Any]) -> ToolDefinition:
         payload = dict(tool or {})
         parameters = payload.get("parameters") or payload.get("input_schema") or {}
+        tool_type = str(payload.get("type") or "function")
+        if tool_type not in {"function", "custom"}:
+            # Hosted tools (web_search, file_search, code_interpreter,
+            # image_generation, computer_use_preview, mcp, local_shell, ...):
+            # identity is the type; no name/parameters exist to mint.
+            return ToolDefinition(
+                name=tool_type,
+                description=payload.get("description"),
+                input_schema={},
+                type=tool_type,
+                extra={"raw": deepcopy(tool), "hosted": True, **{k: deepcopy(v) for k, v in payload.items() if k not in {"type", "name", "description", "parameters", "input_schema"}}},
+            )
         return ToolDefinition(
             name=str(payload.get("name") or ""),
             description=payload.get("description"),
             input_schema=deepcopy(parameters),
-            type=str(payload.get("type") or "function"),
+            type=tool_type,
             extra={k: deepcopy(v) for k, v in payload.items() if k not in {"type", "name", "description", "parameters", "input_schema"}},
         )
 
     def _format_tool(self, tool: ToolDefinition, *, preserve_source: bool = True) -> dict[str, Any]:
+        if tool.type not in {"function", "custom"}:
+            # Hosted tools: {type, ...config} only — name/parameters are not
+            # members of their shapes (strict-param 400 upstream).
+            if preserve_source and isinstance(tool.extra.get("raw"), dict):
+                return deepcopy(tool.extra["raw"])
+            payload: dict[str, Any] = {"type": tool.type}
+            payload.update(deepcopy({k: v for k, v in tool.extra.items() if k not in {"raw", "hosted"}}))
+            return payload
         payload = {"type": "function" if tool.type == "function" else tool.type, "name": tool.name, "parameters": deepcopy(tool.input_schema)}
         if tool.description is not None:
             payload["description"] = tool.description
@@ -733,7 +810,13 @@ class ResponsesProtocol(ProtocolAdapter):
     def _format_function_result(self, result: ToolResult, *, preserve_source: bool) -> dict[str, Any]:
         payload = deepcopy(result.raw) if preserve_source and isinstance(result.raw, dict) else {}
         result_content = {"error": result.content} if result.is_error else result.content
-        payload.update({"type": "function_call_output", "call_id": result.tool_call_id or "", "output": tool_result_text(result_content)})
+        if isinstance(result_content, list):
+            # SDK allows function_call_output.output to be a string OR an
+            # item list (images/files): lists stay lists, never stringified.
+            output_value = deepcopy(result_content)
+        else:
+            output_value = tool_result_text(result_content)
+        payload.update({"type": "function_call_output", "call_id": result.tool_call_id or "", "output": output_value})
         return payload
 
     def _format_generation_params(self, request: UnifiedRequest, *, preserve_source: bool) -> dict[str, Any]:
@@ -759,8 +842,26 @@ class ResponsesProtocol(ProtocolAdapter):
             # the preserved original verbatim.
             payload.update(format_reasoning_controls(reasoning, self.name, request))
         structured = params.pop("structured_output", None)
+        verbosity = params.pop("text_verbosity", None)
         if isinstance(structured, dict):
-            payload["text"] = {"format": format_structured_output(structured, self.name)}
+            formatted_format = format_structured_output(structured, self.name)
+            text_config: dict[str, Any] = payload["text"] if isinstance(payload.get("text"), dict) else {}
+            if formatted_format is not None:
+                text_config["format"] = formatted_format
+            elif not preserve_source:
+                add_conversion_warning(
+                    request,
+                    code="unsupported_optional_control",
+                    message=f"structured output type {structured.get('type')!r} has no Responses representation; dropped",
+                    field="text.format",
+                    target_protocol=self.name,
+                )
+            if verbosity is not None:
+                text_config["verbosity"] = verbosity
+            if text_config:
+                payload["text"] = text_config
+        elif verbosity is not None:
+            payload.setdefault("text", {})["verbosity"] = verbosity
         if "tool_choice" in params:
             payload["tool_choice"] = format_tool_choice(params.pop("tool_choice"), self.name)
         supported = {
@@ -924,15 +1025,17 @@ def _format_responses_usage(usage: Usage | None) -> dict[str, Any] | None:
     if usage.cache_read_tokens:
         input_details["cached_tokens"] = usage.cache_read_tokens
     if usage.cache_write_tokens:
-        # OpenAI Responses does not have a universal cache-write field, but this
-        # extension keeps provider-reported cache creation visible without
-        # leaking the unified internal `cache_write_tokens` key.
-        input_details["cache_creation_tokens"] = usage.cache_write_tokens
+        # Official detail spelling (ResponseUsage.InputTokensDetails).
+        input_details["cache_write_tokens"] = usage.cache_write_tokens
+    if usage.audio_tokens:
+        input_details["audio_tokens"] = usage.audio_tokens
     if input_details:
         payload["input_tokens_details"] = input_details
     output_details: dict[str, Any] = {}
     if usage.reasoning_tokens:
         output_details["reasoning_tokens"] = usage.reasoning_tokens
+    if usage.output_audio_tokens:
+        output_details["audio_tokens"] = usage.output_audio_tokens
     if output_details:
         payload["output_tokens_details"] = output_details
     if usage.cost:
@@ -953,8 +1056,13 @@ def _parse_responses_generation_params(source: dict[str, Any]) -> dict[str, Any]
 
     params = deepcopy(source)
     text = params.pop("text", None)
-    if isinstance(text, dict) and isinstance(text.get("format"), dict):
-        params["structured_output"] = canonical_structured_output(text["format"], "responses")
+    if isinstance(text, dict):
+        if isinstance(text.get("format"), dict):
+            params["structured_output"] = canonical_structured_output(text["format"], "responses")
+        if text.get("verbosity") is not None:
+            # text.verbosity is a first-class output control (low|medium|high)
+            # — carried explicitly, never dropped silently.
+            params["text_verbosity"] = text["verbosity"]
     reasoning = params.get("reasoning")
     if isinstance(reasoning, dict):
         # Source-native dict preserved verbatim for same-protocol rebuild;

@@ -111,6 +111,19 @@ def validate_generative_request(
         supported_tool_types = {"function", "custom"}
     elif target_protocol == "anthropic_messages":
         supported_tool_types = {"function", "server"}
+    elif target_protocol == "responses":
+        # Responses' native ToolParam union: hosted tools are first-class.
+        supported_tool_types = {
+            "function",
+            "custom",
+            "web_search",
+            "file_search",
+            "code_interpreter",
+            "image_generation",
+            "computer_use_preview",
+            "mcp",
+            "local_shell",
+        }
     else:
         supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):
@@ -121,7 +134,7 @@ def validate_generative_request(
                 pass_name="validate_request",
                 payload={"tool_index": tool_index, "tool_type": tool.type, "tool_name": tool.name},
             )
-        if not tool.name or (tool.type == "function" and not isinstance(tool.input_schema, dict)):
+        if tool.type in {"function", "custom"} and (not tool.name or not isinstance(tool.input_schema, dict)):
             raise ProtocolError(
                 "Function tools require a name and object input schema",
                 protocol=target_protocol,

@@ -877,6 +877,12 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
     if target_protocol == "responses":
         if output_type == "json_object":
             return {"type": "json_object"}
+        if output_type == "text":
+            # Text is the documented default format — an explicit constraint,
+            # never a fabricated json_schema.
+            return {"type": "text"}
+        if output_type != "json_schema":
+            return None
         return {
             key: deepcopy(item)
             for key, item in {

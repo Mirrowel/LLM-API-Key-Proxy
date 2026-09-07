@@ -85,7 +85,7 @@ def test_responses_response_extracts_output_items_reasoning_calls_and_usage() ->
     assert formatted["usage"]["input_tokens"] == 10
     assert formatted["usage"]["output_tokens"] == 5
     assert formatted["usage"]["total_tokens"] == 18
-    assert formatted["usage"]["input_tokens_details"] == {"cached_tokens": 3, "cache_creation_tokens": 2}
+    assert formatted["usage"]["input_tokens_details"] == {"cached_tokens": 3, "cache_write_tokens": 2}
     assert formatted["usage"]["output_tokens_details"] == {"reasoning_tokens": 3}
     assert formatted["usage"]["cost_details"]["total_cost"] == 0.02
     assert "raw" not in formatted["usage"]

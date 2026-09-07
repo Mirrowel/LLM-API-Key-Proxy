@@ -967,14 +967,29 @@ def _responses_usage(usage: Usage | None) -> dict[str, Any] | None:
     if usage is None:
         return None
     # Canonical input_tokens is cache-INCLUSIVE (H2): emitted verbatim;
-    # cached_tokens is a detail view, never added on top.
-    return {
+    # details are standard spellings, zero-valued keys omitted.
+    payload: dict[str, Any] = {
         "input_tokens": usage.input_tokens,
-        "input_tokens_details": {"cached_tokens": usage.cache_read_tokens},
         "output_tokens": usage.output_tokens,
-        "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
-        "total_tokens": usage.total_tokens,
+        "total_tokens": usage.total_tokens or (usage.input_tokens + usage.output_tokens),
     }
+    input_details: dict[str, Any] = {}
+    if usage.cache_read_tokens:
+        input_details["cached_tokens"] = usage.cache_read_tokens
+    if usage.cache_write_tokens:
+        input_details["cache_write_tokens"] = usage.cache_write_tokens
+    if usage.audio_tokens:
+        input_details["audio_tokens"] = usage.audio_tokens
+    if input_details:
+        payload["input_tokens_details"] = input_details
+    output_details: dict[str, Any] = {}
+    if usage.reasoning_tokens:
+        output_details["reasoning_tokens"] = usage.reasoning_tokens
+    if usage.output_audio_tokens:
+        output_details["audio_tokens"] = usage.output_audio_tokens
+    if output_details:
+        payload["output_tokens_details"] = output_details
+    return payload
 
 
 def _gemini_usage(usage: Usage | None) -> dict[str, int] | None:
