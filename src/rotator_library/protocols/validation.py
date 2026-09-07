@@ -109,18 +109,34 @@ def validate_generative_request(
     if target_protocol != "anthropic_messages":
         # Block-level cache hints are Anthropic provider policy: drops at
         # foreign targets are disclosed (same-protocol replay keeps them
-        # verbatim via raw). Source-agnostic — any source may carry hints.
+        # verbatim via raw). Source-agnostic — any source may carry hints,
+        # on message blocks, system blocks, or tool definitions.
         hinted = False
-        for message in request.messages:
-            for block in message.content:
-                if isinstance(block.extra, dict) and "cache_control" in block.extra:
-                    hinted = True
-                    break
-                if isinstance(block.raw, dict) and "cache_control" in block.raw:
-                    hinted = True
-                    break
-            if hinted:
+        for block in request.system or []:
+            if (isinstance(block.extra, dict) and "cache_control" in block.extra) or (
+                isinstance(block.raw, dict) and "cache_control" in block.raw
+            ):
+                hinted = True
                 break
+        if not hinted:
+            for tool in request.tools or []:
+                if isinstance(tool.extra, dict) and "cache_control" in tool.extra:
+                    hinted = True
+                    break
+                if isinstance(tool.raw, dict) and "cache_control" in tool.raw:
+                    hinted = True
+                    break
+        if not hinted:
+            for message in request.messages:
+                for block in message.content:
+                    if isinstance(block.extra, dict) and "cache_control" in block.extra:
+                        hinted = True
+                        break
+                    if isinstance(block.raw, dict) and "cache_control" in block.raw:
+                        hinted = True
+                        break
+                if hinted:
+                    break
         if hinted:
             add_conversion_warning(
                 request,
