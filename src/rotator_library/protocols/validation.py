@@ -173,7 +173,7 @@ def validate_generative_request(
         # Gemini hosts googleSearch/codeExecution/urlContext natively and
         # maps web_search server tools onto googleSearch; other hosted
         # families (bash, text_editor, computer) have no Gemini home.
-        supported_tool_types = {"function", "server"}
+        supported_tool_types = {"function", "server", "web_search"}
         for tool in request.tools:
             if tool.type == "server":
                 server_type = str(tool.extra.get("server_tool_type") or tool.extra.get("gemini_hosted_tool") or "")
