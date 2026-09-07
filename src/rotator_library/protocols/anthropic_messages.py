@@ -11,12 +11,14 @@ execution a loss-conscious parser/builder with thinking and tool block support.
 from __future__ import annotations
 
 import json
+import logging
 from copy import deepcopy
 from typing import Any, ClassVar, Iterable
 
 from .base import ProtocolAdapter
 from .canonical import (
     record_instruction_merge,
+    add_conversion_warning,
     format_reasoning_controls,
     attach_conversion_summary,
     STOP_REASON_CONTENT_FILTER,
@@ -45,6 +47,8 @@ from .canonical import (
 )
 from .operation import OPERATION_COUNT_TOKENS, OPERATION_GENERATE, OPERATION_MESSAGES, OPERATION_UNKNOWN, normalize_operation
 from .validation import validate_generative_request, validate_generative_response
+
+lib_logger = logging.getLogger("rotator_library.protocols.anthropic_messages")
 from .types import (
     Annotation,
     ContentBlock,
@@ -172,14 +176,12 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             # documented default with a recorded warning — never a silent
             # omission and never a dead cross-protocol path.
             payload["max_tokens"] = 4096
-            unified_request.warnings.append(
-                ConversionWarning(
-                    code="max_tokens_defaulted",
-                    message="max_tokens is required by Anthropic Messages; defaulted to 4096 (source carried no cap)",
-                    field="max_tokens",
-                    source_protocol=unified_request.source_protocol,
-                    target_protocol=self.name,
-                )
+            add_conversion_warning(
+                unified_request,
+                code="max_tokens_defaulted",
+                message="max_tokens is required by Anthropic Messages; defaulted to 4096 (source carried no cap)",
+                field="max_tokens",
+                target_protocol=self.name,
             )
         if not preserve_source:
             messages_for_first_check = unified_request.messages
@@ -189,14 +191,12 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 # that starts with an assistant turn is anomalous — record
                 # it and let the provider arbitrate (tails are legal when
                 # the omitted head carried the user turn).
-                unified_request.warnings.append(
-                    ConversionWarning(
-                        code="first_turn_assistant",
-                        message="history starts with an assistant turn; Anthropic expects a leading user turn",
-                        field="messages",
-                        source_protocol=unified_request.source_protocol,
-                        target_protocol=self.name,
-                    )
+                add_conversion_warning(
+                    unified_request,
+                    code="first_turn_assistant",
+                    message="history starts with an assistant turn; Anthropic expects a leading user turn",
+                    field="messages",
+                    target_protocol=self.name,
                 )
         payload.update(source_extensions(unified_request.extra, context, self.name, unified_request.source_protocol))
         return payload
@@ -445,7 +445,11 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         formatted: list[dict[str, Any]] = []
         for message in messages:
             role = "assistant" if message.role in {"assistant", "model"} else "user"
-            content = self._format_assistant_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings) if role == "assistant" else self._format_user_content(message, preserve_source=preserve_source)
+            content = self._format_assistant_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings) if role == "assistant" else self._format_user_content(message, preserve_source=preserve_source, warnings=warnings)
+            if not content:
+                # Empty content is illegal wire (400): drops already recorded
+                # their warnings — omit the husk instead of sending it.
+                continue
             payload = {"role": role, "content": content}
             if preserve_source:
                 payload.update(deepcopy(message.extra))
@@ -513,10 +517,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             client_direction=client_direction,
         )
 
-    def _format_user_content(self, message: UnifiedMessage, *, preserve_source: bool) -> list[dict[str, Any]]:
+    def _format_user_content(self, message: UnifiedMessage, *, preserve_source: bool, warnings: list | None = None) -> list[dict[str, Any]]:
         """Format user content and canonical tool results."""
 
-        return self._format_content(ordered_message_blocks(message), preserve_source=preserve_source)
+        return self._format_content(ordered_message_blocks(message), preserve_source=preserve_source, warnings=warnings)
 
     def _format_message(
         self,
@@ -653,16 +657,17 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                 if (
                     not emit_opaque_state
                     and block.reasoning.signature is not None
-                    and block.reasoning.type in {"thinking", "redacted_thinking"}
+                    and isinstance(block.raw, dict)
+                    and str(block.raw.get("type") or "") in {"thinking", "redacted_thinking"}
                     and not client_direction
                 ):
-                    # Anthropic-native thinking must pass back UNMODIFIED
+                    # Anthropic-native thinking (identified by its WIRE shape,
+                    # not the canonical type label) must pass back UNMODIFIED
                     # upstream: without its own signature the block is a
                     # guaranteed upstream 400 — drop the whole block
-                    # (recorded) instead. Foreign reasoning (e.g. Gemini
-                    # thought text) keeps its visible text with the foreign
-                    # signature stripped; client responses always keep
-                    # thinking text (clients display, never validate).
+                    # (recorded) instead. Foreign reasoning keeps its visible
+                    # text with the foreign signature stripped; client
+                    # responses always keep thinking text.
                     if warnings is not None:
                         warnings.append(ConversionWarning(code="thinking_dropped_opaque", message="thinking block dropped: signature cannot be emitted for this provider pair", field="content[thinking]", source_protocol=None, target_protocol="anthropic_messages"))
                     continue
@@ -757,24 +762,20 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             payload["stop_sequences"] = params.pop("stop_sequences")
         if "tool_choice" in params:
             choice = params.pop("tool_choice")
-            if preserve_source and "tool_choice" in payload:
+            if preserve_source and "tool_choice" in payload and not (isinstance(payload["tool_choice"], dict) and payload["tool_choice"].get("type") == "none"):
                 # Same-protocol: the client's original spelling (including
-                # disable_parallel_tool_use) is restored verbatim.
+                # disable_parallel_tool_use) is restored verbatim — except
+                # the illegal {"type":"none"} shape, which Anthropic cannot
+                # accept in any case.
                 pass
             else:
+                if preserve_source and isinstance(payload.get("tool_choice"), dict) and payload["tool_choice"].get("type") == "none":
+                    payload.pop("tool_choice", None)
                 formatted_choice = format_tool_choice(choice, self.name)
                 if formatted_choice is None and isinstance(choice, dict) and choice.get("mode") == "none":
                     # Anthropic disables tools by omitting them entirely.
                     payload.pop("tool_choice", None)
-                    request.warnings.append(
-                        ConversionWarning(
-                            code="unsupported_optional_control",
-                            message="tool_choice none has no Anthropic field; omitting tool_choice and the tools array",
-                            field="tool_choice",
-                            source_protocol=request.source_protocol,
-                            target_protocol=self.name,
-                        )
-                    )
+                    add_conversion_warning(request, code='unsupported_optional_control', message="tool_choice none has no Anthropic field; omitting tool_choice and the tools array", field="tool_choice", target_protocol=self.name)
                 elif formatted_choice is not None:
                     payload["tool_choice"] = formatted_choice
         if "structured_output" in params:
@@ -809,41 +810,21 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             temperature = payload.get("temperature")
             if isinstance(temperature, (int, float)) and not 0 <= float(temperature) <= 1:
                 clamped_temp = max(0.0, min(1.0, float(temperature)))
-                request.warnings.append(
-                    ConversionWarning(
-                        code="generation_control_clamped",
-                        message=f"temperature {temperature} outside Anthropic's [0,1] range; clamped to {clamped_temp}",
-                        field="temperature",
-                        source_protocol=request.source_protocol,
-                        target_protocol=self.name,
-                    )
-                )
+                add_conversion_warning(request, code='generation_control_clamped', message=f"temperature {temperature} outside Anthropic's [0,1] range; clamped to {clamped_temp}", field="temperature", target_protocol=self.name)
                 payload["temperature"] = clamped_temp
             top_p = payload.get("top_p")
             if isinstance(top_p, (int, float)) and not 0 <= float(top_p) <= 1:
                 clamped_p = max(0.0, min(1.0, float(top_p)))
-                request.warnings.append(
-                    ConversionWarning(
-                        code="generation_control_clamped",
-                        message=f"top_p {top_p} outside Anthropic's [0,1] range; clamped to {clamped_p}",
-                        field="top_p",
-                        source_protocol=request.source_protocol,
-                        target_protocol=self.name,
-                    )
-                )
+                add_conversion_warning(request, code='generation_control_clamped', message=f"top_p {top_p} outside Anthropic's [0,1] range; clamped to {clamped_p}", field="top_p", target_protocol=self.name)
                 payload["top_p"] = clamped_p
-            # Provider-bound envelope fields never cross protocols silently.
-            for bound_field in ("container", "service_tier", "context_management", "mcp_servers"):
-                if request.extra.get(bound_field) is not None:
-                    request.warnings.append(
-                        ConversionWarning(
-                            code="unsupported_optional_control",
-                            message=f"{bound_field} is Anthropic-provider-bound state; dropped cross-protocol",
-                            field=bound_field,
-                            source_protocol=request.source_protocol,
-                            target_protocol=self.name,
-                        )
-                    )
+            top_k = payload.get("top_k")
+            if isinstance(top_k, int) and top_k <= 0:
+                payload.pop("top_k")
+                add_conversion_warning(request, code='generation_control_clamped', message=f"top_k {top_k} is not positive; dropped (Anthropic requires a positive integer)", field="top_k", target_protocol=self.name)
+            # NOTE: provider-bound envelope fields (container, service_tier,
+            # context_management, mcp_servers) dropping at FOREIGN targets is
+            # recorded by those targets' extra handling — same-protocol
+            # replay here keeps them verbatim.
         return payload
 
     def _format_usage(self, usage: Usage | None) -> dict[str, int] | None:
@@ -892,6 +873,13 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             elif delta_type == "input_json_delta":
                 call = ToolCall(index=data.get("index"), arguments=delta.get("partial_json") or "")
                 content_block = ContentBlock(type="tool_call", tool_call=call, raw=deepcopy(delta))
+            elif delta_type == "citations_delta":
+                # Citations stream as full citation objects on the open text
+                # block — parsed to annotations so targets can render them
+                # (anthropic replays the raw shape; others map or warn).
+                citation = delta.get("citation")
+                if isinstance(citation, dict):
+                    content_block = ContentBlock(type="citations_delta", annotations=_parse_anthropic_citations([citation]), raw=deepcopy(delta))
         message = UnifiedMessage(role="assistant", content=[content_block] if content_block else [])
         self._promote_message_blocks(message)
         block_index = data.get("index")

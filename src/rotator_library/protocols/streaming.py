@@ -63,6 +63,7 @@ class StreamFormatState:
     block_signatures: dict[str, str] = field(default_factory=dict)
     emitted_signatures: set[str] = field(default_factory=set)
     stop_reason: str | None = None
+    stop_sequence: str | None = None
     usage: Usage | None = None
     next_index: int = 0
     open_blocks: dict[str, int] = field(default_factory=dict)
@@ -172,10 +173,15 @@ def format_canonical_stream_event(
         if state.usage is None:
             state.usage = event.usage
         else:
+            merged_input = event.usage.input_tokens or state.usage.input_tokens
+            merged_output = event.usage.output_tokens or state.usage.output_tokens
             state.usage = Usage(
-                input_tokens=event.usage.input_tokens or state.usage.input_tokens,
-                output_tokens=event.usage.output_tokens or state.usage.output_tokens,
-                total_tokens=event.usage.total_tokens or state.usage.total_tokens,
+                input_tokens=merged_input,
+                output_tokens=merged_output,
+                # Cumulative deltas legitimately recompute the total: an
+                # output-only delta's post_init total (0+42) must never
+                # clobber the message_start total.
+                total_tokens=max(event.usage.total_tokens or 0, state.usage.total_tokens or 0, merged_input + merged_output),
                 cache_read_tokens=event.usage.cache_read_tokens or state.usage.cache_read_tokens,
                 cache_write_tokens=event.usage.cache_write_tokens or state.usage.cache_write_tokens,
                 reasoning_tokens=event.usage.reasoning_tokens or state.usage.reasoning_tokens,
@@ -191,6 +197,8 @@ def format_canonical_stream_event(
         state.stop_reason = event.stop_reason
     elif event.extra.get("stop_reason"):
         state.stop_reason = str(event.extra["stop_reason"])
+    if event.extra.get("stop_sequence"):
+        state.stop_sequence = str(event.extra["stop_sequence"])
 
     if target_protocol == "openai_chat":
         return _format_openai(event, state)
@@ -257,6 +265,17 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
     frames = _anthropic_start(state)
     visible = _client_visible_blocks(event, include_builtins=True)
     for block in visible:
+        if block.type == "citations_delta":
+            # Citations attach to the OPEN text block — no new lifecycle.
+            open_indexes = [state.open_blocks[k] for k in state.block_order if k in state.open_blocks and k.startswith("text:")]
+            if open_indexes and block.annotations:
+                annotation = block.annotations[0]
+                frames.append(_event_frame("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": open_indexes[-1],
+                    "delta": {"type": "citations_delta", "citation": deepcopy(annotation.raw) if isinstance(annotation.raw, dict) else {"type": "citation", "cited_text": annotation.citation, "url": annotation.url}},
+                }))
+            continue
         key, block_type = _block_key(block, state, event)
         if key not in state.open_blocks:
             # Documented grammar: each open block closes before the next
@@ -317,9 +336,14 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
         # unmappable reasons degrade to end_turn upstream in format_response
         # where a warning can be recorded.
         reason = format_stop_reason(state.stop_reason, "anthropic_messages")
+        terminal_stop_sequence = event.extra.get("stop_sequence") or state.stop_sequence
+        if reason == "end_turn" and terminal_stop_sequence:
+            # The matched sequence distinguishes stop_sequence from end_turn
+            # (mirrors the non-stream path).
+            reason = "stop_sequence"
         frames.append(_event_frame("message_delta", {
             "type": "message_delta",
-            "delta": {"stop_reason": reason, "stop_sequence": event.extra.get("stop_sequence")},
+            "delta": {"stop_reason": reason, "stop_sequence": terminal_stop_sequence},
             "usage": _anthropic_usage(state.usage, output_only=True),
         }))
         frames.append(_event_frame("message_stop", {"type": "message_stop"}))
@@ -487,7 +511,7 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         payload: dict[str, Any] = {"candidates": [candidate]}
         if state.model:
             payload["modelVersion"] = state.model
-        usage = _gemini_usage(event.usage)
+        usage = _gemini_usage(state.usage or event.usage)
         if usage and not state.completion_emitted:
             payload["usageMetadata"] = usage
         frames.append(_data_frame(payload))
@@ -936,7 +960,6 @@ def _anthropic_usage(usage: Usage | None, *, output_only: bool = False) -> dict[
             payload["cache_creation_input_tokens"] = usage.cache_write_tokens
     if isinstance(usage.extra.get("server_tool_use"), dict):
         payload["server_tool_use"] = deepcopy(usage.extra["server_tool_use"])
-    return payload
     return payload
 
 

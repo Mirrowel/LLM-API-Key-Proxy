@@ -351,6 +351,8 @@ def format_reasoning_controls(
     enabled = normalized.get("enabled")
     include_thoughts = normalized.get("include_thoughts")
     summary = normalized.get("summary")
+    thinking_type = normalized.get("thinking_type")
+    normalized_display = normalized.get("display")
 
     def _warn(code: str, message: str, field: str) -> None:
         add_conversion_warning(request, code=code, message=message, field=field, target_protocol=target_protocol)
@@ -429,6 +431,14 @@ def format_reasoning_controls(
                 "reasoning.enabled",
             )
         else:
+            if thinking_type == "adaptive" and effort is None and budget is None:
+                # Adaptive-only sources carry no effort/budget lever to map —
+                # the drop is recorded, never silent.
+                _warn(
+                    "reasoning_control_dropped",
+                    "adaptive thinking has no Chat effort representation; reasoning_effort omitted",
+                    "reasoning",
+                )
             if effort is not None:
                 # Chat accepts the full effort vocabulary verbatim, "none"
                 # included — exact mapping, no inference.
@@ -457,8 +467,6 @@ def format_reasoning_controls(
             )
     elif target_protocol == "anthropic_messages":
         # "none" maps exactly to Anthropic's disabled construct (D7 level 1).
-        normalized_display = normalized.get("display")
-        thinking_type = normalized.get("thinking_type")
 
         def _emit_thinking(config: dict[str, Any]) -> None:
             if normalized_display is not None:
@@ -475,9 +483,11 @@ def format_reasoning_controls(
         if disabled:
             _emit_thinking({"type": "disabled"})
         elif thinking_type == "adaptive" or (thinking_type is None and budget is None and effort is None and enabled):
-            # Adaptive: Anthropic steers the budget itself (output_config
-            # effort carries the lever; the table handles it when present).
+            # Adaptive: Anthropic steers the budget itself; a carried effort
+            # stays in its native output_config lever (never discarded).
             _emit_thinking({"type": "adaptive"})
+            if effort is not None:
+                emissions["output_config"] = {"effort": effort}
         elif budget is not None:
             if isinstance(budget, int) and budget < 1024:
                 _warn(
@@ -494,6 +504,11 @@ def format_reasoning_controls(
             approximated = _anthropic_budget(budget_tokens_from_effort(value), (request.generation_params or {}).get("max_output_tokens"))
             if approximated is not None:
                 _emit_thinking({"type": "enabled", "budget_tokens": approximated})
+                _warn(
+                    "reasoning_effort_model_dependent",
+                    "effort mapped to thinking{enabled,budget_tokens}; current flagships (adaptive-only models) reject this shape — verify the target model accepts enabled thinking",
+                    "reasoning.effort",
+                )
             if not coerced:
                 _warn(
                     "reasoning_effort_approximated",
