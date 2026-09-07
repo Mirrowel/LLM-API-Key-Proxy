@@ -771,6 +771,14 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             else:
                 if preserve_source and isinstance(payload.get("tool_choice"), dict) and payload["tool_choice"].get("type") == "none":
                     payload.pop("tool_choice", None)
+                if isinstance(choice, dict) and choice.get("namespaced") is not None:
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message=f"namespaced tool_choice ({choice['namespaced'].get('type')}) has no Anthropic representation; narrowed to the mode",
+                        field="tool_choice",
+                        target_protocol=self.name,
+                    )
                 formatted_choice = format_tool_choice(choice, self.name)
                 if formatted_choice is None and isinstance(choice, dict) and choice.get("mode") == "none":
                     # Anthropic disables tools by omitting them entirely.

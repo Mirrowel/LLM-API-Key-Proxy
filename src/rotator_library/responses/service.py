@@ -40,6 +40,7 @@ from .streaming import (
     content_part_added_payload,
     content_part_done_payload,
     output_text_done_payload,
+    next_sequence_value,
     response_failed_payload,
 )
 from .types import ResponsesStoreSettings, StoredResponse
@@ -895,6 +896,11 @@ class ResponsesService:
                 chat_stream = acquired
             stream_iterator = chat_stream.__aiter__()
             first_chunk = True
+            # Bridge-side buffers for non-text deltas (tool calls, refusal,
+            # reasoning) that stream as native Responses items.
+            bridge_tools: dict[int, dict[str, Any]] = {}
+            bridge_refusal = ""
+            bridge_reasoning = ""
             while True:
                 try:
                     marker, raw_chunk = await next_upstream_chunk(first=first_chunk)
@@ -932,6 +938,35 @@ class ResponsesService:
                     raise ResponsesServiceError(_stream_error_message(chunk), status_code=502, error_type="upstream_error")
                 if chunk.get("usage"):
                     usage = _merge_responses_stream_usage(_responses_chunk_usage(chunk), usage)
+                # Tool-call / refusal / reasoning deltas stream as native
+                # Responses items — never silently dropped (H4).
+                delta_payload = _chunk_delta_payload(chunk)
+                for fragment in delta_payload.get("tool_calls") or []:
+                    if not isinstance(fragment, dict):
+                        continue
+                    call_index = fragment.get("index") if isinstance(fragment.get("index"), int) else 0
+                    entry = bridge_tools.setdefault(call_index, {"id": None, "name": "", "arguments": ""})
+                    if fragment.get("id"):
+                        entry["id"] = fragment["id"]
+                    function_fragment = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
+                    if function_fragment.get("name"):
+                        entry["name"] += function_fragment["name"]
+                    if function_fragment.get("arguments"):
+                        entry["arguments"] += function_fragment["arguments"]
+                        arguments_event = {
+                            "type": "response.function_call_arguments.delta",
+                            "sequence_number": next_sequence_value(),
+                            "item_id": f"fc_{call_index}",
+                            "output_index": 1 + call_index,
+                            "delta": function_fragment["arguments"],
+                        }
+                        yield ResponsesStreamEvent("response.function_call_arguments.delta", arguments_event)
+                refusal_fragment = delta_payload.get("refusal")
+                if isinstance(refusal_fragment, str) and refusal_fragment:
+                    bridge_refusal += refusal_fragment
+                reasoning_fragment = delta_payload.get("reasoning_content")
+                if isinstance(reasoning_fragment, str) and reasoning_fragment:
+                    bridge_reasoning += reasoning_fragment
                 delta = _chunk_text_delta(chunk)
                 if not delta:
                     continue
@@ -986,6 +1021,22 @@ class ResponsesService:
             self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": transport})
             yield ResponsesStreamEvent("response.output_item.done", done_item)
             completed = response_completed_payload(state, _usage_to_responses_stream(usage))
+            # Bridge-side non-text items (tool calls, refusal, reasoning)
+            # flush as native output items before the terminal.
+            extra_output: list[dict[str, Any]] = []
+            if bridge_reasoning:
+                reasoning_item = {"id": "rs_0", "type": "reasoning", "summary": [{"type": "summary_text", "text": bridge_reasoning}], "status": "completed"}
+                yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": 1, "item": dict(reasoning_item, status="in_progress")})
+                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": 1, "item": reasoning_item})
+                extra_output.append(reasoning_item)
+            for tool_index, entry in sorted(bridge_tools.items()):
+                tool_item = {"id": f"fc_{tool_index}", "type": "function_call", "call_id": entry.get("id") or f"fc_{tool_index}", "name": entry.get("name") or "", "arguments": entry.get("arguments") or "", "status": "completed"}
+                yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": 2 + tool_index, "item": dict(tool_item, status="in_progress")})
+                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": 2 + tool_index, "item": tool_item})
+                extra_output.append(tool_item)
+            if bridge_refusal:
+                completed["response"]["output"].append({"id": state.output_item_id + "_r", "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": bridge_refusal}], "status": "completed"})
+            completed["response"]["output"].extend(extra_output)
             _record_responses_session_anchor(session_info, completed)
             self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
             stored = await self._store_stream_response(stream_request, completed, parent, transaction_logger=transaction_logger, session_info=session_info)
@@ -1684,6 +1735,16 @@ def _chunk_text_delta(chunk: dict[str, Any]) -> str:
         return ""
     content = delta.get("content")
     return content if isinstance(content, str) else ""
+
+
+def _chunk_delta_payload(chunk: dict[str, Any]) -> dict[str, Any]:
+    """Full first-choice delta (tool_calls/refusal/reasoning included)."""
+
+    choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
+    if not choices:
+        return {}
+    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
+    return delta if isinstance(delta, dict) else {}
 
 
 def _usage_to_responses_stream(usage: Any) -> Any:

@@ -20,6 +20,7 @@ from typing import Any, ClassVar, Iterable, Optional
 
 from .base import ProtocolAdapter
 from .canonical import (
+    add_conversion_warning,
     attach_conversion_summary,
     canonical_stop_reason,
     canonical_structured_output,
@@ -1105,6 +1106,14 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 # never clobber it with the canonical re-format.
                 pass
             else:
+                if isinstance(choice, dict) and choice.get("namespaced") is not None:
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message=f"namespaced tool_choice ({choice['namespaced'].get('type')}) has no Chat representation; narrowed to the mode",
+                        field="tool_choice",
+                        target_protocol=self.name,
+                    )
                 payload["tool_choice"] = format_tool_choice(choice, self.name)
                 if (
                     isinstance(choice, dict)

@@ -80,6 +80,15 @@ class ResponsesBridge:
         for key, value in unified.generation_params.items():
             if key in _CHAT_GENERATION_KEYS:
                 kwargs[_chat_generation_key(key)] = deepcopy(value)
+        structured = unified.generation_params.get("structured_output") or unified.response_format
+        if isinstance(structured, dict):
+            # Structured output must survive the bridge: format through the
+            # canonical helper so chat receives a legal response_format.
+            from ..protocols.canonical import format_structured_output
+
+            formatted = format_structured_output(structured, "openai_chat")
+            if formatted is not None:
+                kwargs["response_format"] = formatted
         if unified.metadata:
             kwargs.setdefault("metadata", deepcopy(unified.metadata))
         unsupported = {

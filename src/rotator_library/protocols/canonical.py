@@ -724,6 +724,12 @@ def canonical_tool_choice(value: Any, source_protocol: str) -> dict[str, Any] | 
         if value.get("disable_parallel_tool_use") is True:
             result["disable_parallel_tool_use"] = True
         return result
+    if value_type not in {"function", "tool", "named", "allowed_tools"} and isinstance(value.get("type"), str):
+        # Namespaced tool-choice variants (mcp{server_label,name}, custom,
+        # local_shell, apply_patch, allowed_types...): preserve the raw shape
+        # for native round-trips; foreign targets warn instead of silently
+        # widening to auto.
+        return {"mode": "auto", "namespaced": deepcopy(value)}
     if value_type == "allowed_tools":
         # Chat allowed-tools constraint. Variant spellings: {"type":"allowed_tools",
         # "allowed_tools": {"mode":auto|required, "tools":[...]}} or a bare list.
@@ -760,6 +766,11 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
     name = choice.get("name")
     allowed_names = deepcopy(choice.get("allowed_names") or [])
     no_parallel = choice.get("disable_parallel_tool_use") is True
+    if target_protocol != "responses" and isinstance(choice.get("namespaced"), dict):
+        # Namespaced variants have no representation outside Responses —
+        # callers narrow to the mode; the warning lands there via the
+        # canonical record (mode stays "auto").
+        pass
     if target_protocol == "openai_chat":
         if mode == "named":
             return {"type": "function", "function": {"name": name or ""}}
@@ -788,6 +799,9 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
     if target_protocol == "responses":
         if mode == "named":
             return {"type": "function", "name": name or ""}
+        if isinstance(choice.get("namespaced"), dict):
+            # Namespaced variants are Responses-native: round-trip verbatim.
+            return deepcopy(choice["namespaced"])
         return "required" if mode == "required" else mode
     if target_protocol == "gemini":
         if mode == "none":

@@ -135,6 +135,12 @@ def reset_stream_sequence() -> None:
     _sequence_counter["value"] = 0
 
 
+def next_sequence_value() -> int:
+    """Public accessor for service-level event builders."""
+
+    return _next_sequence()
+
+
 def response_created_payload(response_id: str, model: str) -> dict[str, Any]:
     return {"type": "response.created", "sequence_number": _next_sequence(), "response": {"id": response_id, "object": "response", "status": "in_progress", "model": model, "output": []}}
 
