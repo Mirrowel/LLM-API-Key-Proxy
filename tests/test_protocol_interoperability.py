@@ -609,8 +609,14 @@ def test_unknown_native_stop_reason_never_leaks_as_invalid_chat_value() -> None:
 
     payload = get_protocol("openai_chat").format_response(response, _context("gemini", "openai_chat"))
 
-    assert payload["choices"][0]["finish_reason"] is None
+    # Non-stream finish_reason is a required enum: unknown foreign reasons
+    # degrade to the documented fallback with a recorded summary — the raw
+    # value never leaks into the wire enum.
+    assert payload["choices"][0]["finish_reason"] == "stop"
     assert response.metadata["native_stop_reason"] == "OTHER"
+    summary = payload.get("x-proxy-conversion") or {}
+    rendered = summary.get("warnings") or summary.get("entries") or []
+    assert any(entry.get("code") == "stop_reason_approximated" for entry in rendered) or summary.get("count")
 
 
 @pytest.mark.parametrize(

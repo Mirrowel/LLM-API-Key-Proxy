@@ -296,9 +296,12 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         cache_write = int(usage.get("cache_creation_input_tokens") or 0)
         cache_read = int(usage.get("cache_read_input_tokens") or 0)
         return Usage(
-            input_tokens=input_tokens,
+            # Canonical input_tokens is INCLUSIVE of cache reads/writes (the
+            # OpenAI/Gemini convention, H2): Anthropic reports them as
+            # siblings, so they fold in here and unfold at format time.
+            input_tokens=input_tokens + cache_read + cache_write,
             output_tokens=output_tokens,
-            total_tokens=int(usage.get("total_tokens") or input_tokens + output_tokens),
+            total_tokens=int(usage.get("total_tokens") or input_tokens + cache_read + cache_write + output_tokens),
             cache_read_tokens=cache_read,
             cache_write_tokens=cache_write,
             raw=deepcopy(usage),
@@ -591,7 +594,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
     def _format_usage(self, usage: Usage | None) -> dict[str, int] | None:
         if usage is None:
             return None
-        payload = {"input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens}
+        # Anthropic reports cache tokens as SIBLINGS of input_tokens; the
+        # canonical input_tokens is inclusive (H2) — unfold, never negative.
+        input_tokens = max(0, usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens)
+        payload = {"input_tokens": input_tokens, "output_tokens": usage.output_tokens}
         if usage.cache_write_tokens:
             payload["cache_creation_input_tokens"] = usage.cache_write_tokens
         if usage.cache_read_tokens:

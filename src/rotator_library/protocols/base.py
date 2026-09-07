@@ -150,6 +150,16 @@ class ProtocolAdapter:
         event_type = "done" if raw_event == "[DONE]" else "chunk"
         return UnifiedStreamEvent(type=event_type, raw=deepcopy(raw_event))
 
+    def parse_stream_events(self, raw_event: Any, context: ProtocolContext | None = None) -> list[UnifiedStreamEvent]:
+        """Parse one raw frame into one or more canonical events.
+
+        Default is 1:1; protocols that multiplex several logical records
+        into a single wire frame (Chat ``n>1`` choices) override this so
+        no candidate is silently dropped.
+        """
+
+        return [self.parse_stream_event(raw_event, context)]
+
     def format_stream_event(self, unified_event: UnifiedStreamEvent, context: ProtocolContext | None = None) -> Any:
         """Format one canonical stream event for this destination protocol."""
 

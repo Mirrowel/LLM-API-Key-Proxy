@@ -114,6 +114,9 @@ class Usage(ProtocolSerializable):
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
+    audio_tokens: int = 0
+    accepted_prediction_tokens: int = 0
+    rejected_prediction_tokens: int = 0
     cost: Optional[CostDetails] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
@@ -125,6 +128,9 @@ class Usage(ProtocolSerializable):
         "cache_read_tokens",
         "cache_write_tokens",
         "reasoning_tokens",
+        "audio_tokens",
+        "accepted_prediction_tokens",
+        "rejected_prediction_tokens",
         "cost",
         "raw",
         "extra",
@@ -172,7 +178,9 @@ class MediaSource(ProtocolSerializable):
     url: Optional[str] = None
     data: Optional[str] = None
     file_id: Optional[str] = None
+    filename: Optional[str] = None
     detail: Optional[str] = None
+    transcript: Optional[str] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 

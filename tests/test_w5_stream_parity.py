@@ -282,8 +282,10 @@ async def test_no_duplicate_terminal_frames_on_synthetic_done(client_protocol: s
         finish_frames = [line for line in output.splitlines() if '"finish_reason": "stop"' in line]
         assert len(finish_frames) == 1
         assert output.count("data: [DONE]") == 1
-        null_finish_frames = [line for line in output.splitlines() if '"finish_reason": null' in line and '"usage"' in line]
-        assert null_finish_frames == []
+        # Documented include_usage grammar: exactly one terminal usage chunk
+        # with an empty choices array (usage chunks never carry choices).
+        usage_frames = [line for line in output.splitlines() if '"usage": {' in line]
+        assert len(usage_frames) == 1 and '"choices": []' in usage_frames[0]
     else:
         assert output.count('"finishReason": "STOP"') == 1
 

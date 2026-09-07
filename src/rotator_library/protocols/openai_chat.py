@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+import uuid
 from copy import deepcopy
 from typing import Any, ClassVar, Iterable, Optional
 
@@ -70,17 +72,24 @@ _GENERATION_PARAMS = {
     "max_tokens",
     "n",
     "parallel_tool_calls",
+    "prediction",
     "presence_penalty",
+    "prompt_cache_key",
+    "prompt_cache_retention",
     "reasoning_effort",
+    "safety_identifier",
     "seed",
     "service_tier",
     "stop",
+    "store",
     "stream_options",
     "temperature",
     "tool_choice",
     "top_logprobs",
     "top_p",
     "user",
+    "verbosity",
+    "web_search_options",
 }
 
 _REQUEST_CORE_FIELDS = {
@@ -117,6 +126,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
+        warnings_list: list[ConversionWarning] = []
         messages = resolve_tool_result_names([self._parse_message(message) for message in request.get("messages") or []])
         tools = [self._parse_tool_definition(tool) for tool in request.get("tools") or []]
         source_generation_params = {k: deepcopy(request[k]) for k in _GENERATION_PARAMS if k in request}
@@ -129,6 +139,23 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if request.get("audio") is not None:
             generation_params["audio_output"] = deepcopy(request["audio"])
         extra = {k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS}
+        modalities = [str(value).lower() for value in request.get("modalities") or []]
+        if modalities:
+            # Chat output modalities are text|audio: unknown values (e.g.
+            # "image") never sail through to providers that must reject them.
+            legal = [value for value in modalities if value in {"text", "audio"}]
+            dropped = [value for value in modalities if value not in {"text", "audio"}]
+            if dropped:
+                warnings_list.append(
+                    ConversionWarning(
+                        code="unsupported_optional_control",
+                        message=f"modalities {dropped} are not legal Chat output modalities; dropped",
+                        field="modalities",
+                        source_protocol=self.name,
+                        target_protocol=self.name,
+                    )
+                )
+            modalities = legal
 
         return UnifiedRequest(
             operation=OPERATION_CHAT,
@@ -137,12 +164,13 @@ class OpenAIChatProtocol(ProtocolAdapter):
             messages=messages,
             tools=tools,
             stream=bool(request.get("stream", False)),
-            modalities=[str(value).lower() for value in request.get("modalities") or []],
+            modalities=modalities,
             generation_params=generation_params,
             response_format=structured_output,
             metadata=deepcopy(request.get("metadata") or {}),
             source_protocol=self.name,
             extensions={self.name: {"generation_params": source_generation_params, "response_format": deepcopy(request.get("response_format"))}},
+            warnings=warnings_list,
             raw=deepcopy(raw_request),
             extra=extra,
         )
@@ -174,6 +202,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "messages": self._format_request_messages(
                 wire_messages,
                 preserve_source=preserve_source,
+                warnings=unified_request.warnings,
             ),
         }
         if unified_request.tools:
@@ -190,6 +219,16 @@ class OpenAIChatProtocol(ProtocolAdapter):
 
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         response = _as_dict(raw_response)
+        error_payload = response.get("error")
+        if error_payload is not None:
+            # Provider errors are structured failures, never empty successes
+            # (W6/D1 contract; mirrors the stream parser's error branch).
+            raise ProtocolError(
+                "openai_chat provider returned an error payload",
+                protocol="openai_chat",
+                pass_name="parse_response",
+                payload={"error": deepcopy(error_payload)},
+            )
         messages: list[UnifiedMessage] = []
         stop_reason = None
         for choice_position, choice in enumerate(response.get("choices") or []):
@@ -205,6 +244,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 except (TypeError, ValueError):
                     message.index = choice_position
                 message.stop_reason = canonical_stop_reason(choice.get("finish_reason"))
+                if choice.get("logprobs") is not None:
+                    # Choice-level logprobs ride the message for same-protocol
+                    # replay (cross-protocol drops as untranslatable evidence).
+                    message.extra["logprobs"] = deepcopy(choice["logprobs"])
                 message_annotations = _parse_openai_annotations(message_payload.get("annotations"))
                 if message_annotations:
                     if message.content:
@@ -297,47 +340,113 @@ class OpenAIChatProtocol(ProtocolAdapter):
         choices = []
         for position, message in enumerate(messages):
             per_choice_reason = message.stop_reason or unified_response.stop_reason
-            choices.append(
-                {
-                    "index": message.index if message.index is not None else position,
-                    "message": _format_response_message(
-                        self._format_message(message, preserve_source=preserve_source),
-                        message,
-                    ),
-                    "finish_reason": format_stop_reason(per_choice_reason, self.name),
-                }
-            )
+            formatted_reason = format_stop_reason(per_choice_reason, self.name)
+            native_reason = unified_response.metadata.get("native_stop_reason")
+            if formatted_reason is None:
+                # Non-stream finish_reason is a required enum — never null.
+                # Unknown/absent foreign reasons degrade to the honest
+                # fallback with a recorded summary (D7 level 5).
+                if per_choice_reason is not None or native_reason is not None:
+                    _warn_chat_once(
+                        unified_response,
+                        code="stop_reason_approximated",
+                        message=f"native stop reason '{per_choice_reason or native_reason}' has no Chat enum value; emitted 'stop'",
+                        field="finish_reason",
+                    )
+                formatted_reason = "stop"
+            choice_entry: dict[str, Any] = {
+                "index": message.index if message.index is not None else position,
+                "message": _format_response_message(
+                    self._format_message(message, preserve_source=preserve_source, direction="response"),
+                    message,
+                ),
+                "finish_reason": formatted_reason,
+            }
+            choice_logprobs = (message.extra or {}).get("logprobs")
+            if choice_logprobs is not None:
+                choice_entry["logprobs"] = deepcopy(choice_logprobs)
+            choices.append(choice_entry)
         payload = {
-            "id": unified_response.id,
+            "id": unified_response.id or f"chatcmpl-{uuid.uuid4().hex}",
             "object": unified_response.metadata.get("object", "chat.completion"),
-            "created": unified_response.metadata.get("created"),
+            "created": unified_response.metadata.get("created") or int(time.time()),
             "model": unified_response.model,
             "choices": choices,
             "usage": _format_openai_usage(unified_response.usage),
         }
+        # Determinism markers survive the canonical round-trip (their
+        # documented purpose is client-side seed/fingerprint checks).
+        fingerprint = unified_response.metadata.get("system_fingerprint")
+        if fingerprint is not None:
+            payload["system_fingerprint"] = fingerprint
+        service_tier = unified_response.metadata.get("service_tier") or unified_response.extra.get("service_tier")
+        if service_tier is not None:
+            payload["service_tier"] = service_tier
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
         return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
-    def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
+    def parse_stream_events(self, raw_event: Any, context: ProtocolContext | None = None) -> list[UnifiedStreamEvent]:
+        """One canonical event per choice — ``n>1`` frames carry several
+        choices in one SSE chunk and every candidate must survive."""
+
         event = _decode_sse_data(raw_event)
         if event == "[DONE]":
-            return UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))
+            return [UnifiedStreamEvent(type="done", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))]
         data = _as_dict(event)
         if data.get("error") is not None:
-            return UnifiedStreamEvent(type="error", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="error", error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})
+            return [UnifiedStreamEvent(type="error", operation=OPERATION_CHAT, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="error", error=deepcopy(data["error"]), raw=deepcopy(raw_event), extra={"payload": data})]
 
-        delta_message = None
-        finish_reason = None
-        for choice in data.get("choices") or []:
+        events: list[UnifiedStreamEvent] = []
+        saw_choice = False
+        for choice_position, choice in enumerate(data.get("choices") or []):
             if not isinstance(choice, dict):
                 continue
+            saw_choice = True
+            try:
+                choice_index = int(choice.get("index", choice_position))
+            except (TypeError, ValueError):
+                choice_index = choice_position
             delta = choice.get("delta") or {}
+            delta_message = None
+            finish_reason = None
             if delta:
                 delta_message = self._parse_message({"role": delta.get("role", "assistant"), **delta})
-            finish_reason = choice.get("finish_reason") if choice.get("finish_reason") is not None else finish_reason
-            break
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice.get("finish_reason")
+            if delta_message is None and finish_reason is None:
+                continue
+            events.append(self._stream_event(data, delta_message, finish_reason, raw_event, choice_index, logprobs=choice.get("logprobs")))
 
         usage = self.extract_usage(data, context)
+        if usage is not None and not saw_choice:
+            # Terminal usage-only chunk (choices == []): its own event.
+            events.append(self._stream_event(data, None, None, raw_event, 0, usage=usage))
+        elif usage is not None and events:
+            events[0].usage = usage
+        if not events:
+            events.append(self._stream_event(data, None, None, raw_event, 0, usage=usage))
+        return events
+
+    def _stream_event(
+        self,
+        data: dict[str, Any],
+        delta_message: Optional[UnifiedMessage],
+        finish_reason: Optional[str],
+        raw_event: Any,
+        choice_index: int,
+        usage: Optional[Usage] = None,
+        logprobs: Any = None,
+    ) -> UnifiedStreamEvent:
+        extra = {
+            "id": data.get("id"),
+            "model": data.get("model"),
+            "finish_reason": canonical_stop_reason(finish_reason),
+            "payload": data,
+        }
+        if logprobs is not None:
+            # Chunk-level logprobs ride alongside (same-protocol replay;
+            # cross-protocol drops them as untranslatable evidence).
+            extra["logprobs"] = deepcopy(logprobs)
         return UnifiedStreamEvent(
             type="message_delta" if delta_message else "chunk",
             operation=OPERATION_CHAT,
@@ -347,14 +456,14 @@ class OpenAIChatProtocol(ProtocolAdapter):
             delta=delta_message,
             usage=usage,
             stop_reason=canonical_stop_reason(finish_reason),
+            output_index=choice_index,
             raw=deepcopy(raw_event),
-            extra={
-                "id": data.get("id"),
-                "model": data.get("model"),
-                "finish_reason": canonical_stop_reason(finish_reason),
-                "payload": data,
-            },
+            extra=extra,
         )
+
+    def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
+        events = self.parse_stream_events(raw_event, context)
+        return events[0]
 
     def format_stream_event(self, unified_event: UnifiedStreamEvent, context: ProtocolContext | None = None) -> Any:
         from .streaming import format_canonical_stream_event
@@ -389,8 +498,25 @@ class OpenAIChatProtocol(ProtocolAdapter):
             output_tokens=int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
             total_tokens=int(usage.get("total_tokens") or 0),
             cache_read_tokens=int(prompt_details.get("cached_tokens") or usage.get("cache_read_tokens") or 0),
-            cache_write_tokens=int(prompt_details.get("cache_creation_tokens") or usage.get("cache_creation_tokens") or 0),
+            cache_write_tokens=int(
+                prompt_details.get("cache_write_tokens")
+                or prompt_details.get("cache_creation_tokens")
+                or usage.get("cache_creation_tokens")
+                or 0
+            ),
             reasoning_tokens=int(completion_details.get("reasoning_tokens") or usage.get("reasoning_tokens") or 0),
+            audio_tokens=int(
+                prompt_details.get("audio_tokens")
+                or completion_details.get("audio_tokens")
+                or usage.get("audio_tokens")
+                or 0
+            ),
+            accepted_prediction_tokens=int(
+                prompt_details.get("accepted_prediction_tokens") or usage.get("accepted_prediction_tokens") or 0
+            ),
+            rejected_prediction_tokens=int(
+                prompt_details.get("rejected_prediction_tokens") or usage.get("rejected_prediction_tokens") or 0
+            ),
             cost=cost,
             raw=deepcopy(usage),
         )
@@ -398,10 +524,13 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def _parse_message(self, message: dict[str, Any]) -> UnifiedMessage:
         payload = dict(message or {})
         reasoning = _extract_reasoning(payload)
+        # A missing role mirrors the wire verbatim (assistant default); the
+        # upstream API enforces role presence — the adapter does not invent
+        # stricter semantics than the wire contract.
         role = str(payload.get("role") or "assistant")
         content = self._parse_content(payload.get("content"))
         if role == "tool":
-            result_content = canonical_tool_arguments(payload.get("content"))
+            result_content = canonical_tool_arguments(self._concat_text_content(payload.get("content")))
             content = [
                 ContentBlock(
                     type="tool_result",
@@ -414,12 +543,37 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     raw=deepcopy(message),
                 )
             ]
+        elif role == "function":
+            # Legacy function-role results unify into the canonical tool
+            # result (the assistant function_call counterpart already does);
+            # `extra["legacy_function_role"]` marks the spelling so the chat
+            # formatter can replay it verbatim same-protocol.
+            result_content = canonical_tool_arguments(self._concat_text_content(payload.get("content")))
+            content = [
+                ContentBlock(
+                    type="tool_result",
+                    tool_result=ToolResult(
+                        tool_call_id=payload.get("tool_call_id"),
+                        name=payload.get("name"),
+                        content=result_content,
+                        raw=deepcopy(message),
+                    ),
+                    raw=deepcopy(message),
+                    extra={"legacy_function_role": True},
+                )
+            ]
         refusal = payload.get("refusal")
         if isinstance(refusal, str) and refusal and not any(block.type == "refusal" for block in content):
             content.append(ContentBlock(type="refusal", refusal=refusal, raw=refusal))
         audio = payload.get("audio")
         if isinstance(audio, dict) and audio:
-            content.append(ContentBlock(type="audio", source=_openai_media_source(audio, kind="audio"), raw=deepcopy(audio)))
+            parsed_audio = _openai_media_source(audio, kind="audio")
+            # Response audio objects carry a compact format label (mp3) —
+            # normalize to the MIME type so canonical media_type stays
+            # MIME-typed for every downstream target (M2).
+            if parsed_audio.media_type and "/" not in parsed_audio.media_type:
+                parsed_audio.media_type = f"audio/{parsed_audio.media_type}"
+            content.append(ContentBlock(type="audio", source=parsed_audio, raw=deepcopy(audio)))
         return UnifiedMessage(
             role=role,
             content=content,
@@ -431,7 +585,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in payload.items() if k not in {"role", "content", "name", "tool_call_id", "tool_calls", "reasoning", "reasoning_content"}},
         )
 
-    def _format_request_messages(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool) -> list[dict[str, Any]]:
+    @staticmethod
+    def _concat_text_content(content: Any) -> Any:
+        """Tool-message content is string or an array of text parts; arrays
+        concatenate their text (never JSON-stringify the parts array)."""
+
+        if isinstance(content, list):
+            texts = [part.get("text") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str)]
+            if texts and len(texts) == sum(1 for part in content if isinstance(part, dict)):
+                return "".join(texts)
+        return content
+
+    def _format_request_messages(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool, warnings: Optional[list[ConversionWarning]] = None) -> list[dict[str, Any]]:
         """Format messages, expanding protocols that embed tool results in user turns."""
 
         formatted: list[dict[str, Any]] = []
@@ -443,10 +608,20 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     residual_message = deepcopy(message)
                     residual_message.content = residual
                     residual_message.tool_call_id = None
-                    formatted.append(self._format_message(residual_message, preserve_source=False))
+                    formatted.append(self._format_message(residual_message, preserve_source=preserve_source, warnings=warnings))
                 for block in result_blocks:
                     result = block.tool_result
                     if result is None:
+                        continue
+                    if block.extra.get("legacy_function_role"):
+                        # Legacy spelling replays verbatim (role=function).
+                        formatted.append(
+                            {
+                                "role": "function",
+                                "name": result.name or message.name,
+                                "content": _tool_result_text(result.content),
+                            }
+                        )
                         continue
                     formatted.append(
                         {
@@ -456,10 +631,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         }
                     )
                 continue
-            formatted.append(self._format_message(message, preserve_source=preserve_source))
+            formatted.append(self._format_message(message, preserve_source=preserve_source, warnings=warnings))
         return formatted
 
-    def _format_message(self, message: UnifiedMessage, *, preserve_source: bool = True) -> dict[str, Any]:
+    def _format_message(self, message: UnifiedMessage, *, preserve_source: bool = True, direction: str = "request", warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"role": message.role}
         if message.name:
             payload["name"] = message.name
@@ -488,7 +663,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 payload["name"] = result.name
             content = _tool_result_text({"error": result.content} if result.is_error else result.content)
         else:
-            content = self._format_content(message.content, preserve_source=preserve_source)
+            content = self._format_content(message.content, preserve_source=preserve_source, warnings=warnings)
         if isinstance(content, list) and not content:
             if any(block.type == "refusal" and block.refusal for block in message.content):
                 # Refusal-only assistant history: content is null on the wire,
@@ -506,11 +681,12 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if not preserve_source:
             audio_blocks = [block for block in message.content if block.type == "audio"]
             if audio_blocks and message.role == "assistant" and "audio" not in extra:
-                # Response-direction only: synthesize the Chat message-level
-                # audio field from a cross-protocol (e.g. Gemini inlineData)
-                # audio block. Deterministic content digest id (W12
-                # reconstruction parity); unsynthesizable audio records
-                # media_dropped via the response handle (never silent).
+                # Response-direction only: synthesize the Chat RESPONSE audio
+                # object {id, data, transcript} (docs shape — no format key,
+                # which belongs to the request-side audio parameter).
+                # Deterministic content digest id (W12 reconstruction
+                # parity); unsynthesizable audio records media_dropped via
+                # the response handle (never silent).
                 synthesized: dict[str, Any] | None = None
                 for block in audio_blocks:
                     source = block.source
@@ -520,21 +696,33 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         synthesized = {
                             "id": (getattr(source, "file_id", None) or f"audio_{digest}"),
                             "data": data,
-                            "format": _audio_format(getattr(source, "media_type", None)),
+                            "transcript": getattr(source, "transcript", None) or "",
                         }
                         break
                 if synthesized is not None:
                     extra["audio"] = synthesized
         legacy_function_call = extra.get("function_call")
         tool_calls = _message_tool_calls(message)
-        if tool_calls and not legacy_function_call:
-            payload["tool_calls"] = [self._format_tool_call(call, preserve_source=preserve_source) for call in tool_calls]
-        elif tool_calls and legacy_function_call:
-            call = tool_calls[0]
-            extra["function_call"] = {"name": call.name or "", "arguments": tool_arguments_text(call.arguments)}
-        if message.reasoning:
-            # OpenAI-compatible providers use multiple names for reasoning text.
-            # Prefer the common extension field while keeping all blocks in extra.
+        if tool_calls:
+            legacy_only = all(call.extra.get("legacy_function_call") for call in tool_calls)
+            if legacy_only:
+                # Pure legacy history: replay the function_call spelling.
+                call = tool_calls[0]
+                extra["function_call"] = {"name": call.name or "", "arguments": tool_arguments_text(call.arguments)}
+            else:
+                payload["tool_calls"] = [self._format_tool_call(call, preserve_source=preserve_source) for call in tool_calls]
+        if message.reasoning and (
+            preserve_source
+            or direction == "response"
+            or (direction == "request" and message.role == "assistant")
+        ):
+            # reasoning_content is a provider-extension field (DeepSeek-style),
+            # not an OpenAI spec field. Replay verbatim on same-protocol
+            # upstream payloads; cross-protocol, only ASSISTANT history turns
+            # may carry it (reasoning replay is legitimate history; synthesizing
+            # it onto user/tool turns is fabrication strict providers reject).
+            # Responses to chat CLIENTS always render reasoning text through it
+            # (the convention every chat consumer reads).
             text = "".join(block.text or "" for block in message.reasoning if block.text)
             if text:
                 payload["reasoning_content"] = text
@@ -550,7 +738,9 @@ class OpenAIChatProtocol(ProtocolAdapter):
         ]
         if annotations:
             payload["annotations"] = _format_openai_annotations(annotations)
-        payload.update(extra)
+        # Computed fields (annotations/refusal) have typed homes; stale
+        # parse-time copies in extra must never clobber them.
+        payload.update({k: v for k, v in extra.items() if k not in {"annotations", "refusal"}})
         return payload
 
     def _parse_message_tool_calls(self, payload: dict[str, Any]) -> list[ToolCall]:
@@ -606,13 +796,25 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 source = _openai_media_source(raw_source, kind="audio")
                 blocks.append(ContentBlock(type="audio", source=source, raw=deepcopy(block), extra=_without(block, {"type", "input_audio", "audio", "source"})))
             elif block_type in {"file", "input_file"}:
-                source = _openai_media_source(block, kind="file")
-                blocks.append(ContentBlock(type="file", source=source, raw=deepcopy(block), extra=_without(block, {"type", "file_id", "file_data", "filename"})))
+                # Documented Chat shape nests identity/data under "file":
+                # {"type":"file","file":{"file_id"|"file_data","filename"}}.
+                # Flat spellings (Responses input_file) are accepted leniently.
+                nested = block.get("file") if isinstance(block.get("file"), dict) else None
+                source_payload = nested if nested is not None else _without(block, {"type"})
+                source = _openai_media_source(source_payload, kind="file")
+                blocks.append(ContentBlock(type="file", source=source, raw=deepcopy(block), extra=_without(block, {"type", "file", "file_id", "file_data", "filename"})))
+            elif block_type == "refusal":
+                blocks.append(ContentBlock(
+                    type="refusal",
+                    refusal=block.get("refusal"),
+                    raw=deepcopy(block),
+                    extra=_without(block, {"type", "refusal"}),
+                ))
             else:
                 blocks.append(ContentBlock(type=str(block_type), raw=deepcopy(block), extra=_without(block, {"type"})))
         return blocks
 
-    def _format_content(self, blocks: Iterable[ContentBlock], *, preserve_source: bool = True) -> Any:
+    def _format_content(self, blocks: Iterable[ContentBlock], *, preserve_source: bool = True, warnings: Optional[list[ConversionWarning]] = None) -> Any:
         block_list = list(blocks)
         if not block_list:
             return None
@@ -643,34 +845,85 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         formatted.append(deepcopy(block.raw))
                     continue
                 source = _media_source(block.source)
-                payload = {"type": "input_audio", "input_audio": {"data": source.data or "", "format": _audio_format(source.media_type)}}
+                audio_format = _audio_format(source.media_type)
+                if audio_format is None:
+                    # Unmappable MIME type: drop with a recorded warning
+                    # instead of emitting an illegal format label.
+                    if warnings is not None:
+                        warnings.append(
+                            ConversionWarning(
+                                code="media_dropped",
+                                message=f"audio part with MIME type {source.media_type!r} has no legal Chat audio format label; dropped",
+                                field="content[audio]",
+                                source_protocol=None,
+                                target_protocol="openai_chat",
+                            )
+                        )
+                    continue
+                payload = {"type": "input_audio", "input_audio": {"data": source.data or "", "format": audio_format}}
                 formatted.append(payload)
             elif block.type in {"file", "document"}:
                 source = _media_source(block.source)
-                file_payload: dict[str, Any] = {"type": "file"}
+                file_obj: dict[str, Any] = {}
                 if source.file_id:
-                    file_payload["file_id"] = source.file_id
+                    file_obj["file_id"] = source.file_id
                 elif source.data:
-                    file_payload["file_data"] = source.data
-                elif source.url:
-                    file_payload["file_url"] = source.url
-                formatted.append(file_payload)
+                    file_obj["file_data"] = source.data
+                    if source.filename:
+                        file_obj["filename"] = source.filename
+                if not file_obj and source.url:
+                    # No documented Chat home for URL-only files: record the
+                    # drop honestly rather than invent a non-spec key.
+                    if warnings is not None:
+                        warnings.append(ConversionWarning(code="media_dropped", message=f"file without file_id/file_data cannot be represented as a Chat file part (url={source.url})", field="file", source_protocol=None, target_protocol="openai_chat"))
+                    continue
+                formatted.append({"type": "file", "file": file_obj})
+            elif block.type == "refusal":
+                payload = {"type": "refusal", "refusal": block.refusal or ""}
+                formatted.append(payload)
             elif preserve_source and isinstance(block.raw, dict):
                 formatted.append(deepcopy(block.raw))
         return formatted
 
     def _parse_tool_definition(self, tool: dict[str, Any]) -> ToolDefinition:
         payload = dict(tool or {})
+        if str(payload.get("type") or "") == "custom":
+            # Custom tools: {type:"custom", custom:{name, input}} — never
+            # force-wrapped into a function shape.
+            custom = payload.get("custom") if isinstance(payload.get("custom"), dict) else {}
+            return ToolDefinition(
+                name=str(custom.get("name") or ""),
+                description=custom.get("description"),
+                input_schema=deepcopy(custom.get("input") or custom.get("parameters") or {}),
+                type="custom",
+                extra={"raw": deepcopy(tool), **_without(payload, {"type", "custom"})},
+            )
         function = payload.get("function") if isinstance(payload.get("function"), dict) else payload
         return ToolDefinition(
             name=str(function.get("name") or ""),
             description=function.get("description"),
             input_schema=deepcopy(function.get("parameters") or function.get("input_schema") or {}),
             type=str(payload.get("type") or "function"),
-            extra={"raw": deepcopy(tool), **_without(payload, {"type", "function"})},
+            extra={
+                "raw": deepcopy(tool),
+                # Strictness changes enforcement semantics — carried explicitly
+                # so cross-protocol targets can preserve or warn, never drop
+                # silently.
+                **({"strict": deepcopy(function["strict"])} if "strict" in function else {}),
+                **_without(payload, {"type", "function"}),
+            },
         )
 
     def _format_tool_definition(self, tool: ToolDefinition, *, preserve_source: bool = True) -> dict[str, Any]:
+        if tool.type == "custom":
+            payload = deepcopy(tool.extra.get("raw")) if preserve_source and isinstance(tool.extra.get("raw"), dict) else {}
+            payload["type"] = "custom"
+            custom = payload.get("custom") if isinstance(payload.get("custom"), dict) else {}
+            custom["name"] = tool.name
+            if tool.input_schema:
+                custom.setdefault("input", deepcopy(tool.input_schema))
+            payload["custom"] = custom
+            return payload
         raw = tool.extra.get("raw")
         payload = deepcopy(raw) if preserve_source and isinstance(raw, dict) else {
             "type": "function",
@@ -688,6 +941,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
 
     def _parse_tool_call(self, call: dict[str, Any]) -> ToolCall:
         payload = dict(call or {})
+        if str(payload.get("type") or "") == "custom":
+            # Custom tool calls: {id, type:"custom", custom:{name, input}}.
+            custom = payload.get("custom") if isinstance(payload.get("custom"), dict) else {}
+            return ToolCall(
+                id=payload.get("id"),
+                name=custom.get("name") or payload.get("name"),
+                arguments=canonical_tool_arguments(custom.get("input")),
+                type="custom",
+                index=payload.get("index"),
+                raw=deepcopy(call),
+                extra={**_without(custom, {"name", "input"}), **_without(payload, {"id", "custom", "type", "index", "name"})},
+            )
         function = payload.get("function") if isinstance(payload.get("function"), dict) else {}
         arguments: Any = canonical_tool_arguments(function.get("arguments"))
         return ToolCall(
@@ -701,6 +966,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
         )
 
     def _format_tool_call(self, call: ToolCall, *, preserve_source: bool = True) -> dict[str, Any]:
+        if call.type == "custom":
+            payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
+            payload["type"] = "custom"
+            if call.id:
+                payload["id"] = call.id
+            if call.index is not None:
+                payload["index"] = call.index
+            custom = deepcopy(payload.get("custom")) if isinstance(payload.get("custom"), dict) else {}
+            custom["name"] = call.name or ""
+            custom["input"] = tool_arguments_text(call.arguments)
+            payload["custom"] = custom
+            return payload
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
         payload["type"] = "function"
         if call.id:
@@ -720,12 +997,25 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if preserve_source:
             original = request.extensions.get(self.name, {}).get("generation_params")
             payload = deepcopy(original) if isinstance(original, dict) else {}
+            # response_format rides in its own extensions slot (verbatim
+            # original, unknown/custom types included).
+            original_format = request.extensions.get(self.name, {}).get("response_format")
+            if original_format is not None:
+                payload["response_format"] = deepcopy(original_format)
         else:
             payload = {}
         if "max_output_tokens" in params:
-            payload["max_completion_tokens"] = params.pop("max_output_tokens")
+            value = params.pop("max_output_tokens")
+            # Same-protocol: the client's original spelling (max_tokens or
+            # max_completion_tokens) is already restored verbatim — never
+            # emit both keys (o-series providers reject the deprecated one).
+            if not (preserve_source and ("max_tokens" in payload or "max_completion_tokens" in payload)):
+                payload["max_completion_tokens"] = value
         if "stop_sequences" in params:
-            payload["stop"] = params.pop("stop_sequences")
+            value = params.pop("stop_sequences")
+            # Same-protocol: original stop spelling (string or array) wins.
+            if not (preserve_source and "stop" in payload):
+                payload["stop"] = value
         reasoning = params.pop("reasoning", None)
         if not preserve_source:
             # Cross-protocol: map canonical controls onto Chat spellings.
@@ -737,18 +1027,68 @@ class OpenAIChatProtocol(ProtocolAdapter):
             # D9 direct mapping: canonical multiplicity -> Chat `n`.
             payload["n"] = candidate_count
         if "structured_output" in params:
-            payload["response_format"] = format_structured_output(params.pop("structured_output"), self.name)
+            structured = params.pop("structured_output")
+            if preserve_source:
+                # Same-protocol: the original response_format is restored
+                # verbatim from extensions (unknown/custom types included) —
+                # never force-wrap into a canonical json_schema shape.
+                pass
+            else:
+                formatted_output = format_structured_output(structured, self.name)
+                if formatted_output is not None:
+                    payload["response_format"] = formatted_output
+                else:
+                    request.warnings.append(
+                        ConversionWarning(
+                            code="unsupported_optional_control",
+                            message=f"structured output type {structured.get('type')!r} has no Chat representation; dropped",
+                            field="response_format",
+                            source_protocol=request.source_protocol,
+                            target_protocol=self.name,
+                        )
+                    )
         if "tool_choice" in params:
-            payload["tool_choice"] = format_tool_choice(params.pop("tool_choice"), self.name)
+            choice = params.pop("tool_choice")
+            payload["tool_choice"] = format_tool_choice(choice, self.name)
+            if (
+                isinstance(choice, dict)
+                and choice.get("allowed_names")
+                and choice.get("allowed_tools") is None
+                and isinstance(payload["tool_choice"], str)
+            ):
+                request.warnings.append(
+                    ConversionWarning(
+                        code="unsupported_optional_control",
+                        message="tool-choice allowlist has no Chat mode-only representation; constraint narrowed to the mode",
+                        field="tool_choice",
+                        source_protocol=request.source_protocol,
+                        target_protocol=self.name,
+                    )
+                )
         if "audio_output" in params:
             payload["audio"] = deepcopy(params.pop("audio_output"))
+            if unified_request.modalities and "audio" not in unified_request.modalities:
+                request.warnings.append(
+                    ConversionWarning(
+                        code="unsupported_optional_control",
+                        message="audio output requested without modalities including audio; added",
+                        field="modalities",
+                        source_protocol=unified_request.source_protocol,
+                        target_protocol=self.name,
+                    )
+                )
+                payload["modalities"] = [*unified_request.modalities, "audio"]
         supported = {
             "frequency_penalty",
             "logit_bias",
             "logprobs",
             "n",
             "parallel_tool_calls",
+            "prediction",
             "presence_penalty",
+            "prompt_cache_key",
+            "prompt_cache_retention",
+            "safety_identifier",
             "seed",
             "service_tier",
             "stream_options",
@@ -756,6 +1096,8 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "top_logprobs",
             "top_p",
             "user",
+            "verbosity",
+            "web_search_options",
         }
         payload.update(
             retain_supported_generation_params(
@@ -765,6 +1107,24 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 target_protocol=self.name,
             )
         )
+        if not request.stream and "stream_options" in payload:
+            # stream_options is only legal alongside stream:true; a stored
+            # value without streaming is client error, never forwarded.
+            payload.pop("stream_options")
+            request.warnings.append(
+                ConversionWarning(
+                    code="unsupported_optional_control",
+                    message="stream_options dropped: only legal when stream is true",
+                    field="stream_options",
+                    source_protocol=request.source_protocol,
+                    target_protocol=self.name,
+                )
+            )
+        if "top_logprobs" in payload and not payload.get("logprobs"):
+            # The pair is required by the API: logprobs gates top_logprobs.
+            payload["logprobs"] = True
+        if payload.get("logprobs") is True and "top_logprobs" not in payload:
+            payload["top_logprobs"] = 0
         return payload
 
 
@@ -990,9 +1350,11 @@ def _openai_media_source(value: Any, *, kind: str) -> MediaSource:
         url=url,
         data=data,
         file_id=file_id,
+        filename=payload.get("filename") if isinstance(payload.get("filename"), str) else None,
         detail=payload.get("detail"),
+        transcript=payload.get("transcript") if isinstance(payload.get("transcript"), str) else None,
         raw=deepcopy(value),
-        extra=_without(payload, {"url", "file_url", "data", "file_data", "file_id", "media_type", "mime_type", "format", "detail"}),
+        extra=_without(payload, {"url", "file_url", "data", "file_data", "file_id", "filename", "transcript", "media_type", "mime_type", "format", "detail"}),
     )
 
 
@@ -1023,12 +1385,38 @@ def _format_openai_image_source(value: Any) -> dict[str, Any]:
     return payload
 
 
-def _audio_format(media_type: Optional[str]) -> str:
-    """Return OpenAI's compact audio format label from a MIME type."""
+# Legal Chat audio format labels (docs: wav|aac|mp3|flac|opus|pcm16) and
+# the MIME types that map onto them.
+_AUDIO_FORMAT_LABELS = {
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/aac": "aac",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/flac": "flac",
+    "audio/ogg": "opus",
+    "audio/opus": "opus",
+    "audio/pcm": "pcm16",
+    "audio/l16": "pcm16",
+    "wav": "wav",
+    "aac": "aac",
+    "mp3": "mp3",
+    "flac": "flac",
+    "opus": "opus",
+    "pcm16": "pcm16",
+}
+
+
+def _audio_format(media_type: Optional[str]) -> Optional[str]:
+    """Return OpenAI's compact audio format label for a MIME type or label.
+
+    Returns None when no legal label exists (callers drop with a recorded
+    warning instead of emitting an illegal format value)."""
 
     if not media_type:
         return "wav"
-    return media_type.rsplit("/", 1)[-1].lower()
+    return _AUDIO_FORMAT_LABELS.get(str(media_type).strip().lower())
 
 
 def _message_tool_calls(message: UnifiedMessage) -> list[ToolCall]:

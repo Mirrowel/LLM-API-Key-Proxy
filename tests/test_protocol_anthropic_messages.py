@@ -117,7 +117,11 @@ def test_anthropic_response_extracts_content_and_usage() -> None:
     assert unified.messages[0].reasoning[0].signature == "sig_2"
     assert unified.messages[0].reasoning[0].redacted is True
     assert unified.usage is not None
-    assert unified.usage.input_tokens == 10
+    # Canonical input_tokens is cache-INCLUSIVE (H2: OpenAI/Gemini
+    # convention): 10 base + 3 cache-read + 2 cache-write.
+    assert unified.usage.input_tokens == 15
+    assert unified.usage.cache_read_tokens == 3
+    assert unified.usage.cache_write_tokens == 2
     assert unified.usage.output_tokens == 5
     assert unified.usage.cache_write_tokens == 2
     assert unified.usage.cache_read_tokens == 3

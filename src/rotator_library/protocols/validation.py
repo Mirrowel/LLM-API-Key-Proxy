@@ -104,15 +104,18 @@ def validate_generative_request(
                 pass_name="validate_request",
                 payload={"group": group_name, "content_index": block_index, "content_type": block.type},
             )
+    # Tool types each destination understands (custom tools are a Chat-native
+    # variant with their own wire shape; other protocols reject them).
+    supported_tool_types = {"function", "custom"} if target_protocol == "openai_chat" else {"function"}
     for tool_index, tool in enumerate(request.tools):
-        if tool.type != "function":
+        if tool.type not in supported_tool_types:
             raise ProtocolError(
                 f"Cannot safely translate tool type '{tool.type}' into {target_protocol}",
                 protocol=target_protocol,
                 pass_name="validate_request",
                 payload={"tool_index": tool_index, "tool_type": tool.type, "tool_name": tool.name},
             )
-        if not tool.name or not isinstance(tool.input_schema, dict):
+        if not tool.name or (tool.type == "function" and not isinstance(tool.input_schema, dict)):
             raise ProtocolError(
                 "Function tools require a name and object input schema",
                 protocol=target_protocol,
@@ -151,6 +154,27 @@ def validate_generative_request(
                     pass_name="validate_request",
                     payload={"message_index": message_index, "result_index": result_index},
                 )
+    # Pairing check for protocols that REQUIRE every tool call to be
+    # answered before the conversation continues (Anthropic 400s orphans).
+    # Calls on the FINAL message may legitimately await their results.
+    if target_protocol == "anthropic_messages":
+        answered: set[str] = set()
+        for message in request.messages:
+            for result in message_tool_results(message):
+                if result.tool_call_id:
+                    answered.add(result.tool_call_id)
+        last_message_index = len(request.messages) - 1
+        for message_index, message in enumerate(request.messages):
+            if message_index == last_message_index:
+                continue
+            for call in message_tool_calls(message):
+                if call.id and call.id not in answered:
+                    raise ProtocolError(
+                        "Tool calls require a following tool result before the conversation continues",
+                        protocol=target_protocol,
+                        pass_name="validate_request",
+                        payload={"message_index": message_index, "call_id": call.id},
+                    )
     _validate_tool_choice(request, target_protocol)
 
 

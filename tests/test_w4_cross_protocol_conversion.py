@@ -287,8 +287,11 @@ def test_audio_block_synthesizes_chat_message_audio() -> None:
     )
     payload = get_protocol("openai_chat").format_response(response, _ctx("gemini", "openai_chat"))
     audio = payload["choices"][0]["message"].get("audio")
+    # Documented RESPONSE audio object: {id, data, transcript} — the format
+    # label belongs to the request-side audio parameter, not the response.
     assert audio and audio["data"] == "UklGRg=="
-    assert audio["format"] == "wav"
+    assert "transcript" in audio
+    assert "format" not in audio
 
 
 def _audio_response() -> UnifiedResponse:
@@ -656,7 +659,7 @@ def test_audio_id_is_deterministic_across_instances() -> None:
     second = chat.format_response(unified, _ctx("gemini", "openai_chat"))
     audio_id = first["choices"][0]["message"]["audio"]["id"]
     assert audio_id == second["choices"][0]["message"]["audio"]["id"]
-    assert first["choices"][0]["message"]["audio"]["format"] == "wav"
+    assert "transcript" in first["choices"][0]["message"]["audio"]
 
 
 def test_url_only_audio_and_video_at_chat_record_drops() -> None:

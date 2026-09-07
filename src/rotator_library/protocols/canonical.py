@@ -283,7 +283,14 @@ _EFFORT_TO_BUDGET_TOKENS = {
     "low": 4096,
     "medium": 8192,
     "high": 16384,
+    "xhigh": 32768,
+    "max": 65536,
 }
+
+# Protocols whose native reasoning vocabulary is the OpenAI effort scale:
+# effort labels pass through verbatim between them (xhigh/max included);
+# the approximation table only serves foreign-vocabulary targets.
+_EFFORT_NATIVE_PROTOCOLS = {"openai_chat", "responses"}
 
 
 def budget_tokens_from_effort(effort: str) -> int:
@@ -340,18 +347,34 @@ def format_reasoning_controls(
 
     def _effort_or_approximation() -> tuple[Any, bool]:
         """Return (effort_value, approximated?). ``none`` and table levels are
-        exact; unknown efforts coerce to the table's medium with an explicit
-        disclosure warning."""
+        exact; same-vocabulary targets pass any label verbatim (xhigh/max);
+        unknown efforts at foreign-vocabulary targets coerce to the table's
+        medium with an explicit disclosure warning."""
 
         if effort is None:
             return None, False
-        if effort not in _EFFORT_TO_BUDGET_TOKENS and effort != "none":
+        if effort == "none":
+            return effort, False
+        if effort not in _EFFORT_TO_BUDGET_TOKENS:
+            if target_protocol in _EFFORT_NATIVE_PROTOCOLS:
+                # Same vocabulary (current docs: none/minimal/low/medium/
+                # high/xhigh/max — plus forward-compatible labels): verbatim.
+                return effort, False
             _warn(
                 "reasoning_effort_unknown",
                 f"reasoning effort '{effort}' is not a known level; coerced to 'medium' (deterministic table)",
                 "reasoning.effort",
             )
             return "medium", True
+        if effort in {"xhigh", "max"} and target_protocol not in _EFFORT_NATIVE_PROTOCOLS:
+            # Known OpenAI-only levels at foreign-vocabulary targets degrade
+            # through the table with disclosure (not silent).
+            _warn(
+                "reasoning_effort_approximated",
+                f"reasoning effort '{effort}' has no exact {target_protocol} mapping; approximated to 'high' (budget table)",
+                "reasoning.effort",
+            )
+            return "high", True
         return effort, False
 
     def _warn_budget_discarded() -> None:
@@ -653,9 +676,22 @@ def canonical_tool_choice(value: Any, source_protocol: str) -> dict[str, Any] | 
         if "allowed_names" in value:
             return deepcopy(value)
     if value_type in {"auto", "none"}:
-        return {"mode": value_type}
+        result = {"mode": value_type}
+        if isinstance(value.get("allowed_names"), list) and value["allowed_names"]:
+            result["allowed_names"] = deepcopy(value["allowed_names"])
+        return result
     if value_type in {"required", "any"}:
         return {"mode": "required", "allowed_names": deepcopy(value.get("allowed_names") or [])}
+    if value_type == "allowed_tools":
+        # Chat allowed-tools constraint: {"type":"allowed_tools","allowed_tools":{"mode":auto|required,"tools":[...]}}.
+        allowed = value.get("allowed_tools") if isinstance(value.get("allowed_tools"), dict) else {}
+        mode = str(allowed.get("mode") or "auto").lower()
+        if mode not in {"auto", "required"}:
+            mode = "auto"
+        result: dict[str, Any] = {"mode": mode, "allowed_names": deepcopy(allowed.get("tools") or [])}
+        if isinstance(value.get("allowed_tools"), dict):
+            result["allowed_tools"] = deepcopy(value["allowed_tools"])
+        return result
     if value_type in {"function", "tool", "named"}:
         function = value.get("function") if isinstance(value.get("function"), dict) else {}
         name = value.get("name") or function.get("name")
@@ -675,6 +711,13 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
     if target_protocol == "openai_chat":
         if mode == "named":
             return {"type": "function", "function": {"name": name or ""}}
+        if allowed_names and choice.get("allowed_tools") is None:
+            # Constraint without the native variant shape (e.g. from Gemini
+            # allowedFunctionNames): the plain modes cannot express an
+            # allowlist — closest legal narrowing is required.
+            return "required" if mode == "required" else mode
+        if choice.get("allowed_tools") is not None:
+            return {"type": "allowed_tools", "allowed_tools": deepcopy(choice["allowed_tools"])}
         return "required" if mode == "required" else mode
     if target_protocol == "anthropic_messages":
         if mode == "named":
@@ -749,6 +792,14 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
     if target_protocol == "openai_chat":
         if output_type == "json_object":
             return {"type": "json_object"}
+        if output_type == "text":
+            # Text output is the absence of a format constraint.
+            return None
+        if output_type != "json_schema":
+            # Unknown/custom formats (e.g. grammar) have no Chat
+            # representation — callers drop with a recorded warning rather
+            # than fabricating an empty json_schema.
+            return None
         return {
             "type": "json_schema",
             "json_schema": {

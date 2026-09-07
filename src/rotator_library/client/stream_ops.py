@@ -256,14 +256,20 @@ class ChatWireStreamAdapter:
         return events
 
     def _events_for_chunk(self, chunk_dict: Dict[str, Any], chat: Any) -> List[UnifiedStreamEvent]:
-        event = chat.parse_stream_event(chunk_dict)
+        # Plural parse: one wire chunk may carry several choices (n>1) and
+        # every candidate must survive to the client.
+        events: List[UnifiedStreamEvent] = list(chat.parse_stream_events(chunk_dict))
+        if not events:
+            return []
+        event = events[0]
         delta_message = event.delta
 
         if delta_message is not None and getattr(delta_message, "tool_calls", None):
             self._seen_tool_calls = True
 
         if _is_terminal_event(event):
-            return [self._with_final_reason(event)]
+            first = self._with_final_reason(event)
+            return [first, *events[1:]]
 
         meaningful_usage = _event_has_meaningful_usage(event)
         finish_seen = event.stop_reason is not None

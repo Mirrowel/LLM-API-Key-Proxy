@@ -587,8 +587,8 @@ def test_refusal_history_degrades_to_text_across_all_targets() -> None:
     assistant_input = [item for item in resp["input"] if item.get("role") == "assistant"][0]
     assert assistant_input["content"] == [{"type": "input_text", "text": "I won't"}]
 
-    # Chat request history: content is null on the wire for refusal turns.
+    # Chat request history: refusal carries as a legal refusal content part
+    # (documented assistant input shape — exactly one refusal part allowed).
     chat_built = chat.build_request(request, ctx("openai_chat"))
     chat_refusal_turn = [m for m in chat_built["messages"] if m.get("role") == "assistant"][0]
-    assert chat_refusal_turn["content"] is None
-    assert chat_refusal_turn["refusal"] == "I won't"
+    assert chat_refusal_turn["content"] == [{"type": "refusal", "refusal": "I won't"}]

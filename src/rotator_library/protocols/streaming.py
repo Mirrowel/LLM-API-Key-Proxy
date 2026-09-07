@@ -14,6 +14,7 @@ from copy import deepcopy
 
 from dataclasses import dataclass, field
 import json
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -47,6 +48,9 @@ class StreamFormatState:
     completion_emitted: bool = False
     role_emitted: bool = False
     finish_emitted: bool = False
+    created: int = field(default_factory=lambda: int(time.time()))
+    finished_choices: set[int] = field(default_factory=set)
+    usage_emitted: bool = False
     stop_reason: str | None = None
     usage: Usage | None = None
     next_index: int = 0
@@ -86,13 +90,18 @@ class ProtocolStreamConverter:
     def convert(self, raw_event: Any) -> list[Any]:
         """Parse and format one source frame, expanding destination lifecycle frames."""
 
-        event = self.source_protocol.parse_stream_event(raw_event, self.context)
-        return format_canonical_stream_event(
-            event,
-            self.client_protocol.name,
-            self.context,
-            state=self.state,
-        )
+        events = self.source_protocol.parse_stream_events(raw_event, self.context)
+        frames: list[Any] = []
+        for event in events:
+            frames.extend(
+                format_canonical_stream_event(
+                    event,
+                    self.client_protocol.name,
+                    self.context,
+                    state=self.state,
+                )
+            )
+        return frames
 
 
 async def convert_protocol_stream(
@@ -173,23 +182,39 @@ def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
 
     frames: list[str] = []
     delta = _openai_delta(event.delta or event.message)
+    choice_index = event.output_index or 0
+    choice_logprobs = event.extra.get("logprobs")
     if delta:
         if not state.role_emitted:
             delta.setdefault("role", "assistant")
             state.role_emitted = True
-        frames.append(_data_frame(_openai_chunk(state, delta=delta, finish_reason=None, usage=event.usage)))
+        frames.append(_data_frame(_openai_chunk(state, delta=delta, finish_reason=None, choice_index=choice_index, logprobs=choice_logprobs)))
 
-    terminal = _is_terminal(event)
-    if (event.stop_reason or event.extra.get("stop_reason")) and not state.finish_emitted:
-        reason = event.stop_reason or event.extra.get("stop_reason")
+    reason = event.stop_reason or event.extra.get("stop_reason")
+    if reason and choice_index not in state.finished_choices:
         state.stop_reason = str(reason)
-        frames.append(_data_frame(_openai_chunk(state, delta={}, finish_reason=format_stop_reason(state.stop_reason, "openai_chat"), usage=event.usage)))
-        state.finish_emitted = True
-    if terminal:
+        frames.append(_data_frame(_openai_chunk(
+            state,
+            delta={},
+            finish_reason=format_stop_reason(state.stop_reason, "openai_chat"),
+            choice_index=choice_index,
+            logprobs=choice_logprobs,
+        )))
+        state.finished_choices.add(choice_index)
+    if event.usage is not None and not delta:
+        # Documented include_usage grammar: one terminal usage chunk with an
+        # EMPTY choices array, after the finish chunk, before [DONE] — the
+        # usage may legitimately arrive after finish (never swallow it).
+        if not state.usage_emitted:
+            frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=event.usage, empty_choices=True)))
+            state.usage_emitted = True
+        state.usage = event.usage
+    if _is_terminal(event):
+        if state.usage is not None and not state.usage_emitted:
+            frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=state.usage, empty_choices=True)))
+            state.usage_emitted = True
         frames.append("data: [DONE]\n\n")
         state.terminal = True
-    elif event.usage is not None and not delta and not state.finish_emitted:
-        frames.append(_data_frame(_openai_chunk(state, delta={}, finish_reason=None, usage=event.usage)))
     return frames
 
 
@@ -507,19 +532,30 @@ def _openai_delta(message: UnifiedMessage | None) -> dict[str, Any]:
 def _openai_chunk(
     state: StreamFormatState,
     *,
-    delta: dict[str, Any],
+    delta: dict[str, Any] | None,
     finish_reason: str | None,
-    usage: Usage | None,
+    usage: Usage | None = None,
+    choice_index: int = 0,
+    empty_choices: bool = False,
+    logprobs: Any = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "id": state.response_id,
         "object": "chat.completion.chunk",
+        "created": state.created,
         "model": state.model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        # Documented include_usage grammar: intermediate chunks carry an
+        # explicit null usage; the terminal usage chunk carries an EMPTY
+        # choices array.
+        "usage": _openai_usage(usage) if usage is not None else None,
     }
-    formatted_usage = _openai_usage(usage)
-    if formatted_usage:
-        payload["usage"] = formatted_usage
+    if empty_choices:
+        payload["choices"] = []
+    else:
+        choice: dict[str, Any] = {"index": choice_index, "delta": delta if delta is not None else {}, "finish_reason": finish_reason}
+        if logprobs is not None:
+            choice["logprobs"] = deepcopy(logprobs)
+        payload["choices"] = [choice]
     return payload
 
 
@@ -757,8 +793,10 @@ def _error_payload(error: Any) -> dict[str, Any]:
 def _openai_usage(usage: Usage | None) -> dict[str, Any] | None:
     if usage is None:
         return None
+    # Canonical input_tokens is inclusive of cache reads/writes (H2) —
+    # identical formula to the non-streaming formatter, never double-counted.
     payload: dict[str, Any] = {
-        "prompt_tokens": usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+        "prompt_tokens": usage.input_tokens,
         "completion_tokens": usage.output_tokens,
         "total_tokens": usage.total_tokens,
     }
@@ -772,9 +810,11 @@ def _openai_usage(usage: Usage | None) -> dict[str, Any] | None:
 def _anthropic_usage(usage: Usage | None, *, output_only: bool = False) -> dict[str, int]:
     if usage is None:
         return {"output_tokens": 0} if output_only else {"input_tokens": 0, "output_tokens": 0}
-    payload = {"output_tokens": usage.output_tokens}
+    payload: dict[str, int] = {"output_tokens": usage.output_tokens}
     if not output_only:
-        payload["input_tokens"] = usage.input_tokens
+        # Canonical input_tokens is cache-inclusive (H2): unfold to the
+        # Anthropic sibling convention, never negative.
+        payload["input_tokens"] = max(0, usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens)
         if usage.cache_read_tokens:
             payload["cache_read_input_tokens"] = usage.cache_read_tokens
         if usage.cache_write_tokens:
