@@ -288,7 +288,11 @@ RESPONSE_FIXTURES: dict[str, dict[str, Any]] = {
 
 
 def _context(source: str, target: str) -> ProtocolContext:
-    return ProtocolContext(source_protocol=source, target_protocol=target)
+    # Same-protocol pairs model a same-provider rebuild (opaque state may
+    # emit — the raw fast path or field cache owns it otherwise); cross
+    # protocol pairs model incompatible providers (opaque state suppressed).
+    same = source == target
+    return ProtocolContext(source_protocol=source, target_protocol=target, provider_state_compatible=same)
 
 
 def _request_semantics(request: Any) -> dict[str, Any]:
@@ -642,7 +646,13 @@ def test_tool_choice_modes_survive_all_destinations(source_choice: Any, expected
         target = get_protocol(target_name)
         payload = target.build_request(request, _context("openai_chat", target_name))
         reparsed = target.parse_request(payload)
-        assert reparsed.generation_params["tool_choice"]["mode"] == expected_mode
+        if expected_mode == "none" and target_name == "anthropic_messages":
+            # Anthropic has no {"type":"none"}: tools are disabled by
+            # omitting the array entirely — the mode's observable effect.
+            assert "tool_choice" not in payload
+            assert "tools" not in payload
+        else:
+            assert reparsed.generation_params["tool_choice"]["mode"] == expected_mode
 
 
 def test_anthropic_system_preserves_instruction_boundaries_and_order() -> None:

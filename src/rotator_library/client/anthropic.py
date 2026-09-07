@@ -98,7 +98,10 @@ class AnthropicHandler:
         if payload.get("stream"):
             return response
         anthropic_response = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-        anthropic_response["id"] = request_id
+        # Same-protocol fidelity: the upstream msg_* id survives (thinking
+        # signature binding and client idempotency depend on it); the local
+        # request_id only fills a missing one.
+        anthropic_response.setdefault("id", request_id)
         _trace_anthropic(
             anthropic_logger,
             "anthropic_native_protocol_response",

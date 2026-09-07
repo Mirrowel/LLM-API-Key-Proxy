@@ -34,6 +34,7 @@ STOP_REASON_CONTENT_FILTER = "content_filter"
 STOP_REASON_ERROR = "error"
 STOP_REASON_INCOMPLETE = "incomplete"
 STOP_REASON_UNKNOWN = "unknown"
+STOP_REASON_PAUSE = "pause"
 
 
 _STOP_REASON_ALIASES = {
@@ -44,6 +45,7 @@ _STOP_REASON_ALIASES = {
     "length": STOP_REASON_MAX_TOKENS,
     "max_tokens": STOP_REASON_MAX_TOKENS,
     "max_output_tokens": STOP_REASON_MAX_TOKENS,
+    "model_context_window_exceeded": STOP_REASON_MAX_TOKENS,
     "tool_calls": STOP_REASON_TOOL_USE,
     "function_call": STOP_REASON_TOOL_USE,
     "tool_use": STOP_REASON_TOOL_USE,
@@ -52,9 +54,11 @@ _STOP_REASON_ALIASES = {
     "blocklist": STOP_REASON_CONTENT_FILTER,
     "prohibited_content": STOP_REASON_CONTENT_FILTER,
     "recitation": STOP_REASON_CONTENT_FILTER,
+    "refusal": STOP_REASON_CONTENT_FILTER,
     "failed": STOP_REASON_ERROR,
     "error": STOP_REASON_ERROR,
     "incomplete": STOP_REASON_INCOMPLETE,
+    "pause_turn": STOP_REASON_PAUSE,
 }
 
 
@@ -66,6 +70,7 @@ _TARGET_STOP_REASONS = {
         STOP_REASON_CONTENT_FILTER: "content_filter",
         STOP_REASON_ERROR: None,
         STOP_REASON_INCOMPLETE: "length",
+        STOP_REASON_PAUSE: "stop",
         STOP_REASON_UNKNOWN: None,
     },
     "anthropic_messages": {
@@ -75,6 +80,9 @@ _TARGET_STOP_REASONS = {
         STOP_REASON_CONTENT_FILTER: "refusal",
         STOP_REASON_ERROR: None,
         STOP_REASON_INCOMPLETE: "max_tokens",
+        # pause_turn drives the server-tool agent loop and must survive
+        # round-trips exactly (Anthropic clients replay paused content).
+        STOP_REASON_PAUSE: "pause_turn",
         STOP_REASON_UNKNOWN: None,
     },
     "gemini": {
@@ -84,6 +92,7 @@ _TARGET_STOP_REASONS = {
         STOP_REASON_CONTENT_FILTER: "SAFETY",
         STOP_REASON_ERROR: "OTHER",
         STOP_REASON_INCOMPLETE: "MAX_TOKENS",
+        STOP_REASON_PAUSE: "STOP",
         STOP_REASON_UNKNOWN: "OTHER",
     },
     "responses": {
@@ -93,6 +102,7 @@ _TARGET_STOP_REASONS = {
         STOP_REASON_CONTENT_FILTER: "incomplete",
         STOP_REASON_ERROR: "failed",
         STOP_REASON_INCOMPLETE: "incomplete",
+        STOP_REASON_PAUSE: "incomplete",
         STOP_REASON_UNKNOWN: "incomplete",
     },
 }
@@ -447,6 +457,14 @@ def format_reasoning_controls(
             )
     elif target_protocol == "anthropic_messages":
         # "none" maps exactly to Anthropic's disabled construct (D7 level 1).
+        normalized_display = normalized.get("display")
+        thinking_type = normalized.get("thinking_type")
+
+        def _emit_thinking(config: dict[str, Any]) -> None:
+            if normalized_display is not None:
+                config["display"] = normalized_display
+            emissions["thinking"] = config
+
         disabled = enabled is False or effort == "none"
         if disabled and (budget is not None or effort not in (None, "none")):
             _warn(
@@ -455,7 +473,11 @@ def format_reasoning_controls(
                 "reasoning",
             )
         if disabled:
-            emissions["thinking"] = {"type": "disabled"}
+            _emit_thinking({"type": "disabled"})
+        elif thinking_type == "adaptive" or (thinking_type is None and budget is None and effort is None and enabled):
+            # Adaptive: Anthropic steers the budget itself (output_config
+            # effort carries the lever; the table handles it when present).
+            _emit_thinking({"type": "adaptive"})
         elif budget is not None:
             if isinstance(budget, int) and budget < 1024:
                 _warn(
@@ -466,12 +488,12 @@ def format_reasoning_controls(
             else:
                 clamped = _anthropic_budget(budget, (request.generation_params or {}).get("max_output_tokens"))
                 if clamped is not None:
-                    emissions["thinking"] = {"type": "enabled", "budget_tokens": clamped}
+                    _emit_thinking({"type": "enabled", "budget_tokens": clamped})
         elif effort is not None:
             value, coerced = _effort_or_approximation()
             approximated = _anthropic_budget(budget_tokens_from_effort(value), (request.generation_params or {}).get("max_output_tokens"))
             if approximated is not None:
-                emissions["thinking"] = {"type": "enabled", "budget_tokens": approximated}
+                _emit_thinking({"type": "enabled", "budget_tokens": approximated})
             if not coerced:
                 _warn(
                     "reasoning_effort_approximated",
@@ -679,9 +701,14 @@ def canonical_tool_choice(value: Any, source_protocol: str) -> dict[str, Any] | 
         result = {"mode": value_type}
         if isinstance(value.get("allowed_names"), list) and value["allowed_names"]:
             result["allowed_names"] = deepcopy(value["allowed_names"])
+        if value.get("disable_parallel_tool_use") is True:
+            result["disable_parallel_tool_use"] = True
         return result
     if value_type in {"required", "any"}:
-        return {"mode": "required", "allowed_names": deepcopy(value.get("allowed_names") or [])}
+        result = {"mode": "required", "allowed_names": deepcopy(value.get("allowed_names") or [])}
+        if value.get("disable_parallel_tool_use") is True:
+            result["disable_parallel_tool_use"] = True
+        return result
     if value_type == "allowed_tools":
         # Chat allowed-tools constraint. Variant spellings: {"type":"allowed_tools",
         # "allowed_tools": {"mode":auto|required, "tools":[...]}} or a bare list.
@@ -717,6 +744,7 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
     mode = choice.get("mode", "auto")
     name = choice.get("name")
     allowed_names = deepcopy(choice.get("allowed_names") or [])
+    no_parallel = choice.get("disable_parallel_tool_use") is True
     if target_protocol == "openai_chat":
         if mode == "named":
             return {"type": "function", "function": {"name": name or ""}}
@@ -729,9 +757,19 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
             return {"type": "allowed_tools", "allowed_tools": deepcopy(choice["allowed_tools"])}
         return "required" if mode == "required" else mode
     if target_protocol == "anthropic_messages":
+        if mode == "none":
+            # Anthropic has no {"type":"none"}: tools are disabled by
+            # omitting the tools array (callers handle that + warn).
+            return None
         if mode == "named":
-            return {"type": "tool", "name": name or ""}
-        return {"type": "any" if mode == "required" else mode}
+            payload: dict[str, Any] = {"type": "tool", "name": name or ""}
+            if no_parallel:
+                payload["disable_parallel_tool_use"] = True
+            return payload
+        payload = {"type": "any" if mode == "required" else "auto"}
+        if no_parallel:
+            payload["disable_parallel_tool_use"] = True
+        return payload
     if target_protocol == "responses":
         if mode == "named":
             return {"type": "function", "name": name or ""}

@@ -256,6 +256,7 @@ class Annotation(ProtocolSerializable):
     citation: Optional[str] = None
     start_index: Optional[int] = None
     end_index: Optional[int] = None
+    document_index: Optional[int] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
@@ -266,6 +267,7 @@ class Annotation(ProtocolSerializable):
         "citation",
         "start_index",
         "end_index",
+        "document_index",
         "raw",
         "extra",
     )

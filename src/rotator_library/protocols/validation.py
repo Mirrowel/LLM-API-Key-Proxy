@@ -105,8 +105,14 @@ def validate_generative_request(
                 payload={"group": group_name, "content_index": block_index, "content_type": block.type},
             )
     # Tool types each destination understands (custom tools are a Chat-native
-    # variant with their own wire shape; other protocols reject them).
-    supported_tool_types = {"function", "custom"} if target_protocol == "openai_chat" else {"function"}
+    # variant; server/hosted tools are Anthropic-native — their identity is
+    # the versioned type and no cross-protocol mapping exists).
+    if target_protocol == "openai_chat":
+        supported_tool_types = {"function", "custom"}
+    elif target_protocol == "anthropic_messages":
+        supported_tool_types = {"function", "server"}
+    else:
+        supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):
         if tool.type not in supported_tool_types:
             raise ProtocolError(

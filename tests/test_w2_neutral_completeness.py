@@ -178,7 +178,11 @@ def test_annotations_flow_between_chat_responses_anthropic_gemini() -> None:
     anthropic = get_protocol("anthropic_messages")
     anth_out = anthropic.format_response(parsed, _ctx("responses", "anthropic_messages"))
     assert anth_out["content"][0]["text"] == "see this"
-    assert any(w.code == "annotations_dropped" for w in parsed.warnings)
+    # Citations are native Anthropic: the url_citation maps onto a
+    # web_search_result_location citation instead of dropping.
+    citations = anth_out["content"][0].get("citations") or []
+    assert citations and citations[0].get("url") == "https://example.test"
+    assert not any(w.code == "annotations_dropped" for w in parsed.warnings)
 
 
 def test_gemini_grounding_becomes_annotations() -> None:

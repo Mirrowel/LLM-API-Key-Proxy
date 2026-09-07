@@ -50,7 +50,8 @@ class StreamFormatState:
     finish_emitted: bool = False
     created: int = field(default_factory=lambda: int(time.time()))
     finished_choices: set[int] = field(default_factory=set)
-    usage_emitted: bool = False
+    block_signatures: dict[str, str] = field(default_factory=dict)
+    emitted_signatures: set[str] = field(default_factory=set)
     stop_reason: str | None = None
     usage: Usage | None = None
     next_index: int = 0
@@ -154,7 +155,28 @@ def format_canonical_stream_event(
     if state.terminal:
         return []
     if event.usage is not None:
-        state.usage = event.usage
+        # Cumulative stream usage semantics (Anthropic message_delta and
+        # friends): later events refine, they never erase earlier facts —
+        # input_tokens arrives at message_start, output accumulates to the
+        # terminal event. Field-wise merge, event wins when non-zero.
+        if state.usage is None:
+            state.usage = event.usage
+        else:
+            state.usage = Usage(
+                input_tokens=event.usage.input_tokens or state.usage.input_tokens,
+                output_tokens=event.usage.output_tokens or state.usage.output_tokens,
+                total_tokens=event.usage.total_tokens or state.usage.total_tokens,
+                cache_read_tokens=event.usage.cache_read_tokens or state.usage.cache_read_tokens,
+                cache_write_tokens=event.usage.cache_write_tokens or state.usage.cache_write_tokens,
+                reasoning_tokens=event.usage.reasoning_tokens or state.usage.reasoning_tokens,
+                audio_tokens=event.usage.audio_tokens or state.usage.audio_tokens,
+                output_audio_tokens=event.usage.output_audio_tokens or state.usage.output_audio_tokens,
+                accepted_prediction_tokens=event.usage.accepted_prediction_tokens or state.usage.accepted_prediction_tokens,
+                rejected_prediction_tokens=event.usage.rejected_prediction_tokens or state.usage.rejected_prediction_tokens,
+                cost=event.usage.cost or state.usage.cost,
+                raw=event.usage.raw,
+                extra=event.usage.extra or state.usage.extra,
+            )
     if event.stop_reason:
         state.stop_reason = event.stop_reason
     elif event.extra.get("stop_reason"):
@@ -201,21 +223,14 @@ def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             logprobs=choice_logprobs,
         )))
         state.finished_choices.add(choice_index)
-    if event.usage is not None and not delta:
-        # Documented include_usage grammar: one terminal usage chunk with an
-        # EMPTY choices array, after the finish chunk, before [DONE] — the
-        # usage may legitimately arrive after finish (never swallow it).
-        # Intermediate chunks stay usage:null even if a provider sends
-        # running per-chunk totals (non-standard): the spec reserves
-        # non-null usage for the terminal frame only.
-        if not state.usage_emitted:
-            frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=event.usage, empty_choices=True)))
-            state.usage_emitted = True
-        state.usage = event.usage
+    if event.usage is not None and not delta and not state.terminal:
+        # Non-terminal usage sightings (e.g. Anthropic message_start input
+        # accounting) merge into state — the wire usage chunk emits exactly
+        # once at the terminal frame with the FINAL cumulative values.
+        pass
     if _is_terminal(event):
-        if state.usage is not None and not state.usage_emitted:
+        if state.usage is not None:
             frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=state.usage, empty_choices=True)))
-            state.usage_emitted = True
         frames.append("data: [DONE]\n\n")
         state.terminal = True
     return frames
@@ -225,11 +240,23 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
     if event.type == "error" or event.error is not None:
         state.terminal = True
         return [_event_frame("error", {"type": "error", "error": _error_payload(event.error)})]
+    if event.type == "heartbeat" or event.native_type == "ping":
+        # Keep-alives never open message lifecycle frames.
+        return []
 
     frames = _anthropic_start(state)
-    for block in _client_visible_blocks(event):
+    visible = _client_visible_blocks(event)
+    for block in visible:
         key, block_type = _block_key(block, state, event)
         if key not in state.open_blocks:
+            # Documented grammar: each open block closes before the next
+            # opens (index-keyed accumulation tolerates otherwise, but the
+            # wire order stays spec-conformant).
+            if state.open_blocks:
+                for open_key in list(state.open_blocks):
+                    if open_key == key:
+                        continue
+                    frames.extend(_anthropic_close_block(open_key, state))
             index = state.next_index
             state.next_index += 1
             state.open_blocks[key] = index
@@ -240,6 +267,9 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
                 "content_block": _anthropic_block_start(block, key, state),
             }))
         index = state.open_blocks[key]
+        signature = getattr(block.reasoning, "signature", None) if block.reasoning else None
+        if signature:
+            state.block_signatures[key] = signature
         delta = _anthropic_block_delta(block, key, state)
         if delta is not None:
             frames.append(_event_frame("content_block_delta", {
@@ -249,19 +279,44 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
             }))
 
     if _is_terminal(event):
-        for key in state.block_order:
-            frames.append(_event_frame("content_block_stop", {
-                "type": "content_block_stop",
-                "index": state.open_blocks[key],
-            }))
+        for key in list(state.open_blocks):
+            frames.extend(_anthropic_close_block(key, state))
+        # A concrete stop_reason only when one was actually observed (the
+        # completion-evidence contract: bare EOF never fabricates a reason);
+        # unmappable reasons degrade to end_turn upstream in format_response
+        # where a warning can be recorded.
         reason = format_stop_reason(state.stop_reason, "anthropic_messages")
         frames.append(_event_frame("message_delta", {
             "type": "message_delta",
-            "delta": {"stop_reason": reason, "stop_sequence": None},
+            "delta": {"stop_reason": reason, "stop_sequence": event.extra.get("stop_sequence")},
             "usage": _anthropic_usage(state.usage, output_only=True),
         }))
         frames.append(_event_frame("message_stop", {"type": "message_stop"}))
         state.terminal = True
+    return frames
+
+
+def _anthropic_close_block(key: str, state: StreamFormatState) -> list[str]:
+    """Close one open block, flushing an unemitted thinking signature first
+    (signature_delta must precede content_block_stop)."""
+
+    frames: list[str] = []
+    index = state.open_blocks.get(key)
+    if index is None:
+        return frames
+    signature = state.block_signatures.get(key)
+    if signature and signature != "__redacted__" and key not in state.emitted_signatures:
+        frames.append(_event_frame("content_block_delta", {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "signature_delta", "signature": signature},
+        }))
+        state.emitted_signatures.add(key)
+    frames.append(_event_frame("content_block_stop", {
+        "type": "content_block_stop",
+        "index": index,
+    }))
+    state.open_blocks.pop(key, None)
     return frames
 
 
@@ -588,6 +643,10 @@ def _anthropic_block_start(block: ContentBlock, key: str, state: StreamFormatSta
         state.tool_ids[key] = call.id or state.tool_ids.get(key, f"call_{state.open_blocks[key]}")
         return {"type": "tool_use", "id": state.tool_ids[key], "name": state.tool_names[key], "input": {}}
     if block.reasoning:
+        if block.reasoning.redacted:
+            # Redacted blocks never stream deltas — one full start payload.
+            state.block_signatures[key] = "__redacted__"
+            return {"type": "redacted_thinking", "data": block.reasoning.encrypted_content or ""}
         return {"type": "thinking", "thinking": ""}
     return {"type": "text", "text": ""}
 
@@ -831,7 +890,7 @@ def _openai_usage(usage: Usage | None) -> dict[str, Any] | None:
 def _anthropic_usage(usage: Usage | None, *, output_only: bool = False) -> dict[str, int]:
     if usage is None:
         return {"output_tokens": 0} if output_only else {"input_tokens": 0, "output_tokens": 0}
-    payload: dict[str, int] = {"output_tokens": usage.output_tokens}
+    payload: dict[str, Any] = {"output_tokens": usage.output_tokens}
     if not output_only:
         # Canonical input_tokens is cache-inclusive (H2): unfold to the
         # Anthropic sibling convention, never negative.
@@ -840,6 +899,9 @@ def _anthropic_usage(usage: Usage | None, *, output_only: bool = False) -> dict[
             payload["cache_read_input_tokens"] = usage.cache_read_tokens
         if usage.cache_write_tokens:
             payload["cache_creation_input_tokens"] = usage.cache_write_tokens
+    if isinstance(usage.extra.get("server_tool_use"), dict):
+        payload["server_tool_use"] = deepcopy(usage.extra["server_tool_use"])
+    return payload
     return payload
 
 
