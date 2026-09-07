@@ -1122,6 +1122,8 @@ def _anthropic_usage(usage: Usage | None, *, output_only: bool = False) -> dict[
             payload["cache_creation_input_tokens"] = usage.cache_write_tokens
     if isinstance(usage.extra.get("server_tool_use"), dict):
         payload["server_tool_use"] = deepcopy(usage.extra["server_tool_use"])
+    if usage.reasoning_tokens:
+        payload["output_tokens_details"] = {"thinking_tokens": usage.reasoning_tokens}
     return payload
 
 

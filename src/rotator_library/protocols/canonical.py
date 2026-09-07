@@ -575,12 +575,6 @@ def format_reasoning_controls(
             # 4.6 and rejected on current flagships, so adaptive is the
             # default cross-protocol target (disclosed).
             value, coerced = _effort_or_approximation()
-            if budget is not None:
-                _warn(
-                    "reasoning_effort_model_dependent",
-                    "thinking{enabled,budget_tokens} combined with output_config effort: effort (adaptive steering) wins — current flagships reject the budget shape",
-                    "reasoning",
-                )
             _emit_thinking({"type": "adaptive"})
             emissions["output_config"] = {"effort": value}
             _warn(

@@ -956,6 +956,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             payload["server_tool_use"] = deepcopy(usage.extra["server_tool_use"])
         if usage.extra.get("service_tier") is not None:
             payload["service_tier"] = usage.extra["service_tier"]
+        if usage.reasoning_tokens:
+            # The documented observability field: the canonical reasoning
+            # bucket re-emits as output_tokens_details.thinking_tokens.
+            payload["output_tokens_details"] = {"thinking_tokens": usage.reasoning_tokens}
         return payload
 
     def _promote_message_blocks(self, message: UnifiedMessage) -> None:
