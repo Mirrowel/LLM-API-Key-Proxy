@@ -138,7 +138,8 @@ async def test_anthropic_count_tokens_projects_through_chat_view() -> None:
 
     result = await AnthropicHandler(client).count_tokens(payload)
 
-    assert result == {"input_tokens": 6}  # messages + serialized tools
+    assert result["input_tokens"] == 6  # messages + serialized tools
+    assert result["x-proxy-estimate"] == "local-projection"
     assert len(client.calls) == 2
     assert client.calls[0]["messages"][0]["role"] == "user"
     assert "lookup" in client.calls[1]["text"]
