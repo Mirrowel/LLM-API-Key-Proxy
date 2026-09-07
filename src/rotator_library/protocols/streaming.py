@@ -329,14 +329,16 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
                         "type": "content_block_stop",
                         "index": index,
                     }))
-                # Foreign-shaped builtin records stay omitted entirely (no
-                # legal anthropic wire shape, no fabricated empty blocks).
-                _stream_warn(
-                    state,
-                    "builtin_tool_output_dropped",
-                    f"builtin tool record ({getattr(getattr(block, 'tool_call', None), 'name', '') or 'unknown'}) has no Anthropic stream shape; omitted",
-                    "content",
-                )
+                else:
+                    # Foreign-shaped builtin records stay omitted entirely
+                    # (no legal anthropic wire shape, no fabricated empty
+                    # blocks) — disclosed, never silent.
+                    _stream_warn(
+                        state,
+                        "builtin_tool_output_dropped",
+                        f"builtin tool record ({getattr(getattr(block, 'builtin_tool', None), 'kind', '') or 'unknown'}) has no Anthropic stream shape; omitted",
+                        "content",
+                    )
                 continue
             index = state.next_index
             state.next_index += 1

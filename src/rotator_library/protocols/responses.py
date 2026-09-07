@@ -179,7 +179,10 @@ class ResponsesProtocol(ProtocolAdapter):
                     field="system",
                     target_protocol=self.name,
                 )
-        record_instruction_merge(unified_request, self.name)
+        if not preserve_source:
+            # The merge record describes the CROSS-PROTOCOL promotion; the
+            # same-protocol path keeps both homes untouched (nothing merged).
+            record_instruction_merge(unified_request, self.name)
         if unified_request.previous_response_id:
             payload["previous_response_id"] = unified_request.previous_response_id
         if unified_request.tools:

@@ -837,6 +837,11 @@ class GeminiProtocol(ProtocolAdapter):
                     # client chose alongside a schema) survives verbatim —
                     # the canonical rebuild must not fold it to JSON.
                     formatted_structure.pop("responseMimeType", None)
+                if preserve_source and "responseSchema" in generation:
+                    # D4 identity: the original schema-key spelling survives
+                    # verbatim — the rebuild's responseJsonSchema never
+                    # swaps keys on the client's own wire.
+                    formatted_structure.pop("responseJsonSchema", None)
                 generation.update(
                     {
                         key: value

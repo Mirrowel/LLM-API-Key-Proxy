@@ -106,6 +106,29 @@ def validate_generative_request(
                         field="tool_call.signature",
                         target_protocol=target_protocol,
                     )
+        if target_protocol != "anthropic_messages":
+            # Block-level cache hints are Anthropic provider policy: drops
+            # at foreign targets are disclosed (same-protocol replay keeps
+            # them verbatim via raw).
+            hinted = False
+            for message in request.messages:
+                for block in message.content:
+                    if isinstance(block.extra, dict) and "cache_control" in block.extra:
+                        hinted = True
+                        break
+                    if isinstance(block.raw, dict) and "cache_control" in block.raw:
+                        hinted = True
+                        break
+                if hinted:
+                    break
+            if hinted:
+                add_conversion_warning(
+                    request,
+                    code="unsupported_optional_control",
+                    message="cache_control hints have no cross-protocol representation; dropped (same-protocol replay keeps them)",
+                    field="cache_control",
+                    target_protocol=target_protocol,
+                )
     if request.previous_response_id and target_protocol != "responses":
         raise ProtocolError(
             "A provider-bound previous_response_id cannot be translated safely",

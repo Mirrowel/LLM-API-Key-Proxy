@@ -131,11 +131,23 @@ def canonical_stop_reason(value: Any) -> Optional[str]:
 
 
 def format_stop_reason(value: Optional[str], target_protocol: str) -> Optional[str]:
-    """Return the target protocol's public completion reason."""
+    """Return the target protocol's public completion reason.
+
+    Unknown values pass through verbatim by design (same-protocol native
+    spellings the tables have not met yet); known alias spellings map
+    defensively so a hand-built canonical value (e.g. ``pause_turn`` where
+    the canonical is ``pause``) never emits an illegal wire value.
+    """
 
     if value is None:
         return None
-    return _TARGET_STOP_REASONS.get(target_protocol, {}).get(value, value)
+    table = _TARGET_STOP_REASONS.get(target_protocol, {})
+    if value in table:
+        return table[value]
+    alias = canonical_stop_reason(value)
+    if alias in table:
+        return table[alias]
+    return value
 
 
 def is_same_protocol(
@@ -667,51 +679,59 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
     their emission point (stop-reason approximations, usage detail drops).
 
     Called once per format_response pass; appends to the response warnings
-    (deduplicated downstream by attach_conversion_summary rendering).
+    (deduplicated — repeated format passes on one object never duplicate).
     """
 
     from .types import ConversionWarning  # local import: avoid cycles
 
-    stop_reason = getattr(unified_response, "stop_reason", None)
-    if stop_reason == "pause_turn" and target_protocol != "anthropic_messages":
-        unified_response.warnings.append(
-            ConversionWarning(
-                code="stop_reason_approximated",
-                message="pause_turn has no representation outside Anthropic; approximated (the server-tool loop semantics do not carry)",
-                field="stop_reason",
-                source_protocol=getattr(unified_response, "source_protocol", None),
-                target_protocol=target_protocol,
+    def _disclose(code: str, message: str, field: str) -> None:
+        if not any(w.code == code and w.message == message for w in unified_response.warnings):
+            unified_response.warnings.append(
+                ConversionWarning(
+                    code=code,
+                    message=message,
+                    field=field,
+                    source_protocol=getattr(unified_response, "source_protocol", None),
+                    target_protocol=target_protocol,
+                )
             )
+
+    stop_reason = getattr(unified_response, "stop_reason", None)
+    if stop_reason == "pause" and target_protocol != "anthropic_messages":
+        _disclose(
+            "stop_reason_approximated",
+            "pause_turn has no representation outside Anthropic; approximated (the server-tool loop semantics do not carry)",
+            "stop_reason",
         )
     metadata = getattr(unified_response, "metadata", None) or {}
-    if stop_reason == "stop_sequence" and target_protocol != "anthropic_messages":
-        unified_response.warnings.append(
-            ConversionWarning(
-                code="stop_sequence_dropped",
-                message="stop_sequence (the matched sequence text) has no representation outside Anthropic; only the stop reason survives",
-                field="stop_reason",
-                source_protocol=getattr(unified_response, "source_protocol", None),
-                target_protocol=target_protocol,
-            )
+    extra = getattr(unified_response, "extra", None) or {}
+    matched_sequence = (
+        metadata.get("stop_sequence")
+        if isinstance(metadata, dict) and metadata.get("stop_sequence") is not None
+        else (extra.get("stop_sequence") if isinstance(extra, dict) else None)
+    )
+    if matched_sequence is not None and target_protocol != "anthropic_messages":
+        _disclose(
+            "stop_sequence_dropped",
+            "stop_sequence (the matched sequence text) has no representation outside Anthropic; only the stop reason survives",
+            "stop_reason",
         )
     usage = getattr(unified_response, "usage", None)
     usage_extra = getattr(usage, "extra", None) if usage is not None else None
     if isinstance(usage_extra, dict) and usage_extra:
         anthropic_native = {"cache_creation", "server_tool_use", "service_tier"}
+        gemini_native = {"tool_use_prompt_tokens"}
         keys = [
             key
             for key in sorted(usage_extra)
             if not (target_protocol == "anthropic_messages" and key in anthropic_native)
+            and not (target_protocol == "gemini" and key in gemini_native)
         ]
         if keys:
-            unified_response.warnings.append(
-                ConversionWarning(
-                    code="usage_detail_dropped",
-                    message=f"usage detail buckets have no {target_protocol} spelling; dropped: {', '.join(keys)}",
-                    field="usage",
-                    source_protocol=getattr(unified_response, "source_protocol", None),
-                    target_protocol=target_protocol,
-                )
+            _disclose(
+                "usage_detail_dropped",
+                f"usage detail buckets have no {target_protocol} spelling; dropped: {', '.join(keys)}",
+                "usage",
             )
 
 
@@ -847,7 +867,12 @@ def canonical_tool_choice(value: Any, source_protocol: str) -> dict[str, Any] | 
     if value_type in {"function", "tool", "named"}:
         function = value.get("function") if isinstance(value.get("function"), dict) else {}
         name = value.get("name") or function.get("name")
-        return {"mode": "named", "name": name}
+        result = {"mode": "named", "name": name}
+        if value.get("disable_parallel_tool_use") is True:
+            # The parallelism constraint carries in named mode too — the
+            # chat target maps it to its parallel_tool_calls sibling.
+            result["disable_parallel_tool_use"] = True
+        return result
     return {"mode": "auto"}
 
 
