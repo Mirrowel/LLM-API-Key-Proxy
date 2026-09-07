@@ -680,7 +680,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             elif block.tool_result:
                 formatted.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source))
             elif block.type in {"image", "document"}:
-                formatted.append(_format_anthropic_media(block, preserve_source=preserve_source))
+                formatted.append(_format_anthropic_media(block, preserve_source=preserve_source, warnings=warnings))
             elif preserve_source and isinstance(block.raw, dict):
                 formatted.append(deepcopy(block.raw))
         return formatted
@@ -1107,15 +1107,36 @@ def _coerce_media_source(value: Any) -> MediaSource:
     )
 
 
-def _format_anthropic_media(block: ContentBlock, *, preserve_source: bool) -> dict[str, Any]:
+_ANTHROPIC_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_ANTHROPIC_DOCUMENT_MEDIA_TYPES = {"application/pdf", "text/plain"}
+
+
+def _format_anthropic_media(block: ContentBlock, *, preserve_source: bool, warnings: list | None = None) -> dict[str, Any]:
     """Format canonical media as an Anthropic content block."""
 
     source = _coerce_media_source(block.source)
     payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": block.type}
+    media_type = source.media_type
+    if block.type == "image" and media_type and media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
+        # Anthropic accepts exactly jpeg|png|gif|webp base64 images — an
+        # unsupported type is a guaranteed 400 (never a silent default).
+        raise ProtocolError(
+            f"Anthropic Messages does not accept image media_type '{media_type}' (supported: jpeg, png, gif, webp)",
+            protocol="anthropic_messages",
+            pass_name="build_request",
+            payload={"media_type": media_type},
+        )
+    if block.type == "document" and media_type and media_type not in _ANTHROPIC_DOCUMENT_MEDIA_TYPES:
+        raise ProtocolError(
+            f"Anthropic Messages does not accept document media_type '{media_type}' (supported: application/pdf, text/plain)",
+            protocol="anthropic_messages",
+            pass_name="build_request",
+            payload={"media_type": media_type},
+        )
     if source.kind == "base64":
         payload["source"] = {
             "type": "base64",
-            "media_type": source.media_type or "application/octet-stream",
+            "media_type": media_type or ("image/png" if block.type == "image" else "application/pdf"),
             "data": source.data or "",
         }
     elif source.file_id:
@@ -1123,8 +1144,22 @@ def _format_anthropic_media(block: ContentBlock, *, preserve_source: bool) -> di
     elif source.url:
         payload["source"] = {"type": "url", "url": source.url}
     elif source.data and block.type == "document":
-        payload["source"] = {"type": "text", "media_type": source.media_type or "text/plain", "data": source.data}
+        payload["source"] = {"type": "text", "media_type": media_type or "text/plain", "data": source.data}
     else:
         payload["source"] = {"type": source.kind, "data": source.data or ""}
     payload["type"] = block.type
+    # Cache/citation/transform hints on the block extras are provider
+    # policy, not portable semantics — cross-protocol drops are recorded.
+    if not preserve_source and warnings is not None:
+        for dropped_hint in ("cache_control", "citations", "transformations"):
+            if dropped_hint in (block.extra or {}) or (isinstance(block.raw, dict) and dropped_hint in block.raw):
+                warnings.append(
+                    ConversionWarning(
+                        code="unsupported_optional_control",
+                        message=f"{dropped_hint} hint has no cross-protocol representation; dropped",
+                        field=dropped_hint,
+                        source_protocol=None,
+                        target_protocol="anthropic_messages",
+                    )
+                )
     return payload

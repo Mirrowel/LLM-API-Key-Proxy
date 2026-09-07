@@ -35,6 +35,16 @@ from .types import (
     serialize_value,
 )
 
+# Anthropic-native server-tool content-block types (mirrors the anthropic
+# adapter's whitelist; streaming emits these verbatim for anthropic clients).
+_ANTHROPIC_SERVER_TOOL_BLOCK_TYPES = {
+    "server_tool_use",
+    "web_search_tool_result",
+    "code_execution_tool_result",
+    "text_editor_tool_result",
+    "bash_tool_result",
+}
+
 
 @dataclass
 class StreamFormatState:
@@ -245,7 +255,7 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
         return []
 
     frames = _anthropic_start(state)
-    visible = _client_visible_blocks(event)
+    visible = _client_visible_blocks(event, include_builtins=True)
     for block in visible:
         key, block_type = _block_key(block, state, event)
         if key not in state.open_blocks:
@@ -257,6 +267,27 @@ def _format_anthropic(event: UnifiedStreamEvent, state: StreamFormatState) -> li
                     if open_key == key:
                         continue
                     frames.extend(_anthropic_close_block(open_key, state))
+            if block.type == "builtin_tool":
+                raw_type = str(block.raw.get("type") or "") if isinstance(block.raw, dict) else ""
+                if raw_type in _ANTHROPIC_SERVER_TOOL_BLOCK_TYPES:
+                    # Anthropic-native server-tool blocks arrive complete:
+                    # the full payload rides content_block_start, then closes
+                    # (no delta phase exists for them).
+                    index = state.next_index
+                    state.next_index += 1
+                    state.block_order.append(f"builtin:{index}")
+                    frames.append(_event_frame("content_block_start", {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": deepcopy(block.raw),
+                    }))
+                    frames.append(_event_frame("content_block_stop", {
+                        "type": "content_block_stop",
+                        "index": index,
+                    }))
+                # Foreign-shaped builtin records stay omitted entirely (no
+                # legal anthropic wire shape, no fabricated empty blocks).
+                continue
             index = state.next_index
             state.next_index += 1
             state.open_blocks[key] = index
@@ -495,14 +526,18 @@ def _event_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
     return ordered_message_blocks(message)
 
 
-def _client_visible_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
+def _client_visible_blocks(event: UnifiedStreamEvent, *, include_builtins: bool = False) -> list[ContentBlock]:
     """Blocks a NON-responses client target may render.
 
     Builtin tool records are provider-internal: the Responses stream
-    formatter emits them as native output items; every other target omits
-    them (no fabricated empty text blocks).
+    formatter emits them as native output items; Anthropic targets render
+    anthropic-native server-tool blocks verbatim (they are legal wire
+    content); every other target omits them (no fabricated empty text
+    blocks).
     """
 
+    if include_builtins:
+        return list(_event_blocks(event))
     return [block for block in _event_blocks(event) if block.type != "builtin_tool"]
 
 

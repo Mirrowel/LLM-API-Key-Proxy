@@ -145,4 +145,8 @@ class AnthropicHandler:
         if chat_request.get("tools"):
             tools_text = json.dumps(chat_request["tools"])
             total += self._client.token_count(model=model, text=tools_text)
-        return {"input_tokens": total}
+        # Local estimate disclosure (spec: exact counts come from the
+        # upstream /v1/messages/count_tokens endpoint; the projection here
+        # approximates images/PDFs and may include prior-turn thinking the
+        # upstream counter ignores). Anthropic clients ignore unknown keys.
+        return {"input_tokens": total, "x-proxy-estimate": "local-projection"}
