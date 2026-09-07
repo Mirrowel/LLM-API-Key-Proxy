@@ -634,8 +634,13 @@ def test_transport_formatters_expose_sse_and_websocket_seam() -> None:
     assert ResponsesSSEFormatter().format_stream_event(ResponsesStreamEvent("heartbeat", {"comment": "heartbeat"})) == ": heartbeat\n\n"
     websocket = ResponsesWebSocketFormatter()
     assert websocket.transport == "websocket"
-    assert websocket.future_supported is True
-    assert websocket.format_stream_event(ResponsesStreamEvent("response.created", {"id": "resp"})) == '{"event": "response.created", "data": {"id": "resp"}}'
+    # WS frames ARE the event objects (type + payload); SSE artifacts drop.
+    assert (
+        websocket.format_stream_event(ResponsesStreamEvent("response.created", {"type": "response.created", "id": "resp"}))
+        == '{"type": "response.created", "id": "resp"}'
+    )
+    assert websocket.format_stream_event(ResponsesStreamEvent("heartbeat", {})) is None
+    assert websocket.format_stream_event(ResponsesStreamEvent("done", {}, terminal=True)) is None
 
 
 @pytest.mark.asyncio

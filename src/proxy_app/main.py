@@ -108,7 +108,7 @@ _console = Console()
 print("  → Loading FastAPI framework...")
 with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
-    from fastapi import FastAPI, Request, HTTPException, Depends
+    from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
@@ -907,6 +907,52 @@ async def responses_input_items(
         )
     except ResponsesServiceError as e:
         return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
+
+
+@app.websocket("/v1/responses")
+async def responses_websocket(websocket: WebSocket):
+    """WebSocket Mode for the Responses API (persistent connection, turns
+    as response.create frames, standard streaming events as JSON frames).
+
+    Thin shell: the session driver lives in rotator_library
+    (ResponsesWebSocketSession) per the shell-plus-library pattern.
+    Unauthenticated upgrades are denied at the handshake (Starlette sends
+    HTTP 403 on close-before-accept — the deliberate security shape: no
+    socket for unauthenticated peers; there is no official auth close code).
+    """
+
+    from rotator_library.responses.websocket import DEFAULT_MAX_CONNECTION_SECONDS, ResponsesWebSocketSession
+
+    if PROXY_API_KEY:
+        auth_header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
+        if auth_header != f"Bearer {PROXY_API_KEY}":
+            await websocket.close()
+            return
+    service = getattr(websocket.app.state, "responses_service", None)
+    rotating_client = getattr(websocket.app.state, "rotating_client", None)
+    if service is None or rotating_client is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "status": 503, "error": {"code": "server_error", "message": "Responses service unavailable"}})
+        await websocket.close(code=1011)
+        return
+    try:
+        max_seconds = float(os.getenv("RESPONSES_WEBSOCKET_MAX_CONNECTION_SECONDS") or DEFAULT_MAX_CONNECTION_SECONDS)
+        if max_seconds <= 0:
+            max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
+    except (TypeError, ValueError):
+        max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
+    transaction_logger_factory = None
+    if ENABLE_REQUEST_LOGGING:
+        def transaction_logger_factory(model: str):  # noqa: F811
+            return TransactionLogger("responses_ws", model)
+    session = ResponsesWebSocketSession(
+        service=service,
+        client=rotating_client,
+        max_connection_seconds=max_seconds,
+        transaction_logger_factory=transaction_logger_factory,
+    )
+    await websocket.accept()
+    await session.run(websocket)
 
 
 # --- Anthropic Messages API Endpoint ---

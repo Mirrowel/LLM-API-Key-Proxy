@@ -14,7 +14,7 @@ import secrets
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, NoReturn, Optional
+from typing import Any, AsyncGenerator, MutableMapping, NoReturn, Optional
 
 from ..protocols import ProtocolContext
 from ..streaming import StreamEvent, StreamMonitor
@@ -359,6 +359,48 @@ class ResponsesService:
                 )
             yield formatted
 
+    async def stream_turn_events(
+        self,
+        raw_request: dict[str, Any],
+        client: Any,
+        *,
+        request: Optional[Any] = None,
+        transaction_logger: Optional[Any] = None,
+        request_scope: Optional[ResponsesRequestScope] = None,
+        previous_response_access_token: Optional[str] = None,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
+    ) -> AsyncGenerator[ResponsesStreamEvent, None]:
+        """Yield transport-neutral Responses events for any transport.
+
+        The WebSocket seam: the same storage, anchor, usage, and failure
+        semantics as the SSE stream, with formatting left to the transport.
+        """
+
+        if hasattr(client, "agenerate"):
+            async for event in self._stream_native_response(
+                raw_request,
+                client,
+                request=request,
+                transaction_logger=transaction_logger,
+                transport="websocket",
+                request_scope=request_scope,
+                previous_response_access_token=previous_response_access_token,
+                as_events=True,
+                local_cache=local_cache,
+            ):
+                yield event
+            return
+        async for event in self.stream_events(
+            raw_request,
+            client,
+            request=request,
+            transaction_logger=transaction_logger,
+            transport="websocket",
+            request_scope=request_scope,
+            previous_response_access_token=previous_response_access_token,
+        ):
+            yield event
+
     async def _stream_native_response(
         self,
         raw_request: dict[str, Any],
@@ -369,8 +411,17 @@ class ResponsesService:
         transport: str,
         request_scope: Optional[ResponsesRequestScope],
         previous_response_access_token: Optional[str],
-    ) -> AsyncGenerator[str, None]:
-        """Stream through the canonical runtime while retaining Responses storage."""
+        as_events: bool = False,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
+    ) -> AsyncGenerator[Any, None]:
+        """Stream through the canonical runtime while retaining Responses storage.
+
+        ``as_events`` yields transport-neutral :class:`ResponsesStreamEvent`
+        objects (the WebSocket seam) instead of SSE strings; storage,
+        anchors, and usage accounting run identically in both modes.
+        ``local_cache`` is the WebSocket connection-local continuation cache
+        consulted before the global store (store=false / ZDR chains).
+        """
 
         stream_request = dict(raw_request)
         stream_request["stream"] = True
@@ -388,10 +439,12 @@ class ResponsesService:
                 transaction_logger,
                 expected_scope_key=resolved_scope.key,
                 access_token=previous_response_access_token,
+                local_cache=local_cache,
             )
             parent_lineage = await self._load_response_lineage(
                 parent,
                 expected_scope_key=resolved_scope.key,
+                local_cache=local_cache,
             )
             native_request = _expanded_responses_request(stream_request, parent_lineage)
             session_hints = responses_session_hints(unified.previous_response_id)
@@ -424,6 +477,8 @@ class ResponsesService:
                 exc,
                 transaction_logger=transaction_logger,
                 session_info={"scope_access_hash": resolved_scope.access_token_hash},
+                as_events=as_events,
+                local_cache=local_cache,
             ):
                 yield frame
             # Finalize AFTER the terminal frames so the error records the
@@ -444,7 +499,9 @@ class ResponsesService:
         try:
             async for raw_frame in response_stream:
                 if isinstance(raw_frame, str) and raw_frame.lstrip().startswith(":"):
-                    yield raw_frame
+                    # SSE comment heartbeats have no event-mode equivalent.
+                    if not as_events:
+                        yield raw_frame
                     continue
                 event = self.protocol.parse_stream_event(raw_frame, response_context)
                 payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
@@ -460,6 +517,7 @@ class ResponsesService:
                         failed=event.type == "response.failed",
                         transaction_logger=transaction_logger,
                         session_info=session_info,
+                        local_cache=local_cache,
                     )
                     self._trace(
                         transaction_logger,
@@ -468,7 +526,14 @@ class ResponsesService:
                         direction="metadata",
                         stage="final",
                     )
-                yield raw_frame
+                if as_events:
+                    payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
+                    yield ResponsesStreamEvent(
+                        str((payload or {}).get("type") or event.type or "response.event"),
+                        payload if isinstance(payload, dict) else {"type": event.type or "response.event"},
+                    )
+                else:
+                    yield raw_frame
         except Exception as exc:
             # Post-start failures never escape into the transport: the client
             # receives a protocol-valid terminal sequence instead (defect 10).
@@ -479,6 +544,8 @@ class ResponsesService:
                 exc,
                 transaction_logger=transaction_logger,
                 session_info=session_info,
+                as_events=as_events,
+                local_cache=local_cache,
             ):
                 yield frame
             # Finalize AFTER the terminal frames so their error records land
@@ -532,7 +599,9 @@ class ResponsesService:
         *,
         transaction_logger: Optional[Any],
         session_info: dict[str, Any],
-    ) -> AsyncGenerator[str, None]:
+        as_events: bool = False,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
+    ) -> AsyncGenerator[Any, None]:
         """Emit the terminal failure frames for a failed native stream.
 
         Frame emission is isolated from the store attempt: a failing store
@@ -558,6 +627,7 @@ class ResponsesService:
                 failed=True,
                 transaction_logger=transaction_logger,
                 session_info=session_info,
+                local_cache=local_cache,
             )
             self._trace(
                 transaction_logger,
@@ -574,12 +644,16 @@ class ResponsesService:
                 direction="metadata",
                 stage="final",
             )
-        formatter = ResponsesSSEFormatter()
         # Wire convention: the nested {type, response} envelope, matching
-        # provider-emitted terminal frames on the same stream.
-        yield formatter.format_stream_event(
-            ResponsesStreamEvent("response.failed", {"type": "response.failed", "response": failed})
-        )
+        # provider-emitted terminal frames on the same stream. Event mode
+        # (WebSocket) yields the neutral event — no [DONE] sentinel exists
+        # on that transport; the terminal response.failed closes the turn.
+        failed_event = ResponsesStreamEvent("response.failed", {"type": "response.failed", "response": failed})
+        if as_events:
+            yield failed_event
+            return
+        formatter = ResponsesSSEFormatter()
+        yield formatter.format_stream_event(failed_event)
         yield formatter.format_stream_event(ResponsesStreamEvent("done", {}, terminal=True))
 
     async def validate_stream_request(
@@ -1240,6 +1314,7 @@ class ResponsesService:
         *,
         expected_scope_key: str,
         max_depth: int = 20,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
     ) -> list[StoredResponse]:
         """Return parent continuation lineage from oldest to newest."""
 
@@ -1260,7 +1335,11 @@ class ResponsesService:
             previous_id = current.request.get("previous_response_id") if isinstance(current.request, dict) else None
             if not previous_id:
                 break
-            current = await self.store.get(str(previous_id), expected_scope_key)
+            previous_id = str(previous_id)
+            if local_cache is not None and previous_id in local_cache:
+                current = local_cache[previous_id]
+                continue
+            current = await self.store.get(previous_id, expected_scope_key)
         return list(reversed(lineage))
 
     async def _load_previous_response(
@@ -1270,9 +1349,15 @@ class ResponsesService:
         *,
         expected_scope_key: str,
         access_token: Optional[str] = None,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
     ) -> Optional[StoredResponse]:
         if not response_id:
             return None
+        if local_cache is not None and response_id in local_cache:
+            # Connection-local cache (WebSocket mode): in-memory only,
+            # pre-scoped by construction — the guide's fast continuation
+            # path that keeps store=false / ZDR chains working.
+            return local_cache[response_id]
         if expected_scope_key == "public":
             parent = await self._stored_or_not_found(response_id, "public")
         else:
@@ -1408,10 +1493,22 @@ class ResponsesService:
         failed: bool = False,
         transaction_logger: Optional[Any] = None,
         session_info: Optional[dict[str, Any]] = None,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
     ) -> bool:
+        build_and_cache = local_cache is not None
         if not raw_request.get("store", True):
+            if build_and_cache:
+                # WebSocket mode: store=false turns still land in the
+                # connection-local in-memory cache (never the global store,
+                # never disk) so the next turn's previous_response_id
+                # resolves for ZDR-style chains.
+                stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
+                local_cache[stored.id] = stored
             return False
         if failed and not self.store_settings.store_failed:
+            if build_and_cache:
+                stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
+                local_cache[stored.id] = stored
             return False
         stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
         try:
@@ -1419,6 +1516,8 @@ class ResponsesService:
         except Exception as exc:
             self._log_transform_error(transaction_logger, "responses_store_stream_response", exc, stored.to_dict())
             raise
+        if build_and_cache:
+            local_cache[stored.id] = stored
         return True
 
     async def _store_stream_current_state(

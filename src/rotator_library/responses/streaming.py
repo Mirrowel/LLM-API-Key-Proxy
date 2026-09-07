@@ -70,25 +70,6 @@ class ResponsesSSEFormatter:
         return "data: [DONE]\n\n"
 
 
-class ResponsesWebSocketFormatter:
-    """Placeholder transport seam for future WebSocket Responses support."""
-
-    transport = "websocket"
-    future_supported = True
-
-    def format_event(self, event_name: str, payload: dict[str, Any]) -> str:
-        return json.dumps({"event": event_name, "data": serialize_value(payload)}, ensure_ascii=False)
-
-    def format_stream_event(self, event: ResponsesStreamEvent) -> str:
-        """Format one transport-neutral event as a WebSocket message payload."""
-
-        if event.heartbeat:
-            return json.dumps({"event": "heartbeat", "data": {"visible_output": False}}, ensure_ascii=False)
-        if event.terminal:
-            return json.dumps({"event": "done", "data": {}}, ensure_ascii=False)
-        return self.format_event(event.event_name, event.payload)
-
-
 def parse_chat_sse_chunk(chunk: Any) -> dict[str, Any] | None:
     """Decode a chat-completions stream chunk into a dict if possible."""
 
