@@ -140,8 +140,10 @@ class GeminiProtocol(ProtocolAdapter):
                 for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)))
             ],
         }
-        if unified_request.model:
-            payload["model"] = unified_request.model
+        # NOTE: GenerateContentRequest has NO model field (the model rides
+        # the URL path) and NO stream field (streaming is the
+        # :streamGenerateContent?alt=sse endpoint) — neither may leak into
+        # the upstream body (unknown-field 400).
         instructions = instruction_blocks(unified_request)
         if instructions:
             payload["systemInstruction"] = {
@@ -162,9 +164,11 @@ class GeminiProtocol(ProtocolAdapter):
             payload["toolConfig"] = deepcopy(tool_config)
         if unified_request.tools:
             payload["tools"] = self._format_tools(unified_request.tools, preserve_source=preserve_source)
-        if unified_request.stream:
-            payload["stream"] = True
         payload.update(source_extensions(unified_request.extra, context, self.name, unified_request.source_protocol))
+        # Defensive: neither key is ever legal in the body (belt for raw
+        # fast-path replays and extension leakage).
+        payload.pop("model", None)
+        payload.pop("stream", None)
         return payload
 
     def _attach_grounding_annotations(self, message: UnifiedMessage, candidate: dict[str, Any]) -> None:
@@ -425,9 +429,16 @@ class GeminiProtocol(ProtocolAdapter):
             return ContentBlock(type="unknown", raw=deepcopy(part))
         if "text" in part:
             reasoning = None
-            if part.get("thought") or part.get("thoughtSignature"):
-                reasoning = ReasoningBlock(type="reasoning", text=part.get("text"), signature=part.get("thoughtSignature"), raw=deepcopy(part), extra=_without(part, {"text", "thought", "thoughtSignature"}))
+            signature = part.get("thoughtSignature") or part.get("thought_signature")
+            if part.get("thought"):
+                reasoning = ReasoningBlock(type="reasoning", text=part.get("text"), signature=signature, raw=deepcopy(part), extra=_without(part, {"text", "thought", "thoughtSignature", "thought_signature"}))
                 return ContentBlock(type="reasoning", text=part.get("text", ""), reasoning=reasoning, raw=deepcopy(part), extra=_without(part, {"text"}))
+            if signature:
+                # Plain answer text carrying a thought signature stays TEXT
+                # (signatures may attach to any part; only `thought:true`
+                # marks thinking) — the signature rides extra for verbatim
+                # same-protocol replay.
+                return ContentBlock(type="text", text=part.get("text", ""), raw=deepcopy(part), extra=_without(part, {"text"}))
             return ContentBlock(type="text", text=part.get("text", ""), raw=deepcopy(part), extra=_without(part, {"text"}))
         if "inlineData" in part or "inline_data" in part:
             source = part.get("inlineData") or part.get("inline_data")
@@ -439,11 +450,46 @@ class GeminiProtocol(ProtocolAdapter):
             return ContentBlock(type=_media_block_type(media.media_type), source=media, raw=deepcopy(part), extra=_without(part, {"fileData", "file_data"}))
         if "functionCall" in part or "function_call" in part:
             call = part.get("functionCall") or part.get("function_call") or {}
-            return ContentBlock(type="tool_call", tool_call=ToolCall(id=call.get("id"), name=call.get("name"), arguments=canonical_tool_arguments(call.get("args")), type="function", raw=deepcopy(call)), raw=deepcopy(part), extra=_without(part, {"functionCall", "function_call"}))
+            # raw is the OUTER part: same-protocol replay keeps part-level
+            # metadata (thoughtSignature!) instead of corrupting the union.
+            return ContentBlock(
+                type="tool_call",
+                tool_call=ToolCall(
+                    id=call.get("id"),
+                    name=call.get("name"),
+                    arguments=canonical_tool_arguments(call.get("args")),
+                    type="function",
+                    signature=part.get("thoughtSignature") or part.get("thought_signature"),
+                    raw=deepcopy(part),
+                    extra=_without(part, {"functionCall", "function_call", "thoughtSignature", "thought_signature"}),
+                ),
+                raw=deepcopy(part),
+                extra=_without(part, {"functionCall", "function_call"}),
+            )
         if "functionResponse" in part or "function_response" in part:
             response = part.get("functionResponse") or part.get("function_response") or {}
             result_content = canonical_tool_arguments(response.get("response"))
-            return ContentBlock(type="tool_result", tool_result=ToolResult(tool_call_id=response.get("id") or response.get("name"), name=response.get("name"), content=result_content, raw=deepcopy(response)), raw=deepcopy(part), extra=_without(part, {"functionResponse", "function_response"}))
+            return ContentBlock(
+                type="tool_result",
+                tool_result=ToolResult(
+                    tool_call_id=response.get("id") or response.get("name"),
+                    name=response.get("name"),
+                    content=result_content,
+                    raw=deepcopy(part),
+                    extra=_without(part, {"functionResponse", "function_response"}),
+                ),
+                raw=deepcopy(part),
+                extra=_without(part, {"functionResponse", "function_response"}),
+            )
+        if "executableCode" in part or "codeExecutionResult" in part or "toolCall" in part or "toolResponse" in part:
+            # Official union members without dedicated canonical types round-
+            # trip as builtin records (verbatim raw replay; foreign targets
+            # reject — no fabricated text).
+            from .types import BuiltinToolCall
+
+            kind = next(k for k in ("executableCode", "codeExecutionResult", "toolCall", "toolResponse") if k in part)
+            builtin = BuiltinToolCall(kind=kind, call_id=None, status="completed", raw=deepcopy(part))
+            return ContentBlock(type="builtin_tool", builtin_tool=builtin, raw=deepcopy(part))
         return ContentBlock(type="unknown", raw=deepcopy(part), extra=deepcopy(part))
 
     def _format_parts(
@@ -456,7 +502,7 @@ class GeminiProtocol(ProtocolAdapter):
         parts = []
         for block in blocks:
             if block.tool_call:
-                parts.append(self._format_tool_call(block.tool_call, preserve_source=preserve_source))
+                parts.append(self._format_tool_call(block.tool_call, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state))
             elif block.tool_result:
                 parts.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source))
             elif block.type in {"image", "audio", "video", "file", "document"}:
@@ -475,12 +521,22 @@ class GeminiProtocol(ProtocolAdapter):
                 # text part (stop_reason carries the refusal semantics).
                 parts.append({"text": block.refusal})
             elif block.type == "builtin_tool":
-                # Handled by format_response guards (drop with warning or
-                # reject when nothing representable remains); never fabricated
-                # into an empty text part here.
+                # Native union members (executableCode, server toolCall, ...)
+                # replay their raw part verbatim; foreign-source builtin
+                # records have no gemini shape (handled by format_response
+                # guards — never fabricated into empty text here).
+                if isinstance(block.raw, dict) and any(k in block.raw for k in ("executableCode", "codeExecutionResult", "toolCall", "toolResponse")):
+                    parts.append(deepcopy(block.raw))
                 continue
             else:
                 payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {}
+                if isinstance(block.raw, dict) and not any(k in block.raw for k in ("text", "inlineData", "inline_data", "fileData", "file_data", "functionCall", "function_call", "functionResponse", "function_response")):
+                    # Unknown union part (no text member): verbatim replay —
+                    # never inject a fabricated "text" key (illegal union).
+                    if preserve_source:
+                        payload.update(deepcopy(block.extra))
+                    parts.append(payload)
+                    continue
                 payload["text"] = block.text or ""
                 if preserve_source:
                     payload.update(deepcopy(block.extra))
@@ -545,16 +601,28 @@ class GeminiProtocol(ProtocolAdapter):
             return deepcopy(raw)
         return {"functionDeclarations": [{"name": tool.name, "description": tool.description, "parameters": deepcopy(tool.input_schema)}]}
 
-    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool) -> dict[str, Any]:
+    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, emit_opaque_state: bool = True) -> dict[str, Any]:
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
+        # Sanitize the raw replay down to the legal union-part shape.
+        payload.pop("functionCall", None)
+        payload.pop("function_call", None)
+        payload.pop("thoughtSignature", None)
+        payload.pop("thought_signature", None)
         function_call = {"name": call.name or "", "args": tool_arguments_object(call.arguments)}
         if call.id and not (preserve_source and call.extra.get("synthetic_id")):
             function_call["id"] = call.id
         payload["functionCall"] = function_call
+        signature = call.signature or (call.raw.get("thoughtSignature") if isinstance(call.raw, dict) else None) or (call.raw.get("thought_signature") if isinstance(call.raw, dict) else None)
+        if signature and emit_opaque_state:
+            # D8: the signature replays with the call part for compatible
+            # providers (Gemini 3 rejects unsigned first-per-step calls).
+            payload["thoughtSignature"] = signature
         return payload
 
     def _format_tool_result(self, result: ToolResult, *, preserve_source: bool) -> dict[str, Any]:
         payload = deepcopy(result.raw) if preserve_source and isinstance(result.raw, dict) else {}
+        payload.pop("functionResponse", None)
+        payload.pop("function_response", None)
         result_content = {"error": result.content} if result.is_error else result.content
         response = {"name": result.name or result.tool_call_id or "", "response": tool_result_object(result_content)}
         if result.tool_call_id and result.name and not (preserve_source and result.extra.get("synthetic_tool_call_id")):
@@ -604,6 +672,12 @@ class GeminiProtocol(ProtocolAdapter):
                     if value is not None
                 }
             )
+            # responseSchema and responseJsonSchema are mutually exclusive
+            # (the docs mandate omitting the counterpart) — never both.
+            if "responseJsonSchema" in generation:
+                generation.pop("responseSchema", None)
+            elif "responseSchema" in generation and "responseMimeType" in generation and generation.get("responseMimeType") != "application/json":
+                generation.pop("responseSchema", None)
         reasoning = params.pop("reasoning", None)
         if not preserve_source:
             # Cross-protocol mapping only; same-protocol passthrough keeps
@@ -696,14 +770,24 @@ def _parse_gemini_generation_params(generation: dict[str, Any], tool_config: dic
     for wire, canonical in mapping.items():
         if wire in generation:
             params[canonical] = deepcopy(generation[wire])
-    if generation.get("responseMimeType") is not None or generation.get("responseJsonSchema") is not None or generation.get("responseSchema") is not None:
+    response_mime = generation.get("responseMimeType")
+    has_schema = generation.get("responseJsonSchema") is not None or generation.get("responseSchema") is not None
+    if has_schema or (isinstance(response_mime, str) and response_mime == "application/json"):
+        # ONLY application/json means structured output (text/x.enum and
+        # text/plain are distinct modes, never folded into JSON).
         params["structured_output"] = canonical_structured_output(
             {
-                "type": "json_schema" if generation.get("responseJsonSchema") is not None or generation.get("responseSchema") is not None else "json_object",
+                "type": "json_schema" if has_schema else "json_object",
                 "schema": deepcopy(generation.get("responseJsonSchema") or generation.get("responseSchema")),
             },
             "gemini",
         )
+    elif isinstance(response_mime, str) and response_mime not in ("text/plain", "text/x.enum"):
+        # Non-default mime types ride extensions for same-protocol replay
+        # and are recorded as unsupported cross-protocol.
+        params["response_mime_type"] = response_mime
+    elif response_mime == "text/x.enum":
+        params["response_mime_type"] = response_mime
     thinking = generation.get("thinkingConfig")
     if isinstance(thinking, dict):
         budget = thinking.get("thinkingBudget")

@@ -207,10 +207,13 @@ class ToolCall(ProtocolSerializable):
     arguments: Any = None
     type: str = "function"
     index: Optional[int] = None
+    # Provider thought signature attached to the call part (Gemini): opaque
+    # D8 state — replays to compatible providers, never crosses protocols.
+    signature: Optional[str] = None
     raw: Any = None
     extra: JsonObject = field(default_factory=dict)
 
-    _fields: ClassVar[tuple[str, ...]] = ("id", "name", "arguments", "type", "index", "raw", "extra")
+    _fields: ClassVar[tuple[str, ...]] = ("id", "name", "arguments", "type", "index", "signature", "raw", "extra")
 
 
 @dataclass
