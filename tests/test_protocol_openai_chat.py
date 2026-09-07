@@ -255,3 +255,38 @@ def test_openai_chat_stream_event_parses_sse_delta_and_done() -> None:
     assert parsed.delta is not None
     assert parsed.delta.content[0].text == "Hel"
     assert done.type == "done"
+
+
+def test_usage_prompt_totals_agree_across_all_four_targets() -> None:
+    """H2 inclusive semantics: one canonical usage (cache-folded by the
+    anthropic parser) renders the SAME prompt total through every target
+    emitter — no target double-counts cached tokens."""
+
+    anthropic = get_protocol("anthropic_messages")
+    unified = anthropic.parse_response(
+        {
+            "id": "msg_1",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "ok"}],
+            "usage": {"input_tokens": 80, "output_tokens": 10, "cache_read_input_tokens": 20},
+        }
+    )
+    assert unified.usage.input_tokens == 100
+
+    chat = get_protocol("openai_chat").format_response(unified)
+    assert chat["usage"]["prompt_tokens"] == 100
+    assert chat["usage"]["prompt_tokens_details"]["cached_tokens"] == 20
+
+    gemini = get_protocol("gemini").format_response(unified)
+    assert gemini["usageMetadata"]["promptTokenCount"] == 100
+    assert gemini["usageMetadata"]["cachedContentTokenCount"] == 20
+    assert gemini["usageMetadata"]["promptTokenCount"] <= gemini["usageMetadata"]["totalTokenCount"]
+
+    responses = get_protocol("responses").format_response(unified)
+    assert responses["usage"]["input_tokens"] == 100
+    assert responses["usage"]["input_tokens_details"]["cached_tokens"] == 20
+
+    # Round trip: the anthropic formatter unfolds back to its sibling shape.
+    back = get_protocol("anthropic_messages").format_response(unified)
+    assert back["usage"]["input_tokens"] == 80
+    assert back["usage"]["cache_read_input_tokens"] == 20

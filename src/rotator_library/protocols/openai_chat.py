@@ -1109,7 +1109,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     )
         if "audio_output" in params:
             payload["audio"] = deepcopy(params.pop("audio_output"))
-            if request.modalities and "audio" not in request.modalities:
+            # The audio parameter is defined in terms of modalities:["audio"]
+            # — absent or audio-less modalities get the pairing synthesized
+            # with a recorded warning (never a silently reject-able build).
+            if "audio" not in (request.modalities or []):
                 request.warnings.append(
                     ConversionWarning(
                         code="unsupported_optional_control",
@@ -1119,7 +1122,8 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         target_protocol=self.name,
                     )
                 )
-                payload["modalities"] = [*request.modalities, "audio"]
+                base_modalities = [m for m in (request.modalities or []) if m in {"text", "audio"}] or ["text"]
+                payload["modalities"] = [*base_modalities, "audio"]
         supported = {
             "frequency_penalty",
             "logit_bias",

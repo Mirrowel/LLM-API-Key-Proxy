@@ -809,7 +809,11 @@ def _openai_usage(usage: Usage | None) -> dict[str, Any] | None:
             details["cached_tokens"] = usage.cache_read_tokens
         if usage.cache_write_tokens:
             details["cache_creation_tokens"] = usage.cache_write_tokens
+        if usage.audio_tokens:
+            details["audio_tokens"] = usage.audio_tokens
         payload["prompt_tokens_details"] = details
+    elif usage.audio_tokens:
+        payload["prompt_tokens_details"] = {"audio_tokens": usage.audio_tokens}
     completion_details: dict[str, Any] = {}
     if usage.reasoning_tokens:
         completion_details["reasoning_tokens"] = usage.reasoning_tokens
@@ -838,8 +842,10 @@ def _anthropic_usage(usage: Usage | None, *, output_only: bool = False) -> dict[
 def _responses_usage(usage: Usage | None) -> dict[str, Any] | None:
     if usage is None:
         return None
+    # Canonical input_tokens is cache-INCLUSIVE (H2): emitted verbatim;
+    # cached_tokens is a detail view, never added on top.
     return {
-        "input_tokens": usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+        "input_tokens": usage.input_tokens,
         "input_tokens_details": {"cached_tokens": usage.cache_read_tokens},
         "output_tokens": usage.output_tokens,
         "output_tokens_details": {"reasoning_tokens": usage.reasoning_tokens},
@@ -850,8 +856,10 @@ def _responses_usage(usage: Usage | None) -> dict[str, Any] | None:
 def _gemini_usage(usage: Usage | None) -> dict[str, int] | None:
     if usage is None:
         return None
+    # Canonical input_tokens is cache-INCLUSIVE (H2) — matching Gemini's own
+    # convention (promptTokenCount includes cachedContentTokenCount).
     return {
-        "promptTokenCount": usage.input_tokens + usage.cache_read_tokens,
+        "promptTokenCount": usage.input_tokens,
         "candidatesTokenCount": usage.output_tokens,
         "totalTokenCount": usage.total_tokens,
         "cachedContentTokenCount": usage.cache_read_tokens,
