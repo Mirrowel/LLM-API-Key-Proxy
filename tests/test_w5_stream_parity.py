@@ -171,14 +171,17 @@ def test_two_reasoning_items_harvest_attributes_by_output_index() -> None:
         )
         format_canonical_stream_event(delta, "responses", ctx, state=state)
     # Upstream done for the SECOND item only, carrying its encrypted state.
+    # Real wire shape: output_index is a SIBLING of item at the event
+    # level (never inside the item).
     done = UnifiedStreamEvent(
         type="response.output_item.done",
         source_protocol="responses",
+        output_index=1,
         message=UnifiedMessage(
             role="assistant",
             content=[ContentBlock(type="reasoning", reasoning=ReasoningBlock(text="beta", encrypted_content="ENC_B"))],
         ),
-        extra={"payload": {"item": {"id": "rs_upstream_b", "type": "reasoning", "output_index": 1}}},
+        extra={"payload": {"type": "response.output_item.done", "output_index": 1, "item": {"id": "rs_upstream_b", "type": "reasoning"}}},
     )
     format_canonical_stream_event(done, "responses", ctx, state=state)
     terminal = UnifiedStreamEvent(type="response.completed", source_protocol="responses", message=UnifiedMessage(role="assistant"))

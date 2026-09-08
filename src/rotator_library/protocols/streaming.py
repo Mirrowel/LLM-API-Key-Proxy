@@ -749,12 +749,13 @@ def _harvest_done_state(event: UnifiedStreamEvent, state: "StreamFormatState") -
     raw = event.extra.get("payload") if isinstance(event.extra, dict) else None
     raw_item = raw.get("item") if isinstance(raw, dict) and isinstance(raw.get("item"), dict) else None
     raw_item_id = raw_item.get("id") if isinstance(raw_item, dict) else None
-    # Attribution, in order of precision: the raw payload's output_index
-    # (block keys are reasoning:{n} and coincide with the output index for
-    # responses sources), then the upstream item id, then the first open
-    # reasoning item. Without this, multi-reasoning responses mis-bind
-    # opaque state (upstream ids never match the synthesized rs_N ids).
-    raw_output_index = raw_item.get("output_index") if isinstance(raw_item, dict) else None
+    # Attribution, in order of precision: the event's output_index (the
+    # real wire carries it as a SIBLING of item, and the parser populates
+    # event.output_index), then a lenient inside-item read, then the
+    # upstream item id, then the first open reasoning item. Without this,
+    # multi-reasoning responses mis-bind opaque state (upstream ids never
+    # match the synthesized rs_N ids).
+    raw_output_index = event.output_index if isinstance(event.output_index, int) else (raw_item.get("output_index") if isinstance(raw_item, dict) else None)
     encrypted_value = encrypted_blocks[0].reasoning.encrypted_content
     if isinstance(raw_output_index, int):
         candidate_keys = [key for key, _ in state.item_ids.items() if state.item_kinds.get(key) == "reasoning"]
