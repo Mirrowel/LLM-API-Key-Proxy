@@ -938,6 +938,12 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
     name = choice.get("name")
     allowed_names = deepcopy(choice.get("allowed_names") or [])
     no_parallel = choice.get("disable_parallel_tool_use") is True
+    if mode == "validated" and target_protocol != "gemini":
+        # Gemini-exclusive vocabulary: only gemini has a native VALIDATED
+        # mode; every other wire gets the documented auto approximation
+        # (disclosed by the caller's narrowing warning) — NEVER the illegal
+        # literal on a foreign wire.
+        mode = "auto"
     if target_protocol != "responses" and isinstance(choice.get("namespaced"), dict):
         # Namespaced variants have no representation outside Responses —
         # callers narrow to the mode; the warning lands there via the

@@ -444,7 +444,11 @@ class ResponsesProtocol(ProtocolAdapter):
                 raw=deepcopy(item),
                 extra={k: deepcopy(v) for k, v in item.items() if k not in {"type", "role", "content"}},
             )
-        if item_type == "function_call_output":
+        if item_type in {"function_call_output", "custom_tool_call_output"}:
+            # Custom tool outputs share the function-output contract: the
+            # neutral home is the same ToolResult (text content), so a
+            # Responses conversation that used a custom tool replays to any
+            # provider instead of hard-rejecting cross-protocol.
             result_content = canonical_tool_arguments(item.get("output"))
             return UnifiedMessage(
                 role="tool",
@@ -884,9 +888,10 @@ class ResponsesProtocol(ProtocolAdapter):
             # Custom tool calls keep their native spelling (input, not
             # arguments) — coercing to function_call would change how the
             # provider pairs the call with its custom_tool_output.
-            if preserve_source and "input" in payload:
-                # Verbatim replay: never inject arguments alongside the
-                # client's own input member (hybrid shapes 400 upstream).
+            if preserve_source and isinstance(call.raw, dict) and ("input" in call.raw or "arguments" in call.raw):
+                # Verbatim replay: the raw item carries its own member
+                # spelling — never inject the OTHER member alongside (hybrid
+                # input+arguments shapes 400 upstream).
                 payload.update(
                     {
                         "type": "custom_tool_call",

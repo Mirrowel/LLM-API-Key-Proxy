@@ -138,8 +138,12 @@ class GeminiProtocol(ProtocolAdapter):
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
         payload: dict[str, Any] = {
             "contents": [
-                self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_request.warnings)
-                for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)))
+                formatted
+                for formatted in (
+                    self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_request.warnings)
+                    for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)))
+                )
+                if formatted is not None
             ],
         }
         # NOTE: GenerateContentRequest has NO model field (the model rides
@@ -372,7 +376,9 @@ class GeminiProtocol(ProtocolAdapter):
         for index, message in enumerate(kept_messages):
             candidate: dict[str, Any] = {"index": message.index if message.index is not None else index}
             if message.content or message.reasoning or message.tool_calls:
-                candidate["content"] = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_response.warnings)
+                formatted_candidate = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_response.warnings)
+                if formatted_candidate is not None:
+                    candidate["content"] = formatted_candidate
             per_candidate_reason = message.stop_reason or unified_response.stop_reason
             if per_candidate_reason:
                 candidate["finishReason"] = format_stop_reason(per_candidate_reason, self.name)
@@ -516,6 +522,12 @@ class GeminiProtocol(ProtocolAdapter):
             emit_opaque_state=emit_opaque_state,
             warnings=warnings,
         )
+        if not parts and not preserve_source:
+            # Every representable part dropped (e.g. file_id-only media):
+            # contents entries require a non-empty parts array — omit the
+            # whole content instead of emitting an illegal empty one (the
+            # drop itself is already disclosed per-part).
+            return None
         payload = {"role": role, "parts": parts}
         if preserve_source:
             payload.update(
@@ -1212,6 +1224,19 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings
         # URL/fileId-only media: fileUri is the wire member (external HTTPS
         # included; fileId is not a documented FileData member — it stays in
         # canonical identity for chat-side file_id mapping, never emitted).
+        if source.file_id and source.url:
+            # Both identities: the canonical file_id is discarded on the
+            # wire (undocumented member) — disclosed, never silent.
+            if warnings is not None and not any(w.code == "fileId_dropped" for w in warnings):
+                warnings.append(
+                    ConversionWarning(
+                        code="fileId_dropped",
+                        message="fileId has no documented Gemini FileData member; dropped (the fileUri carries the identity)",
+                        field="content[media]",
+                        source_protocol=None,
+                        target_protocol="gemini",
+                    )
+                )
         file_data: dict[str, Any] = {"fileUri": source.url or ""}
         if not file_data["fileUri"] and not source.data:
             # Nothing representable: an empty fileUri is an illegal shape —

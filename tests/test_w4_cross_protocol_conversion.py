@@ -52,6 +52,41 @@ def _summary_codes(payload: dict) -> list[str]:
 # D7 recorded summaries (defect 7's consumer half)
 
 
+def test_validated_tool_choice_never_leaks_onto_foreign_wires() -> None:
+    """Gemini-exclusive VALIDATED approximates to auto on chat/responses
+    wires (disclosed by the narrowing warning), round-trips natively at
+    the gemini target."""
+    from rotator_library.protocols.canonical import format_tool_choice
+
+    assert format_tool_choice({"mode": "validated"}, "openai_chat") == "auto"
+    assert format_tool_choice({"mode": "validated"}, "responses") == "auto"
+    assert format_tool_choice({"mode": "validated"}, "anthropic_messages") == {"type": "auto"}
+    assert format_tool_choice({"mode": "validated"}, "gemini") == {"functionCallingConfig": {"mode": "VALIDATED"}}
+
+
+def test_custom_tool_output_replays_cross_protocol() -> None:
+    """A Responses conversation that used a custom tool replays to any
+    provider: custom_tool_call_output parses into the canonical ToolResult
+    home instead of hard-rejecting."""
+    import json as _json
+
+    responses = get_protocol("responses")
+    chat = get_protocol("openai_chat")
+    parsed = responses.parse_request(
+        {
+            "model": "m",
+            "input": [
+                {"type": "custom_tool_call", "call_id": "c1", "name": "extract", "input": "RAW"},
+                {"type": "custom_tool_call_output", "call_id": "c1", "output": "done"},
+            ],
+        }
+    )
+    built = chat.build_request(parsed, _ctx("responses", "openai_chat"))
+    joined = _json.dumps(built.get("messages", []))
+    assert '"extract"' in joined
+    assert "done" in joined
+
+
 def test_unsupported_control_surfaces_in_response_summary() -> None:
     built, unified = _build("anthropic_messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}], "seed": 42}, source="openai_chat")
     assert "seed" not in built

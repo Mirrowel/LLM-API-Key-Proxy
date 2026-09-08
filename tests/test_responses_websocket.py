@@ -311,6 +311,71 @@ async def test_previous_response_not_found_maps_to_spec_frame_with_param_and_evi
 
 
 @pytest.mark.asyncio
+async def test_store_failed_policy_covers_all_four_cells() -> None:
+    """The failed-turn policy gates the global store AND the ZDR local
+    cache — the store=false x store_failed=false cell is the flagship
+    WebSocket configuration and must MISS on a chained failed id."""
+
+    from rotator_library.responses.types import ResponsesStoreSettings
+
+    async def run_cell(store: bool, store_failed: bool):
+        fail_next = {"state": True}
+
+        class CellClient:
+            async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
+                if fail_next["state"]:
+                    fail_next["state"] = False
+
+                    async def failing():
+                        yield 'event: response.failed\ndata: {"type":"response.failed","response":{"id":"resp_cell","object":"response","status":"failed","model":"m","output":[],"error":{"message":"boom"}}}\n\n'
+
+                    return failing()
+
+                async def ok():
+                    yield 'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_cell2","object":"response","status":"completed","model":"m","output":[]}}\n\n'
+
+                return ok()
+
+        service = ResponsesService(
+            store=InMemoryResponsesStore(),
+            store_settings=ResponsesStoreSettings(store_failed=store_failed),
+        )
+        session = ResponsesWebSocketSession(service=service, client=CellClient())
+        await _collect(
+            session.handle_frame(json.dumps({"type": "response.create", "model": "m", "store": store}))
+        )
+        failed_cached = any(stored.id == "resp_cell" for stored in session.local_cache.values())
+        frames = await _collect(
+            session.handle_frame(
+                json.dumps({"type": "response.create", "model": "m", "store": store, "previous_response_id": "resp_cell"})
+            )
+        )
+        return failed_cached, frames
+
+    # store=false, store_failed=False: the ZDR flagship — failed ids never
+    # cached anywhere; the chained turn MISSES.
+    failed_cached, frames = await run_cell(False, False)
+    assert failed_cached is False
+    assert frames[-1]["type"] == "error"
+
+    # store=false, store_failed=True: local cache keeps the failed id (ZDR
+    # chains continue past failures).
+    failed_cached, frames = await run_cell(False, True)
+    assert failed_cached is True
+    assert frames[-1]["type"] != "error"
+
+    # store=true, store_failed=False: no store, no local cache — miss.
+    failed_cached, frames = await run_cell(True, False)
+    assert failed_cached is False
+    assert frames[-1]["type"] == "error"
+
+    # store=true, store_failed=True: stored (global), chainable.
+    failed_cached, frames = await run_cell(True, True)
+    assert failed_cached is True
+    assert frames[-1]["type"] != "error"
+
+
+@pytest.mark.asyncio
 async def test_failed_turn_evicts_referenced_parent() -> None:
     service = FakeService(
         events=[

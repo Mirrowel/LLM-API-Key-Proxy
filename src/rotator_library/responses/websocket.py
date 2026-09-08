@@ -351,7 +351,8 @@ class ResponsesWebSocketSession:
         self._lanes: dict[str, LaneState] = {}
         self.local_cache: MutableMapping[str, StoredResponse] = _LocalResponsesCache()
         self._formatter = ResponsesWebSocketFormatter()
-        self._sequence = 0
+        # NOTE: locally synthesized frames draw sequence numbers from the
+        # shared module domain (see _next_sequence) — no session counter.
 
     @property
     def lanes(self) -> dict[str, LaneState]:

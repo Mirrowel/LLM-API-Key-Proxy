@@ -742,7 +742,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 call = tool_calls[0]
                 extra["function_call"] = {"name": call.name or "", "arguments": tool_arguments_text(call.arguments)}
             else:
-                payload["tool_calls"] = [self._format_tool_call(call, preserve_source=preserve_source) for call in tool_calls]
+                payload["tool_calls"] = [self._format_tool_call(call, preserve_source=preserve_source, warnings=warnings) for call in tool_calls]
         if message.reasoning and (
             preserve_source
             or direction == "response"
@@ -1030,8 +1030,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
             extra={**_without(function, {"name", "arguments"}), **_without(payload, {"id", "function", "type", "index", "name"})},
         )
 
-    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool = True) -> dict[str, Any]:
-        if call.type == "custom":
+    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool = True, warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
+        if call.type in {"custom", "custom_tool_call"}:
+            # Responses custom_tool_call maps onto Chat's native custom
+            # envelope — the narrowing is disclosed, never silent (the
+            # provider pairs custom calls with custom outputs differently).
+            if call.type == "custom_tool_call" and warnings is not None:
+                _warn_once(
+                    warnings,
+                    code="custom_tool_narrowed",
+                    message="custom tool call maps onto Chat's custom envelope (native custom_tool_call spelling is Responses-only)",
+                    field="tool_calls",
+                )
             payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
             payload["type"] = "custom"
             if call.id:

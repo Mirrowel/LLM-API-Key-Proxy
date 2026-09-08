@@ -1505,6 +1505,12 @@ class ResponsesService:
         local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
     ) -> bool:
         build_and_cache = local_cache is not None
+        # Failed turns honor the store_failed policy FIRST — on the global
+        # store AND the connection-local cache, including store=false (ZDR)
+        # turns: caching a failed id anywhere would let a chained turn
+        # "succeed" against empty lineage instead of missing.
+        if failed and not self.store_settings.store_failed:
+            return False
         if not raw_request.get("store", True):
             if build_and_cache:
                 # WebSocket mode: store=false turns still land in the
@@ -1513,11 +1519,6 @@ class ResponsesService:
                 # resolves for ZDR-style chains.
                 stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
                 local_cache[stored.id] = stored
-            return False
-        if failed and not self.store_settings.store_failed:
-            # Failed turns honor the store_failed policy on the local cache
-            # too — caching a failed id locally would let a chained turn
-            # "succeed" against empty output instead of missing.
             return False
         stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
         try:

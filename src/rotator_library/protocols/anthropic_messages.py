@@ -738,7 +738,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
                     payload.update(deepcopy(block.reasoning.extra))
                 formatted.append(payload)
             elif block.tool_call:
-                formatted.append(self._format_tool_call(block.tool_call, preserve_source=preserve_source))
+                formatted.append(self._format_tool_call(block.tool_call, preserve_source=preserve_source, warnings=warnings))
             elif block.tool_result:
                 formatted.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source))
             elif block.type in {"image", "document"}:
@@ -789,7 +789,16 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             payload.update(deepcopy(tool.extra))
         return payload
 
-    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool) -> dict[str, Any]:
+    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
+        if call.type in {"custom", "custom_tool_call"} and warnings is not None and not preserve_source:
+            # Custom tool calls narrow to plain tool_use cross-protocol —
+            # disclosed (the provider pairs custom outputs differently).
+            _warn_list_once(
+                warnings,
+                code="custom_tool_narrowed",
+                message="custom tool call narrows to a plain tool_use block (custom calling is Chat/Responses-only)",
+                field="tool_calls",
+            )
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
         payload.update({"type": "tool_use", "id": call.id or "", "name": call.name or "", "input": tool_arguments_object(call.arguments)})
         return payload
