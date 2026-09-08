@@ -52,7 +52,12 @@ def validate_generative_request(
     # Cross-protocol extension fields have no foreign representation by
     # definition (each target replays only its own extensions verbatim):
     # every extra key dropping at a foreign target is disclosed (D7).
+    # Exception: keys the TARGET's own build warns about richer (Gemini
+    # bound envelope fields) — one disclosure per fact, never two.
+    gemini_bound_keys = {"cachedContent", "labels", "serviceTier", "store"}
     for extra_key in sorted(request.extra):
+        if target_protocol == "gemini" and extra_key in gemini_bound_keys:
+            continue
         add_conversion_warning(
             request,
             code="unsupported_optional_control",
@@ -202,6 +207,19 @@ def validate_generative_request(
                 pass_name="validate_request",
                 payload={"group": group_name, "content_index": block_index, "content_type": block.type},
             )
+    choice = request.generation_params.get("tool_choice") if isinstance(request.generation_params, dict) else None
+    if (
+        isinstance(choice, dict)
+        and choice.get("mode") == "validated"
+        and target_protocol != "gemini"
+    ):
+        add_conversion_warning(
+            request,
+            code="unsupported_optional_control",
+            message="Gemini VALIDATED tool-choice mode (schema-adherence enforcement) has no cross-protocol representation; approximated as auto",
+            field="tool_choice",
+            target_protocol=target_protocol,
+        )
     # Tool types each destination understands (custom tools are a Chat-native
     # variant; server/hosted tools are Anthropic-native — their identity is
     # the versioned type and no cross-protocol mapping exists).
@@ -247,6 +265,11 @@ def validate_generative_request(
                         "urlContext",
                         "url_context",
                         "googleMaps",
+                        "google_maps",
+                        "fileSearch",
+                        "file_search",
+                        "googleSearchRetrieval",
+                        "google_search_retrieval",
                     )
                 ):
                     raise ProtocolError(

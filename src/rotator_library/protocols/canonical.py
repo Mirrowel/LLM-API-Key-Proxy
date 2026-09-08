@@ -643,14 +643,19 @@ def format_reasoning_controls(
             thinking_config["thinkingBudget"] = budget
         elif effort is not None:
             value, coerced = _effort_or_approximation()
-            approximated = budget_tokens_from_effort(value)
-            thinking_config["thinkingBudget"] = approximated
-            if not coerced:
-                _warn(
-                    "reasoning_effort_approximated",
-                    f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
-                    "reasoning.effort",
-                )
+            if str(value).lower() in {"minimal", "low", "medium", "high"}:
+                # thinkingLevel is the native lever — in-vocabulary efforts
+                # map EXACTLY (no budget approximation needed).
+                thinking_config["thinkingLevel"] = str(value).upper()
+            else:
+                approximated = budget_tokens_from_effort(value)
+                thinking_config["thinkingBudget"] = approximated
+                if not coerced:
+                    _warn(
+                        "reasoning_effort_approximated",
+                        f"reasoning effort '{effort}' approximated as thinkingBudget={approximated} (deterministic table)",
+                        "reasoning.effort",
+                    )
         elif enabled is True and normalized.get("dynamic") is True:
             # Gemini dynamic thinking (thinkingBudget: -1): the model decides.
             thinking_config["thinkingBudget"] = -1
@@ -740,6 +745,14 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
             "stop_details_dropped",
             "refusal stop_details (category/explanation) has no representation outside Anthropic; only the refusal stop survives",
             "stop_details",
+        )
+    if stop_reason == "incomplete" and target_protocol == "gemini":
+        # Canonical incomplete maps to Gemini MAX_TOKENS — an approximation
+        # (other incomplete causes collapse to the token-budget reading).
+        _disclose(
+            "stop_reason_approximated",
+            "incomplete stop approximated as Gemini MAX_TOKENS (token-budget reading)",
+            "stop_reason",
         )
     usage = getattr(unified_response, "usage", None)
     usage_extra = getattr(usage, "extra", None) if usage is not None else None
@@ -965,6 +978,9 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
     if target_protocol == "gemini":
         if mode == "none":
             config: dict[str, Any] = {"mode": "NONE"}
+        elif mode == "validated":
+            # Native mode: schema-adherence enforcement round-trips exactly.
+            config = {"mode": "VALIDATED"}
         elif mode == "required":
             config = {"mode": "ANY"}
             if allowed_names:
@@ -977,6 +993,10 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
                 # AUTO within an allowlist is a legal Gemini shape.
                 config["allowedFunctionNames"] = allowed_names
         return {"functionCallingConfig": config}
+    if mode == "validated":
+        # Gemini-native VALIDATED mode approximates to AUTO elsewhere — a
+        # schema-adherence guarantee the other protocols cannot express.
+        return "auto"
     return deepcopy(value)
 
 

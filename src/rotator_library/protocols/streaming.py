@@ -104,6 +104,7 @@ class StreamFormatState:
     tool_names: dict[str, str] = field(default_factory=dict)
     tool_ids: dict[str, str] = field(default_factory=dict)
     tool_signatures: dict[str, str] = field(default_factory=dict)
+    tool_occurrences: dict[str, int] = field(default_factory=dict)
     source_protocol: str | None = None
     emitted_tools: set[str] = field(default_factory=set)
     # Block-identity bookkeeping (defect 8): events that carry explicit
@@ -514,7 +515,20 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         return [_data_frame({"error": _error_payload(event.error)})]
 
     parts: list[dict[str, Any]] = []
-    for block in _client_visible_blocks(event):
+    for block in _client_visible_blocks(event, include_builtins=True):
+        if block.type == "builtin_tool" and not (
+            isinstance(block.raw, dict)
+            and any(k in block.raw for k in ("executableCode", "codeExecutionResult", "toolCall", "toolResponse"))
+        ):
+            # Foreign-shaped builtin records (no Gemini part home) drop
+            # disclosed — never silently, never fabricated.
+            _stream_warn(
+                state,
+                "builtin_tool_output_dropped",
+                f"builtin tool record ({getattr(getattr(block, 'builtin_tool', None), 'kind', '') or 'unknown'}) has no Gemini stream part; omitted",
+                "content",
+            )
+            continue
         if block.tool_call:
             key, _ = _block_key(block, state, event)
             call = block.tool_call
@@ -572,14 +586,14 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             # Media parts stream as inlineData/fileData exactly like the
             # non-stream path — never silently dropped.
             source = getattr(block, "source", None)
-            media_part = _gemini_media_part(block, source)
+            media_part = _gemini_media_part(block, source, state=state)
             if media_part is not None:
                 parts.append(media_part)
         elif block.type == "builtin_tool":
             # Native union members (executableCode, server toolCall, ...)
-            # replay their raw part verbatim on the stream.
-            if isinstance(block.raw, dict) and any(k in block.raw for k in ("executableCode", "codeExecutionResult", "toolCall", "toolResponse")):
-                parts.append(deepcopy(block.raw))
+            # replay their raw part verbatim on the stream (foreign shapes
+            # were filtered + disclosed at the loop top).
+            parts.append(deepcopy(block.raw))
 
     if _is_terminal(event):
         for key in state.tool_names:
@@ -602,12 +616,16 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
     if event.stop_reason or event.extra.get("stop_reason"):
         state.stop_reason = str(event.stop_reason or event.extra.get("stop_reason"))
         finish_reason = format_stop_reason(state.stop_reason, "gemini")
-    if finish_reason and state.completion_emitted:
+    candidate_index = event.output_index or 0
+    if finish_reason and (state.completion_emitted or candidate_index in state.finished_choices):
         # Duplicate completion (e.g. synthetic terminal after a finish frame):
-        # never re-emit the finish reason.
+        # never re-emit the finish reason. Per-candidate: multi-candidate
+        # streams finish each index exactly once (the stream-global flag
+        # stays for usage framing).
         finish_reason = None
-    if parts or finish_reason or event.usage is not None:
-        candidate: dict[str, Any] = {"index": event.output_index or 0}
+    usage_ready = event.usage is not None and not state.completion_emitted
+    if parts or finish_reason or usage_ready:
+        candidate: dict[str, Any] = {"index": candidate_index}
         if parts:
             candidate["content"] = {"role": "model", "parts": parts}
         if finish_reason:
@@ -620,7 +638,17 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             payload["usageMetadata"] = usage
         frames.append(_data_frame(payload))
         if finish_reason:
+            state.finished_choices.add(candidate_index)
             state.completion_emitted = True
+    elif event.usage is not None and state.completion_emitted and not parts and not finish_reason:
+        # Terminal usage after the last finish frame: a usage-only chunk —
+        # never an empty-candidate husk (undocumented shape).
+        usage = _gemini_usage(state.usage or event.usage)
+        if usage:
+            payload = {"usageMetadata": usage}
+            if state.model:
+                payload["modelVersion"] = state.model
+            frames.append(_data_frame(payload))
     if _is_terminal(event):
         state.terminal = True
     return frames
@@ -649,7 +677,7 @@ def _gemini_function_call_part(
     return {"functionCall": function_call}
 
 
-def _gemini_media_part(block: Any, source: Any) -> dict[str, Any] | None:
+def _gemini_media_part(block: Any, source: Any, state: "StreamFormatState | None" = None) -> dict[str, Any] | None:
     """Render a canonical media block as a Gemini inlineData/fileData part."""
 
     if source is None:
@@ -661,17 +689,27 @@ def _gemini_media_part(block: Any, source: Any) -> dict[str, Any] | None:
             # Fabricating a mimeType the source never declared is a guess —
             # plain data without mime never reaches the wire (Gemini requires
             # a concrete inlineData.mimeType).
+            if state is not None:
+                _stream_warn(
+                    state,
+                    "media_dropped",
+                    "media without a declared mimeType has no Gemini inlineData shape; dropped",
+                    "content",
+                )
             return None
         return {"inlineData": {"mimeType": mime, "data": data}}
     file_uri = getattr(source, "file_uri", None) or getattr(source, "url", None)
-    file_id = getattr(source, "file_id", None)
-    if file_uri or file_id:
-        file_data: dict[str, Any] = {}
-        if file_uri:
-            file_data["fileUri"] = file_uri
-        if file_id:
-            file_data["fileId"] = file_id
-        return {"fileData": file_data}
+    if file_uri:
+        # fileUri is the wire member (external HTTPS included, ≤100MB fetch);
+        # file_id is an OpenAI-side identity with no Gemini spelling.
+        return {"fileData": {"fileUri": file_uri}}
+    if state is not None:
+        _stream_warn(
+            state,
+            "media_dropped",
+            "media without inline data or a fileUri has no Gemini part shape; dropped",
+            "content",
+        )
     return None
 
 
@@ -738,6 +776,12 @@ def _block_key(block: ContentBlock, state: StreamFormatState, event: UnifiedStre
     if block.tool_call:
         call = block.tool_call
         identity = call.index if call.index is not None else call.id or call.name or "default"
+        # Same-name parallel calls (id-less, index-less — legal on Gemini):
+        # a per-event occurrence counter separates them so the second call
+        # never collides with the first (which hard-fails argument merges).
+        occurrence = state.tool_occurrences.get(identity, 0)
+        state.tool_occurrences[identity] = occurrence + 1
+        identity = f"{identity}#{occurrence}" if call.index is None and call.id is None else identity
         # Tool blocks also advance the family sequence so a following text
         # block reopens as a new block instead of merging with the earlier one.
         state.last_family = "tool"

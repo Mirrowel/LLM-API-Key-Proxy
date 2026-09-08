@@ -206,6 +206,17 @@ class GeminiProtocol(ProtocolAdapter):
         # fast-path replays and extension leakage).
         payload.pop("model", None)
         payload.pop("stream", None)
+        if unified_request.operation == OPERATION_COUNT_TOKENS:
+            # CountTokensRequest = {contents, generateContentRequest}: the
+            # generate-only members (tools, toolConfig, safetySettings,
+            # generationConfig, systemInstruction) ride the nested envelope
+            # — never the count body top level.
+            nested_keys = ("tools", "toolConfig", "safetySettings", "generationConfig", "systemInstruction")
+            nested = {key: payload.pop(key) for key in nested_keys if key in payload}
+            return {
+                "contents": payload.get("contents", []),
+                "generateContentRequest": nested,
+            }
         return payload
 
     def _attach_grounding_annotations(self, message: UnifiedMessage, candidate: dict[str, Any]) -> None:
@@ -419,10 +430,14 @@ class GeminiProtocol(ProtocolAdapter):
                     native_type="gemini.chunk",
                     delta=message,
                     usage=response.usage if position == 0 else None,
-                    stop_reason=(response.stop_reason if position == 0 else message.stop_reason),
+                    # Per-candidate finish only: response.stop_reason derives
+                    # from the LAST finished candidate — leaking it onto
+                    # unfinished siblings prematurely closes them in every
+                    # client target.
+                    stop_reason=message.stop_reason,
                     output_index=message.index if message.index is not None else position,
                     raw=deepcopy(raw_event),
-                    extra={"payload": data, "finish_reason": response.stop_reason if position == 0 else message.stop_reason},
+                    extra={"payload": data, "finish_reason": message.stop_reason},
                 )
             )
         return events
@@ -659,8 +674,28 @@ class GeminiProtocol(ProtocolAdapter):
         for container_index, tool in enumerate(tools):
             payload = dict(tool or {})
             # Hosted Gemini tools (googleSearch, codeExecution, urlContext,
-            # ...): identity is the single-key envelope; no declarations.
-            hosted_key = next((k for k in ("googleSearch", "google_search", "codeExecution", "code_execution", "urlContext", "url_context", "googleMaps") if k in payload), None)
+            # fileSearch, googleSearchRetrieval, ...): identity is the
+            # single-key envelope; no declarations.
+            hosted_key = next(
+                (
+                    k
+                    for k in (
+                        "googleSearch",
+                        "google_search",
+                        "codeExecution",
+                        "code_execution",
+                        "urlContext",
+                        "url_context",
+                        "googleMaps",
+                        "fileSearch",
+                        "file_search",
+                        "googleSearchRetrieval",
+                        "google_search_retrieval",
+                    )
+                    if k in payload
+                ),
+                None,
+            )
             if hosted_key and not payload.get("functionDeclarations"):
                 parsed.append(
                     ToolDefinition(
@@ -716,11 +751,26 @@ class GeminiProtocol(ProtocolAdapter):
                 else:
                     ungrouped.append({hosted_kind: {}})
                 continue
-            server_type = tool.extra.get("server_tool_type")
-            if (server_type and str(server_type).startswith("web_search")) or tool.type == "web_search":
-                # Cross-protocol hosted web search maps onto googleSearch
-                # (Anthropic web_search_* and Responses web_search alike).
-                ungrouped.append({"googleSearch": {}})
+            server_type = str(tool.extra.get("server_tool_type") or "")
+            # Cross-protocol hosted tools map onto their Gemini native
+            # envelopes — NEVER fabricated as functionDeclarations (the
+            # model would call a function the client never declared and
+            # the hosted tool never executes).
+            hosted_map = {
+                "web_search": "googleSearch",
+                "googlesearch": "googleSearch",
+                "code_execution": "codeExecution",
+                "url_context": "urlContext",
+                "google_maps": "googleMaps",
+                "file_search": "fileSearch",
+            }
+            mapped_envelope = None
+            for prefix, native in hosted_map.items():
+                if server_type.startswith(prefix) or (tool.type == "web_search" and native == "googleSearch"):
+                    mapped_envelope = native
+                    break
+            if mapped_envelope:
+                ungrouped.append({mapped_envelope: {}})
                 continue
             raw_container = tool.extra.get("raw_container")
             container_index = tool.extra.get("container_index")
@@ -820,6 +870,29 @@ class GeminiProtocol(ProtocolAdapter):
         for canonical, wire in mapping.items():
             if canonical in params:
                 generation[wire] = params.pop(canonical)
+        thinking_config = generation.get("thinkingConfig") or generation.get("thinking_config")
+        if preserve_source and isinstance(thinking_config, dict) and "thinkingBudget" in thinking_config and "thinkingLevel" in thinking_config:
+            # Same-protocol verbatim replay of a documented-illegal pair:
+            # warn without rewriting (the provider's own 400 is clearer
+            # than a silent mutation of the client's shape).
+            add_conversion_warning(
+                request,
+                code="reasoning_control_conflict",
+                message="thinkingConfig carries both thinkingBudget and thinkingLevel; the API rejects the pair (replayed verbatim — the provider will arbitrate)",
+                field="generationConfig.thinkingConfig",
+                target_protocol=self.name,
+            )
+        tool_config_raw = generation.get("toolConfig") or generation.get("tool_config")
+        if preserve_source and isinstance(tool_config_raw, dict) and isinstance(tool_config_raw.get("retrievalConfig"), dict):
+            # Vertex-only retrieval config riding a verbatim replay: no
+            # canonical home — disclosed so the loss is visible on rebuild.
+            add_conversion_warning(
+                request,
+                code="unsupported_optional_control",
+                message="toolConfig.retrievalConfig has no canonical representation; kept verbatim on the same-protocol path only",
+                field="toolConfig.retrievalConfig",
+                target_protocol=self.name,
+            )
         structured = params.pop("structured_output", None)
         if isinstance(structured, dict) and not preserve_source:
             # Same-protocol keeps generationConfig verbatim from extensions
@@ -835,16 +908,6 @@ class GeminiProtocol(ProtocolAdapter):
                 )
             formatted_structure = format_structured_output(structured, self.name)
             if formatted_structure is not None:
-                if preserve_source and "responseMimeType" in generation and generation["responseMimeType"] != "application/json":
-                    # D4 identity: text/x.enum (or any non-JSON mime the
-                    # client chose alongside a schema) survives verbatim —
-                    # the canonical rebuild must not fold it to JSON.
-                    formatted_structure.pop("responseMimeType", None)
-                if preserve_source and "responseSchema" in generation:
-                    # D4 identity: the original schema-key spelling survives
-                    # verbatim — the rebuild's responseJsonSchema never
-                    # swaps keys on the client's own wire.
-                    formatted_structure.pop("responseJsonSchema", None)
                 generation.update(
                     {
                         key: value
@@ -990,6 +1053,17 @@ def _parse_gemini_generation_params(generation: dict[str, Any], tool_config: dic
             params[canonical] = deepcopy(generation[wire])
     response_mime = generation.get("responseMimeType")
     has_schema = generation.get("responseJsonSchema") is not None or generation.get("responseSchema") is not None
+    # responseFormat (the newer structured-output envelope) parses alongside
+    # the classic keys — the schema/mime inside it carry the same semantics.
+    response_format = generation.get("responseFormat")
+    if isinstance(response_format, dict) and isinstance(response_format.get("text"), dict):
+        text_cfg = response_format["text"]
+        if response_mime is None and isinstance(text_cfg.get("mimeType"), str):
+            response_mime = text_cfg["mimeType"]
+        if not has_schema and isinstance(text_cfg.get("schema"), dict):
+            generation = dict(generation)
+            generation["responseSchema"] = text_cfg["schema"]
+            has_schema = True
     if has_schema or (isinstance(response_mime, str) and response_mime == "application/json"):
         # ONLY application/json means structured output (text/x.enum and
         # text/plain are distinct modes, never folded into JSON).
@@ -1022,14 +1096,13 @@ def _parse_gemini_generation_params(generation: dict[str, Any], tool_config: dic
                 "include_thoughts": thinking.get("includeThoughts"),
             }
         # thinkingLevel is a thinkingConfig member (Gemini-3 effort lever:
-        # minimal/low/medium/high, or the "dynamic" string form).
+        # minimal/low/medium/high — the documented vocabulary only; level
+        # strings always map to effort, NEVER to the dynamic mode flag
+        # (dynamic is thinkingBudget:-1's semantic alone).
         level = thinking.get("thinkingLevel") or thinking.get("thinking_level")
         if isinstance(level, str) and level.strip():
             normalized_level = level.strip().lower()
-            if normalized_level == "dynamic":
-                params["reasoning"] = {"enabled": True, "dynamic": True, **params["reasoning"]}
-            else:
-                params["reasoning"] = {"effort": normalized_level, **params["reasoning"]}
+            params["reasoning"] = {"effort": normalized_level, **params["reasoning"]}
         params["reasoning"] = {k: v for k, v in params["reasoning"].items() if v is not None}
     if tool_config:
         params["tool_choice"] = _parse_gemini_tool_choice(tool_config)
@@ -1046,6 +1119,10 @@ def _parse_gemini_tool_choice(tool_config: dict[str, Any]) -> Any:
     names = deepcopy(config.get("allowedFunctionNames") or config.get("allowed_function_names") or [])
     if mode == "none":
         return {"mode": "none"}
+    if mode == "validated":
+        # Documented distinct mode (schema-adherence enforcement); a silent
+        # downgrade to AUTO would lose the guarantee the client asked for.
+        return {"mode": "validated"}
     if mode == "any" and len(names) == 1:
         return {"mode": "named", "name": names[0]}
     if mode == "any":
@@ -1114,7 +1191,9 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings
         else:
             # inlineData.mimeType is required: mime-less inline data drops
             # with a recorded warning rather than an invented type.
-            if warnings is not None:
+            if warnings is not None and not any(
+                w.code == "media_dropped" and w.message == "inline media without a mimeType has no Gemini representation; dropped" for w in warnings
+            ):
                 warnings.append(
                     ConversionWarning(
                         code="media_dropped",
@@ -1126,14 +1205,13 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings
                 )
             return None
     else:
-        # URL/fileId-only media: fileData carries what exists — a missing
-        # mimeType key is legal (the API resolves it), an invented
-        # octet-stream is not a declaration the source made.
-        file_data: dict[str, Any] = {"fileUri": source.url or source.file_id or ""}
-        if source.url and source.file_id and source.file_id != source.url:
-            # Both identities present on the source: fileId rides alongside
-            # fileUri verbatim (same-protocol identity for File API refs).
-            file_data["fileId"] = source.file_id
+        # URL/fileId-only media: fileUri is the wire member (external HTTPS
+        # included; fileId is not a documented FileData member — it stays in
+        # canonical identity for chat-side file_id mapping, never emitted).
+        file_data: dict[str, Any] = {"fileUri": source.url or ""}
+        if not file_data["fileUri"] and not source.data:
+            # Nothing representable: an empty fileUri is an illegal shape.
+            return None
         if source.media_type:
             file_data["mimeType"] = source.media_type
         payload["fileData"] = file_data

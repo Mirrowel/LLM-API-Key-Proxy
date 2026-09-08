@@ -137,8 +137,10 @@ def test_effort_to_gemini_budget_with_warning() -> None:
         {"model": "g", "contents": [{"role": "user", "parts": [{"text": "hi"}]}], "reasoning_effort": "high"},
         source="openai_chat",
     )
-    assert built["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 16384
-    assert "reasoning_effort_approximated" in _warnings_of(unified)
+    # In-vocabulary efforts map to the EXACT native lever (thinkingLevel),
+    # not a budget approximation.
+    assert built["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH"
+    assert "reasoning_effort_approximated" not in _warnings_of(unified)
 
 
 def test_direct_effort_mapping_emits_no_approximation_warning() -> None:
@@ -752,7 +754,9 @@ def test_effort_and_budget_both_disclosure_of_discarded_budget() -> None:
         "reasoning": {"effort": "high", "budget_tokens": 2048, "summary": "auto"},
     }
     built, unified = _build("gemini", payload, source="responses")
-    assert built["generationConfig"]["thinkingConfig"]["thinkingBudget"] == 16384
+    # Effort wins via the exact native lever; the client budget is
+    # discarded with disclosure.
+    assert built["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH"
     assert "reasoning_control_dropped" in _warnings_of(unified)
 
 
