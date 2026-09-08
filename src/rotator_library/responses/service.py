@@ -651,10 +651,10 @@ class ResponsesService:
         # provider-emitted terminal frames on the same stream. Event mode
         # (WebSocket) yields the neutral event — no [DONE] sentinel exists
         # on that transport; the terminal response.failed closes the turn.
-        # Every event carries a monotonic sequence_number — synthesized
-        # failure frames included.
-        failed.setdefault("sequence_number", next_sequence_value())
+        # The event frame (not the nested response object) carries the
+        # monotonic sequence_number per the streaming-events reference.
         failed_event = ResponsesStreamEvent("response.failed", {"type": "response.failed", "response": failed})
+        failed_event.payload["sequence_number"] = next_sequence_value()
         if as_events:
             yield failed_event
             return

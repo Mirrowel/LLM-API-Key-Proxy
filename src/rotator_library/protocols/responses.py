@@ -876,10 +876,21 @@ class ResponsesProtocol(ProtocolAdapter):
 
     def _format_function_call(self, call: ToolCall, *, preserve_source: bool) -> dict[str, Any]:
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
-        if call.type == "custom":
+        if call.type in {"custom", "custom_tool_call"}:
             # Custom tool calls keep their native spelling (input, not
             # arguments) — coercing to function_call would change how the
             # provider pairs the call with its custom_tool_output.
+            if preserve_source and "input" in payload:
+                # Verbatim replay: never inject arguments alongside the
+                # client's own input member (hybrid shapes 400 upstream).
+                payload.update(
+                    {
+                        "type": "custom_tool_call",
+                        "call_id": call.id or payload.get("call_id") or "",
+                        "name": call.name or payload.get("name") or "",
+                    }
+                )
+                return payload
             payload.update(
                 {
                     "type": "custom_tool_call",

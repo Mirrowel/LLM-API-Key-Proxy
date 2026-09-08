@@ -271,6 +271,34 @@ async def test_cross_protocol_never_uses_raw_basis() -> None:
     assert "messages" in transport.payload or "system" in transport.payload
 
 
+def test_custom_tool_call_replays_verbatim_and_keeps_native_spelling() -> None:
+    responses = get_protocol("responses")
+    request = {
+        "model": "model-a",
+        "input": [
+            {"role": "user", "content": "hi"},
+            {"type": "custom_tool_call", "id": "ctc_0", "call_id": "call_9", "name": "extract", "input": "RAW-INPUT", "status": "completed"},
+            {"type": "custom_tool_output", "call_id": "call_9", "output": "done"},
+        ],
+    }
+    parsed = responses.parse_request(request)
+    ctx = ProtocolContext(
+        source_protocol="responses",
+        target_protocol="responses",
+        input_protocol="responses",
+        client_protocol="responses",
+    )
+    built = responses.build_request(parsed, ctx)
+    calls = [item for item in built["input"] if str(item.get("type", "")).endswith("tool_call")]
+    assert calls, "custom tool call must survive the round trip"
+    call = calls[0]
+    # Verbatim identity: native spelling, native input member, and NEVER a
+    # hybrid function_call+input shape (strict-param 400 upstream).
+    assert call["type"] == "custom_tool_call"
+    assert call["input"] == "RAW-INPUT"
+    assert "arguments" not in call
+
+
 def test_encrypted_reasoning_survives_responses_round_trip() -> None:
     responses = get_protocol("responses")
     request = {

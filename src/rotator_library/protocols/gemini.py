@@ -755,18 +755,22 @@ class GeminiProtocol(ProtocolAdapter):
             # Cross-protocol hosted tools map onto their Gemini native
             # envelopes — NEVER fabricated as functionDeclarations (the
             # model would call a function the client never declared and
-            # the hosted tool never executes).
-            hosted_map = {
-                "web_search": "googleSearch",
-                "googlesearch": "googleSearch",
-                "code_execution": "codeExecution",
-                "url_context": "urlContext",
-                "google_maps": "googleMaps",
-                "file_search": "fileSearch",
-            }
+            # the hosted tool never executes). Matching normalizes case and
+            # underscores (validation admits both spellings); retrieval is
+            # ordered BEFORE search so the prefix never folds it.
+            normalized_server = server_type.lower().replace("_", "")
+            hosted_map = [
+                ("websearch", "googleSearch"),
+                ("googlesearchretrieval", "googleSearchRetrieval"),
+                ("googlesearch", "googleSearch"),
+                ("codeexecution", "codeExecution"),
+                ("urlcontext", "urlContext"),
+                ("googlemaps", "googleMaps"),
+                ("filesearch", "fileSearch"),
+            ]
             mapped_envelope = None
-            for prefix, native in hosted_map.items():
-                if server_type.startswith(prefix) or (tool.type == "web_search" and native == "googleSearch"):
+            for prefix, native in hosted_map:
+                if normalized_server.startswith(prefix) or (tool.type == "web_search" and native == "googleSearch"):
                     mapped_envelope = native
                     break
             if mapped_envelope:
@@ -882,8 +886,8 @@ class GeminiProtocol(ProtocolAdapter):
                 field="generationConfig.thinkingConfig",
                 target_protocol=self.name,
             )
-        tool_config_raw = generation.get("toolConfig") or generation.get("tool_config")
-        if preserve_source and isinstance(tool_config_raw, dict) and isinstance(tool_config_raw.get("retrievalConfig"), dict):
+        tool_config_replay = tool_config if isinstance(tool_config, dict) else None
+        if preserve_source and isinstance(tool_config_replay, dict) and isinstance(tool_config_replay.get("retrievalConfig"), dict):
             # Vertex-only retrieval config riding a verbatim replay: no
             # canonical home — disclosed so the loss is visible on rebuild.
             add_conversion_warning(
@@ -1210,7 +1214,20 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings
         # canonical identity for chat-side file_id mapping, never emitted).
         file_data: dict[str, Any] = {"fileUri": source.url or ""}
         if not file_data["fileUri"] and not source.data:
-            # Nothing representable: an empty fileUri is an illegal shape.
+            # Nothing representable: an empty fileUri is an illegal shape —
+            # disclosed, never a silent empty part.
+            if warnings is not None and not any(
+                w.code == "media_dropped" and w.message == "media without inline data or a fileUri has no Gemini part shape; dropped" for w in warnings
+            ):
+                warnings.append(
+                    ConversionWarning(
+                        code="media_dropped",
+                        message="media without inline data or a fileUri has no Gemini part shape; dropped",
+                        field="content[media]",
+                        source_protocol=None,
+                        target_protocol="gemini",
+                    )
+                )
             return None
         if source.media_type:
             file_data["mimeType"] = source.media_type

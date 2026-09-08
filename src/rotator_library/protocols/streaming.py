@@ -731,12 +731,17 @@ def _harvest_done_state(event: UnifiedStreamEvent, state: "StreamFormatState") -
     Real upstreams deliver ``encrypted_content`` (and tool signatures) only
     on ``output_item.done`` / terminal objects — the delta path never sees
     them. Harvest here so the synthesized done frames and the terminal
-    response object carry the bound opaque state (D8).
+    response object carry the bound opaque state (D8). Reads the event's
+    message DIRECTLY: the delta-skip filter returns empty for exactly
+    these events.
     """
 
+    message = event.delta or event.message
+    if message is None:
+        return
     encrypted_blocks = [
         block
-        for block in _client_visible_blocks(event, include_builtins=True)
+        for block in ordered_message_blocks(message)
         if block.reasoning and block.reasoning.encrypted_content
     ]
     if not encrypted_blocks:
@@ -754,6 +759,18 @@ def _harvest_done_state(event: UnifiedStreamEvent, state: "StreamFormatState") -
     for key, kind in state.item_kinds.items():
         if kind == "reasoning":
             state.reasoning_encrypted[key] = encrypted_blocks[0].reasoning.encrypted_content
+            return
+    # The item never streamed deltas (complete-on-arrival): register it now
+    # so the done frames + terminal object include it.
+    key = f"reasoning:{state.next_index}"
+    state.next_index += 1
+    item_id = raw_item_id if isinstance(raw_item_id, str) else _responses_item_id("reasoning", state.next_index)
+    state.item_ids[key] = item_id
+    state.item_kinds[key] = "reasoning"
+    state.reasoning_encrypted[key] = encrypted_blocks[0].reasoning.encrypted_content
+    for block in encrypted_blocks:
+        if block.reasoning and block.reasoning.text:
+            state.text_by_key[key] = (state.text_by_key.get(key, "") or "") + block.reasoning.text
             break
 
 

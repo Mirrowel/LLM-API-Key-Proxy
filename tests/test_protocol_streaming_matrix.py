@@ -141,6 +141,41 @@ def test_responses_failed_stream_is_an_error_in_every_alternate_output(output_pr
     assert "response.completed" not in output
 
 
+def test_responses_converter_harvests_encrypted_content_from_done_events() -> None:
+    from rotator_library.protocols.types import (
+        ContentBlock,
+        ReasoningBlock,
+        UnifiedMessage,
+        UnifiedStreamEvent,
+    )
+    from rotator_library.protocols.streaming import format_canonical_stream_event, stream_format_state
+
+    responses = get_protocol("responses")
+    ctx = ProtocolContext(
+        source_protocol="responses",
+        target_protocol="responses",
+        input_protocol="responses",
+        client_protocol="responses",
+    )
+    state = stream_format_state(ctx, "responses")
+    # Real upstream delivery pattern: encrypted content rides ONLY the
+    # output_item.done snapshot (the delta path never sees it).
+    done_event = UnifiedStreamEvent(
+        type="response.output_item.done",
+        source_protocol="responses",
+        message=UnifiedMessage(
+            role="assistant",
+            content=[ContentBlock(type="reasoning", reasoning=ReasoningBlock(text="", encrypted_content="E9"))],
+        ),
+        extra={"payload": {"item": {"id": "rs_1", "type": "reasoning"}}},
+    )
+    frames = format_canonical_stream_event(done_event, "responses", ctx, state=state)
+    terminal = UnifiedStreamEvent(type="response.completed", source_protocol="responses", message=UnifiedMessage(role="assistant"))
+    frames.extend(format_canonical_stream_event(terminal, "responses", ctx, state=state))
+    joined = "".join(frames)
+    assert "E9" in joined, "encrypted_content from the done snapshot must land in the terminal object"
+
+
 def test_gemini_rejects_incomplete_foreign_tool_arguments_at_terminal() -> None:
     context = ProtocolContext(model="model-a", source_protocol="openai_chat", target_protocol="gemini", transport="sse")
     converter = ProtocolStreamConverter(get_protocol("openai_chat"), get_protocol("gemini"), context)
@@ -184,7 +219,17 @@ def test_stream_formatter_never_exposes_foreign_thought_signatures() -> None:
     output = "".join(converter.convert({"candidates": [{"content": {"role": "model", "parts": [{"text": "hidden", "thought": True, "thoughtSignature": "opaque-secret"}]}}]}))
 
     assert "hidden" in output
-    assert "opaque-secret" not in output
+    # D8: same-protocol streams pass opaque state through verbatim (gemini
+    # clients replay parts unmodified); FOREIGN-source signatures (different
+    # converter) never surface — covered by the field-cache stream tests.
+    assert "opaque-secret" in output
+
+    foreign_context = ProtocolContext(model="model-a", source_protocol="anthropic_messages", target_protocol="gemini", transport="sse")
+    foreign_converter = ProtocolStreamConverter(get_protocol("anthropic_messages"), get_protocol("gemini"), foreign_context)
+    foreign_output = "".join(
+        foreign_converter.convert({"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "foreign", "signature": "foreign-secret"}})
+    )
+    assert "foreign-secret" not in foreign_output
 
 
 @pytest.mark.parametrize("output_protocol", PROTOCOLS)
