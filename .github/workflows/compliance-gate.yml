@@ -12,6 +12,11 @@
 #          job) - never silent. The required check itself stays "Expected"
 #          (merge blocked) either way; this is redundancy + visibility.
 #
+# EXECUTES FROM: THE PR's BASE BRANCH (pull_request semantics). On PRs
+#   targeting dev, dev's copy runs - keep dev merge-synced when this file
+#   changes (`git merge main` into dev; see docs/workflows/overview.md).
+#   Zero secrets either way: this is a marker poster, nothing else.
+#
 # SECURITY: pull_request trigger, ZERO secrets, permissions statuses:write
 #          only. A same-repo PR CAN modify this file before it runs - the
 #          tamper ceiling of a modified copy is the same platform-level

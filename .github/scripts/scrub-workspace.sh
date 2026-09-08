@@ -2,12 +2,29 @@
 # ============================================================================
 # scrub-workspace.sh — canonical agent workspace scrub
 # ============================================================================
-# Trust rule: agent-auto-loaded files may exist in the workspace only when
-# byte-identical to a maintained branch. Anything a PR/head added or changed
-# relative to the anchor is removed from the working tree. Ref-based diffs
-# (what reviews read) are unaffected by working-tree removal, so scrubbed
-# content stays fully visible in the review — it just stops auto-loading
-# into the agent.
+# SPLIT TRUST — the core security concept of this script. Two surfaces, two
+# different trust rules:
+#
+#   AUTO-LOAD FILES (AGENTS.md, CLAUDE.md, .claude/, .opencode/, skills, the
+#   harness-variant rule files...): these are files opencode ingests by
+#   ITSELF at startup — content that becomes instructions to the agent with
+#   nobody in the loop. A file may stay in the workspace only when its bytes
+#   match a state a TRUST BRANCH (main or dev) shipped at-or-after that
+#   branch's merge-base with HEAD (the fork floor; the fork state itself
+#   included). Rationale: this content DESCRIBES the code it ships with, so
+#   it legitimately evolves on dev before merging up. Anything else — a state
+#   older than every floor (a deliberate rollback resurrecting content a
+#   trust branch already abandoned) or bytes no trust branch ever had — is
+#   removed from the working tree and quarantined as data.
+#
+#   .github/ PLATFORM FILES (workflows, actions, prompts, scripts): NOT
+#   auto-loaded, so they are never removed (the reviewer must see them), but
+#   any branch-side change is a TAINT alarm anchored to MAIN ONLY. Platform
+#   wiring is maintained main-first and executes from main; dev never
+#   vouches for it.
+#
+# Both lists live below (TRUST CONFIGURATION) and are edited on the default
+# branch only. See the .github taint section for the alarm mechanics.
 #
 # Auto-load surface (what opencode ingests at startup / directory entry):
 #   AGENTS.md, CLAUDE.md (any depth), .claude/, .opencode/,
@@ -21,7 +38,7 @@
 # are agent-harness instruction files with a compat-absorption track record
 # (opencode already absorbed .claude/, then .agents/, then CLAUDE.md as
 # fallback). The bot must never consume another harness's rules, so they get
-# the same keep-iff-identical treatment preemptively:
+#   the same trusted-state treatment preemptively:
 #   GEMINI.md, CLAUDE.local.md, .cursorrules, .windsurfrules, .clinerules
 #   (any depth); .cursor/, .windsurf/, .devin/ (root dirs).
 #   Deliberately NOT covered: anything under .github/ (Copilot instruction
@@ -31,23 +48,21 @@
 # Plus: .mirrobot_files/ (workflow scratch space) — always wiped; the
 # workflow diff steps regenerate its contents from scratch.
 #
-# Anchor selection: --anchor <branch> is honored ONLY when it is a
-# maintained branch (ALLOWED_BRANCHES below — edit on the default branch
-# only). Any other value — including the base of an unmaintained branch a
-# PR happens to target — falls back to DEFAULT_ANCHOR. This list
-# intentionally mirrors the MAINTAINED_BASE_BRANCHES job env in the agent
-# workflows; both live in default-branch-controlled files only.
-#
 # Invocation contexts:
 #   workflow step: after EVERY checkout, before any agent/opencode work.
 #   in-agent:      when the bot checks out a ref it did not create, it runs
 #                  `bash /tmp/scrub-workspace.sh --anchor <pr-base>` —
 #                  NEVER the workspace copy under .github/scripts/, which
 #                  belongs to the (possibly untrusted) checked-out tree.
+#                  (--anchor selects the .github TAINT anchor only; auto-load
+#                  trust always spans AUTOLOAD_BRANCHES regardless of it.)
 #
-# Fail-closed: if the anchor ref cannot be resolved, ALL auto-load files
-# are removed. Removals are printed and appended to /tmp/scrub-removals.txt
-# so the agent can surface them (path + reason) in its final summary.
+# Fail-closed: if NO trust branch can be resolved, ALL auto-load files are
+# removed. An OPTIONAL trust branch that does not exist in this clone (a
+# deployment without a dev) is skipped with a notice — graceful degradation
+# to the remaining branches, never a fail-closed trigger. Removals are
+# printed and appended to /tmp/scrub-removals.txt so the agent can surface
+# them (path + reason) in its final summary.
 # Quarantine: a removed auto-load file is copied (symlinks dereferenced)
 # to /tmp/scrub-quarantine/<original-path> when — and only when — its
 # resolved target stays inside this repository (out-of-repo/absolute
@@ -62,7 +77,16 @@
 set -u -o pipefail  # pipefail: a failed git log/diff inside a pipeline must not
                     # masquerade as an empty (clean) result via cut/sed/awk.
 
-ALLOWED_BRANCHES="main dev"
+# ---- TRUST CONFIGURATION (edit on the default branch only) ------------------
+# TAINT_ALLOWED_BRANCHES: .github platform changes anchor to these branches
+#   ONLY. Platform wiring is maintained main-first and executes from main;
+#   dev must never vouch for it. (--anchor requests outside this list fall
+#   back to DEFAULT_ANCHOR with a notice.)
+# AUTOLOAD_BRANCHES: auto-load files are trusted from ANY branch in this
+#   list (each with its own merge-base floor — see the header). The default
+#   anchor MUST resolve; other branches degrade gracefully when absent.
+TAINT_ALLOWED_BRANCHES="main"
+AUTOLOAD_BRANCHES="main dev"
 DEFAULT_ANCHOR="main"
 REMOVALS_FILE="${SCRUB_REMOVALS_FILE:-/tmp/scrub-removals.txt}"
 QUARANTINE_DIR="${SCRUB_QUARANTINE_DIR:-/tmp/scrub-quarantine}"
@@ -78,10 +102,10 @@ if [ "${1:-}" = "--foreign" ]; then
   FOREIGN=1
 elif [ "${1:-}" = "--anchor" ] && [ -n "${2:-}" ]; then
   requested="${2:-}"
-  case " $ALLOWED_BRANCHES " in
+  case " $TAINT_ALLOWED_BRANCHES " in
     *" $requested "*) anchor="$requested" ;;
     *)
-      echo "::notice::Requested anchor '$requested' is not a maintained branch ($ALLOWED_BRANCHES); using '$anchor'."
+      echo "::notice::Requested anchor '$requested' is not a .github taint anchor ($TAINT_ALLOWED_BRANCHES); using '$anchor'. Platform (.github) changes anchor to main only; auto-load content is separately trusted from: $AUTOLOAD_BRANCHES."
       ;;
   esac
 fi
@@ -102,7 +126,44 @@ if [ "$FOREIGN" != 1 ]; then
   fi
 fi
 
+# --- Resolve auto-load trust branches (graceful for optional branches) -------
+# Foreign mode has no trust branches at all. The DEFAULT_ANCHOR MUST resolve
+# (its absence is fail-closed); optional branches (e.g. dev) that do not
+# exist in this clone are skipped with a notice — a deployment without a
+# dev degrades to main-only trust, never to fail-closed.
+AUTOLOAD_REFS=""
+if [ "$FOREIGN" != 1 ]; then
+  for b in $AUTOLOAD_BRANCHES; do
+    ref="refs/remotes/origin/$b"
+    if ! git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+      git fetch --quiet origin "$b:${ref}" 2>/dev/null || true
+    fi
+    if git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+      AUTOLOAD_REFS="${AUTOLOAD_REFS}${b}=${ref} "
+    fi
+  done
+  case " $AUTOLOAD_REFS " in
+    *" $DEFAULT_ANCHOR="*) : ;;
+    *)
+      echo "::warning::scrub-workspace: default trust branch '$DEFAULT_ANCHOR' unresolvable; removing ALL auto-load files (fail closed)."
+      AUTOLOAD_REFS=""
+      ;;
+  esac
+  for b in $AUTOLOAD_BRANCHES; do
+    case " $AUTOLOAD_REFS " in
+      *" $b="*) : ;;
+      *) [ -n "$AUTOLOAD_REFS" ] && echo "::notice::scrub-workspace: auto-load trust branch '$b' not present in this clone (optional); trusting the remaining branches." ;;
+    esac
+  done
+fi
+
 removed_this_run=0
+# Era notes: auto-load files kept at trusted NON-TIP states (collected during
+# the auto-load pass, flushed to the taint file AFTER its line-1 alert is
+# written — the workflows read line 1 as the compact warning, and a benign ℹ
+# era note may legitimately BE line 1 when no alert exists).
+ERA_NOTES=""
+ERA_COUNT=0
 # quarantine_file <path> — copy a doomed auto-load item (dereferencing
 # symlinks so the content the agent WOULD have loaded is what's preserved)
 # to $QUARANTINE_DIR/<original-path>. Prints the quarantine path on success,
@@ -188,38 +249,88 @@ resolved_blob() {
   done
 }
 
+# autoload_verdict <path> — classify HEAD's state of an auto-load file
+# against the auto-load trust branches. Prints one of:
+#   tip               matches a trust branch TIP (current doctrine)
+#   floor:<branch>    matches a trust branch's merge-base state (fork era)
+#   history:<branch>  matches a state a trust branch reached AFTER the fork
+#                     (e.g. dev's in-flight rules, or a main-side patch)
+#   no                matches nothing any trust branch shipped at-or-after
+#                     its floor (pre-fork rollback, or novel content)
+# Regular files compare by blob id; symlinked files compare by RESOLVED
+# content (the agent loads the target's bytes, not the link string).
+autoload_verdict() {
+  local path="${1#./}" pair b ref csha mb head_blob rev_blob rev
+  for pair in $AUTOLOAD_REFS; do
+    b="${pair%%=*}"; ref="${pair#*=}"
+    # Resolve to a commit SHA once, then compare via "<sha>:<path>" — full
+    # ref names in rev/show <rev>:<path> arguments get mangled by MSYS path
+    # conversion on Windows (sha-prefixed forms survive everywhere).
+    csha=$(git rev-parse -q --verify "${ref}^{commit}" 2>/dev/null) || continue
+    mb=$(git merge-base "$csha" HEAD 2>/dev/null) || mb=""
+    if [ -L "$path" ]; then
+      local head_res rev_res
+      head_res=$(resolved_blob HEAD "$path" 2>/dev/null) || head_res=""
+      [ -n "$head_res" ] || continue
+      rev_res=$(resolved_blob "$csha" "$path" 2>/dev/null) || rev_res=""
+      if [ -n "$rev_res" ] && [ "$rev_res" = "$head_res" ]; then echo "tip"; return 0; fi
+      [ -n "$mb" ] || continue
+      rev_res=$(resolved_blob "$mb" "$path" 2>/dev/null) || rev_res=""
+      if [ -n "$rev_res" ] && [ "$rev_res" = "$head_res" ]; then echo "floor:$b"; return 0; fi
+      for rev in $(git rev-list "$mb..$csha" -- "$path" 2>/dev/null); do
+        rev_res=$(resolved_blob "$rev" "$path" 2>/dev/null) || rev_res=""
+        if [ -n "$rev_res" ] && [ "$rev_res" = "$head_res" ]; then echo "history:$b"; return 0; fi
+      done
+    else
+      head_blob=$(git rev-parse -q --verify "HEAD:$path" 2>/dev/null) || head_blob=""
+      [ -n "$head_blob" ] || continue
+      if [ "$(git rev-parse -q --verify "$csha:$path" 2>/dev/null)" = "$head_blob" ]; then echo "tip"; return 0; fi
+      [ -n "$mb" ] || continue
+      if [ "$(git rev-parse -q --verify "$mb:$path" 2>/dev/null)" = "$head_blob" ]; then echo "floor:$b"; return 0; fi
+      for rev in $(git rev-list "$mb..$csha" -- "$path" 2>/dev/null); do
+        rev_blob=$(git rev-parse -q --verify "$rev:$path" 2>/dev/null) || rev_blob=""
+        if [ "$rev_blob" = "$head_blob" ]; then echo "history:$b"; return 0; fi
+      done
+    fi
+  done
+  echo "no"
+}
+
 # keep_if_identical <path>
-# Keep the path only when it is tracked in HEAD, present in the anchor
-# commit, byte-identical between anchor and HEAD, and the working tree
-# matches HEAD. Otherwise remove it and record why.
-# Symlinked files are compared by their RESOLVED content (git compares link
-# strings, but the agent loads the target's bytes — an unchanged link with a
-# mutated target must count as modified).
+# Keep the path only when it is tracked in HEAD, its state is one a trust
+# branch shipped at-or-after the fork floor (see autoload_verdict), and the
+# working tree matches HEAD. Otherwise remove it and record why.
+# Non-tip trusted states are KEPT with an era note so the agent treats them
+# as dated context rather than current doctrine.
 keep_if_identical() {
-  local path="$1" reason=""
+  local path="$1" reason="" verdict=""
   { [ -e "$path" ] || [ -L "$path" ]; } || return 0
 
   if ! git ls-files --error-unmatch -- "$path" >/dev/null 2>&1; then
     reason="untracked in HEAD"
-  elif [ -z "$ANCHOR" ]; then
-    reason="anchor unresolvable; fail-closed"
-  elif ! git cat-file -e "$ANCHOR:$path" 2>/dev/null; then
-    reason="not present in $anchor (added by this head)"
-  elif [ -L "$path" ]; then
-    head_resolved=$(resolved_blob HEAD "${path#./}") || reason="symlink chain unresolvable at HEAD"
-    if [ -z "$reason" ]; then
-      anchor_resolved=$(resolved_blob "$ANCHOR" "${path#./}") || reason="symlink chain unresolvable at $anchor"
-      if [ -z "$reason" ] && [ "$head_resolved" != "$anchor_resolved" ]; then
-        reason="resolved target differs from $anchor"
-      fi
-    fi
-    [ -z "$reason" ] && return 0 # resolved content identical to the maintained branch — trusted, keep
-  elif ! git diff --quiet "$ANCHOR" HEAD -- "$path" 2>/dev/null; then
-    reason="differs from $anchor"
-  elif ! git diff --quiet HEAD -- "$path" 2>/dev/null; then
-    reason="working tree differs from HEAD"
+  elif [ -z "$AUTOLOAD_REFS" ]; then
+    reason="no auto-load trust branch resolvable; fail-closed"
   else
-    return 0 # byte-identical to the maintained branch — trusted, keep
+    verdict=$(autoload_verdict "$path")
+    case "$verdict" in
+      tip|floor:*|history:*)
+        if ! git diff --quiet HEAD -- "$path" 2>/dev/null; then
+          reason="working tree differs from HEAD"
+        elif [ "$verdict" = "tip" ]; then
+          return 0 # identical to a trust branch tip — current doctrine, keep
+        else
+          # Trusted-era content (a state a trust branch shipped at-or-after
+          # the fork floor) that is no longer the tip: keep the file, note
+          # the era so the agent treats it as DATED context, not doctrine.
+          ERA_NOTES="${ERA_NOTES}
+ℹ $path — auto-load file kept at a pre-tip state (${verdict}): trusted-era content, not current doctrine — a newer version exists on the trust branches. Dated context: honor it only as far as it matches this branch's era."
+          ERA_COUNT=$((ERA_COUNT + 1))
+          return 0
+        fi ;;
+      no)
+        reason="matches no state any trust branch shipped at-or-after the fork floor (rollback of abandoned content, or new)"
+        ;;
+    esac
   fi
 
   note_removal "$path" "$reason"
@@ -429,6 +540,15 @@ else
   echo "scrub: .github/ clean vs ${TAINT_BASE_DESC} (no branch-side commits touch it)."
 fi
 
+# --- Era notes flush ----------------------------------------------------------
+# Appended BELOW the alert line (which owns line 1 of the taint file); when
+# there is no alert at all, the first era note becomes line 1 — benign ℹ
+# context the security brief distinguishes from a ⚠ TAINT alert.
+if [ "$ERA_COUNT" -gt 0 ]; then
+  printf '%s\n' "$ERA_NOTES" | sed '/^$/d' >> "$TAINT_FILE"
+  echo "scrub: $ERA_COUNT auto-load file(s) kept at pre-tip (trusted-era) states — era notes recorded for the agent."
+fi
+
 quar_note=""
 [ -d "$QUARANTINE_DIR" ] && [ -n "$(ls -A "$QUARANTINE_DIR" 2>/dev/null)" ] && quar_note="; quarantine: $QUARANTINE_DIR (removed auto-load files, readable on demand)"
-echo "scrub: complete (anchor: ${anchor}; removed: $removed_this_run auto-load item(s); log: $REMOVALS_FILE${quar_note}; taint: $TAINT_FILE)"
+echo "scrub: complete (taint anchor: ${anchor}; auto-load trust: ${AUTOLOAD_BRANCHES}; removed: $removed_this_run auto-load item(s); log: $REMOVALS_FILE${quar_note}; taint: $TAINT_FILE)"

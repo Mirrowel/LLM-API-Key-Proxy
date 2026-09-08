@@ -70,6 +70,28 @@ git ls-files -s AGENTS.md | grep -q '^120000' || { echo "FAIL: AGENTS.md fixture
 git commit -qm 'autoload: hostile additions + modifications + out-of-repo symlink'
 git checkout -q main
 
+# dev-trust fixtures (SPLIT TRUST): auto-load doctrine legitimately evolves
+# ON DEV with the work it describes, before merging up. CLAUDE.md gives main
+# a two-state history (v1 abandoned -> v2) BEFORE any fork, so a branch
+# resurrecting v1 is a pre-fork rollback under every branch's floor.
+printf 'claude v1\n' > CLAUDE.md; git add -A; git commit -qm 'main: claude v1'
+printf 'claude v2\n' > CLAUDE.md; git add -A; git commit -qm 'main: claude v2 (v1 abandoned)'
+git checkout -q -b dev main
+printf 'gemini v2 dev doctrine\n' > GEMINI.md
+printf 'agents doctrine dev\n' > AGENTS.md
+git add -A; git commit -qm 'dev: autoload doctrine evolves with dev work'
+# dev matures again — its first GEMINI.md becomes an INTERMEDIATE state
+# (kept with an era note when a branch carries it; dev's own tip stays the
+# current doctrine and keeps silently).
+printf 'gemini v3 dev doctrine\n' > GEMINI.md
+git add -A; git commit -qm 'dev: doctrine matures further'
+git checkout -q -b autoload-dev main
+printf 'gemini v2 dev doctrine\n' > GEMINI.md
+printf 'agents doctrine dev\n' > AGENTS.md
+printf 'claude v1\n' > CLAUDE.md
+git add -A; git commit -qm 'branch: adopt dev doctrine (v2 intermediate) + resurrect abandoned claude v1'
+git checkout -q main
+
 # parity fixtures: platform-sync carve-out matrix (see scrub-workspace.sh
 # "Post-fork platform parity"). main evolves AFTER the fork points — D
 # (deletion) and E (addition) — so branches syncing that content carry
@@ -154,7 +176,38 @@ if [ "$SYMLINKS_REAL" = yes ]; then
 else
   echo "SKIP: out-of-repo symlink staging checks (120000 blobs materialize as text files on this platform; the mode precondition above already failed loudly if the fixture itself degraded)"
 fi
+
+# ---- autoload split-trust matrix (main ∪ dev, per-branch floors) ------------
+# Dev-tip doctrine keeps SILENTLY (dev is a maintained branch — its tip is
+# current doctrine); an INTERMEDIATE dev state keeps with an era note; a
+# pre-fork rollback (content every trust branch abandoned before the fork)
+# is removed + quarantined.
+git checkout -q --detach origin/autoload-dev
+rm -f /tmp/scrub-taint.txt /tmp/scrub-removals.txt
+rm -rf /tmp/scrub-quarantine
+bash "$SCRUB" --anchor main >/tmp/scrub-fix.log 2>&1
+check "autoload: dev-tip AGENTS.md kept (current dev doctrine)"  yes "$(survives AGENTS.md)"
+check "autoload: dev intermediate GEMINI.md kept (era state)"    yes "$(survives GEMINI.md)"
+check "autoload: pre-fork CLAUDE.md rollback removed"            no  "$(survives CLAUDE.md)"
+check "autoload: rollback quarantined as data"                   yes "$(quarantined CLAUDE.md)"
+check "autoload: era note recorded for intermediate keep"        yes "$(grep -q 'pre-tip state' /tmp/scrub-taint.txt && echo yes || echo no)"
+check "autoload: era note names dated-context stance"            yes "$(grep -q 'Dated context' /tmp/scrub-taint.txt && echo yes || echo no)"
+check "autoload: rollback reason names the floor"                yes "$(grep -q 'rollback of abandoned content' /tmp/scrub-removals.txt && echo yes || echo no)"
 git checkout -q --detach origin/main
+
+# ---- graceful degradation: deployment without a dev branch ------------------
+# A bare clone with dev stripped simulates a deployment that has no dev:
+# the optional trust branch's ref AND its fetch both fail -> notice, never
+# fail-closed; main-only trust keeps working.
+git clone -q --bare "$SRC" "$WORK/bare-nodev" >/dev/null 2>&1
+git -C "$WORK/bare-nodev" branch -D dev >/dev/null 2>&1
+git clone -q "$WORK/bare-nodev" "$WORK/nodev" --branch main >/dev/null 2>&1
+( cd "$WORK/nodev" && bash "$SCRUB" --anchor main >/tmp/scrub-nodev.log 2>&1 )
+check "graceful: absent optional trust branch noticed"              yes "$(grep -q "'dev' not present" /tmp/scrub-nodev.log && echo yes || echo no)"
+check "graceful: no fail-closed when only the optional branch is missing" no "$(grep -q 'fail closed' /tmp/scrub-nodev.log && echo yes || echo no)"
+check "graceful: main-tip content still kept without dev"           yes "$( [ -e "$WORK/nodev/GEMINI.md" ] && echo yes || echo no)"
+check "graceful: main-tip CLAUDE.md v2 still kept without dev"      yes "$( [ -e "$WORK/nodev/CLAUDE.md" ] && echo yes || echo no)"
+rm -rf "$WORK/bare-nodev" "$WORK/nodev"
 
 # ---- stub->review dispatch contract (drift tripwire) --------------------------
 # The stub dispatches PR Review directly (dispatch IS the decision: declined
@@ -178,6 +231,15 @@ check "review: auto context keyed on source=stub input"      yes "$(grep -q "inp
 # must exist to surface the encrypted block on the run page.
 for wf in pr-review bot-reply compliance-check issue-comment; do
   WFF="$SCRIPT_DIR/../workflows/$wf.yml"
+  # The agent-key each workflow passes to bot-setup (per-agent model
+  # resolution): it must be the workflow's OWN identity, never a copy-paste
+  # neighbor's.
+  case "$wf" in
+    pr-review)       AGENT_KEY="pr-review" ;;
+    bot-reply)       AGENT_KEY="bot-reply" ;;
+    compliance-check) AGENT_KEY="compliance-check" ;;
+    issue-comment)   AGENT_KEY="issue-comment" ;;
+  esac
   check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   # opencode prints the share link on STDERR (TUI/status channel): the
   # merge is load-bearing - without 2>&1 the link bypasses the filter.
@@ -191,7 +253,86 @@ for wf in pr-review bot-reply compliance-check issue-comment; do
   check "share: $wf copies filter to /tmp"         yes "$(grep -q 'cp .github/scripts/share-filter.sh /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   check "share: $wf has summary step"              yes "$(grep -q 'Share link summary' "$WFF" && echo yes || echo no)"
   check "share: $wf step sets pipefail"            yes "$(grep -B15 'opencode run --share' "$WFF" | grep -q 'set -o pipefail' && echo yes || echo no)"
+
+  # ---- per-agent models + plugins + config lifecycle (bot-setup contract) ----
+  check "models: $wf passes its agent-key"         yes "$(grep -q "agent-key: $AGENT_KEY" "$WFF" && echo yes || echo no)"
+  check "models: $wf passes AGENT_MODELS_JSON"     yes "$(grep -q 'agent-models-json: \${{ vars.AGENT_MODELS_JSON }}' "$WFF" && echo yes || echo no)"
+  check "plugins: $wf wires base plugins var"      yes "$(grep -q 'plugins-json: \${{ vars.OPENCODE_PLUGINS_JSON }}' "$WFF" && echo yes || echo no)"
+  check "plugins: $wf wires numbered plugin vars"  yes "$(grep -q 'plugins-json-5: \${{ vars.OPENCODE_PLUGINS_JSON_5 }}' "$WFF" && echo yes || echo no)"
+  # Config lifecycle: opencode reads config+plugins once at boot; the
+  # boot-sentinel waiter + post-run cleanup guarantee the sensitive files
+  # do not survive the run.
+  check "lifecycle: $wf has boot-sentinel waiter"  yes "$(grep -q '/tmp/.oc-booted' "$WFF" && grep -q '\[ -f /tmp/.oc-booted \] && break' "$WFF" && echo yes || echo no)"
+  check "lifecycle: $wf post-run cleanup step"     yes "$(grep -q 'Post-run cleanup and usage stats' "$WFF" && echo yes || echo no)"
+  check "lifecycle: $wf cleanup is always()"       yes "$(grep -A5 'Post-run cleanup and usage stats' "$WFF" | grep -q 'if: always()' && echo yes || echo no)"
+  # Bare stats only: --models would EXPOSE model names; --days is pointless
+  # on a fresh runner (history = this run).
+  check "stats: $wf runs bare stats (no --models)" no  "$(grep -q 'stats --models' "$WFF" && echo yes || echo no)"
+  check "stats: $wf runs bare stats (no --days)"   no  "$(grep -q 'stats --days' "$WFF" && echo yes || echo no)"
+  # Pause gate: the agent's brain skips visibly; rails (stub/gate) stay on.
+  check "pause: $wf job gated on AGENT_PAUSED"     yes "$(grep -q "vars.AGENT_PAUSED != 'true'" "$WFF" && echo yes || echo no)"
 done
+
+# ---- pause coverage: rails stay on while the brain is off --------------------
+# The stub (pr-review-trigger) must NOT pause: it owns the pending compliance
+# status that keeps merges blocked. It must suppress only the dispatch, with
+# a visible notice. The compliance-gate must not pause either.
+STUB="$SCRIPT_DIR/../workflows/pr-review-trigger.yml"
+GATE="$SCRIPT_DIR/../workflows/compliance-gate.yml"
+check "pause: stub has NO job-level pause gate"    no  "$(sed -n '/^jobs:/,$p' "$STUB" | grep -B2 'runs-on' | grep -q 'AGENT_PAUSED' && echo yes || echo no)"
+check "pause: stub suppresses dispatch when paused" yes "$(grep -q 'AGENT_PAUSED: \${{ vars.AGENT_PAUSED }}' "$STUB" && grep -q 'AGENT_PAUSED" = "true' "$STUB" && echo yes || echo no)"
+check "pause: gate has NO pause gate"              no  "$(grep -q 'AGENT_PAUSED' "$GATE" && echo yes || echo no)"
+
+# ---- bot-setup: mask sweep + plugins materialization + drift scope -----------
+ACTION="$SCRIPT_DIR/../actions/bot-setup/action.yml"
+EXAMPLE="$SCRIPT_DIR/../actions/bot-setup/permissions.example.json"
+check "setup: mask sweep registers add-mask"       yes "$(grep -q '::add-mask::' "$ACTION" && echo yes || echo no)"
+check "setup: mask sweep walks credential keys"    yes "$(grep -q 'api\[_-\]?key|key|token|secret|password|authorization|cookie' "$ACTION" && echo yes || echo no)"
+# The URL rule must catch PREFIXED credential params (?tavilyApiKey=...):
+# a leading-anchor alternation misses them (live-caught in local test).
+check "setup: mask URL rule catches prefixed params" yes "$(grep -q '\[?&\].\*(api\[_-\]?key|token|secret|password)=' "$ACTION" && echo yes || echo no)"
+check "setup: mask skips sub-8-char values"        yes "$(grep -q '\${#v}' "$ACTION" && grep -q '\-ge 8' "$ACTION" && echo yes || echo no)"
+check "setup: plugins materialize under own dir"   yes "$(grep -q 'PLUGINS_DIR="\$HOME/.mirrobot-plugins"' "$ACTION" && echo yes || echo no)"
+check "setup: plugins path traversal rejected"     yes "$(grep -q '\.\./\*|' "$ACTION" && echo yes || echo no)"
+check "setup: numbered plugin vars merge (collision errors)" yes "$(grep -q 'Duplicate plugin path' "$ACTION" && echo yes || echo no)"
+# Drift check is PERMISSION-ONLY: the example is a full-config template, so
+# comparing against the whole file would false-warn on every repo whose
+# config lacks the example's providers/mcp/plugin shape.
+check "setup: drift compares .permission both sides" yes "$(grep -q "jq -S '.permission // empty'" "$ACTION" && echo yes || echo no)"
+# The example must look like a full config, carry the GENERIC plugin entry,
+# and never name a real router/provider anywhere in the repo.
+check "example: full-config shape (has \$schema)"  yes "$(grep -q '"\$schema"' "$EXAMPLE" && echo yes || echo no)"
+check "example: plugin entry uses generic name"    yes "$(grep -q 'secretplugin/secretplugin.js' "$EXAMPLE" && echo yes || echo no)"
+check "example: plugin denies in bash tail"        yes "$(grep -q '\*~/.mirrobot-plugins\*' "$EXAMPLE" && echo yes || echo no)"
+check "example: plugin denies in read block"       yes "$(grep -q '~/.mirrobot-plugins/\*' "$EXAMPLE" && echo yes || echo no)"
+check "repo: no closedrouter references"           no  "$(grep -rqi closedrouter "$SCRIPT_DIR/../../.github/" --exclude=scrub-fixtures.sh && echo yes || echo no)"
+
+# ---- share-filter boot sentinel ------------------------------------------------
+FILTER="$SCRIPT_DIR/share-filter.sh"
+check "filter: boot sentinel touched on first line" yes "$(grep -q 'printf \"\" > boot_out' "$FILTER" && echo yes || echo no)"
+
+# ---- bootstrap: dispatch-only, sole actions:write, state-silent ---------------
+BOOT="$SCRIPT_DIR/../workflows/agent-bootstrap.yml"
+check "bootstrap: workflow_dispatch only"          yes "$(grep -A2 '^on:' "$BOOT" | grep -q 'workflow_dispatch' && ! grep -q 'schedule:' "$BOOT" && echo yes || echo no)"
+# GITHUB_TOKEN cannot reach the variables API at all (live-verified 403
+# class) - the workflow must hold NO grant (permissions: {}) and seed via
+# the bot identity tokens; with none it degrades to manual instructions.
+check "bootstrap: no GITHUB_TOKEN grant (variables need user tokens)" no  "$(grep -A2 '^permissions:' "$BOOT" | grep -q 'actions: write' && echo yes || echo no)"
+check "bootstrap: resolves bot identity token"        yes "$(grep -q 'mode=account' "$BOOT" && grep -q 'mode=app' "$BOOT" && grep -q 'create-github-app-token' "$BOOT" && echo yes || echo no)"
+check "bootstrap: manual fallback when tokenless"     yes "$(grep -q 'mode=manual' "$BOOT" && grep -q 'gh variable set' "$BOOT" && echo yes || echo no)"
+check "bootstrap: seeds AGENT_PAUSED default"      yes "$(grep -q '\[AGENT_PAUSED\]="false"' "$BOOT" && echo yes || echo no)"
+# GitHub variables reject empty values (live-verified 422) - empty-default
+# variables must NOT be seeded (absence is the empty state for consumers).
+check "bootstrap: no empty-value seeds (422 trap)"  no  "$(grep -q '\]="\""' "$BOOT" && echo yes || echo no)"
+check "bootstrap: models template prefilled"       yes "$(grep -q '{\"pr-review\":{\"model\":\"\",\"fast\":\"\"}' "$BOOT" && echo yes || echo no)"
+check "bootstrap: exists-check never overwrites"   yes "$(grep -q 'actions/variables/\$name' "$BOOT" && grep -q 'continue' "$BOOT" && echo yes || echo no)"
+# State-silence: no per-variable outcome lines anywhere in the seed step.
+check "bootstrap: no per-variable outcome logs"    no  "$(grep -E 'echo .*(created|already exists|skipping)' "$BOOT" | grep -v 'Bootstrap complete' | grep -q . && echo yes || echo no)"
+check "bootstrap: static checklist in summary"     yes "$(grep -q '## Agent Bootstrap' "$BOOT" && echo yes || echo no)"
+# Bootstrap is the ONLY workflow holding actions:write (least privilege
+# concentration: one dispatch-only surface for variable creation).
+OTHERS_WITH_WRITE=$(grep -l 'actions: write' "$SCRIPT_DIR/../workflows/"*.yml | grep -v agent-bootstrap | grep -v pr-review-trigger || true)
+check "bootstrap: sole actions:write holder (stub excepted for dispatch)" no  "$([ -z "$OTHERS_WITH_WRITE" ] && echo yes || echo no)"
 
 # ---- channel hygiene -------------------------------------------------------
 git checkout -q --detach origin/evil; rm -f /tmp/scrub-taint.txt; bash "$SCRUB" --anchor main >/dev/null 2>&1

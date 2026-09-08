@@ -1,5 +1,10 @@
 name: Bot Reply on Mention
 
+# EXECUTES FROM: THE DEFAULT BRANCH, always (dispatched by the agent router
+# on the default branch; issue_comment-family triggers are default-branch
+# by GitHub rule). Platform updates land on main - see
+# docs/workflows/overview.md for the execution map and update doctrine.
+
 on:
   # Anti-phantom: an explicit never-matching push trigger. Dispatch-only
   # workflows otherwise get dead push-event runs (red X, 0 jobs) whenever
@@ -62,7 +67,10 @@ jobs:
     # manual dispatch of a bot-authored or mention-less comment no-ops).
     # Event guard: phantom push-event runs (see inputs comment) skip the
     # whole job instead of running with empty inputs.
-    if: github.event_name == 'workflow_dispatch'
+    # AGENT_PAUSED variable: kill switch - paused runs skip entirely
+    # (visible gray skip); the stub and compliance-gate keep the pending
+    # status posted so merges stay blocked while paused.
+    if: github.event_name == 'workflow_dispatch' && vars.AGENT_PAUSED != 'true'
     runs-on: ubuntu-latest
     # Least privilege for the built-in GITHUB_TOKEN: it is only used by the
     # initial actions/checkout. All bot operations (reactions, comments, pushes)
@@ -72,6 +80,10 @@ jobs:
       contents: read
 
     env:
+      # ─── EDITABLE KNOBS ──────────────────────────────────────────────────
+      # Everything a fork tunes in THIS file lives near this block (the rest
+      # is machinery). Full reference: docs/configuration.md and
+      # docs/workflows/bot-reply.md.
       THREAD_NUMBER: ${{ inputs.threadNumber }}
       # Cross-repo guest mode: empty = home. Set by mention-poller dispatch.
       TARGET_REPO: ${{ inputs.targetRepo || '' }}
@@ -398,6 +410,16 @@ jobs:
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
+          # Per-agent model override (AGENT_MODELS_JSON variable) and
+          # plugin materialization (OPENCODE_PLUGINS_JSON / _1.._5).
+          agent-key: bot-reply
+          agent-models-json: ${{ vars.AGENT_MODELS_JSON }}
+          plugins-json: ${{ vars.OPENCODE_PLUGINS_JSON }}
+          plugins-json-1: ${{ vars.OPENCODE_PLUGINS_JSON_1 }}
+          plugins-json-2: ${{ vars.OPENCODE_PLUGINS_JSON_2 }}
+          plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
+          plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
+          plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
 
       - name: Add reaction to comment (lifecycle start)
         # Eyes on the mention comment via the shared lifecycle script; the
@@ -914,7 +936,6 @@ jobs:
           SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA }}
           SHARE_CTX_DETAIL: ${{ inputs.targetRepo != '' && format('guest session ({0})', inputs.triggerKind || 'mention') || 'agent reply' }}
         run: |
-            set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
             if [ "$IS_PR" = "true" ]; then
               FULL_DIFF_PATH="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
@@ -927,9 +948,36 @@ jobs:
             VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY'
             # Prepend the security brief (with the verified requester and trust context lines);
             # guest sessions additionally carry the guest rules block right after the brief.
+            # Config lifecycle: opencode reads config + plugins once at boot.
+            # The share filter touches /tmp/.oc-booted on the first output
+            # line (= boot complete, config consumed); this waiter deletes
+            # the sensitive files shortly after. Hard timeout so a hung
+            # boot cannot pin them; the always() post-run step is the belt.
+            ( for _ in $(seq 1 180); do [ -f /tmp/.oc-booted ] && break; sleep 1; done
+              sleep 2
+              rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
+              rm -rf ~/.mirrobot-plugins ) &
+            set -o pipefail
             { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; \
               [ -n "${TARGET_REPO:-}" ] && { echo; echo '## GUEST SESSION RULES (foreign repository)'; echo; cat /tmp/guest-rules.md; echo; } || true; \
               bash /tmp/assemble-prompt.sh bot-reply | FULL_DIFF_PATH="$FULL_DIFF_PATH" PR_NUMBER="$THREAD_NUMBER" INCREMENTAL_DIFF_PATH="$INCREMENTAL_DIFF_PATH" LAST_REVIEWED_SHA="$LAST_REVIEWED_SHA" envsubst "$VARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
+            rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
+            rm -rf ~/.mirrobot-plugins
+
+      - name: Post-run cleanup and usage stats
+        # Guaranteed removal of the config/plugin files on every path plus
+        # the per-run token/cost summary. Bare `opencode stats` only -
+        # model stats are hidden by default (the --models flag would
+        # expose model names).
+        if: always()
+        run: |
+            rm -f ~/.config/opencode/opencode.json /tmp/.oc-booted
+            rm -rf ~/.mirrobot-plugins
+            OC="$(command -v opencode || true)"
+            if [ -z "$OC" ] && [ -x "$HOME/.local/bin/opencode" ]; then OC="$HOME/.local/bin/opencode"; fi
+            if [ -n "$OC" ]; then
+              { echo "### Agent usage (this run)"; echo '```'; "$OC" stats 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
 
       - name: Share link summary
         if: always()

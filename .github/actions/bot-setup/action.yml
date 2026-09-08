@@ -26,6 +26,38 @@ inputs:
   opencode-config-json:
     description: 'Optional: A complete minified opencode.json used as the base config before model and API key overrides.'
     required: false
+  agent-key:
+    description: 'Optional: per-agent key (e.g. pr-review, bot-reply) resolved against the AGENT_MODELS_JSON variable to override opencode-model/opencode-fast-model for this agent. Missing key or empty model string falls back to the global inputs.'
+    required: false
+    default: ''
+  agent-models-json:
+    description: 'Optional: contents of the AGENT_MODELS_JSON repo variable: {"<agent-key>": {"model": "provider/model", "fast": "provider/model"}}. Malformed JSON fails loudly; empty/missing keys fall back silently.'
+    required: false
+    default: ''
+  plugins-json:
+    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under ~/.mirrobot-plugins/ for referencing from the config secret plugin array (absolute path /home/runner/.mirrobot-plugins/<path>).'
+    required: false
+    default: ''
+  plugins-json-1:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_1. Numbered variables let each plugin live in its own variable; all are merged (path collisions are a hard error). Supported through _5.'
+    required: false
+    default: ''
+  plugins-json-2:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_2.'
+    required: false
+    default: ''
+  plugins-json-3:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_3.'
+    required: false
+    default: ''
+  plugins-json-4:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_4.'
+    required: false
+    default: ''
+  plugins-json-5:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_5.'
+    required: false
+    default: ''
 
 outputs:
   token:
@@ -165,10 +197,34 @@ runs:
         MAIN_MODEL: ${{ inputs.opencode-model }}
         FAST_MODEL: ${{ inputs.opencode-fast-model }}
         DEFAULT_API_KEY: ${{ inputs.opencode-api-key }}
+        AGENT_KEY: ${{ inputs.agent-key }}
+        AGENT_MODELS_JSON: ${{ inputs.agent-models-json }}
       run: |
         set -e # Exit immediately if a command fails
 
         mkdir -p ~/.config/opencode
+
+        # --- PER-AGENT MODEL RESOLUTION (AGENT_MODELS_JSON variable) ---
+        # Precedence: agent-specific entry > global inputs. Empty string
+        # values count as absent (the seeded template ships empty strings).
+        # Malformed JSON is a hard error: a typo must never silently
+        # degrade every agent to the global model. Model values are never
+        # echoed here.
+        if [ -n "$AGENT_MODELS_JSON" ] && [ -n "$AGENT_KEY" ]; then
+          if ! jq -e type >/dev/null 2>&1 <<< "$AGENT_MODELS_JSON"; then
+            echo "::error::AGENT_MODELS_JSON variable is not valid JSON. Fix it in repo settings (Settings -> Secrets and variables -> Actions -> Variables)."
+            exit 1
+          fi
+          resolved_model=$(jq -r --arg k "$AGENT_KEY" '.[$k].model // "" | select(. != "")' <<< "$AGENT_MODELS_JSON" 2>/dev/null || true)
+          if [ -n "$resolved_model" ]; then
+            MAIN_MODEL="$resolved_model"
+            echo "Model: per-agent override for '$AGENT_KEY' active."
+          fi
+          resolved_fast=$(jq -r --arg k "$AGENT_KEY" '.[$k].fast // "" | select(. != "")' <<< "$AGENT_MODELS_JSON" 2>/dev/null || true)
+          if [ -n "$resolved_fast" ]; then
+            FAST_MODEL="$resolved_fast"
+          fi
+        fi
 
         # Use the full OpenCode config as the base when supplied. Model inputs below
         # intentionally override it so workflows can select runtime models per job.
@@ -227,15 +283,18 @@ runs:
         # See .github/actions/bot-setup/permissions.example.json for the
         # recommended profile to paste into the secret.
         if ! jq -e 'has("permission")' <<< "$CONFIG" >/dev/null 2>&1; then
-          echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste .github/actions/bot-setup/permissions.example.json into the secret."
+          echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste the permission block from .github/actions/bot-setup/permissions.example.json into the secret."
         else
           # Drift check: warn when the secret's permission block differs from
           # the recommended example (e.g. after the example evolves but the
-          # secret was not refreshed). Comparison is informational only — the
-          # secret always wins; this just makes silent drift visible.
+          # secret was not refreshed). Comparison is PERMISSION-ONLY by
+          # design: the example is a full-config template (providers, mcp,
+          # plugin array) and divergence anywhere else is expected, never a
+          # warning. Informational only — the secret always wins; this just
+          # makes silent drift visible.
           if ! diff <(jq -S . <<< "$CONFIG" | jq -S '.permission') \
-                     <(jq -S . "${GITHUB_ACTION_PATH}/permissions.example.json") >/dev/null 2>&1; then
-            echo "::warning::OPENCODE_CONFIG_JSON permission block differs from .github/actions/bot-setup/permissions.example.json. If intentional, update the example to match; otherwise refresh the secret from the example."
+                     <(jq -S '.permission // empty' "${GITHUB_ACTION_PATH}/permissions.example.json") >/dev/null 2>&1; then
+            echo "::warning::OPENCODE_CONFIG_JSON permission block differs from the example in .github/actions/bot-setup/permissions.example.json. If intentional, update the example to match; otherwise refresh the secret's permission block from the example."
           fi
         fi
 
@@ -246,6 +305,88 @@ runs:
         # jq . ~/.config/opencode/opencode.json
         # echo "----------------------------------------"
         echo "Successfully generated OpenCode configuration."
+
+    - name: Materialize plugins and mask credential leaves
+      shell: bash
+      env:
+        PLUGINS_JSON: ${{ inputs.plugins-json }}
+        PLUGINS_JSON_1: ${{ inputs.plugins-json-1 }}
+        PLUGINS_JSON_2: ${{ inputs.plugins-json-2 }}
+        PLUGINS_JSON_3: ${{ inputs.plugins-json-3 }}
+        PLUGINS_JSON_4: ${{ inputs.plugins-json-4 }}
+        PLUGINS_JSON_5: ${{ inputs.plugins-json-5 }}
+      run: |
+        set -e
+        # --- PLUGINS (OPENCODE_PLUGINS_JSON + numbered _1.._5 -> ~/.mirrobot-plugins/) ---
+        # Operator-owned code files referenced BY the config secret's plugin
+        # array via absolute path (/home/runner/.mirrobot-plugins/<path>).
+        # Numbered variables let each plugin live in its own variable; all
+        # maps merge (path collisions across variables are a hard error -
+        # two plugins claiming one path is always a config mistake).
+        # Reading this directory is permission-denied in the example profile
+        # and the workflows delete it after opencode boots (config and
+        # plugins are read once at startup). Plugin content is not masked
+        # (operator decision) - protection is lifecycle + read-denies.
+        # Nothing about which plugins exist is logged.
+        ALL_PLUGINS='{}'
+        for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
+          [ -z "$(printf '%s' "$src" | tr -d '[:space:]')" ] && continue
+          if ! jq -e 'type == "object"' <<< "$src" >/dev/null 2>&1; then
+            echo "::error::An OPENCODE_PLUGINS_JSON(_N) variable is not a JSON object. Expected {\"<relative-path>\": \"<file content>\"} - see the repo README."
+            exit 1
+          fi
+          if [ -n "$(jq -n --argjson acc "$ALL_PLUGINS" --argjson add "$src" '$add | keys[] | select(. as $k | $acc | has($k))')" ]; then
+            echo "::error::Duplicate plugin path across OPENCODE_PLUGINS_JSON variables - each file path may be defined exactly once."
+            exit 1
+          fi
+          ALL_PLUGINS=$(jq -n --argjson acc "$ALL_PLUGINS" --argjson add "$src" '$acc * $add')
+        done
+
+        if [ "$ALL_PLUGINS" != "{}" ]; then
+          PLUGINS_DIR="$HOME/.mirrobot-plugins"
+          mkdir -p "$PLUGINS_DIR"
+          chmod 700 "$PLUGINS_DIR"
+          while IFS= read -r relpath; do
+            # Defensive CR strip: some jq builds emit CRLF; a real path never ends in CR.
+            relpath="${relpath%$'\r'}"
+            case "$relpath" in
+              ""|".."|../*|*/../*|*/..|/*|*[[:space:]]*|*"~"*|*"\\"*)
+                echo "::error::OPENCODE_PLUGINS_JSON contains an unsafe path entry. Use relative paths without spaces, traversal, or escapes."
+                exit 1
+                ;;
+            esac
+            target="$PLUGINS_DIR/$relpath"
+            mkdir -p "$(dirname "$target")"
+            jq -rn --argjson all "$ALL_PLUGINS" --arg k "$relpath" '$all[$k]' > "$target"
+            chmod 600 "$target"
+          done < <(jq -r 'keys[]' <<< "$ALL_PLUGINS")
+          echo "Plugins materialized."
+        fi
+
+        # --- MASK CREDENTIAL LEAVES (config-derived secrets) ---
+        # GitHub masks whole SECRET values automatically, but
+        # OPENCODE_CONFIG_JSON is one blob: its inner leaves (provider
+        # apiKeys, mcp header values, credential-bearing URLs) would echo
+        # UNMASKED if any step ever printed them. Register each leaf
+        # explicitly so every later step's output is scrubbed. The URL rule
+        # catches credential QUERY PARAMS with any prefix (e.g.
+        # ?tavilyApiKey=...). GitHub ignores masks shorter than 8
+        # characters, so short values cannot be registered and are skipped.
+        while IFS= read -r v; do
+          [ -z "$v" ] && continue
+          if [ "${#v}" -ge 8 ]; then
+            printf '::add-mask::%s\n' "$v"
+          fi
+        done < <(jq -r '
+          [ (.. | objects | to_entries[]
+              | select(.key | test("(api[_-]?key|key|token|secret|password|authorization|cookie)"; "i"))
+              | .value | strings | select(length >= 8))
+            , (.. | strings
+              | select(length >= 8)
+              | select(test("https?://.+[?&].*(api[_-]?key|token|secret|password)=" ; "i")))
+          ] | unique | .[]
+        ' ~/.config/opencode/opencode.json 2>/dev/null || true)
+        echo "Credential leaf masking applied."
 
     - name: Check for Python requirements file
       id: check_requirements_file

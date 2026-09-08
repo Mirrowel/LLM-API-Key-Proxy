@@ -5,6 +5,18 @@
 #          pull_request_target secret-exposure hole that the old PR Review
 #          workflow had.
 #
+# EXECUTES FROM: THE PR's BASE BRANCH (pull_request_target semantics — GitHub
+#   runs the workflow file version found on the branch the PR targets).
+#   Practical consequences for MAINTAINERS:
+#     - On PRs targeting main, main's copy of this file runs (the norm).
+#     - On PRs targeting dev, DEV's copy runs — changes to this file only
+#       take effect there after `git merge main` into dev. Keep dev
+#       merge-synced when this stub changes (see docs/workflows/overview.md).
+#     - Everything this stub DISPATCHES always targets the default branch
+#       (--ref), so no downstream code ever executes from a PR base.
+#   UPDATE DOCTRINE: platform files (.github) are maintained main-first;
+#   never patch this file on a feature branch and expect it to run.
+#
 # SECURITY MODEL — READ BEFORE EDITING:
 #   pull_request_target executes THIS FILE from the PR's BASE branch. Any
 #   branch can be a base (including bot-created feature branches), so assume
@@ -168,13 +180,22 @@ jobs:
         # guarantee workflow_run used to provide). Retries absorb transient
         # API errors; if all attempts fail the step FAILS LOUDLY - a lost
         # review is a real failure worth a red run, not a silent skip.
+        # PAUSE EXCEPTION: while AGENT_PAUSED=true this step still runs but
+        # suppresses the dispatch with a visible notice (the agent's brain
+        # is off) - the stub itself is NOT paused: it owns the pending
+        # compliance status, which must keep blocking merges.
         if: steps.decide.outputs.review_wanted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           ACTION: ${{ github.event.action }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          AGENT_PAUSED: ${{ vars.AGENT_PAUSED }}
         run: |
+          if [ "$AGENT_PAUSED" = "true" ]; then
+            echo "::notice::Agent is paused (AGENT_PAUSED=true) - review dispatch suppressed; pending compliance status keeps blocking merges."
+            exit 0
+          fi
           for attempt in 1 2 3; do
             if gh workflow run pr-review.yml \
               --repo "$GITHUB_REPOSITORY" \

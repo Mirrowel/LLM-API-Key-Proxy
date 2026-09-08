@@ -38,15 +38,20 @@ TMP="${RUNNER_TEMP:-/tmp}"
 ENC_OUT="$TMP/share-link.enc"
 CTX_OUT="$TMP/share-link.ctx"
 URL_OUT="$TMP/share-link.url"
+BOOT_OUT="/tmp/.oc-booted"
 
 # ---- stage 1: stream filter (pure awk, no subprocesses) -------------------
-awk -v url_out="$URL_OUT" -v ctx_out="$CTX_OUT" \
+# The first passthrough line proves opencode booted and consumed its config;
+# the awk stage touches BOOT_OUT so the calling workflow's cleanup waiter can
+# delete the sensitive config/plugin files shortly after (config lifecycle).
+awk -v url_out="$URL_OUT" -v ctx_out="$CTX_OUT" -v boot_out="$BOOT_OUT" \
     -v repo="${GITHUB_REPOSITORY:-unknown}" -v run="${GITHUB_RUN_ID:-unknown}" \
     -v actor="${GITHUB_ACTOR:-unknown}" \
     -v thread="${SHARE_CTX_THREAD:-}" -v head="${SHARE_CTX_HEAD:-}" \
     -v detail="${SHARE_CTX_DETAIL:-}" '
-BEGIN { captured = 0 }
+BEGIN { captured = 0; booted = 0 }
 {
+  if (!booted) { printf "" > boot_out; booted = 1 }
   if ($0 ~ /opncd\.ai\/share\//) {
     line = $0
     esc = sprintf("%c", 27)

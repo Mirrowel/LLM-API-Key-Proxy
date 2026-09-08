@@ -5,6 +5,11 @@
 #          by checking file group consistency, documentation updates, and
 #          enforcing project-specific merge requirements.
 #
+# EXECUTES FROM: THE DEFAULT BRANCH, always (dispatched by the agent router
+#          on the default branch). Platform updates land on main - see
+#          docs/workflows/overview.md for the execution map and update
+#          doctrine.
+#
 # Triggers (deliberately manual — compliance runs ONCE at the end of a PR's
 # life, when a maintainer is ready to merge; PR Review runs throughout):
 #   - Comment with '/mirrobot-check' or '/mirrobot_check'
@@ -64,7 +69,10 @@ jobs:
   compliance-check:
     # Comment-triggered runs arrive exclusively via agent-router.yml dispatch
     # (the router owns the bot-loop guard and trigger-word validation).
-    if: github.event_name == 'workflow_dispatch'
+    # AGENT_PAUSED variable: kill switch - paused runs skip entirely
+    # (visible gray skip); the compliance-gate workflow keeps the pending
+    # status posted so merges stay blocked while paused.
+    if: github.event_name == 'workflow_dispatch' && vars.AGENT_PAUSED != 'true'
     runs-on: ubuntu-latest
     
     # Minimal permissions following principle of least privilege
@@ -75,10 +83,19 @@ jobs:
       issues: write           # Post issue comments
 
     env:
+      # ─── EDITABLE KNOBS ──────────────────────────────────────────────────
+      # Everything a fork tunes in THIS file lives in this env block (the
+      # rest is machinery) - especially FILE_GROUPS_JSON below, the
+      # repo-specific compliance watch-list. Full reference:
+      # docs/configuration.md and docs/workflows/compliance-check.md.
       # -----------------------------------------------------------------------
       # BASIC CONFIGURATION
       # -----------------------------------------------------------------------
       PR_NUMBER: ${{ inputs.pr_number }}
+      # PR-TARGET context only ("is the base a maintained branch?" for the
+      # trust-context line) — NOT the scrub anchor. Scrub trust is SPLIT:
+      # .github taint anchors to MAIN alone; auto-load content trusts
+      # main+dev (see scrub-workspace.sh TRUST CONFIGURATION).
       MAINTAINED_BASE_BRANCHES: 'main dev'
       # Identities of THIS agent only (case-insensitive comparisons).
       # NOTE: bare "mirrobot" is the NAME, not an identity - a human user
@@ -150,6 +167,7 @@ jobs:
             ]
           }
         ]
+
     steps:
       # Runtime enforcement of the dispatch contract (schema-required is
       # impossible - see the inputs comment for the platform bug).
@@ -270,6 +288,16 @@ jobs:
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
+          # Per-agent model override (AGENT_MODELS_JSON variable) and
+          # plugin materialization (OPENCODE_PLUGINS_JSON / _1.._5).
+          agent-key: compliance-check
+          agent-models-json: ${{ vars.AGENT_MODELS_JSON }}
+          plugins-json: ${{ vars.OPENCODE_PLUGINS_JSON }}
+          plugins-json-1: ${{ vars.OPENCODE_PLUGINS_JSON_1 }}
+          plugins-json-2: ${{ vars.OPENCODE_PLUGINS_JSON_2 }}
+          plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
+          plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
+          plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
 
       # ======================================================================
       # PHASE 2: GATHER PR CONTEXT
@@ -722,7 +750,36 @@ jobs:
         run: |
           set -o pipefail
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
+          # Config lifecycle: opencode reads config + plugins once at boot.
+          # The share filter touches /tmp/.oc-booted on the first output
+          # line (= boot complete, config consumed); this waiter deletes the
+          # sensitive files shortly after. Hard timeout so a hung boot
+          # cannot pin them for the whole run; the post-run step is the
+          # belt for fast exits and killed waiters.
+          ( for _ in $(seq 1 180); do [ -f /tmp/.oc-booted ] && break; sleep 1; done
+            sleep 2
+            rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
+            rm -rf ~/.mirrobot-plugins ) &
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt" 2>&1 | bash /tmp/share-filter.sh
+          # Fast-exit belt (the step runs under -e; on failure the
+          # always() post-run step below is the cleanup guarantee).
+          rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
+          rm -rf ~/.mirrobot-plugins
+
+      - name: Post-run cleanup and usage stats
+        # Guaranteed removal of the config/plugin files on every path plus
+        # the per-run token/cost summary. Bare `opencode stats` only -
+        # model stats are hidden by default (the --models flag would
+        # expose model names).
+        if: always()
+        run: |
+          rm -f ~/.config/opencode/opencode.json /tmp/.oc-booted
+          rm -rf ~/.mirrobot-plugins
+          OC="$(command -v opencode || true)"
+          if [ -z "$OC" ] && [ -x "$HOME/.local/bin/opencode" ]; then OC="$HOME/.local/bin/opencode"; fi
+          if [ -n "$OC" ]; then
+            { echo "### Agent usage (this run)"; echo '```'; "$OC" stats 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Share link summary
         if: always()
