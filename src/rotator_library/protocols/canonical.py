@@ -758,6 +758,18 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
                 f"usage detail buckets have no {target_protocol} spelling; dropped: {', '.join(keys)}",
                 "usage",
             )
+    response_extra = getattr(unified_response, "extra", None)
+    if isinstance(response_extra, dict) and response_extra and target_protocol != getattr(unified_response, "source_protocol", None):
+        # Foreign response extensions replay only on the source protocol
+        # (source_extensions): drops at other targets are disclosed — the
+        # response-side mirror of the request extra loop.
+        keys = sorted(response_extra)
+        if keys:
+            _disclose(
+                "response_extension_dropped",
+                f"response extension fields have no {target_protocol} representation; dropped: {', '.join(keys)}",
+                "extra",
+            )
 
 
 def attach_conversion_summary(payload: dict[str, Any], unified_response: Any) -> dict[str, Any]:

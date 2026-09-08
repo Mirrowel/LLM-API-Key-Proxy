@@ -360,8 +360,12 @@ class ResponsesWebSocketSession:
     # -- sequencing for locally synthesized frames --------------------------
 
     def _next_sequence(self) -> int:
-        self._sequence += 1
-        return self._sequence
+        # Shared module domain (the same counter native-turn events use):
+        # per-connection counters would collide with turn event sequences —
+        # every frame on the connection must be monotonic together.
+        from .streaming import next_sequence_value
+
+        return next_sequence_value()
 
     def _lane(self, stream_id: Optional[str]) -> LaneState:
         key = stream_id or ""
@@ -490,7 +494,19 @@ class ResponsesWebSocketSession:
                 if event.event_name in _TERMINAL_EVENT_TYPES:
                     terminal_seen = True
                     if event.event_name == "response.failed":
-                        turn_error_status = 500
+                        # Failure status derives from the failure payload when
+                        # the provider classified it (4xx request classes),
+                        # else 500 — never a blanket 500.
+                        failure_payload = event.payload.get("response") if isinstance(event.payload, dict) else None
+                        failure_status = (
+                            failure_payload.get("error", {}).get("status")
+                            if isinstance(failure_payload, dict) and isinstance(failure_payload.get("error"), dict)
+                            else None
+                        )
+                        try:
+                            turn_error_status = int(failure_status) if failure_status else 500
+                        except (TypeError, ValueError):
+                            turn_error_status = 500
                         # Failed turns evict the referenced parent from the
                         # connection-local cache (never reuse stale state).
                         if isinstance(previous_id, str):

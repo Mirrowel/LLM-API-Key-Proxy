@@ -18,6 +18,7 @@ from .base import ProtocolAdapter
 from .canonical import (
     record_instruction_merge,
     disclose_response_drops,
+    STOP_REASON_CONTENT_FILTER,
     format_reasoning_controls,
     normalize_reasoning_controls,
     attach_conversion_summary,
@@ -156,6 +157,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 # single instructions field below.
                 list(unified_request.messages) if preserve_source else conversation_messages(unified_request),
                 preserve_source=preserve_source,
+                warnings=unified_request.warnings,
             ),
         }
         if preserve_source:
@@ -190,17 +192,16 @@ class ResponsesProtocol(ProtocolAdapter):
         if unified_request.stream:
             payload["stream"] = True
         # NOTE: Responses has NO modalities field — the canonical concept
-        # never leaks into upstream payloads (foreign requests carrying it
-        # drop with a recorded warning).
-        if unified_request.modalities and not preserve_source:
-            unified_request.warnings.append(
-                ConversionWarning(
-                    code="unsupported_optional_control",
-                    message="modalities has no Responses representation; dropped",
-                    field="modalities",
-                    source_protocol=unified_request.source_protocol,
-                    target_protocol=self.name,
-                )
+        # never leaks into upstream payloads; a foreign or rebuilt request
+        # carrying it drops with a recorded warning (the raw fast path keeps
+        # the client's own payload verbatim).
+        if unified_request.modalities:
+            add_conversion_warning(
+                unified_request,
+                code="unsupported_optional_control",
+                message="modalities has no Responses representation; dropped",
+                field="modalities",
+                target_protocol=self.name,
             )
         if unified_request.metadata:
             payload["metadata"] = deepcopy(unified_request.metadata)
@@ -315,7 +316,13 @@ class ResponsesProtocol(ProtocolAdapter):
         if unified_response.metadata.get("incomplete_details"):
             payload["incomplete_details"] = deepcopy(unified_response.metadata["incomplete_details"])
         elif payload["status"] == "incomplete" and not preserve_source:
-            payload["incomplete_details"] = {"reason": "max_output_tokens" if unified_response.stop_reason == "max_tokens" else "content_filter"}
+            # Incomplete reasons are evidence-based: max_tokens maps exactly;
+            # content_filter only when the canonical stop says so; anything
+            # else defaults to max_output_tokens (the SDK's default reason —
+            # never a speculative content_filter claim).
+            payload["incomplete_details"] = {
+                "reason": "content_filter" if unified_response.stop_reason == STOP_REASON_CONTENT_FILTER else "max_output_tokens"
+            }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
         return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
 
@@ -480,7 +487,7 @@ class ResponsesProtocol(ProtocolAdapter):
             )
         return UnifiedMessage(role=str(item.get("role") or "user"), content=[ContentBlock(type=str(item_type or "unknown"), raw=deepcopy(item))], raw=deepcopy(item))
 
-    def _format_input(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool) -> list[dict[str, Any]]:
+    def _format_input(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool, warnings: list | None = None) -> list[dict[str, Any]]:
         """Format canonical turns into ordered Responses input items."""
 
         items: list[dict[str, Any]] = []
@@ -494,7 +501,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 residual_message.content = list(visible)
                 residual_message.tool_calls = []
                 residual_message.reasoning = []
-                items.append(self._format_input_message(residual_message, preserve_source=preserve_source))
+                items.append(self._format_input_message(residual_message, preserve_source=preserve_source, warnings=warnings))
                 visible.clear()
 
             for block in ordered_message_blocks(message):
@@ -547,7 +554,7 @@ class ResponsesProtocol(ProtocolAdapter):
             flush_visible()
         return items
 
-    def _format_input_message(self, message: UnifiedMessage, *, preserve_source: bool = True) -> dict[str, Any]:
+    def _format_input_message(self, message: UnifiedMessage, *, preserve_source: bool = True, warnings: list | None = None) -> dict[str, Any]:
         if preserve_source and isinstance(message.raw, dict):
             payload = deepcopy(message.raw)
             if payload.get("type") == "function_call_output":
@@ -562,10 +569,10 @@ class ResponsesProtocol(ProtocolAdapter):
                 # members of their shapes.
                 return payload
             payload["role"] = message.role
-            payload["content"] = self._format_content(message.content, role=message.role, preserve_source=preserve_source)
+            payload["content"] = self._format_content(message.content, role=message.role, preserve_source=preserve_source, warnings=warnings)
             return payload
         role = "assistant" if message.role in {"assistant", "model"} else "user"
-        return {"type": "message", "role": role, "content": self._format_content(message.content, role=role, preserve_source=preserve_source)}
+        return {"type": "message", "role": role, "content": self._format_content(message.content, role=role, preserve_source=preserve_source, warnings=warnings)}
 
     def _parse_output_item(self, item: dict[str, Any]) -> UnifiedMessage | None:
         item_type = item.get("type")
@@ -600,7 +607,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 raw=deepcopy(item),
             )
             return UnifiedMessage(role="assistant", content=[ContentBlock(type="builtin_tool", builtin_tool=builtin, raw=deepcopy(item))], raw=deepcopy(item))
-        if item_type and item_type not in {"message", "reasoning", "function_call", "custom_tool_call", "item_reference"}:
+        if item_type and item_type not in {"message", "reasoning", "function_call", "custom_tool_call"}:
             # Unknown provider-executed / server-side item kinds (MCP list/
             # approval, shell calls, future tools) become catch-all builtin
             # records: retained with raw for same-protocol fidelity, guarded
@@ -777,7 +784,7 @@ class ResponsesProtocol(ProtocolAdapter):
             return [ContentBlock(type="file", source=source, index=block_index, raw=deepcopy(block), extra={"source_type": block_type, **_without(block, {"type", "file_id", "file_data", "file_url"})})]
         return [ContentBlock(type=block_type, index=block_index, raw=deepcopy(block), extra=_without(block, {"type"}))]
 
-    def _format_content(self, blocks: Iterable[ContentBlock], *, role: str = "user", output: bool = False, preserve_source: bool = True) -> list[dict[str, Any]]:
+    def _format_content(self, blocks: Iterable[ContentBlock], *, role: str = "user", output: bool = False, preserve_source: bool = True, warnings: list | None = None) -> list[dict[str, Any]]:
         formatted = []
         for block in blocks:
             if block.type == "text":
@@ -796,6 +803,13 @@ class ResponsesProtocol(ProtocolAdapter):
                     # Request-side history (any role, including assistant
                     # turns): Responses input has no refusal part; degrade to
                     # input_text per D7 (validator admits refusal).
+                    if warnings is not None and not preserve_source:
+                        _warn_responses_list_once(
+                            warnings,
+                            code="incompatible_content_downgrade",
+                            message="refusal has no Responses input part; degraded to input_text (the refusal semantics carry as text)",
+                            field="content",
+                        )
                     formatted.append({"type": "input_text", "text": block.refusal})
             elif block.type == "image":
                 if output:
@@ -812,6 +826,10 @@ class ResponsesProtocol(ProtocolAdapter):
             elif block.type in {"file", "document"}:
                 payload = {"type": "input_file"}
                 payload.update(_format_responses_file_source(block.source))
+                if preserve_source:
+                    # Cache hints (prompt_cache_breakpoint etc.) ride the
+                    # part like the text/image branches — never dropped.
+                    payload.update({k: deepcopy(v) for k, v in block.extra.items() if k != "source_type"})
                 formatted.append(payload)
             elif preserve_source and isinstance(block.raw, dict):
                 formatted.append(deepcopy(block.raw))
@@ -858,6 +876,19 @@ class ResponsesProtocol(ProtocolAdapter):
 
     def _format_function_call(self, call: ToolCall, *, preserve_source: bool) -> dict[str, Any]:
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
+        if call.type == "custom":
+            # Custom tool calls keep their native spelling (input, not
+            # arguments) — coercing to function_call would change how the
+            # provider pairs the call with its custom_tool_output.
+            payload.update(
+                {
+                    "type": "custom_tool_call",
+                    "call_id": call.id or "",
+                    "name": call.name or "",
+                    "input": tool_arguments_text(call.arguments),
+                }
+            )
+            return payload
         payload.update(
             {
                 "type": "function_call",
@@ -936,11 +967,12 @@ class ResponsesProtocol(ProtocolAdapter):
             payload["tool_choice"] = format_tool_choice(params.pop("tool_choice"), self.name)
         supported = {
             "background",
-            "context_management",
+            # NOTE: context_management/moderation are doc-unverified create
+            # params with no canonical producer — deliberately NOT in the
+            # supported set (they would emit unverified fields upstream).
             "conversation",
             "include",
             "max_tool_calls",
-            "moderation",
             "parallel_tool_calls",
             "prompt",
             "prompt_cache_key",
@@ -977,6 +1009,17 @@ def _responses_output_modalities(messages: list[UnifiedMessage]) -> list[str]:
     if any(block.type == "builtin_tool" and block.builtin_tool is not None and block.builtin_tool.kind == "image_generation" for block in blocks):
         modalities.append("image")
     return modalities
+
+
+def _warn_responses_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
+    """Append a deduplicated ConversionWarning to a plain list sink."""
+
+    if warnings is None:
+        return
+    for warning in warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="responses"))
 
 
 def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:

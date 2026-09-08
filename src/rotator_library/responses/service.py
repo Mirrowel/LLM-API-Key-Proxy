@@ -567,6 +567,8 @@ class ResponsesService:
                 terminal_exc,
                 transaction_logger=transaction_logger,
                 session_info=session_info,
+                as_events=as_events,
+                local_cache=local_cache,
             ):
                 yield frame
             self._finalize_stream_metadata(transaction_logger, error=terminal_exc)
@@ -649,6 +651,9 @@ class ResponsesService:
         # provider-emitted terminal frames on the same stream. Event mode
         # (WebSocket) yields the neutral event — no [DONE] sentinel exists
         # on that transport; the terminal response.failed closes the turn.
+        # Every event carries a monotonic sequence_number — synthesized
+        # failure frames included.
+        failed.setdefault("sequence_number", next_sequence_value())
         failed_event = ResponsesStreamEvent("response.failed", {"type": "response.failed", "response": failed})
         if as_events:
             yield failed_event
@@ -1510,9 +1515,9 @@ class ResponsesService:
                 local_cache[stored.id] = stored
             return False
         if failed and not self.store_settings.store_failed:
-            if build_and_cache:
-                stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-                local_cache[stored.id] = stored
+            # Failed turns honor the store_failed policy on the local cache
+            # too — caching a failed id locally would let a chained turn
+            # "succeed" against empty output instead of missing.
             return False
         stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
         try:

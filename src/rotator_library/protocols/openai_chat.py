@@ -1106,6 +1106,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 formatted_output = format_structured_output(structured, self.name)
                 if formatted_output is not None:
                     payload["response_format"] = formatted_output
+                elif structured.get("type") == "text":
+                    # Chat's default IS text — dropping the explicit text
+                    # format is lossless, not a drop worth warning about.
+                    pass
                 else:
                     add_conversion_warning(
                         request,

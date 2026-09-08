@@ -210,17 +210,24 @@ def validate_generative_request(
     elif target_protocol == "anthropic_messages":
         supported_tool_types = {"function", "server"}
     elif target_protocol == "responses":
-        # Responses' native ToolParam union: hosted tools are first-class.
+        # Responses' native ToolParam union: hosted tools are first-class
+        # (namespace/apply_patch/tool_search/shell/web_search_preview are
+        # current union members; preview spellings stay accepted).
         supported_tool_types = {
             "function",
             "custom",
             "web_search",
+            "web_search_preview",
             "file_search",
             "code_interpreter",
             "image_generation",
             "computer_use_preview",
             "mcp",
             "local_shell",
+            "shell",
+            "namespace",
+            "apply_patch",
+            "tool_search",
         }
     elif target_protocol == "gemini":
         # Gemini hosts googleSearch/codeExecution/urlContext natively and

@@ -455,6 +455,10 @@ def _format_responses(event: UnifiedStreamEvent, state: StreamFormatState) -> li
         return frames
 
     frames = _responses_start(state)
+    # Done/terminal snapshots are the only carrier of bound opaque state
+    # (encrypted reasoning) on real upstreams — harvest before the delta
+    # skip so synthesized frames carry it (D8).
+    _harvest_done_state(event, state)
     for block in _event_blocks(event):
         if block.type == "builtin_tool" and block.builtin_tool is not None:
             # Provider-executed tool records stream as native output items.
@@ -681,6 +685,38 @@ def _event_blocks(event: UnifiedStreamEvent) -> list[ContentBlock]:
     if message is None:
         return []
     return ordered_message_blocks(message)
+
+
+def _harvest_done_state(event: UnifiedStreamEvent, state: "StreamFormatState") -> None:
+    """Harvest provider-owned state from done/terminal snapshots.
+
+    Real upstreams deliver ``encrypted_content`` (and tool signatures) only
+    on ``output_item.done`` / terminal objects — the delta path never sees
+    them. Harvest here so the synthesized done frames and the terminal
+    response object carry the bound opaque state (D8).
+    """
+
+    encrypted_blocks = [
+        block
+        for block in _client_visible_blocks(event, include_builtins=True)
+        if block.reasoning and block.reasoning.encrypted_content
+    ]
+    if not encrypted_blocks:
+        return
+    raw = event.extra.get("payload") if isinstance(event.extra, dict) else None
+    raw_item = raw.get("item") if isinstance(raw, dict) and isinstance(raw.get("item"), dict) else None
+    raw_item_id = raw_item.get("id") if isinstance(raw_item, dict) else None
+    # Match by upstream item id when present; else the (single) reasoning
+    # item open on this state.
+    if isinstance(raw_item_id, str):
+        for key, item_id in state.item_ids.items():
+            if item_id == raw_item_id and state.item_kinds.get(key) == "reasoning":
+                state.reasoning_encrypted[key] = encrypted_blocks[0].reasoning.encrypted_content
+                return
+    for key, kind in state.item_kinds.items():
+        if kind == "reasoning":
+            state.reasoning_encrypted[key] = encrypted_blocks[0].reasoning.encrypted_content
+            break
 
 
 def _client_visible_blocks(event: UnifiedStreamEvent, *, include_builtins: bool = False) -> list[ContentBlock]:
