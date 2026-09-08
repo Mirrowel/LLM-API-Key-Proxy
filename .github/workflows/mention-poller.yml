@@ -6,6 +6,10 @@
 #   in — the account is mentionable anywhere; GitHub turns those into account
 #   notifications; this workflow consumes them.
 #
+# EXECUTES FROM: THE DEFAULT BRANCH, always (repository_dispatch /
+#   workflow_dispatch on the default ref). Platform updates land on main -
+#   see docs/workflows/overview.md for the execution map and update doctrine.
+#
 # Opt-in: the FOREIGN_MENTIONS_ENABLED repo VARIABLE must be exactly 'true'
 # (variables are the house pattern for non-sensitive toggles; secrets would
 # need the env-derivation dance for if-conditions). Default: disabled.
@@ -82,7 +86,9 @@ concurrency:
 
 jobs:
   poll:
-    if: vars.FOREIGN_MENTIONS_ENABLED == 'true'
+    # AGENT_PAUSED is part of the kill switch family: while paused the
+    # poller stays silent too (no guest sessions while the brain is off).
+    if: vars.FOREIGN_MENTIONS_ENABLED == 'true' && vars.AGENT_PAUSED != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Sparse checkout of shared scripts

@@ -1,5 +1,9 @@
 name: Agent Router
 
+# EXECUTES FROM: THE DEFAULT BRANCH, always (issue_comment events are
+# default-branch by GitHub rule). Platform updates land on main - see
+# docs/workflows/overview.md for the execution map and update doctrine.
+
 # ============================================================================
 # SINGLE COMMENT-TRIGGER ENTRYPOINT (noise consolidation)
 # ============================================================================
@@ -55,6 +59,7 @@ jobs:
     # agent names enumerate known casings (logins are case-insensitive; when
     # an identity is renamed, add its new casing here).
     if: |
+      vars.AGENT_PAUSED != 'true' &&
       !endsWith(github.event.comment.user.login, '[bot]') &&
       github.event.comment.user.login != 'mirrobot' &&
       github.event.comment.user.login != 'mirrobot-agent' &&

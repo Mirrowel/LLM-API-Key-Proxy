@@ -1,5 +1,9 @@
 name: Issue Analysis
 
+# EXECUTES FROM: THE DEFAULT BRANCH, always (issues[opened] events are
+# default-branch by GitHub rule). Platform updates land on main - see
+# docs/workflows/overview.md for the execution map and update doctrine.
+
 on:
   # Anti-phantom: an explicit never-matching push trigger. Dispatch-only
   # workflows otherwise get dead push-event runs (red X, 0 jobs) whenever
@@ -19,6 +23,10 @@ on:
 
 jobs:
   check-issue:
+    # AGENT_PAUSED variable: kill switch - paused runs skip entirely
+    # (visible gray skip); the stub and compliance-gate keep the pending
+    # status posted so merges stay blocked while paused.
+    if: vars.AGENT_PAUSED != 'true'
     runs-on: ubuntu-latest
     # Least privilege for the built-in GITHUB_TOKEN: only the initial
     # actions/checkout uses it. The reaction, comments, and all bot operations
@@ -28,6 +36,10 @@ jobs:
       contents: read
 
     env:
+      # ─── EDITABLE KNOBS ──────────────────────────────────────────────────
+      # Everything a fork tunes in THIS file lives in this env block (the
+      # rest is machinery). Full reference: docs/configuration.md and
+      # docs/workflows/issue-comment.md.
       # If triggered by 'issues', it uses github.event.issue.number.
       # If triggered by 'workflow_dispatch', it uses the number you provided in the form.
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
@@ -68,6 +80,16 @@ jobs:
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
           opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
+          # Per-agent model override (AGENT_MODELS_JSON variable) and
+          # plugin materialization (OPENCODE_PLUGINS_JSON / _1.._5).
+          agent-key: issue-comment
+          agent-models-json: ${{ vars.AGENT_MODELS_JSON }}
+          plugins-json: ${{ vars.OPENCODE_PLUGINS_JSON }}
+          plugins-json-1: ${{ vars.OPENCODE_PLUGINS_JSON_1 }}
+          plugins-json-2: ${{ vars.OPENCODE_PLUGINS_JSON_2 }}
+          plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
+          plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
+          plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
 
       - name: Add reaction to issue
         env:
@@ -235,8 +257,34 @@ jobs:
             set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
             VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}'
+            # Config lifecycle: opencode reads config + plugins once at boot.
+            # The share filter touches /tmp/.oc-booted on the first output
+            # line (= boot complete, config consumed); this waiter deletes
+            # the sensitive files shortly after. Hard timeout so a hung
+            # boot cannot pin them; the always() post-run step is the belt.
+            ( for _ in $(seq 1 180); do [ -f /tmp/.oc-booted ] && break; sleep 1; done
+              sleep 2
+              rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
+              rm -rf ~/.mirrobot-plugins ) &
             # Prepend the security brief (with the verified requester + trust context lines)
             { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
+            rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
+            rm -rf ~/.mirrobot-plugins
+
+      - name: Post-run cleanup and usage stats
+        # Guaranteed removal of the config/plugin files on every path plus
+        # the per-run token/cost summary. Bare `opencode stats` only -
+        # model stats are hidden by default (the --models flag would
+        # expose model names).
+        if: always()
+        run: |
+            rm -f ~/.config/opencode/opencode.json /tmp/.oc-booted
+            rm -rf ~/.mirrobot-plugins
+            OC="$(command -v opencode || true)"
+            if [ -z "$OC" ] && [ -x "$HOME/.local/bin/opencode" ]; then OC="$HOME/.local/bin/opencode"; fi
+            if [ -n "$OC" ]; then
+              { echo "### Agent usage (this run)"; echo '```'; "$OC" stats 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            fi
 
       - name: Share link summary
         if: always()
