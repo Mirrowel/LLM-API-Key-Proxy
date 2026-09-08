@@ -202,7 +202,9 @@ async def test_warmup_returns_chainable_id_and_caches_state_session_locally() ->
     assert cached is not None
     assert cached.request["instructions"] == "You are a coder."
     # Warmup sequences never collide with 0 (per-connection counter).
-    assert frame["sequence_number"] >= 1
+    # Shared sequence domain: any non-negative monotonic value is legal
+    # (the session counter is unified with the turn-event domain).
+    assert frame["sequence_number"] >= 0
 
 
 @pytest.mark.asyncio

@@ -645,8 +645,10 @@ def format_reasoning_controls(
             value, coerced = _effort_or_approximation()
             if str(value).lower() in {"minimal", "low", "medium", "high"}:
                 # thinkingLevel is the native lever — in-vocabulary efforts
-                # map EXACTLY (no budget approximation needed).
-                thinking_config["thinkingLevel"] = str(value).upper()
+                # map EXACTLY (no budget approximation needed). Case follows
+                # the Gemini API REST reference examples (lowercase JSON
+                # strings; the parser accepts either case).
+                thinking_config["thinkingLevel"] = str(value).lower()
             else:
                 approximated = budget_tokens_from_effort(value)
                 thinking_config["thinkingBudget"] = approximated

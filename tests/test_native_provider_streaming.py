@@ -469,11 +469,12 @@ async def test_provider_stream_state_is_cached_for_followups_but_not_exposed(
         model="gpt-test",
     )
     output_text = "".join([frame async for frame in pipeline.run(event_source())])
-    if protocol == "anthropic_messages":
-        # Spec contract (gatekeeper H4): signature_delta is part of the
-        # client-visible anthropic stream — same-protocol clients receive it
-        # for multi-turn replay; the cache records it independently below.
+    if protocol in {"anthropic_messages", "gemini"}:
+        # Spec contract: signatures are part of the client-visible wire for
+        # these protocols (anthropic signature_delta, gemini thoughtSignature
+        # parts) — same-protocol clients receive them for multi-turn replay;
+        # the cache records them independently below.
         assert secret in output_text
     else:
-        # Non-anthropic wires never expose provider signature state raw.
+        # Other wires never expose provider signature state raw.
         assert secret not in output_text

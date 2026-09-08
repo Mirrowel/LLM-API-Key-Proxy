@@ -617,11 +617,11 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         state.stop_reason = str(event.stop_reason or event.extra.get("stop_reason"))
         finish_reason = format_stop_reason(state.stop_reason, "gemini")
     candidate_index = event.output_index or 0
-    if finish_reason and (state.completion_emitted or candidate_index in state.finished_choices):
+    if finish_reason and candidate_index in state.finished_choices:
         # Duplicate completion (e.g. synthetic terminal after a finish frame):
-        # never re-emit the finish reason. Per-candidate: multi-candidate
-        # streams finish each index exactly once (the stream-global flag
-        # stays for usage framing).
+        # never re-emit a candidate's finish reason. Per-index ONLY — the
+        # stream-global flag is usage framing, sibling candidates must each
+        # close on the wire even after candidate 0 finished.
         finish_reason = None
     usage_ready = event.usage is not None and not state.completion_emitted
     if parts or finish_reason or usage_ready:
@@ -749,16 +749,27 @@ def _harvest_done_state(event: UnifiedStreamEvent, state: "StreamFormatState") -
     raw = event.extra.get("payload") if isinstance(event.extra, dict) else None
     raw_item = raw.get("item") if isinstance(raw, dict) and isinstance(raw.get("item"), dict) else None
     raw_item_id = raw_item.get("id") if isinstance(raw_item, dict) else None
-    # Match by upstream item id when present; else the (single) reasoning
-    # item open on this state.
+    # Attribution, in order of precision: the raw payload's output_index
+    # (block keys are reasoning:{n} and coincide with the output index for
+    # responses sources), then the upstream item id, then the first open
+    # reasoning item. Without this, multi-reasoning responses mis-bind
+    # opaque state (upstream ids never match the synthesized rs_N ids).
+    raw_output_index = raw_item.get("output_index") if isinstance(raw_item, dict) else None
+    encrypted_value = encrypted_blocks[0].reasoning.encrypted_content
+    if isinstance(raw_output_index, int):
+        candidate_keys = [key for key, _ in state.item_ids.items() if state.item_kinds.get(key) == "reasoning"]
+        candidate_keys.sort(key=lambda key: list(state.item_ids).index(key))
+        if 0 <= raw_output_index < len(candidate_keys):
+            state.reasoning_encrypted[candidate_keys[raw_output_index]] = encrypted_value
+            return
     if isinstance(raw_item_id, str):
         for key, item_id in state.item_ids.items():
             if item_id == raw_item_id and state.item_kinds.get(key) == "reasoning":
-                state.reasoning_encrypted[key] = encrypted_blocks[0].reasoning.encrypted_content
+                state.reasoning_encrypted[key] = encrypted_value
                 return
     for key, kind in state.item_kinds.items():
         if kind == "reasoning":
-            state.reasoning_encrypted[key] = encrypted_blocks[0].reasoning.encrypted_content
+            state.reasoning_encrypted[key] = encrypted_value
             return
     # The item never streamed deltas (complete-on-arrival): register it now
     # so the done frames + terminal object include it.

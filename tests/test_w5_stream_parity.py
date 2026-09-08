@@ -116,6 +116,99 @@ def _anthropic_frames(output: str, event_name: str) -> List[Dict[str, Any]]:
     return frames
 
 
+def test_same_chunk_multi_candidate_finishes_each_index_once() -> None:
+    from rotator_library.protocols import ProtocolContext, get_protocol
+    from rotator_library.protocols.streaming import ProtocolStreamConverter
+
+    gemini = get_protocol("gemini")
+    ctx = ProtocolContext(
+        source_protocol="gemini",
+        target_protocol="gemini",
+        input_protocol="gemini",
+        client_protocol="gemini",
+    )
+    converter = ProtocolStreamConverter(gemini, gemini, ctx)
+    # One chunk carrying TWO candidates, both finishing: each index must
+    # close on the wire (candidate 0 finishing first must not suppress
+    # candidate 1's finishReason).
+    raw = {
+        "candidates": [
+            {"index": 0, "content": {"role": "model", "parts": [{"text": "a"}]}, "finishReason": "STOP"},
+            {"index": 1, "content": {"role": "model", "parts": [{"text": "b"}]}, "finishReason": "STOP"},
+        ],
+        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 2, "totalTokenCount": 5},
+    }
+    frames = list(converter.convert(raw))
+    joined = "".join(frames)
+    assert joined.count('"finishReason": "STOP"') == 2, "both candidates must finish on the wire"
+
+
+def test_two_reasoning_items_harvest_attributes_by_output_index() -> None:
+    from rotator_library.protocols.types import (
+        ContentBlock,
+        ReasoningBlock,
+        UnifiedMessage,
+        UnifiedStreamEvent,
+    )
+    from rotator_library.protocols.streaming import format_canonical_stream_event, stream_format_state
+    from rotator_library.protocols import ProtocolContext
+
+    ctx = ProtocolContext(
+        source_protocol="responses",
+        target_protocol="responses",
+        input_protocol="responses",
+        client_protocol="responses",
+    )
+    state = stream_format_state(ctx, "responses")
+
+    # Open two reasoning items via deltas (index 0 and 1).
+    for idx, text in enumerate(["alpha", "beta"]):
+        delta = UnifiedStreamEvent(
+            type="response.reasoning_summary_text.delta",
+            source_protocol="responses",
+            output_index=idx,
+            message=UnifiedMessage(role="assistant", content=[ContentBlock(type="reasoning", reasoning=ReasoningBlock(text=text))]),
+        )
+        format_canonical_stream_event(delta, "responses", ctx, state=state)
+    # Upstream done for the SECOND item only, carrying its encrypted state.
+    done = UnifiedStreamEvent(
+        type="response.output_item.done",
+        source_protocol="responses",
+        message=UnifiedMessage(
+            role="assistant",
+            content=[ContentBlock(type="reasoning", reasoning=ReasoningBlock(text="beta", encrypted_content="ENC_B"))],
+        ),
+        extra={"payload": {"item": {"id": "rs_upstream_b", "type": "reasoning", "output_index": 1}}},
+    )
+    format_canonical_stream_event(done, "responses", ctx, state=state)
+    terminal = UnifiedStreamEvent(type="response.completed", source_protocol="responses", message=UnifiedMessage(role="assistant"))
+    frames = format_canonical_stream_event(terminal, "responses", ctx, state=state)
+    joined = "".join(frames)
+    # ENC_B lands on the SECOND reasoning item (beta) — verify the terminal
+    # reasoning item that carries beta's text also carries ENC_B, and the
+    # alpha item does not.
+    import json as _json
+
+    reasoning_items = []
+    for chunk in joined.split("\n\n"):
+        for line in chunk.splitlines():
+            if line.startswith("data:"):
+                try:
+                    payload = _json.loads(line[len("data:"):].strip())
+                except ValueError:
+                    continue
+                response = payload.get("response") if isinstance(payload, dict) else None
+                if isinstance(response, dict):
+                    for item in response.get("output") or []:
+                        if isinstance(item, dict) and item.get("type") == "reasoning":
+                            reasoning_items.append(item)
+    assert len(reasoning_items) == 2, "terminal must carry both reasoning items"
+    alpha_item = next(item for item in reasoning_items if "alpha" in str(item.get("summary")))
+    beta_item = next(item for item in reasoning_items if "beta" in str(item.get("summary")))
+    assert beta_item.get("encrypted_content") == "ENC_B", "encrypted state must bind to the item it arrived on"
+    assert not alpha_item.get("encrypted_content"), "sibling items never inherit opaque state"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("client_protocol", ["openai_chat", "anthropic_messages", "responses", "gemini"])
 async def test_native_stream_terminal_frames_usage_and_anchors_per_client_protocol(client_protocol: str) -> None:

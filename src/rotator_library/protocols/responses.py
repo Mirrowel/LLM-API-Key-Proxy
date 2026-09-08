@@ -638,6 +638,10 @@ class ResponsesProtocol(ProtocolAdapter):
                 call = message.tool_calls[0]
                 payload["call_id"] = call.id
                 payload["name"] = call.name
+                if item_type == "custom_tool_call" and "input" in payload:
+                    # Native input member present: NEVER stamp arguments
+                    # alongside it (hybrid shapes 400 upstream).
+                    return payload
                 payload["arguments"] = tool_arguments_text(call.arguments)
                 return payload
             if item_type in _BUILTIN_TOOL_ITEM_TYPES:
