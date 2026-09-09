@@ -7,6 +7,8 @@ body:
       value: |
         Thanks for taking the time to report a bug! Please fill out the information below to help us investigate.
 
+        An AI triage agent analyzes new issues automatically — it will investigate, label, and respond. No need to @mention anyone.
+
   - type: dropdown
     id: branch
     attributes:
@@ -31,7 +33,7 @@ body:
     id: version
     attributes:
       label: Version / Tag / Commit
-      description: Release version, git tag, or commit hash. Enter "latest" if using the latest release.
+      description: Release version, git tag, or commit hash — see the Releases page. Enter "latest" if using the latest release.
       placeholder: e.g., v1.15, latest, abc1234
 
   - type: input
@@ -109,7 +111,7 @@ body:
     id: logs
     attributes:
       label: Error Logs / Messages
-      description: Paste any relevant error messages or logs. This will be formatted as code.
+      description: Paste any relevant error messages or logs. This will be formatted as code. REDACT API keys and tokens before pasting — this issue is public.
       render: text
 
   - type: checkboxes

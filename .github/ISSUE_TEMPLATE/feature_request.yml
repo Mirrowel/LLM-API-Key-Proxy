@@ -7,6 +7,8 @@ body:
       value: |
         Thanks for suggesting an improvement! Please describe what you'd like to see.
 
+        An AI triage agent evaluates new requests — motivation, feasibility, impact. A clear case helps it help you.
+
   - type: dropdown
     id: feature_type
     attributes:
@@ -40,12 +42,19 @@ body:
       required: true
 
   - type: textarea
+    id: existing_attempt
+    attributes:
+      label: What have you tried instead?
+      description: Is there an existing way to get close to this (config, provider, workaround)? What did it miss?
+      placeholder: I tried ... but it doesn't cover ...
+
+  - type: textarea
     id: additional_context
     attributes:
       label: Additional Context
       description: |
         Any other information that might help.
-        
+
         For new provider requests, please include if available:
         - Link to provider API documentation
         - Authentication type (API key, OAuth, etc.)

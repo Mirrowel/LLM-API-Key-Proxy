@@ -1,3 +1,5 @@
 blank_issues_enabled: true
-# To disable blank issues, uncomment:
-# blank_issues_enabled: false
+contact_links:
+  - name: Questions & Ideas
+    url: https://github.com/Mirrowel/LLM-API-Key-Proxy/discussions
+    about: Ask anything or float ideas in Discussions — mention the agent there and it will pick it up.

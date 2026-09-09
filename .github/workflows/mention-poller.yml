@@ -1,0 +1,148 @@
+# ============================================================================
+# MENTION POLLER (cross-repo ears)
+# ============================================================================
+# Purpose: lets the agent respond to genuine @mentions of its USER ACCOUNT
+#   (and review-request-button requests) in PUBLIC repos it is NOT installed
+#   in — the account is mentionable anywhere; GitHub turns those into account
+#   notifications; this workflow consumes them.
+#
+# EXECUTES FROM: THE DEFAULT BRANCH, always (repository_dispatch /
+#   workflow_dispatch on the default ref). Platform updates land on main -
+#   see docs/workflows/overview.md for the execution map and update doctrine.
+#
+# Opt-in: the FOREIGN_MENTIONS_ENABLED repo VARIABLE must be exactly 'true'
+# (variables are the house pattern for non-sensitive toggles; secrets would
+# need the env-derivation dance for if-conditions). Default: disabled.
+#
+# WORKER-FIRST (default): the primary entry path is repository_dispatch
+# from the external mention-worker (tools/mention-worker/, Cloudflare free
+# tier) - Actions run ONLY when a qualifying notification exists. To also
+# keep an in-repo fallback poller, add a schedule trigger back:
+#     schedule:
+#       - cron: '*/5 * * * *'
+# (deliberate opt-in: an always-on schedule costs ~288 runs/day of idle
+# polling - exactly the load the worker exists to avoid; mark-read acks
+# make the two paths mutually exclusive when both are active).
+#
+# Account-mode only: the App is structurally blind abroad (not installed
+# there). Without ACCOUNT_GH_TOKEN the job notices-and-exits.
+#
+# Two entry paths, one trust pipeline (all logic in handle-mentions.sh):
+#   workflow_dispatch    — manual runs and testing (the poll entry works
+#                          standalone: run it by hand any time)
+#   repository_dispatch  — the mention-worker (tools/mention-worker/,
+#                          Cloudflare, free tier) forwards RAW notifications;
+#                          the worker holds no logic, and every payload field
+#                          is re-fetched from the GitHub API before any
+#                          decision. Actions then only run when something
+#                          actually happened (the anti-abuse path).
+#
+# SECURITY: this workflow never checks out PR content, never renders request
+#   bodies into prompts. Its ceiling: it can dispatch bot-reply guest runs
+#   for qualifying notifications — everything downstream re-verifies
+#   (bot-reply re-fetches the comment, re-checks the allowlist, re-checks
+#   the mention; guest rules govern the session).
+# ============================================================================
+
+name: Mention Poller
+
+# The default dispatch run title ("Repository dispatch triggered by
+# <token owner>") is misleading - the token owner did nothing; the
+# mention-worker relayed an automated mention FROM somewhere. Name the
+# actual source: the first relayed notification's repo + reason for
+# worker relays, the human actor for manual polls. (No extraction of
+# issue numbers in GH expressions - repo + reason is the ceiling.)
+run-name: >
+  ${{ github.event_name == 'repository_dispatch'
+      && format('Automated mention relay from {0} ({1})',
+           github.event.client_payload.notifications[0].repository.full_name,
+           github.event.client_payload.notifications[0].reason)
+      || format('Manual poll by @{0}', github.actor) }}
+
+on:
+  # Anti-phantom: an explicit never-matching push trigger. Dispatch-only
+  # workflows otherwise get dead push-event runs (red X, 0 jobs) whenever a
+  # push modifies the workflow file (actions/runner#4001 residue, live-
+  # observed repeatedly). With this declared, push-event evaluation finds
+  # no matching ref and creates NO run at all. Semantics unchanged.
+  push:
+    branches-ignore: ["**"]
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'Optional relay payload (raw notifications JSON) — internal use'
+        required: false
+        type: string
+  repository_dispatch:
+    types: [foreign-mention]
+
+permissions:
+  contents: read   # sparse checkout of trusted scripts
+  actions: write   # dispatch bot-reply.yml
+
+concurrency:
+  group: mention-poller
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    # AGENT_PAUSED is part of the kill switch family: while paused the
+    # poller stays silent too (no guest sessions while the brain is off).
+    if: vars.FOREIGN_MENTIONS_ENABLED == 'true' && vars.AGENT_PAUSED != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sparse checkout of shared scripts
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Guard — account mode required
+        env:
+          ACCOUNT_TOKEN_SET: ${{ secrets.ACCOUNT_GH_TOKEN != '' }}
+        run: |
+          if [ "$ACCOUNT_TOKEN_SET" != "true" ]; then
+            echo "::notice::FOREIGN_MENTIONS_ENABLED is on but ACCOUNT_GH_TOKEN is absent - cross-repo mentions are account-mode only. Skipping."
+            exit 1
+          fi
+
+      - name: Run mention pipeline
+        env:
+          GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
+          # Dispatch token: the workflow's ephemeral token (actions: write
+          # declared above). The account PAT cannot dispatch bot-reply (no
+          # write access; notifications are user-scoped but dispatches are
+          # repo-write-scoped - two tokens, two purposes).
+          DISPATCH_GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HOME_OWNER: ${{ github.repository_owner }}
+          FOREIGN_MENTIONS_USERS: ${{ vars.FOREIGN_MENTIONS_USERS || '' }}
+          # Identity + triggers (resolved below by bot-config.sh): identities =
+          # BOT_IDENTITIES variable (+) the /user-detected account login;
+          # fallback only when both are absent. Trigger stems = BOT_TRIGGERS
+          # variable, else identity-derived, else the mirrobot words.
+          BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+          BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
+          BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
+          MAX_DISPATCH: '3'
+        run: |
+          set -euo pipefail
+          chmod +x .github/scripts/*.sh
+          # Resolve identity + trigger stems for the gauntlet below (same-step
+          # consumption via --export). Workspace copy is trusted here: this
+          # workflow always runs from the default branch.
+          eval "$(bash .github/scripts/bot-config.sh --export)"
+          # Relay payload comes from the event file, NEVER via env expressions:
+          # client_payload.notifications is a JSON ARRAY, and injecting an
+          # array into an env value makes the whole template invalid
+          # ("A sequence was not expected" — live-lesson; only the real relay
+          # shape triggers it, manual dispatches pass a scalar fallback).
+          RELAY_PAYLOAD="$(jq -rc '.client_payload.notifications // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+          if [ -z "$RELAY_PAYLOAD" ] || [ "$RELAY_PAYLOAD" = "null" ]; then
+            RELAY_PAYLOAD="$(jq -rc '.inputs.payload // empty' "$GITHUB_EVENT_PATH" 2>/dev/null || true)"
+          fi
+          if [ -n "$RELAY_PAYLOAD" ] && [ "$RELAY_PAYLOAD" != "null" ]; then
+            bash .github/scripts/handle-mentions.sh --payload "$RELAY_PAYLOAD"
+          else
+            bash .github/scripts/handle-mentions.sh
+          fi

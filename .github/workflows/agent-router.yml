@@ -1,0 +1,375 @@
+name: Agent Router
+
+# EXECUTES FROM: THE DEFAULT BRANCH, always (issue_comment events are
+# default-branch by GitHub rule). Platform updates land on main - see
+# docs/workflows/overview.md for the execution map and update doctrine.
+
+# ============================================================================
+# SINGLE COMMENT-TRIGGER ENTRYPOINT (noise consolidation)
+# ============================================================================
+# Every issue_comment[created] event fired ALL THREE agent workflows, of which
+# at most one proceeded (the rest skipped). This router is now the only
+# comment-triggered workflow: it parses the comment once and dispatches ONLY
+# the matching target workflow(s). Per comment: 3 workflow entries -> 1.
+#
+# Routing rules replicate the targets' former triggers EXACTLY:
+#   - /mirrobot-review or /mirrobot_review  -> PR Review        (PRs only)
+#   - /mirrobot-check  or /mirrobot_check   -> Compliance Check  (PRs only)
+#   - @mirrobot / @mirrobot-agent mention   -> Bot Reply
+#   - compound comments dispatch ALL matches (parallel agents, as before)
+#   - bot-authored comments ([bot] suffix, mirrobot, mirrobot-agent): no route
+#   - trigger words only inside quotes/code fences/inline code: no route
+#
+# Security model:
+#   - issue_comment is default-branch-guaranteed: this file, and everything
+#     it dispatches, always comes from the default branch.
+#   - The ONLY privileges are GITHUB_TOKEN with actions:write (workflow
+#     dispatch) and contents:read (the single sparse default-branch checkout
+#     of the shared routing script). No App key, no LLM key, no PR/fork
+#     checkout, no untrusted code execution: comment text is parsed by
+#     route-comment.sh and never interpolated into shell via ${{ }} (env:
+#     only).
+#   - GITHUB_TOKEN CAN trigger workflow_dispatch (documented GitHub exception
+#     to the token-recursion rule).
+#   - Routing decisions are logged to the run step summary: this run is the
+#     audit trail for "why did/didn't the agent respond".
+#   - Targets re-fetch comment context from the API by id (comment_id input):
+#     author/association/body arrive from GitHub, never from this run's
+#     inputs, so the requester-verification chain is unchanged.
+# ============================================================================
+
+on:
+  issue_comment:
+    types: [created]
+  # Discussions (2026-09-09 extension): both paths are mention-summons for
+  # Bot Reply (discussions are reply-only threads — no review/compliance
+  # routes). Default-branch guaranteed like issue_comment. Discussion
+  # payloads have no REST endpoints: the target re-fetches via GraphQL.
+  discussion_comment:
+    types: [created]
+  discussion:
+    types: [created]
+
+permissions:
+  actions: write    # dispatch the target agent workflows
+  contents: read    # sparse default-branch checkout of .github/scripts only
+                    # (the shared route-comment.sh; see Checkout routing script)
+
+concurrency:
+  group: agent-router-${{ github.event.comment.id }}
+  cancel-in-progress: false
+
+jobs:
+  route:
+    # Bot-loop guard, platform level: comments authored by any [bot] identity
+    # never even start a runner. The AGENT-identity half of the guard runs
+    # inside the routing step (shell, case-insensitive, from the resolved
+    # identity set - no login enumeration here, so renames need no edit).
+    # EVENT GUARD: this job reads issue_comment payload shapes only — for
+    # discussion events github.event.issue does not exist (threadNumber
+    # would dispatch empty). The discussion sibling job handles those.
+    if: |
+      github.event_name == 'issue_comment' &&
+      vars.AGENT_PAUSED != 'true' &&
+      !endsWith(github.event.comment.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      # Default-branch checkout for the SHARED routing script ONLY.
+      # issue_comment always executes this workflow from the default branch,
+      # so this tree is trusted-by-construction (same trust level as this
+      # workflow file itself) - NOT the untrusted-PR-code case the security
+      # model prohibits. No PR/fork ref is ever checked out here.
+      - name: Checkout routing script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Parse comment and route
+        env:
+          COMMENT_ID: ${{ github.event.comment.id }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association }}
+          THREAD_NUMBER: ${{ github.event.issue.number }}
+          IS_PR: ${{ github.event.issue.pull_request != '' && 'true' || 'false' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+          BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
+          AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
+          OPEN_TRIGGERING: ${{ vars.OPEN_TRIGGERING || 'true' }}
+          TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS || '' }}
+        run: |
+          set -euo pipefail
+
+          # --- Resolve identity + trigger stems (workspace copy is trusted:
+          # default-branch checkout). Same-step consumption via --export.
+          eval "$(bash .github/scripts/bot-config.sh --export)"
+
+          # --- Agent-identity loop guard (the [bot] half ran at job level).
+          author_lc=$(printf '%s' "$COMMENT_AUTHOR" | tr 'A-Z' 'a-z')
+          if printf '%s' "$BOT_NAMES_JSON" | jq -e --arg a "$author_lc" \
+               'map(ascii_downcase) | index($a) != null' >/dev/null 2>&1; then
+            echo "::notice::Comment authored by our own identity (@${COMMENT_AUTHOR}); bot-loop guard - not routed."
+            exit 0
+          fi
+
+          # --- Shared decision logic (route-comment.sh): same cleaning and
+          # matching as every former per-workflow guard, from the one file
+          # bot-reply re-validation and the fixture suite also use.
+          ROUTES=$(printf '%s' "$COMMENT_BODY" | bash .github/scripts/route-comment.sh "$IS_PR")
+
+          # --- Open-triggering gate (OPEN_TRIGGERING, default true). false =
+          # on-demand summons (mentions + commands through this router) are
+          # accepted only from collaborators or the TRUSTED_AGENT_USERS
+          # roster. Auto paths are deliberately NOT gated: PR auto-reviews,
+          # issues-opened analysis, and cross-repo mentions (which carry
+          # their own FOREIGN_MENTIONS_USERS allowlist). Zero API cost: the
+          # association rides the event payload, the roster is a variable.
+          if [ "$ROUTES" != "none" ] && [ "${OPEN_TRIGGERING}" != "true" ]; then
+            authorized=no
+            case "$AUTHOR_ASSOC" in
+              OWNER|MEMBER|COLLABORATOR) authorized=yes ;;
+            esac
+            if [ "$authorized" = "no" ] && [ -n "$TRUSTED_USERS" ]; then
+              author_check=$(printf '%s' "$TRUSTED_USERS" | tr ',' '\n' | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+              if printf '%s\n' "$author_check" | grep -qxf "$author_lc"; then
+                authorized=yes
+              fi
+            fi
+            if [ "$authorized" = "no" ]; then
+              {
+                echo "- OPEN_TRIGGERING is off: on-demand summons are limited to collaborators and the trusted roster; this author ($AUTHOR_ASSOC) is neither. Not routed."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice::OPEN_TRIGGERING is off and @${COMMENT_AUTHOR} is not a collaborator/trusted user - on-demand trigger declined."
+              exit 0
+            fi
+          fi
+
+          route_review=false
+          route_compliance=false
+          route_reply=false
+          case " $ROUTES " in
+            *" review "*)     route_review=true ;;
+          esac
+          case " $ROUTES " in
+            *" compliance "*) route_compliance=true ;;
+          esac
+          case " $ROUTES " in
+            *" reply "*)      route_reply=true ;;
+          esac
+
+          # --- Audit trail: this run's summary is the record of the decision.
+          {
+            echo "### Agent Router — comment #$COMMENT_ID on #$THREAD_NUMBER"
+            echo "- Thread is PR: $IS_PR"
+            echo "- Commands found: review=$route_review compliance=$route_compliance mention=$route_reply"
+            echo "- (Words inside quotes/code fences are ignored; bot authors never route.)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          dispatched=0
+          failed=0
+          # Per-part pause (AGENT_PAUSED_PARTS_JSON): {"pr-review":true,...}
+          # pauses ONE agent part; true = paused, missing key/variable =
+          # not paused, malformed = loud fail (a broken kill switch must be
+          # visible, not silently ignored). AGENT_PAUSED (job-level if)
+          # remains the global kill above all parts.
+          part_paused() { # $1 = part key
+            v="${AGENT_PAUSED_PARTS_JSON:-}"
+            [ -z "$v" ] && return 1
+            if ! printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              echo "::error::AGENT_PAUSED_PARTS_JSON is not a JSON object - fix the variable (got: $(printf '%s' "$v" | head -c 80))."
+              exit 1
+            fi
+            printf '%s' "$v" | jq -e --arg k "$1" '.[$k] == true' >/dev/null 2>&1
+          }
+          # Each dispatch is isolated: one failing target (renamed workflow
+          # file, API hiccup) must not silently kill the remaining routes for
+          # compound comments - warn, record, keep routing.
+          if [ "$route_review" = "true" ]; then
+            if part_paused pr-review; then
+              echo "::notice::PR Review is paused (AGENT_PAUSED_PARTS_JSON) - skipping dispatch."
+            else
+              echo "::notice::Routing to PR Review (PR #$THREAD_NUMBER)"
+              if ! gh workflow run pr-review.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f prNumber="$THREAD_NUMBER" -f commentId="$COMMENT_ID" -f source=router; then
+                echo "::warning::Failed to dispatch PR Review for #$THREAD_NUMBER"
+                failed=1
+              fi
+              dispatched=1
+            fi
+          fi
+          if [ "$route_compliance" = "true" ]; then
+            if part_paused compliance-check; then
+              echo "::notice::Compliance Check is paused (AGENT_PAUSED_PARTS_JSON) - skipping dispatch."
+            else
+              echo "::notice::Routing to Compliance Check (PR #$THREAD_NUMBER)"
+              if ! gh workflow run compliance-check.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f pr_number="$THREAD_NUMBER" -f commentId="$COMMENT_ID"; then
+                echo "::warning::Failed to dispatch Compliance Check for #$THREAD_NUMBER"
+                failed=1
+              fi
+              dispatched=1
+            fi
+          fi
+          if [ "$route_reply" = "true" ]; then
+            if part_paused bot-reply; then
+              echo "::notice::Bot Reply is paused (AGENT_PAUSED_PARTS_JSON) - skipping dispatch."
+            else
+              echo "::notice::Routing to Bot Reply (thread #$THREAD_NUMBER)"
+              if ! gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" -f commentId="$COMMENT_ID" -f threadNumber="$THREAD_NUMBER"; then
+                echo "::warning::Failed to dispatch Bot Reply for #$THREAD_NUMBER"
+                failed=1
+              fi
+              dispatched=1
+            fi
+          fi
+
+          if [ "$dispatched" = "0" ]; then
+            echo "::notice::No agent trigger found in comment #$COMMENT_ID; nothing dispatched."
+          elif [ "$failed" = "1" ]; then
+            # A dispatch failure is a REAL failure: fail the router run so the
+            # miss is visible in the Actions tab, not just a warning line.
+            echo "::error::One or more target dispatches failed for comment #$COMMENT_ID"
+            exit 1
+          fi
+
+  # ==========================================================================
+  # DISCUSSION ROUTING (sibling of the route job)
+  # ==========================================================================
+  # discussion_comment[created] = mention inside a discussion comment;
+  # discussion[created] = mention in a NEW discussion's body (the landing
+  # page path — a discussion created without a mention wakes nothing, the
+  # same deliberate asymmetry as issues: no first-contact analysis mode).
+  # Payload shapes differ from issue_comment (comment under a discussion /
+  # the discussion itself), hence a separate job — but the decision logic
+  # is the SAME shared script, and the loop guards, OPEN_TRIGGERING gate,
+  # pause parts, and audit-trail contract are identical to the route job.
+  # The target re-fetches the discussion via GraphQL by number (and by
+  # comment databaseId for comment triggers); nothing trust-relevant rides
+  # the dispatch payload.
+  route_discussion:
+    # EVENT GUARD: discussion payloads only (the route job handles
+    # issue_comment; without this gate it would run on discussion events
+    # too and dispatch with an empty threadNumber - live-caught).
+    if: |
+      (github.event_name == 'discussion_comment' || github.event_name == 'discussion') &&
+      vars.AGENT_PAUSED != 'true' &&
+      !endsWith(github.event.comment.user.login || github.event.discussion.user.login, '[bot]')
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout routing script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Parse discussion trigger and route
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_ID: ${{ github.event.comment.id || '' }}
+          COMMENT_BODY: ${{ github.event.comment.body || github.event.discussion.body }}
+          COMMENT_AUTHOR: ${{ github.event.comment.user.login || github.event.discussion.user.login }}
+          AUTHOR_ASSOC: ${{ github.event.comment.author_association || github.event.discussion.author_association || 'NONE' }}
+          THREAD_NUMBER: ${{ github.event.discussion.number }}
+          REPO_OWNER: ${{ github.event.repository.owner.login }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GITHUB_TOKEN: ${{ github.token }}
+          BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+          BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
+          AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
+          OPEN_TRIGGERING: ${{ vars.OPEN_TRIGGERING || 'true' }}
+          TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS || '' }}
+        run: |
+          set -euo pipefail
+
+          eval "$(bash .github/scripts/bot-config.sh --export)"
+
+          # --- Agent-identity loop guard (same contract as the route job).
+          author_lc=$(printf '%s' "$COMMENT_AUTHOR" | tr 'A-Z' 'a-z')
+          if printf '%s' "$BOT_NAMES_JSON" | jq -e --arg a "$author_lc" \
+               'map(ascii_downcase) | index($a) != null' >/dev/null 2>&1; then
+            echo "::notice::Discussion trigger authored by our own identity (@${COMMENT_AUTHOR}); bot-loop guard - not routed."
+            exit 0
+          fi
+
+          # --- Shared decision logic. Discussions are reply-only threads:
+          # is_pr=false strips the review/compliance routes; only a genuine
+          # mention routes (code/quote cleaning applies as everywhere).
+          ROUTES=$(printf '%s' "$COMMENT_BODY" | bash .github/scripts/route-comment.sh false)
+
+          # --- Open-triggering gate (identical to the route job). Discussion
+          # webhook payloads may lack author_association: when the gate is
+          # armed and the payload carried none, one GraphQL call resolves it
+          # (the target re-fetches everything again — this is gate-only).
+          if [ "$ROUTES" != "none" ] && [ "${OPEN_TRIGGERING}" != "true" ]; then
+            assoc="$AUTHOR_ASSOC"
+            if [ -z "$assoc" ] || [ "$assoc" = "NONE" ]; then
+              assoc=$(gh api graphql -f owner="$REPO_OWNER" -f name="$REPO_NAME" -F n="$THREAD_NUMBER" \
+                -f query='query($owner:String!,$name:String!,$n:Int!) { repository(owner:$owner,name:$name) { discussion(number:$n) { authorAssociation } } }' \
+                --jq '.data.repository.discussion.authorAssociation // "NONE"' 2>/dev/null || echo NONE)
+            fi
+            authorized=no
+            case "$assoc" in
+              OWNER|MEMBER|COLLABORATOR) authorized=yes ;;
+            esac
+            if [ "$authorized" = "no" ] && [ -n "$TRUSTED_USERS" ]; then
+              author_check=$(printf '%s' "$TRUSTED_USERS" | tr ',' '\n' | tr -d '[:space:]' | tr 'A-Z' 'a-z')
+              if printf '%s\n' "$author_check" | grep -qxf "$author_lc"; then
+                authorized=yes
+              fi
+            fi
+            if [ "$authorized" = "no" ]; then
+              {
+                echo "- OPEN_TRIGGERING is off: on-demand summons are limited to collaborators and the trusted roster; this author (${assoc}) is neither. Not routed."
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::notice::OPEN_TRIGGERING is off and @${COMMENT_AUTHOR} is not a collaborator/trusted user - discussion trigger declined."
+              exit 0
+            fi
+          fi
+
+          if [ "$ROUTES" != "reply" ]; then
+            echo "::notice::No agent trigger found in discussion #${THREAD_NUMBER} content; nothing dispatched."
+            {
+              echo "### Agent Router — discussion #${THREAD_NUMBER}"
+              echo "- No trigger found; nothing dispatched."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # --- Per-part pause (bot-reply owns discussions).
+          v="${AGENT_PAUSED_PARTS_JSON:-}"
+          if [ -n "$v" ]; then
+            if ! printf '%s' "$v" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              echo "::error::AGENT_PAUSED_PARTS_JSON is not a JSON object - fix the variable."
+              exit 1
+            fi
+            if printf '%s' "$v" | jq -e '.["bot-reply"] == true' >/dev/null 2>&1; then
+              echo "::notice::Bot Reply is paused (AGENT_PAUSED_PARTS_JSON) - skipping discussion dispatch."
+              exit 0
+            fi
+          fi
+
+          {
+            echo "### Agent Router — discussion #${THREAD_NUMBER} (${EVENT_NAME})"
+            echo "- Author: @${COMMENT_AUTHOR} (${AUTHOR_ASSOC})"
+            echo "- Dispatching Bot Reply (${EVENT_NAME} trigger)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$EVENT_NAME" = "discussion" ]; then
+            echo "::notice::Routing to Bot Reply (new discussion #${THREAD_NUMBER}, body mention)"
+            if ! gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+                 -f threadNumber="$THREAD_NUMBER" -f threadType=discussion-new; then
+              echo "::error::Failed to dispatch Bot Reply for discussion #$THREAD_NUMBER"
+              exit 1
+            fi
+          else
+            echo "::notice::Routing to Bot Reply (discussion #${THREAD_NUMBER}, comment #$COMMENT_ID)"
+            if ! gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+                 -f commentId="$COMMENT_ID" -f threadNumber="$THREAD_NUMBER" -f threadType=discussion; then
+              echo "::error::Failed to dispatch Bot Reply for discussion #$THREAD_NUMBER"
+              exit 1
+            fi
+          fi

@@ -1,0 +1,48 @@
+[
+  {
+    "name": "GitHub Workflows",
+    "description": "When code changes affect the build or CI process, verify build.yml is updated with new steps, jobs, or release configurations. Check that code changes are reflected in build matrix, deploy steps, and CI/CD pipeline.",
+    "files": [
+      ".github/workflows/build.yml",
+      ".github/workflows/cleanup.yml"
+    ]
+  },
+  {
+    "name": "Documentation",
+    "description": "Ensure README.md and DOCUMENTATION.md reflect code changes. For new features (providers, configuration options, CLI changes), verify feature documentation exists in both files. For API endpoint changes, check that DOCUMENTATION.md is updated. The 'Deployment guide.md' should be updated for deployment-related changes.",
+    "files": [
+      "README.md",
+      "DOCUMENTATION.md",
+      "Deployment guide.md",
+      "src/rotator_library/README.md"
+    ]
+  },
+  {
+    "name": "Python Dependencies",
+    "description": "When requirements.txt changes, ensure all new dependencies are properly listed. When pyproject.toml in src/rotator_library changes, verify it's consistent with requirements.txt. No lockfile is required for this project, but verify dependency versions are compatible.",
+    "files": [
+      "requirements.txt",
+      "src/rotator_library/pyproject.toml"
+    ]
+  },
+  {
+    "name": "Provider Configuration",
+    "description": "When adding or modifying LLM providers in src/rotator_library/providers/, ensure the provider is documented in DOCUMENTATION.md and README.md. New providers should have corresponding model definitions in model_definitions.py if needed.",
+    "files": [
+      "src/rotator_library/providers/**/*.py",
+      "src/rotator_library/model_definitions.py",
+      "src/rotator_library/provider_factory.py"
+    ]
+  },
+  {
+    "name": "Proxy Application",
+    "description": "Changes to proxy_app endpoints, TUI launcher, or settings should be reflected in documentation. New CLI arguments should be documented in README.md Quick Start section.",
+    "files": [
+      "src/proxy_app/main.py",
+      "src/proxy_app/launcher_tui.py",
+      "src/proxy_app/settings_tool.py",
+      "src/proxy_app/batch_manager.py",
+      "src/proxy_app/detailed_logger.py"
+    ]
+  }
+]
