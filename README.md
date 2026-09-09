@@ -105,6 +105,8 @@ openai/gpt-4o                    ← OpenAI API
 anthropic/claude-3-5-sonnet      ← Anthropic API
 openrouter/anthropic/claude-3-opus  ← OpenRouter
 gemini_cli/gemini-2.5-pro        ← Gemini CLI (OAuth)
+minimax/MiniMax-M3               (MiniMax OpenAI-compatible route)
+minimax/MiniMax-M2.7             (MiniMax OpenAI-compatible route)
 ```
 
 ### Usage Examples
@@ -278,6 +280,7 @@ GEMINI_API_KEY_1="your-gemini-key"
 GEMINI_API_KEY_2="another-gemini-key"
 OPENAI_API_KEY_1="your-openai-key"
 ANTHROPIC_API_KEY_1="your-anthropic-key"
+MINIMAX_API_KEY_1="your-minimax-key"
 ```
 
 > Copy `.env.example` to `.env` as a starting point.
@@ -453,6 +456,25 @@ The proxy includes a powerful text-based UI for configuration and management.
 | `ROTATION_MODE_<PROVIDER>` | `balanced` or `sequential` | `ROTATION_MODE_GEMINI=sequential` |
 | `IGNORE_MODELS_<PROVIDER>` | Blacklist (comma-separated, supports `*`) | `IGNORE_MODELS_OPENAI=*-preview*` |
 | `WHITELIST_MODELS_<PROVIDER>` | Whitelist (overrides blacklist) | `WHITELIST_MODELS_GEMINI=gemini-2.5-pro` |
+
+### MiniMax Endpoint Selection
+
+MiniMax supports both configured regions and both compatibility protocols. Set
+the region and protocol in `.env`; the provider plugin then routes requests
+through the selected base URL.
+
+```env
+MINIMAX_API_REGION="global_en"  # or cn_zh
+MINIMAX_API_PROTOCOL="openai"   # or anthropic
+
+MINIMAX_GLOBAL_OPENAI_BASE_URL="https://api.minimax.io/v1"
+MINIMAX_GLOBAL_ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic"
+MINIMAX_CN_OPENAI_BASE_URL="https://api.minimaxi.com/v1"
+MINIMAX_CN_ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic"
+```
+
+Anthropic-compatible base URLs must end with `/anthropic`. The adapter uses
+the provider's `/v1/messages` request path without exposing a derived base URL.
 
 ### Advanced Features
 
