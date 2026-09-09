@@ -952,5 +952,40 @@ check "body-chars: issue-mode comments clip + patterns + budget" yes \
 check "body-chars: linked-issue body cap in both PR workflows" "2" \
   "$(grep -l 'linked-issue body truncated' "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/pr-review.yml | wc -l | tr -d ' ')"
 
+# ---- BOT_NAMES_JSON shadowing fix (live-caught on proxy PR review) ---------
+# Regression class (live): job/step-level `BOT_NAMES_JSON:` env declarations
+# shadow the GITHUB_ENV exports of the normalizer/bot-config, leaking the
+# FLAT variable format into every `jq --argjson` consumer ("jq: invalid
+# JSON text passed to --argjson"); the old in-step normalizers only ran on
+# routed-comment dispatches, so stub-dispatched auto reviews died too.
+check "names-json: NO env: declaration in any agent workflow" "0" \
+  "$(grep -c 'BOT_NAMES_JSON: ${{' "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml "$SCRIPT_DIR"/../workflows/issue-comment.yml | awk -F: '{s+=$2} END{print s}')"
+check "names-json: unconditional normalize step in all four" "4" \
+  "$(grep -l 'name: Normalize identity list' "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml "$SCRIPT_DIR"/../workflows/issue-comment.yml | wc -l | tr -d ' ')"
+# Behavioral probe of the normalize pipeline itself (the exact chain the
+# step runs): flat in -> valid JSON array usable by --argjson.
+NJ_RAW='Zeta-Agent, zeta-agent[bot]; Other Bot'
+NJ_JSON=$(printf '%s' "$NJ_RAW" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)
+check "names-json: flat chain yields --argjson-usable array" "true" \
+  "$(jq -e --argjson bots "$NJ_JSON" '$bots | map(ascii_downcase) | index("zeta-agent[bot]") != null' <<< 'null' >/dev/null 2>&1 && echo true || echo false)"
+NJ_EMPTY_JSON=$(printf '%s' 'mirrobot-agent, mirrobot-agent[bot]' | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)
+check "names-json: stock fallback chain stays valid" "2" \
+  "$(printf '%s' "$NJ_EMPTY_JSON" | jq 'length')"
+
+# ---- compliance gate: pull_request_target + zero-secret contract -----------
+# Fork PRs park pull_request workflows behind maintainer approval; the gate
+# exists to be the ALWAYS-available second status poster, so it must ride
+# the base-branch-controlled trigger. A pull_request_target workflow must
+# never gain secrets, a checkout, or event-content interpolation.
+GATE="$SCRIPT_DIR/../workflows/compliance-gate.yml"
+check "gate: rides pull_request_target (fork-approval-proof)" yes \
+  "$(grep -q '^  pull_request_target:' "$GATE" && ! grep -q '^  pull_request:' "$GATE" && echo yes || echo no)"
+check "gate: ZERO secrets references" "0" \
+  "$(grep -c 'secrets\.' "$GATE")"
+check "gate: NO checkout" "0" \
+  "$(grep -c 'uses: actions/checkout' "$GATE")"
+check "gate: statuses-only permission" yes \
+  "$(grep -A2 '^permissions:' "$GATE" | grep -q 'statuses: write' && ! grep -q 'contents:' "$GATE" && echo yes || echo no)"
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

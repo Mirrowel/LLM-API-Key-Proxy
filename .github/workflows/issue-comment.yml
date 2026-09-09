@@ -50,9 +50,11 @@ jobs:
       # variable, else identity-derived, else the mirrobot words.
       BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
       BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
-      # Early-consumer fallback (bot-config.sh upgrades this with the
-      # /user-detected login once it runs, post-artifacts):
-      BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
+      # NOTE: no BOT_NAMES_JSON declaration here, ever. It is exported as
+      # the JSON array by the unconditional early step below and
+      # re-exported authoritatively by bot-config.sh; a job/step-level
+      # env: declaration would SHADOW those GITHUB_ENV exports and leak the
+      # flat variable format into every jq --argjson consumer.
       AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
       # Noise filtering for thread context (see fetch-pr-discussion.sh):
       # CONTEXT_IGNORE_AUTHORS - comma logins dropped outright (repo variable)
@@ -76,6 +78,20 @@ jobs:
             echo "::error::AGENT_PAUSED_PARTS_JSON must be a JSON object like {\"pr-review\": true} — got a different shape. Refusing to run with a broken kill switch (fix or delete the variable)."
             exit 1
           }
+      # Normalize the identity list ONCE, unconditionally, before any
+      # consumer (uniform with the other agent workflows): the flat
+      # BOT_IDENTITIES variable becomes the JSON array every jq consumer
+      # expects; bot-config.sh later re-exports the authoritative array
+      # (with the /user-detected account login merged in).
+      - name: Normalize identity list
+        env:
+          BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+        run: |
+          raw="${BOT_IDENTITIES_INPUT:-mirrobot-agent, mirrobot-agent[bot]}"
+          case "$raw" in
+            '['*) printf 'BOT_NAMES_JSON=%s\n' "$raw" >> "$GITHUB_ENV" ;;
+            *) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)" >> "$GITHUB_ENV" ;;
+          esac
 
       - name: Checkout repository
         uses: actions/checkout@v4

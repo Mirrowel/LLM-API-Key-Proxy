@@ -12,27 +12,36 @@
 #          job) - never silent. The required check itself stays "Expected"
 #          (merge blocked) either way; this is redundancy + visibility.
 #
-# EXECUTES FROM: THE PR's BASE BRANCH (pull_request semantics). On PRs
-#   targeting your integration branch, that branch's copy runs - keep it
-#   merge-synced when this file changes (see docs/workflows/overview.md).
-#   Zero secrets either way: this is a marker poster, nothing else.
+# EXECUTES FROM: THE PR's BASE BRANCH (pull_request_target semantics - the
+#   workflow FILE always comes from the base branch; a PR cannot redefine
+#   this gate). On PRs targeting your integration branch, that branch's copy
+#   runs - keep it merge-synced when this file changes
+#   (see docs/workflows/overview.md).
 #
-# SECURITY: pull_request trigger, ZERO secrets, permissions statuses:write
-#          only. A same-repo PR CAN modify this file before it runs - the
-#          tamper ceiling of a modified copy is the same platform-level
-#          exposure class as the PR Review Trigger stub (a tampered copy can
-#          declare its own permissions block and reference repo secrets by
-#          name); the defense is preventing tampered branches (agent
-#          edit-denies on .github, scrub taint alarms, merge scrutiny), not
-#          this file. The honest copy's own ceiling is posting arbitrary
-#          commit statuses with the run's 1h token. Fork PRs: the token is
-#          read-only, so the post is skipped there (the stub covers forks).
+# WHY pull_request_target AND NOT pull_request: fork PRs place pull_request
+#   workflows behind maintainer approval ("action_required") - for as long
+#   as the approval sits unanswered, the gate is approval-hostage and the
+#   second posting path does not exist exactly where independent
+#   verification matters most (untrusted contributors). pull_request_target
+#   runs immediately for fork AND same-repo PRs alike. The stub uses the
+#   same trigger for the same reason; with the required check configured,
+#   an unposted status blocks merge either way, but this workflow's whole
+#   job is to make sure the status is POSTED.
+#
+# SECURITY: ZERO secrets, permissions statuses:write only, NO checkout, no
+#   github.event.* content fields in run: (descriptions are fixed strings;
+#   the event action is a closed enum; the SHA is hex). The file itself is
+#   base-branch-controlled by construction, so a PR cannot weaken this
+#   contract. The honest copy's ceiling is posting arbitrary commit
+#   statuses with the run's 1h token. Fixtures pin: pull_request_target
+#   trigger only, no secrets, no checkout - a pull_request_target workflow
+#   must NEVER gain any of those.
 # ============================================================================
 
 name: Compliance Gate
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, ready_for_review, reopened]
 
 permissions:
@@ -44,8 +53,9 @@ jobs:
     steps:
       - name: Post pending compliance status
         # Redundant with the PR Review Trigger stub's own (retried) post;
-        # two independent trigger paths, one shared contract.
-        if: github.event.pull_request.draft == false && github.event.pull_request.head.repo.fork == false
+        # two independent trigger paths, one shared contract. The base-repo
+        # token posts for fork PRs too (statuses attach to the PR head SHA).
+        if: github.event.pull_request.draft == false
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           # Wording matches the stub exactly: a synchronize push resets
@@ -74,7 +84,3 @@ jobs:
           done
           echo "::error::Could not post pending compliance status after 6 attempts. The required check stays 'Expected' (merge blocked) - investigate API health."
           exit 1
-
-      - name: Fork PR note
-        if: github.event.pull_request.head.repo.fork == true
-        run: echo "Fork PR - gate token is read-only; the PR Review Trigger stub owns the pending marker here."

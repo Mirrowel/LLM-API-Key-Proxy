@@ -136,9 +136,11 @@ jobs:
       #               (@stem, /stem-review, /stem-check), else the mirrobot words.
       BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
       BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
-      # Early-consumer fallback (bot-config.sh upgrades this with the
-      # /user-detected login once it runs, post-artifacts):
-      BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
+      # NOTE: no BOT_NAMES_JSON declaration here, ever. It is normalized to
+      # the JSON array once by the unconditional early step below and
+      # re-exported authoritatively by bot-config.sh; a job/step-level
+      # env: declaration would SHADOW those GITHUB_ENV exports and leak the
+      # flat variable format into every jq --argjson consumer.
       AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
       # Noise filtering for thread context (see fetch-pr-discussion.sh):
       # CONTEXT_IGNORE_AUTHORS - comma logins dropped outright (repo variable)
@@ -199,6 +201,23 @@ jobs:
             echo "::error::commentId dispatch input is required on the home comment path (got empty)"
             exit 1
           fi
+      # Normalize the identity list ONCE, unconditionally, before any
+      # consumer. The old in-step normalizers only ran on some dispatch
+      # paths - commentId-less dispatches (guest relays, discussion-new)
+      # hit every jq --argjson consumer with the raw flat value
+      # ("jq: invalid JSON text passed to --argjson"). Unconditional +
+      # early + no shadowing env: declaration = the array is valid for
+      # every code path. bot-config.sh later re-exports the authoritative
+      # array (with the /user-detected account login merged in).
+      - name: Normalize identity list
+        env:
+          BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+        run: |
+          raw="${BOT_IDENTITIES_INPUT:-mirrobot-agent, mirrobot-agent[bot]}"
+          case "$raw" in
+            '['*) printf 'BOT_NAMES_JSON=%s\n' "$raw" >> "$GITHUB_ENV" ;;
+            *) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)" >> "$GITHUB_ENV" ;;
+          esac
       # Sparse default-branch checkout for the SHARED routing script, so the
       # re-validation below runs the exact same decision logic as the router
       # (single source of truth: .github/scripts/route-comment.sh). The
@@ -262,14 +281,9 @@ jobs:
               echo "should_proceed=false" >> "$GITHUB_OUTPUT"; exit 0
             fi
 
-            # Normalize the flat identity list for the loop guard (same
-            # normalization the guest block uses; bot-config.sh re-exports
-            # the authoritative array later).
-            case "$BOT_NAMES_JSON" in
-              '['*) ;;
-              *) BOT_NAMES_JSON=$(printf '%s' "${BOT_IDENTITIES_INPUT:-$BOT_NAMES_JSON}" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)
-                 printf 'BOT_NAMES_JSON=%s\n' "$BOT_NAMES_JSON" >> "$GITHUB_ENV" ;;
-            esac
+            # BOT_NAMES_JSON is already the normalized JSON array
+            # (unconditional early step; bot-config.sh re-exports the
+            # authoritative array later).
 
             # --- resolve the trigger --------------------------------------
             trig_body=""; trig_author=""; trig_assoc="NONE"; trig_node=""
@@ -460,16 +474,9 @@ jobs:
               trigger_message="$body"
             fi
 
-            # BOT_NAMES_JSON arrives as a FLAT comma list (the variable and
-            # the stock fallback are both flat now; the platform format
-            # doctrine). Normalize to a JSON array once for every jq
-            # consumer this run; the artifacts step re-exports the
-            # authoritative array via bot-config.sh.
-            case "$BOT_NAMES_JSON" in
-              '['*) ;;
-              *) BOT_NAMES_JSON=$(printf '%s' "${BOT_IDENTITIES_INPUT:-$BOT_NAMES_JSON}" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)
-                 printf 'BOT_NAMES_JSON=%s\n' "$BOT_NAMES_JSON" >> "$GITHUB_ENV" ;;
-            esac
+            # BOT_NAMES_JSON is already the normalized JSON array
+            # (unconditional early step; bot-config.sh re-exports the
+            # authoritative array later).
 
             # --- bot-loop guard (identity family, case-insensitive) ------
             author_lc=$(printf '%s' "$trigger_author" | tr 'A-Z' 'a-z')
@@ -1214,7 +1221,6 @@ jobs:
           # Guest mode: the kit and the instruction sets operate against the
           # FOREIGN repo (kit is pure-API; GITHUB_REPOSITORY drives it).
           GITHUB_REPOSITORY: ${{ inputs.targetRepo || github.repository }}
-          BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           THREAD_NUMBER: ${{ env.THREAD_NUMBER }}
           THREAD_AUTHOR: ${{ env.THREAD_AUTHOR }}
           NEW_COMMENT_AUTHOR: ${{ env.NEW_COMMENT_AUTHOR }}
