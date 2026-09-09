@@ -612,26 +612,41 @@ jobs:
 
           # ---- rebase ladder --------------------------------------------------
           # After a force-push/rebase, the old reviewed SHAs are unreachable
-          # (not ancestors of HEAD). Walk the candidates newest-first and
-          # diff from the NEWEST REACHABLE reviewed state; if none are
+          # (not ancestors of the PR HEAD). Walk the candidates newest-first
+          # and diff from the NEWEST REACHABLE reviewed state; if none are
           # reachable, fall through to the full diff with an explicit
           # rebase context so the agent reconstructs follow-up awareness
           # in-session instead of being silently downgraded to FIRST.
+          # CRITICAL: this step runs on the DEFAULT-BRANCH checkout - HEAD is
+          # main's tip, NOT the PR head. Ancestry must be tested against the
+          # PR HEAD object, and the head must be fetched first (fork PRs are
+          # not in the initial all-branches checkout; live-caught: testing
+          # against HEAD declared an UNMODIFIED head "rewritten" and main's
+          # log rode along as the branch's "recent commits").
+          git fetch origin "pull/$PR_NUMBER/head" >/dev/null 2>&1 || true
+          PR_HEAD_OBJ="$PR_HEAD_SHA"
+          if ! git cat-file -e "$PR_HEAD_SHA^{commit}" 2>/dev/null; then
+            PR_HEAD_OBJ=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "")
+          fi
           resolved_ts=""
-          while IFS="$(printf '\t')" read -r csha cts; do
-            [ -n "$csha" ] || continue
-            if git cat-file -e "$csha" 2>/dev/null && git merge-base --is-ancestor "$csha" HEAD 2>/dev/null; then
-              resolved_sha="$csha"
-              resolved_ts="$cts"
-              echo "Using newest REACHABLE reviewed state: $resolved_sha (reviewed at ${cts:-unknown})"
-              break
-            fi
-          done <<< "$candidates"
+          if [ -n "$PR_HEAD_OBJ" ]; then
+            while IFS="$(printf '\t')" read -r csha cts; do
+              [ -n "$csha" ] || continue
+              if git cat-file -e "$csha" 2>/dev/null && git merge-base --is-ancestor "$csha" "$PR_HEAD_OBJ" 2>/dev/null; then
+                resolved_sha="$csha"
+                resolved_ts="$cts"
+                echo "Using newest REACHABLE reviewed state: $resolved_sha (reviewed at ${cts:-unknown})"
+                break
+              fi
+            done <<< "$candidates"
+          else
+            echo "::warning::Could not materialize the PR head object; skipping reachability walk (no rebase verdict)."
+          fi
 
-          if [ -z "$resolved_sha" ] && [ -n "$candidates" ]; then
+          if [ -z "$resolved_sha" ] && [ -n "$candidates" ] && [ -n "$PR_HEAD_OBJ" ]; then
             newest_sha=$(printf '%s\n' "$candidates" | head -1 | cut -f1)
             newest_ts=$(printf '%s\n' "$candidates" | head -1 | cut -f2)
-            recent_commits=$(git log --oneline -12 2>/dev/null | head -c 2000)
+            recent_commits=$(git log --oneline -12 "$PR_HEAD_OBJ" 2>/dev/null | head -c 2000)
             {
               echo "REBASE_CONTEXT<<RB_CTX_EOF"
               echo "NOTE - branch history was rewritten (force-push/rebase) after your last review (${newest_sha:0:10}, reviewed at ${newest_ts:-unknown time}); every previously reviewed state is unreachable from the current head, so no incremental diff exists. The FULL diff is provided below. Your prior reviews are in the review-memory blocks: reconstruct what still applies yourself - verify your earlier findings against the new state and review the full delta knowingly."
@@ -934,7 +949,7 @@ jobs:
           SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
           SHARE_CTX_THREAD: "PR #${{ inputs.prNumber || env.PR_NUMBER }}"
           SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA }}
-          SHARE_CTX_DETAIL: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST review' || format('FOLLOW-UP (last reviewed {0})', steps.review_type.outputs.last_reviewed_sha) }}
+          SHARE_CTX_DETAIL: ${{ steps.review_type.outputs.is_first_review == 'true' && 'FIRST review' || (steps.review_type.outputs.last_reviewed_sha != '' && format('FOLLOW-UP (last reviewed {0})', steps.review_type.outputs.last_reviewed_sha) || 'FOLLOW-UP (rebased - full re-review)') }}
         run: |
           set -o pipefail
           TMP_DIR="${RUNNER_TEMP:-/tmp}"

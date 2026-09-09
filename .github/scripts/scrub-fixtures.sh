@@ -1024,6 +1024,18 @@ check "rebase: envsubst VARS list carries REBASE_CONTEXT" yes \
   "$(grep -q 'REBASE_CONTEXT' <(grep 'VARS=' "$SCRIPT_DIR/../workflows/pr-review.yml") && echo yes || echo no)"
 check "rebase: full-diff fallback note survives generation (prepended, not clobbered)" yes \
   "$(grep -q 'INC_OUT.note' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'INC_NOTE' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+# Live-caught: the ladder ran on the DEFAULT-BRANCH checkout, so HEAD was
+# main's tip - an UNMODIFIED PR head was declared "rewritten" and main's log
+# rode along as the branch's recent commits. Ancestry must target the PR HEAD
+# object, fetched first (fork PRs are absent from the all-branches checkout).
+check "rebase: walk targets the PR HEAD object, not HEAD" yes \
+  "$(grep -q 'pull/\$PR_NUMBER/head' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q -- '--is-ancestor "$csha" "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "rebase: recent commits listed from the PR head" yes \
+  "$(grep -q 'git log --oneline -12 "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "rebase: share-context words the no-SHA case honestly" yes \
+  "$(grep -q 'rebased - full re-review' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "cc-rule: manual dispatch and auto runs get no cc" yes \
+  "$(grep -q 'manual dispatches' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && grep -q 'EXACTLY one case' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && echo yes || echo no)"
 
 # ---- noise-filter defaults: bootstrap seed must MATCH the script ----------
 # Live-caught: bootstrap seeded [] which REPLACES the baked defaults -
