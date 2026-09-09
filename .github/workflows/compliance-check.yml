@@ -303,6 +303,12 @@ jobs:
             echo "RESOLVED_COMMENT_AUTHOR=${author}"
             echo "RESOLVED_ASSOCIATION=${association}"
           } >> "$GITHUB_ENV"
+          # Step-output mirror: GITHUB_ENV vars are invisible to later
+          # steps' with: expressions - the requester chain reads outputs.
+          {
+            echo "resolved_author=${author}"
+            echo "resolved_assoc=${association}"
+          } >> "$GITHUB_OUTPUT"
           # Trigger-message block: the routed comment IS the request.
           body=$(printf '%s' "$comment_json" | jq -r '.body')
           TM_DELIMITER="GH_TRIGGER_MSG_$(openssl rand -hex 8)"
@@ -345,6 +351,24 @@ jobs:
             echo "file groups: workflow default (no override file)"
           fi
 
+      # Manual-dispatch requester identity (workflow_dispatch carries no
+      # author_association): resolve the dispatch actor's real standing via
+      # the API - the same fix pr-review got (live-caught there: the owner
+      # rendered as NONE/unverified on manual dispatch).
+      - name: Resolve dispatch actor association
+        id: dispatch_assoc
+        if: github.event_name == 'workflow_dispatch' && steps.validate.outputs.resolved_assoc == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR_LOGIN: ${{ github.actor }}
+        run: |
+          perm=$(gh api "/repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR_LOGIN}/permission" --jq '.permission' 2>/dev/null || echo "")
+          case "$perm" in
+            admin) echo "association=OWNER" >> "$GITHUB_OUTPUT" ;;
+            maintain|write|triage|read) echo "association=COLLABORATOR" >> "$GITHUB_OUTPUT" ;;
+            *) echo "association=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       # Builds the factual requester context line (routed-comment author when
       # dispatched by the router, dispatch actor otherwise) consumed by the security brief.
       # Any user may trigger the check; this only informs the agent's judgment.
@@ -353,8 +377,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/requester-context
         with:
-          login: ${{ env.RESOLVED_COMMENT_AUTHOR || github.actor }}
-          association: ${{ env.RESOLVED_ASSOCIATION }}
+          login: ${{ steps.validate.outputs.resolved_author || github.actor }}
+          association: ${{ steps.validate.outputs.resolved_assoc || steps.dispatch_assoc.outputs.association }}
           trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
           trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
 
@@ -426,7 +450,7 @@ jobs:
           echo "$BODY_DELIMITER" >> $GITHUB_OUTPUT
           
           # Changed files (paginated REST; large PRs span multiple pages)
-          files_json=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename' | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          files_json=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files?per_page=100" --paginate --jq '.[].filename' | jq -R -s -c 'split("\n") | map(select(length > 0))')
           changed_files=$(echo "$files_json" | jq -r '.[]' | tr '\n' ' ')
           echo "changed_files=$changed_files" >> $GITHUB_OUTPUT
           echo "files_json=$files_json" >> $GITHUB_OUTPUT
@@ -465,9 +489,19 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
         run: |
+          # HIDDEN = GONE: a minimized compliance report must not select as
+          # the newest report (operator-intent doctrine: hide means
+          # wanted-deleted). Review-level hides are GraphQL-only; issue
+          # comments are covered here through their node ids.
+          hidden_json='{"reviews":[],"comments":[]}'
+          hidden_json=$(bash .github/scripts/minimized-nodes.sh "$PR_NUMBER") || {
+            hidden_json='{"reviews":[],"comments":[]}'
+            echo "::warning::Hidden-state fetch failed; a hidden report may be treated as the previous report this run."
+          }
           latest=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
-            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
-              map(select(
+            --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" --argjson hidden "$hidden_json" '
+              [.[] | .node_id as $nid | select(($hidden.comments | index($nid)) == null)]
+              | map(select(
                 ((.user.login // "" | ascii_downcase) as $u | $bots | index($u)) and
                 (.body | contains("<!-- compliance-check-id:"))
               ))
@@ -642,12 +676,22 @@ jobs:
                 # compliance-checked commit (same contract as PR Review).
                 if [ -n "$LAST_COMPLIANCE_SHA" ]; then
                   INC_OUT="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
-                  if git diff --patch "$LAST_COMPLIANCE_SHA".."$CURRENT_SHA" > "$INC_OUT" 2>/dev/null; then
+                  if git cat-file -e "$LAST_COMPLIANCE_SHA^{commit}" 2>/dev/null \
+                     && git diff --patch "$LAST_COMPLIANCE_SHA".."$CURRENT_SHA" > "$INC_OUT" 2>/dev/null; then
                     bash /tmp/split-diff.sh "$INC_OUT" "${DIFF_SPLIT_BYTES:-1000000}"
                     echo "incremental_diff_path=$INC_OUT" >> $GITHUB_OUTPUT
                   else
-                    echo "::warning::Incremental diff failed; falling back to full diff focus."
-                    echo "incremental_diff_path=$DIFF_OUT" >> $GITHUB_OUTPUT
+                    # Unreachable SHA (force-push/rebase) or diff failure: the
+                    # full diff becomes the incremental scope - SAY SO inside
+                    # the file; the followup protocol otherwise asserts it
+                    # reads only incremental changes (INC_NOTE pattern).
+                    echo "::warning::Last compliance SHA unreachable or diff failed; full diff as incremental scope."
+                    if { printf '%s\n' "[NOTE: the last compliance-checked state could not be resolved (force-push/rebase or diff failure); this is the FULL PR diff against the base branch, not an incremental one. Audit it with first-run thoroughness.]"; cat "$DIFF_OUT"; } > "$INC_OUT" 2>/dev/null; then
+                      bash /tmp/split-diff.sh "$INC_OUT" "${DIFF_SPLIT_BYTES:-1000000}"
+                      echo "incremental_diff_path=$INC_OUT" >> $GITHUB_OUTPUT
+                    else
+                      echo "incremental_diff_path=$DIFF_OUT" >> $GITHUB_OUTPUT
+                    fi
                   fi
                 else
                   # FOLLOW-UP with unresolvable last SHA (marker present but

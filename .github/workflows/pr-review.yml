@@ -566,13 +566,23 @@ jobs:
           # 2) Find latest bot-authored item containing the marker <!-- last_reviewed_sha:... -->
           # 3) If the marker item is the latest, use its SHA. Otherwise, try to obtain commit_id from the latest bot review via REST.
           # 4) If still not possible, leave SHA empty and log that the agent should locate the last summary in-session.
+          # HIDDEN = GONE: minimized reviews/comments never count as reviewed
+          # coverage (operator-intent doctrine: hide means wanted-deleted).
+          # Review-level hide does NOT propagate to comments and is GraphQL-
+          # only - minimized-nodes.sh is the single source for it. Fail-closed:
+          # an unverifiable hidden state skips the walk, never trusts blindly.
+          hidden_json='{"reviews":[],"comments":[]}'
+          hidden_json=$(bash .github/scripts/minimized-nodes.sh "$PR_NUMBER") || {
+            hidden_json='{"reviews":[],"comments":[]}'
+            echo "::warning::Hidden-state fetch failed; cannot safely attribute reviewed coverage. Skipping reachability walk."
+          }
 
           pr_summary_payload=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json comments,reviews)
 
-          detect_json=$(echo "$pr_summary_payload" | jq -c --argjson bots "$BOT_NAMES_JSON" '
+          detect_json=$(echo "$pr_summary_payload" | jq -c --argjson bots "$BOT_NAMES_JSON" --argjson hidden "$hidden_json" '
             def items:
-              [ (.comments[]? | {type:"comment", body:(.body//""), ts:(.updatedAt // .createdAt // ""), author:(.author.login // "unknown")} ),
-                (.reviews[]?  | {type:"review",  body:(.body//""), ts:(.submittedAt // .updatedAt // .createdAt // ""), author:(.author.login // "unknown")} )
+              [ (.comments[]? | .id as $cid | select((.isMinimized != true) and (($hidden.comments | index($cid)) == null)) | {type:"comment", body:(.body//""), ts:(.updatedAt // .createdAt // ""), author:(.author.login // "unknown")} ),
+                (.reviews[]?  | .id as $rid | select(($hidden.reviews | index($rid)) == null) | {type:"review",  body:(.body//""), ts:(.submittedAt // .updatedAt // .createdAt // ""), author:(.author.login // "unknown")} )
               ] | map(select((.author // "" | ascii_downcase as $a | $bots | index($a))));
             def latest(testexpr):
               (items | map(select(.body | test(testexpr))) | sort_by(.ts) | last) // {};
@@ -600,8 +610,8 @@ jobs:
           if [ -n "$latest_phrase_ts" ]; then
             echo "Phrase-bearing review present; adding its commit_id as the last-resort candidate..."
             reviews_rest=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" || echo '[]')
-            commit_id_cand=$(echo "$reviews_rest" | jq -r --argjson bots "$BOT_NAMES_JSON" '
-              map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
+            commit_id_cand=$(echo "$reviews_rest" | jq -r --argjson bots "$BOT_NAMES_JSON" --argjson hidden "$hidden_json" '
+              map(.node_id as $nid | select(($hidden.reviews | index($nid)) == null) | select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
               | sort_by(.submitted_at)
               | last
               | [(.commit_id // ""), (.submitted_at // "")]
@@ -696,7 +706,8 @@ jobs:
           cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
           cp .github/scripts/split-diff.sh /tmp/split-diff.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh
+          cp .github/scripts/minimized-nodes.sh /tmp/minimized-nodes.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh /tmp/minimized-nodes.sh
           bash /tmp/assemble-prompt.sh --verify
           # Resolve identity + trigger stems (exports BOT_NAMES_JSON / BOT_TRIGGER_STEMS)
           bash /tmp/bot-config.sh

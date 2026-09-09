@@ -158,7 +158,7 @@ jobs:
                   # lowercases the author side only (map(ascii_downcase) |
                   # index($r)); a display-case array matches nothing.
                   '['*) BOT_NAMES_JSON=$(printf '%s' "$BOT_NAMES_JSON" | jq -sc 'map(ascii_downcase)') ;;
-                  *) BOT_NAMES_JSON=$(printf '%s' "${BOT_IDENTITIES_INPUT:-$BOT_NAMES_JSON}" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)') ;;
+                  *) BOT_NAMES_JSON=$(printf '%s' "$BOT_NAMES_JSON" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)') ;;
                 esac
                 rl=$(printf '%s' "$REQUESTED_LOGIN" | tr 'A-Z' 'a-z')
                 if printf '%s' "$BOT_NAMES_JSON" | jq -e --arg r "$rl" \

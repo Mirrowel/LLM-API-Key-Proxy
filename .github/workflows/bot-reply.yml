@@ -407,6 +407,10 @@ jobs:
             echo "THREAD_AUTHOR=${trig_author}" >> "$GITHUB_ENV"
             echo "RESOLVED_COMMENT_AUTHOR=${trig_author}" >> "$GITHUB_ENV"
             echo "RESOLVED_ASSOCIATION=${trig_assoc}" >> "$GITHUB_ENV"
+
+            # Step-output mirror: GITHUB_ENV vars are invisible to later
+            # steps' with: expressions - the requester chain reads outputs.
+            { echo "resolved_author=${trig_author}"; echo "resolved_assoc=${trig_assoc}"; } >> "$GITHUB_OUTPUT"
             echo "REACTION_SUBJECT_NODE=${trig_node}" >> "$GITHUB_ENV"
             echo "DISCUSSION_NODE_ID=$(printf '%s' "$disc_json" | jq -r '.id')" >> "$GITHUB_ENV"
             echo "DISCUSSION_TITLE=$(printf '%s' "$disc_json" | jq -r '.title')" >> "$GITHUB_ENV"
@@ -551,6 +555,8 @@ jobs:
             echo "RESOLVED_COMMENT_ID=${comment_id}" >> "$GITHUB_ENV"
             echo "RESOLVED_COMMENT_AUTHOR=${trigger_author}" >> "$GITHUB_ENV"
             echo "RESOLVED_ASSOCIATION=GUEST_SUMMONER" >> "$GITHUB_ENV"
+            # Step-output mirror (GITHUB_ENV is invisible in with:).
+            { echo "resolved_author=${trigger_author}"; echo "resolved_assoc=GUEST_SUMMONER"; } >> "$GITHUB_OUTPUT"
             RESOLVED_BODY_DELIM="RESOLVED_BODY_EOF_$(openssl rand -hex 8)"
             {
               printf 'RESOLVED_COMMENT_BODY<<%s\n' "$RESOLVED_BODY_DELIM"
@@ -627,6 +633,8 @@ jobs:
             echo "RESOLVED_COMMENT_ID=${COMMENT_ID_INPUT}"
             echo "RESOLVED_COMMENT_AUTHOR=${author}"
             echo "RESOLVED_ASSOCIATION=${association}"
+            # Step-output mirror (GITHUB_ENV is invisible in with:).
+            { echo "resolved_author=${author}"; echo "resolved_assoc=${association}"; echo "resolved_is_pr=${is_pr}"; } >> "$GITHUB_OUTPUT"
             echo "RESOLVED_IS_PR=${is_pr}"
             printf 'RESOLVED_COMMENT_BODY<<%s\n' "$COMMENT_DELIMITER"
             printf '%s\n' "$body"
@@ -675,13 +683,31 @@ jobs:
       # Builds the factual requester context line (GitHub author association +
       # optional vars.TRUSTED_AGENT_USERS list) consumed by the security brief.
       # Any user may trigger the bot; this only informs the agent's judgment.
+      # Manual-dispatch requester identity (workflow_dispatch carries no
+      # author_association): resolve the dispatch actor's real standing via
+      # the API so the security brief is factual - the same fix pr-review
+      # got (live-caught there: the owner rendered as NONE/unverified).
+      - name: Resolve dispatch actor association
+        id: dispatch_assoc
+        if: github.event_name == 'workflow_dispatch' && steps.validate.outputs.resolved_assoc == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR_LOGIN: ${{ github.actor }}
+        run: |
+          perm=$(gh api "/repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR_LOGIN}/permission" --jq '.permission' 2>/dev/null || echo "")
+          case "$perm" in
+            admin) echo "association=OWNER" >> "$GITHUB_OUTPUT" ;;
+            maintain|write|triage|read) echo "association=COLLABORATOR" >> "$GITHUB_OUTPUT" ;;
+            *) echo "association=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Build requester context
+        if: github.event_name == 'workflow_dispatch'
         id: requester
-        if: steps.validate.outputs.should_proceed == 'true'
         uses: ./.github/actions/requester-context
         with:
-          login: ${{ env.RESOLVED_COMMENT_AUTHOR }}
-          association: ${{ env.RESOLVED_ASSOCIATION }}
+          login: ${{ steps.validate.outputs.resolved_author || github.actor }}
+          association: ${{ steps.validate.outputs.resolved_assoc || steps.dispatch_assoc.outputs.association }}
           trusted-users: ${{ inputs.targetRepo != '' && vars.FOREIGN_MENTIONS_USERS || vars.TRUSTED_AGENT_USERS }}
           trigger-note: "${{ inputs.targetRepo != '' && format('cross-repo guest summon in {0} (allowlist-verified)', inputs.targetRepo) || format('routed comment on {0}', inputs.threadNumber) }}"
 
@@ -793,7 +819,7 @@ jobs:
           # requester.login — it demands user-profile scopes the PAT lacks
           # (see compliance-check.yml pr_info for the REST pattern if a
           # field ever needs migrating). Do NOT add reviewRequests here.
-          pr_json=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
+          pr_json=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository)
             timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$THREAD_NUMBER/timeline")
 
             echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
@@ -811,10 +837,21 @@ jobs:
             additions=$(echo "$pr_json" | jq -r .additions)
             deletions=$(echo "$pr_json" | jq -r .deletions)
             total_commits=$(echo "$pr_json" | jq -r '.commits | length')
-            changed_files_count=$(echo "$pr_json" | jq -r '.files | length')
             title=$(echo "$pr_json" | jq -r .title)
             body=$(echo "$pr_json" | jq -r '.body // "(No description provided)"')
-            changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-\((.deletions))"')
+
+            # Changed files via the paginated REST files API (gh pr view's
+            # --json files caps at ONE page of 100 and lies on 300+-file
+            # PRs); compact one line per file - status letter + counts.
+            # Same fix pr-review got.
+            files_tsv=$(gh api "repos/${{ github.repository }}/pulls/$THREAD_NUMBER/files?per_page=100" --paginate --jq '.[] | [.status, (.additions // 0), (.deletions // 0), .filename] | @tsv' 2>/dev/null || true)
+            changed_files_count=$(printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
+            changed_files_list=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==4 {
+            st = toupper(substr($1,1,1))
+            if (st == "C") st = "M"
+            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
+            printf "%s %s %s %s\n", "-", st, $4, counts
+          }')
 
             linked_issues_content=""
             issue_numbers=$(echo "$pr_json" | jq -r '.closingIssuesReferences[].number')
@@ -953,17 +990,29 @@ jobs:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           QUERY_REPO: ${{ inputs.targetRepo || github.repository }}
         run: |
+          # HIDDEN = GONE (operator-intent doctrine): minimized reviews and
+          # comments never count as reviewed coverage. Review-level hide does
+          # not propagate to its comments and is GraphQL-only -
+          # minimized-nodes.sh is the single source (QUERY_REPO-aware for the
+          # guest PR path). Fail-closed: unverifiable hidden state skips the
+          # hidden filtering with a warning, never trusts blindly.
+          hidden_json='{"reviews":[],"comments":[]}'
+          hidden_json=$(bash .github/scripts/minimized-nodes.sh "$THREAD_NUMBER") || {
+            hidden_json='{"reviews":[],"comments":[]}'
+            echo "::warning::Hidden-state fetch failed; hidden reviews may be counted as coverage this run."
+          }
           pr_summary_payload=$(gh pr view "$THREAD_NUMBER" --repo "$QUERY_REPO" --json comments,reviews)
-          detect_json=$(echo "$pr_summary_payload" | jq -c --argjson bots "$BOT_NAMES_JSON" '
+          detect_json=$(echo "$pr_summary_payload" | jq -c --argjson bots "$BOT_NAMES_JSON" --argjson hidden "$hidden_json" '
             def ts(x): if (x//""=="") then null else x end;
             def items:
-              [ (.comments[]? | select((.author.login // "" | ascii_downcase) as $a | $bots | index($a)) | {type:"comment", body:(.body//""), ts:(.updatedAt // .createdAt // "")} ),
-                (.reviews[]?  | select((.author.login // "" | ascii_downcase) as $a | $bots | index($a)) | {type:"review",  body:(.body//""), ts:(.submittedAt // .updatedAt // .createdAt // "")} )
+              [ (.comments[]? | .id as $cid | select((.isMinimized != true) and (($hidden.comments | index($cid)) == null)) | select((.author.login // "" | ascii_downcase) as $a | $bots | index($a)) | {type:"comment", body:(.body//""), ts:(.updatedAt // .createdAt // "")} ),
+                (.reviews[]?  | .id as $rid | select(($hidden.reviews | index($rid)) == null) | select((.author.login // "" | ascii_downcase) as $a | $bots | index($a)) | {type:"review",  body:(.body//""), ts:(.submittedAt // .updatedAt // .createdAt // "")} )
               ] | sort_by(.ts) | .;
             def has_phrase: (.body//"") | test("This review was generated by an AI assistant\\.?");
             def has_marker: (.body//"") | test("<!--\\s*last_reviewed_sha:[a-f0-9]{7,40}\\s*-->");
             { latest_phrase: (items | map(select(has_phrase)) | last // {}),
-              latest_marker: (items | map(select(has_marker)) | last // {}) }
+              latest_marker: (items | map(select(has_marker)) | last // {}),
+              all_markers: [ items | map(select(has_marker)) | reverse | .[] | {ts: .ts, sha: (.body | capture("(?<s><!--\\s*last_reviewed_sha:(?<h>[a-f0-9]{7,40})\\s*-->").h // "")} ] }
           ')
           latest_phrase_ts=$(echo "$detect_json" | jq -r '.latest_phrase.ts // ""')
           latest_marker_ts=$(echo "$detect_json" | jq -r '.latest_marker.ts // ""')
@@ -973,12 +1022,49 @@ jobs:
           if [ -z "$latest_phrase_ts" ] && [ -z "$latest_marker_ts" ]; then
             echo "is_first_review=true" >> $GITHUB_OUTPUT
           fi
-          if [ -n "$latest_marker_ts" ] && { [ -z "$latest_phrase_ts" ] || [ "$latest_marker_ts" \> "$latest_phrase_ts" ] || [ "$latest_marker_ts" = "$latest_phrase_ts" ]; }; then
+          # ---- rebase ladder (same doctrine as pr-review.yml) ----------------
+          # Walk ALL marker SHAs newest-first; anchor on the newest REACHABLE
+          # reviewed state (ancestry vs the PR HEAD object, fetched first -
+          # never HEAD, which is the default-branch checkout). None reachable
+          # -> FOLLOW-UP awareness + REBASE_CONTEXT instead of an orphaned
+          # anchor presenting a full diff as incremental.
+          # Home mode only (origin IS the PR's repo): guest PR numbers belong
+          # to the FOREIGN repo - fetching origin's pull/N/head there would
+          # target the wrong PR, and guests diff via the API path anyway.
+          # PR_HEAD_OBJ stays empty unless the head was actually fetched (a
+          # stale FETCH_HEAD would test ancestry against the wrong object).
+          PR_HEAD_OBJ=""
+          if [ "$QUERY_REPO" = "$GITHUB_REPOSITORY" ]; then
+            if git fetch origin "pull/$THREAD_NUMBER/head" >/dev/null 2>&1; then
+              PR_HEAD_OBJ=$(git rev-parse FETCH_HEAD 2>/dev/null || echo "")
+            fi
+          fi
+          candidates=$(echo "$detect_json" | jq -r '.all_markers[] | select(.sha != "") | [.sha, .ts] | @tsv')
+          if [ -n "$PR_HEAD_OBJ" ] && [ -n "$candidates" ]; then
+            while IFS="$(printf '\t')" read -r csha cts; do
+              [ -n "$csha" ] || continue
+              if git cat-file -e "$csha" 2>/dev/null && git merge-base --is-ancestor "$csha" "$PR_HEAD_OBJ" 2>/dev/null; then
+                resolved_sha="$csha"
+                echo "Using newest REACHABLE reviewed state: $resolved_sha"
+                break
+              fi
+            done <<< "$candidates"
+            if [ -z "$resolved_sha" ]; then
+              newest_sha=$(printf '%s\n' "$candidates" | head -1 | cut -f1)
+              {
+                echo "REBASE_CONTEXT<<RB_CTX_EOF"
+                echo "NOTE - branch history was rewritten (force-push/rebase) after the last review (${newest_sha:0:10}); every previously reviewed state is unreachable from the current head, so no incremental diff exists. The FULL diff is provided. Your prior reviews are in the review-memory blocks: reconstruct what still applies yourself."
+                echo "RB_CTX_EOF"
+              } >> "$GITHUB_ENV"
+              echo "Rebase detected: all reviewed states unreachable."
+            fi
+          elif [ -n "$latest_marker_ts" ] && { [ -z "$latest_phrase_ts" ] || [ "$latest_marker_ts" \> "$latest_phrase_ts" ] || [ "$latest_marker_ts" = "$latest_phrase_ts" ]; }; then
+            # No head object to verify reachability: classic newest-marker.
             resolved_sha=$(printf "%s" "$latest_marker_body" | sed -nE 's/.*<!--\s*last_reviewed_sha:([a-f0-9]{7,40})\s*-->.*/\1/p' | head -n1)
           fi
-          if [ -z "$resolved_sha" ] && [ -n "$latest_phrase_ts" ]; then
+          if [ -z "$resolved_sha" ] && [ -n "$latest_phrase_ts" ] && [ -z "${REBASE_CONTEXT:-}" ]; then
             reviews_json=$(gh api "/repos/$QUERY_REPO/pulls/$THREAD_NUMBER/reviews" || echo '[]')
-            resolved_sha=$(echo "$reviews_json" | jq -r --argjson bots "$BOT_NAMES_JSON" '[.[] | select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)) | .commit_id] | last // ""')
+            resolved_sha=$(echo "$reviews_json" | jq -r --argjson bots "$BOT_NAMES_JSON" --argjson hidden "$hidden_json" '[.[] | .node_id as $nid | select(($hidden.reviews | index($nid)) == null) | select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)) | .commit_id] | last // ""')
           fi
           if [ -n "$resolved_sha" ]; then
             echo "last_reviewed_sha=$resolved_sha" >> $GITHUB_OUTPUT
@@ -1010,7 +1096,8 @@ jobs:
           cp .github/scripts/fetch-pr-discussion.sh /tmp/fetch-pr-discussion.sh
           cp .github/scripts/generate-review-kit.sh /tmp/generate-review-kit.sh
           cp .github/scripts/split-diff.sh /tmp/split-diff.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/fetch-pr-discussion.sh /tmp/generate-review-kit.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh
+          cp .github/scripts/minimized-nodes.sh /tmp/minimized-nodes.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/fetch-pr-discussion.sh /tmp/generate-review-kit.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh /tmp/minimized-nodes.sh
           bash /tmp/assemble-prompt.sh --verify
           # Resolve identity + trigger stems (exports BOT_NAMES_JSON / BOT_TRIGGER_STEMS)
           bash /tmp/bot-config.sh

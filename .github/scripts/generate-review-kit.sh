@@ -58,14 +58,22 @@ printf '%s\n' "$PR_HEAD_SHA" > "$KIT_DIR/head_sha.txt"
 # time, keeping ONLY this agent's review bodies (a 300-review PR never lands
 # whole in shell memory); reviews arrive chronologically, so the LAST marker
 # in the stream is the newest.
+# HIDDEN = GONE: minimized reviews never count as reviewed coverage. The
+# node-id join below drops them; a failed hidden-state fetch warns and
+# proceeds unfiltered (fail-open here only loses hide-fidelity, never data).
 LAST_REVIEWED_SHA=""
+HIDDEN_REVIEWS='[]'
+if [ -x /tmp/minimized-nodes.sh ]; then
+  HIDDEN_REVIEWS=$(bash /tmp/minimized-nodes.sh "$PR" 2>/dev/null | jq '.reviews // []' 2>/dev/null) || HIDDEN_REVIEWS='[]'
+  [ -n "$HIDDEN_REVIEWS" ] || HIDDEN_REVIEWS='[]'
+fi
 bot_review_bodies() {
   # Streams THIS agent's review bodies (chronological, newest last) without
   # ever holding a full review list in memory: jq sits on the pipe outside
   # gh api and passes page documents through one at a time.
   gh api "/repos/$REPO/pulls/$PR/reviews" --paginate 2>/dev/null |
-    jq -r --arg bots "$BOT_IDS_CSV" \
-      '.[] | select((.user.login // "" | ascii_downcase) as $u | ($bots | split(",") | index($u))) | (.body // "")'
+    jq -r --arg bots "$BOT_IDS_CSV" --argjson hidden "$HIDDEN_REVIEWS" \
+      '.[] | .node_id as $nid | select(($hidden | index($nid)) == null) | select((.user.login // "" | ascii_downcase) as $u | ($bots | split(",") | index($u))) | (.body // "")'
 }
 BOT_IDS_CSV=$(printf '%s' "$BOT_NAMES_JSON" | jq -r 'join(",")')
 for _attempt in 1 2; do
@@ -77,9 +85,36 @@ for _attempt in 1 2; do
   sleep 2
 done
 if [ -n "${marker_stream:-}" ]; then
-  LAST_REVIEWED_SHA=$(printf '%s\n' "$marker_stream" | grep -o 'last_reviewed_sha:[a-f0-9]\{7,40\}' | tail -1 | cut -d: -f2 || true)
+  # Rebase ladder (same doctrine as pr-review.yml): walk ALL marker SHAs
+  # newest-first and anchor on the NEWEST REACHABLE reviewed state. After a
+  # force-push the old SHAs are orphaned; anchoring on one would present a
+  # full diff as "incremental". Newest reachable wins; none reachable ->
+  # FOLLOW-UP awareness + full diff + an explicit rebase note.
+  git fetch origin "pull/$PR/head" >/dev/null 2>&1 || true
+  PR_HEAD_OBJ="${PR_HEAD_SHA:-$(git rev-parse FETCH_HEAD 2>/dev/null || echo "")}"
+  all_markers=$(printf '%s\n' "$marker_stream" | grep -o 'last_reviewed_sha:[a-f0-9]\{7,40\}' | cut -d: -f2 | awk 'NF' | tac)
+  if [ -n "$PR_HEAD_OBJ" ] && [ -n "$all_markers" ]; then
+    for cand in $all_markers; do
+      if git cat-file -e "$cand" 2>/dev/null && git merge-base --is-ancestor "$cand" "$PR_HEAD_OBJ" 2>/dev/null; then
+        LAST_REVIEWED_SHA="$cand"
+        break
+      fi
+    done
+    if [ -z "$LAST_REVIEWED_SHA" ]; then
+      newest_mark=$(printf '%s\n' "$all_markers" | head -1)
+      REBASE_CONTEXT="NOTE - branch history was rewritten (force-push/rebase) after the last review (newest reviewed state ${newest_mark:0:10} is unreachable from the current head), so no incremental diff exists. The FULL diff is provided. Your prior reviews are in the review-memory blocks: reconstruct what still applies yourself - verify earlier findings against the new state and review the full delta knowingly."
+      export REBASE_CONTEXT
+    fi
+  else
+    # No head object to test against: keep the classic newest-marker behavior.
+    LAST_REVIEWED_SHA=$(printf '%s\n' "$all_markers" | head -1)
+  fi
 fi
 if [ -n "$LAST_REVIEWED_SHA" ]; then
+  REVIEW_TYPE="FOLLOW-UP"
+elif [ -n "${REBASE_CONTEXT:-}" ]; then
+  # Reviews exist but every reviewed state is unreachable: this is a
+  # re-review with full scope, not a virgin FIRST.
   REVIEW_TYPE="FOLLOW-UP"
 else
   REVIEW_TYPE="FIRST"
@@ -96,12 +131,15 @@ git diff "origin/$PR_BASE...FETCH_HEAD" > "$FULL_DIFF" 2>/dev/null || git diff "
 INCREMENTAL_DIFF=""
 if [ "$REVIEW_TYPE" = "FOLLOW-UP" ]; then
   INCREMENTAL_DIFF="$KIT_DIR/incremental_diff.patch"
-  if git diff "$LAST_REVIEWED_SHA..FETCH_HEAD" > "$INCREMENTAL_DIFF" 2>/dev/null; then
+  if [ -n "$LAST_REVIEWED_SHA" ] && git diff "$LAST_REVIEWED_SHA..FETCH_HEAD" > "$INCREMENTAL_DIFF" 2>/dev/null; then
     :
   else
-    # marker no longer resolvable (force-push orphaned it): fall back to full
+    # No reachable anchor (rebase/force-push) or diff failure: the incremental
+    # file IS the full diff - say so INSIDE the file (the followup protocol
+    # otherwise asserts it reads only incremental changes).
     cp "$FULL_DIFF" "$INCREMENTAL_DIFF"
-    echo "KIT NOTE: last-reviewed SHA $LAST_REVIEWED_SHA unresolvable - incremental diff fell back to the full diff"
+    { printf '%s\n' "[NOTE: no reachable last-reviewed state; this is the FULL PR diff against the base branch, not an incremental one. Review it with first-review thoroughness.]"; cat "$INCREMENTAL_DIFF"; } > "$INCREMENTAL_DIFF.note" 2>/dev/null && mv "$INCREMENTAL_DIFF.note" "$INCREMENTAL_DIFF"
+    echo "KIT NOTE: no reachable last-reviewed state - incremental diff fell back to the full diff"
     LAST_REVIEWED_SHA=""
   fi
 fi
