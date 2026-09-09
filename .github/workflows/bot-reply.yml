@@ -214,9 +214,14 @@ jobs:
           BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
         run: |
           raw="${BOT_IDENTITIES_INPUT:-mirrobot-agent, mirrobot-agent[bot]}"
+          # Lowercased by design: consumers lowercase the author side and
+          # compare against this array (ascii_downcase as $a | $bots |
+          # index($a)); a display-case array matches nothing (live-caught:
+          # FIRST misclassification, empty review-memory blocks, own
+          # reviews polluting thread context as "other reviewers").
           case "$raw" in
-            '['*) printf 'BOT_NAMES_JSON=%s\n' "$raw" >> "$GITHUB_ENV" ;;
-            *) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)" >> "$GITHUB_ENV" ;;
+            '['*) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | jq -sc 'map(ascii_downcase)')" >> "$GITHUB_ENV" ;;
+            *) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)')" >> "$GITHUB_ENV" ;;
           esac
       # Sparse default-branch checkout for the SHARED routing script, so the
       # re-validation below runs the exact same decision logic as the router

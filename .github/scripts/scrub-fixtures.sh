@@ -435,14 +435,14 @@ asm() { bash "$ASM" "$1" | REVIEW_TYPE=FIRST envsubst "$RVARS"; }
 # per-mode VARS (must mirror each workflow's real VARS list + invocation bridges)
 vars_for() {
   case "$1" in
-    pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
+    pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
     bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${DISCUSSION_NODE_ID} ${DISCUSSION_TITLE}' ;;
     issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
     compliance-first|compliance-followup) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
     # bot-reply's on-demand instruction sets: union of the IVARS list and the
     # review RVARS additions from the Generate-instruction-sets step. A name
     # missing here shows up as raw-variable residue below.
-    review-*-instructions) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${REVIEW_TYPE} ${PR_AUTHOR} ${PULL_REQUEST_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
+    review-*-instructions) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${REVIEW_TYPE} ${PR_AUTHOR} ${PULL_REQUEST_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
     agentlib-*) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
   esac
 }
@@ -986,6 +986,67 @@ check "gate: NO checkout" "0" \
   "$(grep -c 'uses: actions/checkout' "$GATE")"
 check "gate: statuses-only permission" yes \
   "$(grep -A2 '^permissions:' "$GATE" | grep -q 'statuses: write' && ! grep -q 'contents:' "$GATE" && echo yes || echo no)"
+
+# ---- identity array is LOWERCASED (live-caught: display-case arrays ------
+# ---- matched nothing -> FIRST misclassification, empty memory blocks, ----
+# ---- own reviews polluting thread context) -------------------------------
+for wf in bot-reply pr-review compliance-check issue-comment pr-review-trigger; do
+  check "names-lc: $wf normalizer lowercases the array" yes \
+    "$(grep -q "jq -sc 'map(ascii_downcase)'" "$SCRIPT_DIR/../workflows/$wf.yml" && echo yes || echo no)"
+done
+NJ_CASE_JSON=$(printf '%s' 'Zeta-Agent, ZETA-BOT[bot]' | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)')
+check "names-lc: chain behavior probe (display case in, lowercase out)" '["zeta-agent","zeta-bot[bot]"]' \
+  "$NJ_CASE_JSON"
+check "names-lc: author match works against display-case input" "true" \
+  "$(jq -en --argjson bots "$NJ_CASE_JSON" '"ZETA-Agent" | ascii_downcase as $a | $bots | index($a) != null' >/dev/null 2>&1 && echo true || echo false)"
+
+# ---- manual-dispatch requester association resolution ---------------------
+# Live-caught: the repo OWNER rendered as "NONE (verified by GitHub)" on a
+# manual dispatch - no association source exists for that trigger shape.
+check "requester: pr-review resolves dispatch actor association" yes \
+  "$(grep -q "collaborators/.*permission" "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q "dispatch_assoc" "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "requester: with-chain reads step outputs, not GITHUB_ENV (invisible in with:)" yes \
+  "$(grep -q 'steps.validate.outputs.resolved_author' "$SCRIPT_DIR/../workflows/pr-review.yml" && ! grep -q 'env.RESOLVED_COMMENT_AUTHOR' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "requester: action words empty association as unknown, never fake-verified NONE" yes \
+  "$(grep -q 'could not be resolved for this trigger' "$SCRIPT_DIR/../actions/requester-context/action.yml" && echo yes || echo no)"
+
+# ---- rebase ladder (force-push/rewritten history) --------------------------
+# Prior markers whose SHAs are not ancestors of HEAD must not be diff bases;
+# the newest REACHABLE reviewed state wins, else full diff + explicit
+# rebase context (never a silent FIRST downgrade).
+check "rebase: determine step walks candidates by ancestry" yes \
+  "$(grep -q 'merge-base --is-ancestor' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'all_markers' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "rebase: REBASE_CONTEXT exported with history-rewrite note" yes \
+  "$(grep -q 'REBASE_CONTEXT<<' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'Recent commits (newest first' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "rebase: placeholder lives in mission-review type context" yes \
+  "$(grep -q 'REBASE_CONTEXT' "$SCRIPT_DIR/../prompts/parts/mission-review.md" && echo yes || echo no)"
+check "rebase: envsubst VARS list carries REBASE_CONTEXT" yes \
+  "$(grep -q 'REBASE_CONTEXT' <(grep 'VARS=' "$SCRIPT_DIR/../workflows/pr-review.yml") && echo yes || echo no)"
+check "rebase: full-diff fallback note survives generation (prepended, not clobbered)" yes \
+  "$(grep -q 'INC_OUT.note' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'INC_NOTE' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+
+# ---- noise-filter defaults: bootstrap seed must MATCH the script ----------
+# Live-caught: bootstrap seeded [] which REPLACES the baked defaults -
+# every bootstrapped repo ran with noise filtering silently disabled.
+# The seed values carry apostrophe splicing ('"'"') - extract the raw
+# assignment text and let bash evaluate it, then compare the RESULTS.
+SEED_RAW=$(sed -n "s/^.*\[CONTEXT_FILTER_PATTERNS_JSON\]=//p" "$SCRIPT_DIR/../workflows/agent-bootstrap.yml" | head -1)
+SCRIPT_RAW=$(sed -n "s/^DEFAULT_FILTER_PATTERNS_JSON=//p" "$SCRIPT_DIR/fetch-pr-discussion.sh" | head -1)
+SEED_PAT=$(eval "printf '%s' $SEED_RAW" 2>/dev/null || echo SEED-BROKEN)
+SCRIPT_PAT=$(eval "printf '%s' $SCRIPT_RAW" 2>/dev/null || echo SCRIPT-BROKEN)
+check "noise: bootstrap seed matches script defaults byte-for-byte" "same" \
+  "$( [ "$SEED_PAT" = "$SCRIPT_PAT" ] && [ -n "$SEED_PAT" ] && [ "$SEED_PAT" != "SEED-BROKEN" ] && echo same || echo differ )"
+check "noise: usage-credits pattern present in defaults" yes \
+  "$(printf '%s' "$SCRIPT_PAT" | grep -q 'usage credits' && echo yes || echo no)"
+
+# ---- changed files: paginated + compact (live-caught: gh pr view --json ---
+# ---- files caps at one page of 100 and lied about a 324-file PR) ----------
+check "files: PR-context fetch no longer asks --json for files" yes \
+  "$(grep -q -- '--json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "files: paginated REST files API used" yes \
+  "$(grep -q 'pulls/\$PR_NUMBER/files?per_page=100' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q -- '--paginate' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "files: compact status-letter rendering" yes \
+  "$(grep -q 'toupper(substr(\$1,1,1))' "$SCRIPT_DIR/../workflows/pr-review.yml" && ! grep -q '(MODIFIED)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

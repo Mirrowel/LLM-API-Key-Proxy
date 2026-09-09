@@ -127,7 +127,7 @@ THREAD_COMMENT_FETCH=$(( THREAD_COMMENT_FETCH * 3 )); [ "$THREAD_COMMENT_FETCH" 
 
 # Noise-filter configuration (repo variables; see header).
 CONTEXT_IGNORE_AUTHORS="${CONTEXT_IGNORE_AUTHORS:-}"
-DEFAULT_FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","<!-- greptile-status -->","Too many files changed for review"]'
+DEFAULT_FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review"]'
 if [ -n "${CONTEXT_FILTER_PATTERNS_JSON:-}" ]; then
   if printf '%s' "$CONTEXT_FILTER_PATTERNS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
     FILTER_PATTERNS_JSON="$CONTEXT_FILTER_PATTERNS_JSON"

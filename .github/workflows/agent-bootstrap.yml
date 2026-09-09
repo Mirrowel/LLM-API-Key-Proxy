@@ -113,7 +113,7 @@ jobs:
             [BOT_IDENTITIES]="$IDENT_SEED"
             [BOT_TRIGGERS]="mirrobot, mirrobot-agent"
             [CONTEXT_LIMITS_JSON]='{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-comments":70,"body-chars":3000}'
-            [CONTEXT_FILTER_PATTERNS_JSON]="[]"
+            [CONTEXT_FILTER_PATTERNS_JSON]='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review"]'
             [FOREIGN_MENTIONS_ENABLED]="false"
             [OPEN_TRIGGERING]="true"
             [OPENCODE_PLUGINS_JSON]="{}"
@@ -217,7 +217,7 @@ jobs:
           | `BOT_TRIGGERS` | `mirrobot, mirrobot-agent` | WHAT summons the agent: comma-separated raw names (no @ or / prefixes). Each stem derives `@<stem>`, `/<stem>-review`, `/<stem>_review`, `/<stem>-check`, `/<stem>_check`. Renaming the bot? Set this + `BOT_IDENTITIES`. |
           | `CONTEXT_LIMITS_JSON` | full budget template | Context budget (newest-first, filter-before-cap): `comments`, `reviews`, `own-reviews` (always-include safeguard), `threads-per-review`, `thread-comments`, `orphan-threads`, `orphan-thread-comments`. Lower values = smaller first prompts on noisy repos. |
           | `CONTEXT_IGNORE_AUTHORS` | empty | Comma-separated authors whose posts are filtered from agent context (AI-reviewer noise, bots). |
-          | `CONTEXT_FILTER_PATTERNS_JSON` | `[]` | JSON array of regex patterns; matching posts are filtered from context. REPLACES the baked defaults. |
+          | `CONTEXT_FILTER_PATTERNS_JSON` | the built-in AI-reviewer noise patterns | JSON array of regex patterns; matching posts are filtered from context. Absent = built-in defaults; a set array (including `[]`) REPLACES them - `[]` disables noise filtering entirely. |
           | `TRUSTED_AGENT_USERS` | empty | Extra trusted users (comma-separated) beyond direct collaborators (who already count as friendly). |
           | `FOREIGN_MENTIONS_ENABLED` | `false` | Cross-repo guest mode master switch. |
           | `FOREIGN_MENTIONS_USERS` | empty | Allowlist for cross-repo summons (comma-separated logins). |
@@ -265,7 +265,8 @@ jobs:
           gh variable set BOT_IDENTITIES -R <owner>/<repo> --body 'your-bot-name'
           gh variable set BOT_TRIGGERS -R <owner>/<repo> --body "your-bot-name, your-other-name"
           gh variable set CONTEXT_LIMITS_JSON -R <owner>/<repo> --body '{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-comments":70,"body-chars":3000}'
-          gh variable set CONTEXT_FILTER_PATTERNS_JSON -R <owner>/<repo> --body "[]"
+          # Absent = built-in defaults; [] disables noise filtering; a list replaces the defaults.
+          gh variable set CONTEXT_FILTER_PATTERNS_JSON -R <owner>/<repo> --body '<same pattern list as seeded above - copy from the DEFAULTS block>'
           gh variable set FOREIGN_MENTIONS_ENABLED -R <owner>/<repo> --body "false"
           gh variable set OPENCODE_PLUGINS_JSON -R <owner>/<repo> --body "{}"
           gh variable set PREVIOUS_BOT_REVIEWS_COUNT -R <owner>/<repo> --body "1"
