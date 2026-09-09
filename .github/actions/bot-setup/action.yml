@@ -1,13 +1,19 @@
 name: 'Bot Setup'
-description: 'Performs all common setup steps for bot workflows, including token generation, git config, and dependency installation.'
+description: 'Performs all common setup steps for bot workflows, including token selection, git config, and dependency installation. Dual identity mode: uses the bot ACCOUNT token when provided (account mode), falling back to the GitHub App installation token (app mode). Agent permissions are owned by the OPENCODE_CONFIG_JSON secret (see permissions.example.json); this action does not inject or export any permission configuration.'
 
 inputs:
+  account-token:
+    description: 'Optional bot-account PAT. When non-empty, runs in account mode (this token is used directly, validated against /user) and the App credentials below are ignored.'
+    required: false
+    default: ''
   bot-app-id:
-    description: 'The ID of the GitHub App.'
-    required: true
+    description: 'The ID of the GitHub App (app mode only, required when no account token is provided).'
+    required: false
+    default: ''
   bot-private-key:
-    description: 'The private key of the GitHub App.'
-    required: true
+    description: 'The private key of the GitHub App (app mode only, required when no account token is provided).'
+    required: false
+    default: ''
   opencode-api-key:
     description: 'Optional API key to apply to the provider inferred from opencode-model.'
     required: false
@@ -20,17 +26,141 @@ inputs:
   opencode-config-json:
     description: 'Optional: A complete minified opencode.json used as the base config before model and API key overrides.'
     required: false
+  agent-key:
+    description: 'Optional: per-agent key (e.g. pr-review, bot-reply) resolved against the AGENT_MODELS_JSON variable to override opencode-model/opencode-fast-model for this agent. Missing key or empty model string falls back to the global inputs.'
+    required: false
+    default: ''
+  agent-models-json:
+    description: 'Optional: contents of the AGENT_MODELS_JSON repo variable: {"<agent-key>": {"model": "provider/model", "fast": "provider/model"}}. Malformed JSON fails loudly; empty/missing keys fall back silently.'
+    required: false
+    default: ''
+  plugins-json:
+    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under ~/.mirrobot-plugins/ for referencing from the config secret plugin array (absolute path /home/runner/.mirrobot-plugins/<path>).'
+    required: false
+    default: ''
+  plugins-json-1:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_1. Numbered variables let each plugin live in its own variable; all are merged (path collisions are a hard error). Supported through _5.'
+    required: false
+    default: ''
+  plugins-json-2:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_2.'
+    required: false
+    default: ''
+  plugins-json-3:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_3.'
+    required: false
+    default: ''
+  plugins-json-4:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_4.'
+    required: false
+    default: ''
+  plugins-json-5:
+    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_5.'
+    required: false
+    default: ''
 
 outputs:
   token:
-    description: "The generated GitHub App token."
-    value: ${{ steps.generate_token.outputs.token }}
+    description: "The bot token (account PAT in account mode, App installation token in app mode)."
+    value: ${{ steps.account_token.outputs.token || steps.generate_token.outputs.token }}
+  mode:
+    description: "Which identity mode was activated: 'account' or 'app'."
+    value: ${{ steps.resolve_mode.outputs.mode }}
+  identity:
+    description: "Human-readable bot identity used this run (account login in account mode, the app bot name in app mode), for logging."
+    value: ${{ steps.account_token.outputs.login || 'mirrobot-agent[bot]' }}
 
 runs:
   using: "composite"
   steps:
-    - name: Generate GitHub App Token
+    - name: Resolve token mode
+      id: resolve_mode
+      shell: bash
+      env:
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+        APP_ID: ${{ inputs.bot-app-id }}
+        APP_KEY: ${{ inputs.bot-private-key }}
+      run: |
+        if [ -n "$ACCOUNT_TOKEN" ]; then
+          echo "mode=account" >> "$GITHUB_OUTPUT"
+        elif [ -n "$APP_ID" ] && [ -n "$APP_KEY" ]; then
+          echo "mode=app" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error::No bot credentials available. Provide ACCOUNT_GH_TOKEN (account mode) or BOT_APP_ID + BOT_PRIVATE_KEY (app mode)."
+          exit 1
+        fi
+
+    - name: Validate account token (account mode)
+      id: account_token
+      if: steps.resolve_mode.outputs.mode == 'account'
+      shell: bash
+      env:
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+      run: |
+        set -e
+        # Fail-fast validation: a present-but-broken secret must NOT silently
+        # fall back to app mode - it needs human attention (rotation).
+        # ONE round-trip (--include) yields body (login, id) AND the
+        # X-OAuth-Scopes header, so scope sufficiency is checked here too.
+        resp=$(GH_TOKEN="$ACCOUNT_TOKEN" gh api --include /user) || {
+          echo "::error::ACCOUNT_GH_TOKEN is set but invalid (gh api /user failed). Rotate the secret or remove it to fall back to app mode."
+          exit 1
+        }
+        body=$(printf '%s\n' "$resp" | awk 'body {print} /^\r?$/{body=1}')
+        login=$(printf '%s' "$body" | jq -r .login)
+        account_id=$(printf '%s' "$body" | jq -r .id)
+        # __ABSENT__ sentinel distinguishes "header not in response" (non-classic
+        # token) from "header present but empty" (classic token with NO scopes).
+        scopes=$(printf '%s\n' "$resp" | awk '
+          tolower($0) ~ /^x-oauth-scopes:/ {
+            sub(/^[^:]*:[ ]*/, ""); gsub(/\r/, ""); print; found = 1; exit
+          }
+          END { if (!found) print "__ABSENT__" }')
+
+        echo "token=$ACCOUNT_TOKEN" >> "$GITHUB_OUTPUT"
+        echo "login=$login" >> "$GITHUB_OUTPUT"
+        echo "account_id=$account_id" >> "$GITHUB_OUTPUT"
+        # Identity auto-detection for bot-config.sh: the account login joins
+        # the resolved identity set (and derives trigger stems when no
+        # BOT_TRIGGERS variable is set). App mode cannot self-detect
+        # (installation tokens 403 on /user) - it relies on the variable
+        # or the stock fallback.
+        echo "BOT_DETECTED_LOGIN=$login" >> "$GITHUB_ENV"
+
+        # Scope contract (classic PAT): public_repo (or repo) required for the
+        # bot's work; `workflow` FORBIDDEN - without that scope GitHub
+        # mechanically rejects .github/workflows pushes, which is the platform
+        # backstop the agent's whole workflow-deny posture relies on.
+        if [ "$scopes" = "__ABSENT__" ]; then
+          echo "::warning::Could not read X-OAuth-Scopes (non-classic token?). Proceeding without scope verification - expected: classic PAT, public_repo only, WITHOUT workflow scope."
+        elif [ -z "$scopes" ]; then
+          echo "::error::ACCOUNT_GH_TOKEN carries NO scopes (X-OAuth-Scopes header is empty) - it cannot operate on the repository. Regenerate with public_repo."
+          exit 1
+        else
+          echo "Token scopes: $scopes"
+          # CRs stripped at extraction; commas normalized to spaces so word
+          # matching is position-independent ("workflow, public_repo" and
+          # "public_repo, workflow" both match; last-position too).
+          scopes_norm=" ${scopes//,/ } "
+          case "$scopes_norm" in
+            *" workflow "*)
+              echo "::error::ACCOUNT_GH_TOKEN has the 'workflow' scope - this removes the platform's workflow-push hard-deny. Regenerate the PAT with public_repo ONLY."
+              exit 1
+              ;;
+          esac
+          case "$scopes_norm" in
+            *" public_repo "*|*" repo "*) : ;;
+            *)
+              echo "::error::ACCOUNT_GH_TOKEN lacks public_repo/repo scope - the token cannot operate on the repository. Regenerate with public_repo."
+              exit 1
+              ;;
+          esac
+        fi
+        echo "::notice::Bot identity: account @$login (account-token mode)"
+
+    - name: Generate GitHub App Token (app mode)
       id: generate_token
+      if: steps.resolve_mode.outputs.mode == 'app'
       uses: actions/create-github-app-token@v1
       with:
         app-id: ${{ inputs.bot-app-id }}
@@ -39,11 +169,33 @@ runs:
     - name: Configure Git for Bot
       shell: bash
       env:
-        GH_TOKEN: ${{ steps.generate_token.outputs.token }}
+        MODE: ${{ steps.resolve_mode.outputs.mode }}
+        ACCOUNT_TOKEN: ${{ inputs.account-token }}
+        APP_TOKEN: ${{ steps.generate_token.outputs.token }}
+        ACCOUNT_LOGIN: ${{ steps.account_token.outputs.login }}
+        ACCOUNT_ID: ${{ steps.account_token.outputs.account_id }}
+        APP_ID: ${{ inputs.bot-app-id }}
       run: |
-        git config --global user.name "mirrobot-agent[bot]"
-        git config --global user.email "${{ inputs.bot-app-id }}+mirrobot-agent@users.noreply.github.com"
-        git config --global url."https://x-access-token:${{ steps.generate_token.outputs.token }}@github.com/".insteadOf "https://github.com/"
+        set -e
+        if [ "$MODE" = "account" ]; then
+          # Account mode: commits attribute to the bot account profile via the
+          # ID-prefixed noreply email; display name keeps the [bot] look.
+          NAME="${ACCOUNT_LOGIN}[bot]"
+          EMAIL="${ACCOUNT_ID}+${ACCOUNT_LOGIN}@users.noreply.github.com"
+          TOKEN="$ACCOUNT_TOKEN"
+        else
+          # App mode. Display name carries the capitalized branding; commit
+          # attribution rides the numeric ID in the noreply email, so email
+          # casing is cosmetic too. (If the GitHub App is renamed, the API
+          # bot login follows the new casing; repo-side identity matching is
+          # case-insensitive everywhere.)
+          NAME="Mirrobot-Agent[bot]"
+          EMAIL="${APP_ID}+Mirrobot-Agent@users.noreply.github.com"
+          TOKEN="$APP_TOKEN"
+        fi
+        git config --global user.name "$NAME"
+        git config --global user.email "$EMAIL"
+        git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
 
     - name: Generate OpenCode Configuration
       shell: bash
@@ -51,10 +203,34 @@ runs:
         MAIN_MODEL: ${{ inputs.opencode-model }}
         FAST_MODEL: ${{ inputs.opencode-fast-model }}
         DEFAULT_API_KEY: ${{ inputs.opencode-api-key }}
+        AGENT_KEY: ${{ inputs.agent-key }}
+        AGENT_MODELS_JSON: ${{ inputs.agent-models-json }}
       run: |
         set -e # Exit immediately if a command fails
 
         mkdir -p ~/.config/opencode
+
+        # --- PER-AGENT MODEL RESOLUTION (AGENT_MODELS_JSON variable) ---
+        # Precedence: agent-specific entry > global inputs. Empty string
+        # values count as absent (the seeded template ships empty strings).
+        # Malformed JSON is a hard error: a typo must never silently
+        # degrade every agent to the global model. Model values are never
+        # echoed here.
+        if [ -n "$AGENT_MODELS_JSON" ] && [ -n "$AGENT_KEY" ]; then
+          if ! jq -e type >/dev/null 2>&1 <<< "$AGENT_MODELS_JSON"; then
+            echo "::error::AGENT_MODELS_JSON variable is not valid JSON. Fix it in repo settings (Settings -> Secrets and variables -> Actions -> Variables)."
+            exit 1
+          fi
+          resolved_model=$(jq -r --arg k "$AGENT_KEY" '.[$k].model // "" | select(. != "")' <<< "$AGENT_MODELS_JSON" 2>/dev/null || true)
+          if [ -n "$resolved_model" ]; then
+            MAIN_MODEL="$resolved_model"
+            echo "Model: per-agent override for '$AGENT_KEY' active."
+          fi
+          resolved_fast=$(jq -r --arg k "$AGENT_KEY" '.[$k].fast // "" | select(. != "")' <<< "$AGENT_MODELS_JSON" 2>/dev/null || true)
+          if [ -n "$resolved_fast" ]; then
+            FAST_MODEL="$resolved_fast"
+          fi
+        fi
 
         # Use the full OpenCode config as the base when supplied. Model inputs below
         # intentionally override it so workflows can select runtime models per job.
@@ -104,6 +280,30 @@ runs:
           configure_model "$FAST_MODEL" "small_model"
         fi
 
+        # NOTE ON PERMISSIONS: the agent permission profile is owned by the
+        # OPENCODE_CONFIG_JSON secret (repository settings), NOT by this action.
+        # Whatever `permission` block the secret supplies lands in
+        # ~/.config/opencode/opencode.json verbatim; no permission injection or
+        # OPENCODE_PERMISSION export happens here. The env var variant would
+        # deep-merge over the config (upstream issue #22292) and override it.
+        # See .github/actions/bot-setup/permissions.example.json for the
+        # recommended profile to paste into the secret.
+        if ! jq -e 'has("permission")' <<< "$CONFIG" >/dev/null 2>&1; then
+          echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste the permission block from .github/actions/bot-setup/permissions.example.json into the secret."
+        else
+          # Drift check: warn when the secret's permission block differs from
+          # the recommended example (e.g. after the example evolves but the
+          # secret was not refreshed). Comparison is PERMISSION-ONLY by
+          # design: the example is a full-config template (providers, mcp,
+          # plugin array) and divergence anywhere else is expected, never a
+          # warning. Informational only — the secret always wins; this just
+          # makes silent drift visible.
+          if ! diff <(jq -S . <<< "$CONFIG" | jq -S '.permission') \
+                     <(jq -S '.permission // empty' "${GITHUB_ACTION_PATH}/permissions.example.json") >/dev/null 2>&1; then
+            echo "::warning::OPENCODE_CONFIG_JSON permission block differs from the example in .github/actions/bot-setup/permissions.example.json. If intentional, update the example to match; otherwise refresh the secret's permission block from the example."
+          fi
+        fi
+
         # --- FINALIZATION ---
         jq -e . <<< "$CONFIG" > ~/.config/opencode/opencode.json
         chmod 600 ~/.config/opencode/opencode.json
@@ -111,6 +311,88 @@ runs:
         # jq . ~/.config/opencode/opencode.json
         # echo "----------------------------------------"
         echo "Successfully generated OpenCode configuration."
+
+    - name: Materialize plugins and mask credential leaves
+      shell: bash
+      env:
+        PLUGINS_JSON: ${{ inputs.plugins-json }}
+        PLUGINS_JSON_1: ${{ inputs.plugins-json-1 }}
+        PLUGINS_JSON_2: ${{ inputs.plugins-json-2 }}
+        PLUGINS_JSON_3: ${{ inputs.plugins-json-3 }}
+        PLUGINS_JSON_4: ${{ inputs.plugins-json-4 }}
+        PLUGINS_JSON_5: ${{ inputs.plugins-json-5 }}
+      run: |
+        set -e
+        # --- PLUGINS (OPENCODE_PLUGINS_JSON + numbered _1.._5 -> ~/.mirrobot-plugins/) ---
+        # Operator-owned code files referenced BY the config secret's plugin
+        # array via absolute path (/home/runner/.mirrobot-plugins/<path>).
+        # Numbered variables let each plugin live in its own variable; all
+        # maps merge (path collisions across variables are a hard error -
+        # two plugins claiming one path is always a config mistake).
+        # Reading this directory is permission-denied in the example profile
+        # and the workflows delete it after opencode boots (config and
+        # plugins are read once at startup). Plugin content is not masked
+        # (operator decision) - protection is lifecycle + read-denies.
+        # Nothing about which plugins exist is logged.
+        ALL_PLUGINS='{}'
+        for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
+          [ -z "$(printf '%s' "$src" | tr -d '[:space:]')" ] && continue
+          if ! jq -e 'type == "object"' <<< "$src" >/dev/null 2>&1; then
+            echo "::error::An OPENCODE_PLUGINS_JSON(_N) variable is not a JSON object. Expected {\"<relative-path>\": \"<file content>\"} - see the repo README."
+            exit 1
+          fi
+          if [ -n "$(jq -n --argjson acc "$ALL_PLUGINS" --argjson add "$src" '$add | keys[] | select(. as $k | $acc | has($k))')" ]; then
+            echo "::error::Duplicate plugin path across OPENCODE_PLUGINS_JSON variables - each file path may be defined exactly once."
+            exit 1
+          fi
+          ALL_PLUGINS=$(jq -n --argjson acc "$ALL_PLUGINS" --argjson add "$src" '$acc * $add')
+        done
+
+        if [ "$ALL_PLUGINS" != "{}" ]; then
+          PLUGINS_DIR="$HOME/.mirrobot-plugins"
+          mkdir -p "$PLUGINS_DIR"
+          chmod 700 "$PLUGINS_DIR"
+          while IFS= read -r relpath; do
+            # Defensive CR strip: some jq builds emit CRLF; a real path never ends in CR.
+            relpath="${relpath%$'\r'}"
+            case "$relpath" in
+              ""|".."|../*|*/../*|*/..|/*|*[[:space:]]*|*"~"*|*"\\"*)
+                echo "::error::OPENCODE_PLUGINS_JSON contains an unsafe path entry. Use relative paths without spaces, traversal, or escapes."
+                exit 1
+                ;;
+            esac
+            target="$PLUGINS_DIR/$relpath"
+            mkdir -p "$(dirname "$target")"
+            jq -rn --argjson all "$ALL_PLUGINS" --arg k "$relpath" '$all[$k]' > "$target"
+            chmod 600 "$target"
+          done < <(jq -r 'keys[]' <<< "$ALL_PLUGINS")
+          echo "Plugins materialized."
+        fi
+
+        # --- MASK CREDENTIAL LEAVES (config-derived secrets) ---
+        # GitHub masks whole SECRET values automatically, but
+        # OPENCODE_CONFIG_JSON is one blob: its inner leaves (provider
+        # apiKeys, mcp header values, credential-bearing URLs) would echo
+        # UNMASKED if any step ever printed them. Register each leaf
+        # explicitly so every later step's output is scrubbed. The URL rule
+        # catches credential QUERY PARAMS with any prefix (e.g.
+        # ?tavilyApiKey=...). GitHub ignores masks shorter than 8
+        # characters, so short values cannot be registered and are skipped.
+        while IFS= read -r v; do
+          [ -z "$v" ] && continue
+          if [ "${#v}" -ge 8 ]; then
+            printf '::add-mask::%s\n' "$v"
+          fi
+        done < <(jq -r '
+          [ (.. | objects | to_entries[]
+              | select(.key | test("(api[_-]?key|key|token|secret|password|authorization|cookie)"; "i"))
+              | .value | strings | select(length >= 8))
+            , (.. | strings
+              | select(length >= 8)
+              | select(test("https?://.+[?&].*(api[_-]?key|token|secret|password)=" ; "i")))
+          ] | unique | .[]
+        ' ~/.config/opencode/opencode.json 2>/dev/null || true)
+        echo "Credential leaf masking applied."
 
     - name: Check for Python requirements file
       id: check_requirements_file
