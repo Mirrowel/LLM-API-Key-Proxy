@@ -127,7 +127,7 @@ check "syntax scrub-workspace" OK "$(bash -n "$SCRUB" && echo OK)"
 check "syntax fetch-roster"    OK "$(bash -n "$SCRIPT_DIR/fetch-roster.sh" && echo OK)"
 check "syntax fetch-pr-discussion" OK "$(bash -n "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo OK)"
 check "discussion: ellipsis hardcode removed" no "$(grep -q ellipsis "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
-check "discussion: minimized filter on agent reviews" yes "$(grep -q "isMinimized != true)))) as \$agent_reviews" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "discussion: minimized filter on agent reviews" yes "$(grep -q "select(is_own and (.isMinimized != true))" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
 check "discussion: noise patterns baked" yes "$(grep -q "rate limited by coderabbit" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
 check "discussion: jq pattern binding (. as \$p)" yes "$(grep -q ". as \$p | select" "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
 check "stale-base docs branch -> INFO (informed, not alarmed)"  INFO  "$(run_scrub stale)"
@@ -262,7 +262,9 @@ for wf in pr-review bot-reply compliance-check issue-comment; do
   # Config lifecycle: opencode reads config+plugins once at boot; the
   # boot-sentinel waiter + post-run cleanup guarantee the sensitive files
   # do not survive the run.
-  check "lifecycle: $wf has boot-sentinel waiter"  yes "$(grep -q '/tmp/.oc-booted' "$WFF" && grep -q '\[ -f /tmp/.oc-booted \] && break' "$WFF" && echo yes || echo no)"
+  # The waiter logic lives in the shared trusted artifact
+  # (opencode-cleanup.sh); workflows must background it and copy it to /tmp.
+  check "lifecycle: $wf has boot-sentinel waiter"  yes "$(grep -q 'bash /tmp/opencode-cleanup.sh waiter' "$WFF" && grep -q 'cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh' "$WFF" && echo yes || echo no)"
   check "lifecycle: $wf post-run cleanup step"     yes "$(grep -q 'Post-run cleanup and usage stats' "$WFF" && echo yes || echo no)"
   check "lifecycle: $wf cleanup is always()"       yes "$(grep -A5 'Post-run cleanup and usage stats' "$WFF" | grep -q 'if: always()' && echo yes || echo no)"
   # Bare stats only: --models would EXPOSE model names; --days is pointless
@@ -383,6 +385,13 @@ route() { # body is_pr -> flags or "none" — delegates to the shared script
   # re-derivation would resolve against the fixture repo and break in CI.
   printf '%s' "$1" | bash "$SCRIPT_DIR/route-comment.sh" "$2"
 }
+# Event guards: the route job MUST be issue_comment-only and route_discussion
+# discussion-only — without the gate, the route job runs on discussion events
+# with a nonexistent github.event.issue and dispatches empty inputs
+# (live-caught 2026-09-09: red run per discussion comment).
+ROUTER_YML="$SCRIPT_DIR/../workflows/agent-router.yml"
+check "router: route job gated to issue_comment" yes "$(sed -n '/^  route:$/,/^  [a-z]/p' "$ROUTER_YML" | head -30 | grep -q "github.event_name == 'issue_comment'" && echo yes || echo no)"
+check "router: route_discussion gated to discussion events" yes "$(sed -n '/^  route_discussion:$/,/^  [a-z]/p' "$ROUTER_YML" | head -30 | grep -q "github.event_name == 'discussion_comment'" && echo yes || echo no)"
 check "router: plain mention (PR)"          "reply"                  "$(route 'hey @mirrobot look at this' true)"
 check "router: plain mention (issue)"       "reply"                  "$(route 'hey @mirrobot look at this' false)"
 check "router: review command (PR)"         "review"                 "$(route 'please /mirrobot-review' true)"
@@ -415,6 +424,7 @@ export THREAD_CONTEXT='<tc>' NEW_COMMENT_AUTHOR=someone NEW_COMMENT_BODY='<b>'
 export THREAD_NUMBER=42 THREAD_AUTHOR=octo IS_FIRST_REVIEW=true
 export FULL_DIFF_PATH=/tmp/f.txt INCREMENTAL_DIFF_PATH=/tmp/i.txt LAST_REVIEWED_SHA=abc123
 export ISSUE_CONTEXT='<ic>' ISSUE_NUMBER=7 ISSUE_AUTHOR=octo
+export DISCUSSION_NODE_ID=D_kwDO_123 DISCUSSION_TITLE='Disc Title'
 export PR_TITLE='T' PR_BODY='<pb>' PR_LABELS='[]' CHANGED_FILES='<cf>'
 export CHANGED_FILES_JSON='[]' PREVIOUS_REVIEWS='<pr>' FILE_GROUPS='<fg>'
 export REPORT_TEMPLATE='<rt>' DIFF_PATH=/tmp/c.txt
@@ -425,15 +435,15 @@ asm() { bash "$ASM" "$1" | REVIEW_TYPE=FIRST envsubst "$RVARS"; }
 # per-mode VARS (must mirror each workflow's real VARS list + invocation bridges)
 vars_for() {
   case "$1" in
-    pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT}' ;;
-    bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY}' ;;
-    issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}' ;;
-    compliance-first|compliance-followup) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY}' ;;
+    pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
+    bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${DISCUSSION_NODE_ID} ${DISCUSSION_TITLE}' ;;
+    issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
+    compliance-first|compliance-followup) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
     # bot-reply's on-demand instruction sets: union of the IVARS list and the
     # review RVARS additions from the Generate-instruction-sets step. A name
     # missing here shows up as raw-variable residue below.
-    review-*-instructions) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${REVIEW_TYPE} ${PR_AUTHOR} ${PULL_REQUEST_CONTEXT}' ;;
-    agentlib-*) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR}' ;;
+    review-*-instructions) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${REVIEW_TYPE} ${PR_AUTHOR} ${PULL_REQUEST_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
+    agentlib-*) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
   esac
 }
 
@@ -590,6 +600,18 @@ if react_calls | grep -q "content=rocket"; then
 else
   echo "PASS: react: issue target keeps eyes (no terminal reaction)"
 fi
+
+# Discussion regime (GraphQL): the discussion-kind checks below exercise
+# addReaction/removeReaction mutations with a GraphQL node id target.
+: > "$RSIM_DIR/calls.log"
+PATH="$RSIM_DIR:$PATH" bash "$SCRIPT_DIR/react.sh" start discussion D_kwDO_abc >/dev/null 2>&1
+react_calls | grep -q "graphql.*addReaction.*subjectId.*D_kwDO_abc.*EYES" \
+  && echo "PASS: react: discussion start posts EYES via GraphQL" || { echo "FAIL: react: discussion start posts EYES via GraphQL"; FAIL=1; }
+: > "$RSIM_DIR/calls.log"
+PATH="$RSIM_DIR:$PATH" bash "$SCRIPT_DIR/react.sh" success discussion D_kwDO_abc >/dev/null 2>&1
+react_calls | grep -q "graphql.*removeReaction.*EYES" \
+  && react_calls | grep -q "graphql.*addReaction.*ROCKET" \
+  && echo "PASS: react: discussion success swaps EYES->ROCKET" || { echo "FAIL: react: discussion success swaps EYES->ROCKET"; FAIL=1; }
 rm -rf "$RSIM_DIR"
 
 # ---- handle-mentions.sh pipeline simulation (mock gh; REAL script) ---------
@@ -608,6 +630,12 @@ case "$a" in
   *"/repos/Home/platform/contents/.github/workflows/bot-reply.yml"*) exit 0 ;;
   *"/repos/Home/plain/contents/.github/workflows/bot-reply.yml"*) exit 1 ;;
   *"/repos/Other/x/contents/.github/workflows/bot-reply.yml"*) exit 1 ;;
+  # Discussion subjects (GraphQL lane — payload served from env by number).
+  # Must precede nothing in particular: graphql args contain no /repos/ URL
+  # substrings, so no shadowing risk from later cases.
+  *"graphql"*"-F n=31"*) printf '%s' "$D1_PAYLOAD" ;;
+  *"graphql"*"-F n=32"*) printf '%s' "$D2_PAYLOAD" ;;
+  *"graphql"*"-F n=33"*) printf '%s' "$D3_PAYLOAD" ;;
   *"issues/comments/501"*) printf '{"user":{"login":"homeboss"},"body":"@Mirrobot-Agent please explain this","issue_url":"https://api.github.com/repos/Other/x/issues/11"}' ;;
   *"issues/comments/502"*) printf '{"user":{"login":"stranger"),"body":"@mirrobot-agent do my bidding","issue_url":"https://api.github.com/repos/Other/x/issues/12"}' ;;
   *"issues/comments/503"*) printf '{"user":{"login":"homeboss"},"body":"no mention token at all","issue_url":"https://api.github.com/repos/Other/x/issues/13"}' ;;
@@ -643,6 +671,22 @@ mention_pipeline() { PATH="$MSIM_DIR:$PATH" GH_TOKEN=mock GITHUB_REPOSITORY=Home
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
 mention_pipeline "[$(notif 1 ci_activity Other/x Other Issue 9 '')]"
 check "mentions: non-mention reason acked not dispatched" yes "$( [ "$(wc -l < "$ACK_LOG")" = 1 ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+
+# Discussion subjects (GraphQL lane): type Discussion + /discussions/N url.
+# Payloads are EXPORTED and served by the mock's graphql cases by -F n= match.
+notif_disc() { printf '{"id":%s,"reason":"%s","repository":{"full_name":"Other/x","owner":{"login":"Other"}},"subject":{"type":"Discussion","url":"https://api.github.com/repos/Other/x/discussions/%s","latest_comment_url":"https://api.github.com/repos/Other/x/discussions/%s"}}' "$1" "$2" "$3" "$3"; }
+export D1_PAYLOAD='{"number":31,"body":"anyone around?","author":{"login":"someoneold"},"comments":{"nodes":[{"author":{"login":"homeboss"},"body":"@Mirrobot-Agent can you explain the config?","createdAt":"2026-09-09T01:00:00Z"}]}}}'
+export D2_PAYLOAD='{"number":32,"body":"x","author":{"login":"someoneold"},"comments":{"nodes":[{"author":{"login":"stranger"},"body":"@mirrobot-agent do my bidding","createdAt":"2026-09-09T01:00:00Z"}]}}'
+export D3_PAYLOAD='{"number":33,"body":"no token in body","author":{"login":"homeboss"},"comments":{"nodes":[{"author":{"login":"homeboss"},"body":"and none in comments","createdAt":"2026-09-09T01:00:00Z"}]}}'
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif_disc 41 mention 31)]"
+check "mentions: discussion mention by roster member dispatches (threadType=discussion)" yes "$(grep -q "threadType=discussion" "$DISPATCH_LOG" && grep -q "targetRepo=Other/x" "$DISPATCH_LOG" && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif_disc 42 mention 32)]"
+check "mentions: discussion mention by stranger declined" yes "$( [ ! -s "$DISPATCH_LOG" ] && [ "$(wc -l < "$ACK_LOG")" = 1 ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+mention_pipeline "[$(notif_disc 43 mention 33)]"
+check "mentions: discussion without mention token declined" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
 
 # B: skip matrix - home-owner repo WITH platform is a no-op
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
@@ -806,6 +850,101 @@ else
   echo "FAIL: strict YAML check (GitHub would reject these files - fix before pushing)"
   FAIL=1
 fi
+
+# ---- identity isolation: no synthesized [bot] twin, ever -------------------
+# GitHub app slugs and usernames are SEPARATE namespaces: anyone can
+# register an app named like the account. A login[bot] identity is trusted
+# ONLY when the operator declared it (variable) or it is the verifiable
+# stock pair. These pins keep the no-synthesis doctrine from regressing.
+WORKER="$SCRIPT_DIR/../../tools/mention-worker/worker.js"
+check "identity: worker never synthesizes a [bot] twin (template form)" no \
+  "$(grep -qF 'botLogin.toLowerCase()}[bot]' "$WORKER" && echo yes || echo no)"
+check "identity: worker never builds a [bot] twin (concat form)" no \
+  "$(grep -qE '\+ *."[[]bot[]]"|"\[bot\]" *\) *\+|login *\+ *`\[bot\]`' "$WORKER" && echo yes || echo no)"
+check "identity: worker self set includes declared variable" yes \
+  "$(grep -q 'actions/variables/BOT_IDENTITIES' "$WORKER" && echo yes || echo no)"
+check "identity: worker reads the FLAT variable (no JSON endpoint)" no \
+  "$(grep -q 'actions/variables/BOT_IDENTITIES_JSON' "$WORKER" && echo yes || echo no)"
+BC_OUT=$(BOT_IDENTITIES_INPUT='' BOT_DETECTED_LOGIN='zeta-acct' BOT_TRIGGERS_INPUT='' bash "$SCRIPT_DIR/bot-config.sh" --export 2>/dev/null; echo "rc=$?")
+check "identity: bot-config detected-only set has NO twin" \
+  'export BOT_NAMES_JSON=\[\"zeta-acct\"\]' \
+  "$(printf '%s\n' "$BC_OUT" | grep '^export BOT_NAMES_JSON=')"
+BC_OUT2=$(BOT_IDENTITIES_INPUT='a*' BOT_DETECTED_LOGIN='' BOT_TRIGGERS_INPUT='' bash "$SCRIPT_DIR/bot-config.sh" --export 2>/dev/null; echo "rc=$?")
+check "identity: glob-stem variable passes through for route escaping" \
+  'export BOT_NAMES_JSON=\[\"a\*\"\]' \
+  "$(printf '%s\n' "$BC_OUT2" | grep '^export BOT_NAMES_JSON=')"
+BC_OUT3=$(BOT_IDENTITIES_INPUT='["legacy"]' BOT_DETECTED_LOGIN='' BOT_TRIGGERS_INPUT='' bash "$SCRIPT_DIR/bot-config.sh" --export 2>"$WORK/bc3.err"; echo "rc=$?")
+BC3_EVAL=$(eval "$(printf '%s\n' "$BC_OUT3" | grep '^export ')" 2>/dev/null; printf '%s' "$BOT_NAMES_JSON")
+check "identity: retired JSON-shaped value ignored (falls back, warns)" yes \
+  "$( [ "$BC3_EVAL" = '["mirrobot-agent","mirrobot-agent[bot]"]' ] && grep -q 'Migrate the variable' "$WORK/bc3.err" && echo yes || echo no)"
+
+# ---- runtime env pairing: a used $VAR must be defined upstream -------------
+# Regression class (live): an audit-fix commit deleted an env entry but kept
+# both usages — every bot-reply PR run died at the review-type step while
+# fixtures stayed green (they never check pairing). These pins do.
+check "pairing: bot-reply QUERY_REPO defined AND used" yes \
+  "$(grep -q 'QUERY_REPO: ' "$BOTWF" && grep -q '"\$QUERY_REPO"' "$BOTWF" && echo yes || echo no)"
+
+# ---- pause shape validation present in all four agent workflows -----------
+for wf in bot-reply pr-review compliance-check issue-comment; do
+  check "pause-shape: $wf validates AGENT_PAUSED_PARTS_JSON type" yes \
+    "$(grep -q "type == .object." "$SCRIPT_DIR/../workflows/$wf.yml" && echo yes || echo no)"
+done
+
+# ---- guest checkout is SHA-pinned, no ref-tip fallback ---------------------
+check "guest: TOCTOU - checkout fails instead of falling back to tip" yes \
+  "$(grep -q 'force-pushed mid-run' "$BOTWF" && ! grep -q 'checkout --quiet --force pr-head' "$BOTWF" && echo yes || echo no)"
+
+# ---- era notes surface independently of taint line 1 -----------------------
+check "era: dedicated era file written" yes \
+  "$(grep -q 'SCRUB_ERA_FILE' "$SCRIPT_DIR/scrub-workspace.sh" && echo yes || echo no)"
+check "era: pr-review exports TRUST_CONTEXT_ERA" yes \
+  "$(grep -q 'TRUST_CONTEXT_ERA<<' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'ERA_EOF_\$(openssl rand -hex 8)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "era: brief carries the era placeholder" yes \
+  "$(grep -q 'TRUST_CONTEXT_ERA' "$SCRIPT_DIR/../prompts/security-brief.md" && echo yes || echo no)"
+
+# ---- diff split-not-truncate (DIFF_SPLIT_BYTES replaced DIFF_MAX_BYTES) ----
+check "split: no truncation path in any workflow" none \
+  "$(grep -l 'DIFF TRUNCATED' "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml 2>/dev/null | wc -l | tr -d ' ' | sed 's/^0$/none/;t;s/.*/FOUND/')"
+check "split: DIFF_SPLIT_BYTES knob in all three workflows" "3" \
+  "$(grep -l "DIFF_SPLIT_BYTES: '1000000'" "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml | wc -l | tr -d ' ')"
+check "split: no DIFF_MAX_BYTES residue" no \
+  "$(grep -rq 'DIFF_MAX_BYTES' "$SCRIPT_DIR"/../workflows/ && echo yes || echo no)"
+check "split: split-diff.sh captured as trusted artifact everywhere" "3" \
+  "$(grep -l 'cp .github/scripts/split-diff.sh /tmp/split-diff.sh' "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml | wc -l | tr -d ' ')"
+check "split: kit splits both diff files" yes \
+  "$(grep -q 'split-diff.sh "$FULL_DIFF"' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'split-diff.sh "$INCREMENTAL_DIFF"' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+check "split: missions teach index detection" "2" \
+  "$(grep -l 'DIFF SPLIT' "$SCRIPT_DIR/../prompts/parts/mission-review.md" "$SCRIPT_DIR/../prompts/parts/mission-compliance.md" | wc -l | tr -d ' ')"
+check "split: <diff> inline-fossil tag renamed" no \
+  "$(grep -q '<diff>$' "$SCRIPT_DIR/../prompts/parts/mission-review.md" && echo yes || echo no)"
+
+# ---- split-diff.sh behavior (unit, temp dir; threshold >= 1000 floor) ------
+SD_TMP=$(mktemp -d)
+printf 'small\n' > "$SD_TMP/small.txt"
+check "split unit: under threshold is a no-op" "$SD_TMP/small.txt" \
+  "$(bash "$SCRIPT_DIR/split-diff.sh" "$SD_TMP/small.txt" 1000)"
+{ echo "diff --git a/one.py b/one.py"; echo "+hello $(head -c 800 /dev/zero | tr '\0' 'z')"; echo "diff --git a/two.py b/two.py"; echo "+world $(head -c 800 /dev/zero | tr '\0' 'z')"; } > "$SD_TMP/big.txt"
+SD_ORIG_BYTES=$(wc -c < "$SD_TMP/big.txt")
+bash "$SCRIPT_DIR/split-diff.sh" "$SD_TMP/big.txt" 1000 >/dev/null 2>&1
+SD_PART_BYTES=$(cat "$SD_TMP/big.txt".part* 2>/dev/null | wc -c)
+check "split unit: content conserved byte-for-byte" "yes" \
+  "$([ "$SD_ORIG_BYTES" -eq "$SD_PART_BYTES" ] && echo yes || echo no)"
+check "split unit: index marker at the base path" yes \
+  "$(head -c 12 "$SD_TMP/big.txt" | grep -q '^\[DIFF SPLIT' && echo yes || echo no)"
+check "split unit: idempotent on an existing index" "0" \
+  "$(N1=$(ls "$SD_TMP/big.txt".part* | wc -l); bash "$SCRIPT_DIR/split-diff.sh" "$SD_TMP/big.txt" 1000 >/dev/null 2>&1; N2=$(ls "$SD_TMP/big.txt".part* | wc -l); echo $((N2 - N1)))"
+rm -rf "$SD_TMP"
+
+# ---- per-body budget (body-chars) ------------------------------------------
+check "body-chars: default parsed in fetch-pr-discussion" yes \
+  "$(grep -q '"body-chars" // 3000' "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "body-chars: clip applied to all four body sites" "4" \
+  "$(grep -c 'clip((' "$SCRIPT_DIR/fetch-pr-discussion.sh" | tr -d ' ')"
+check "body-chars: issue-mode comments clip + patterns + budget" yes \
+  "$(grep -q 'noisy' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'bodyChars' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'limComments' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "body-chars: linked-issue body cap in both PR workflows" "2" \
+  "$(grep -l 'linked-issue body truncated' "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/pr-review.yml | wc -l | tr -d ' ')"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

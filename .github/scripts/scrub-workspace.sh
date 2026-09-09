@@ -541,12 +541,17 @@ else
 fi
 
 # --- Era notes flush ----------------------------------------------------------
-# Appended BELOW the alert line (which owns line 1 of the taint file); when
-# there is no alert at all, the first era note becomes line 1 — benign ℹ
-# context the security brief distinguishes from a ⚠ TAINT alert.
+# TWO destinations: appended BELOW the alert line in the taint file (which
+# owns line 1) AND mirrored to a dedicated era file — workflows surface
+# $ERA_FILE content independently, so dated-context notes stay visible to
+# the agent even when a ⚠ TAINT alert occupies taint line 1.
+ERA_FILE="${SCRUB_ERA_FILE:-/tmp/scrub-era.txt}"
 if [ "$ERA_COUNT" -gt 0 ]; then
-  printf '%s\n' "$ERA_NOTES" | sed '/^$/d' >> "$TAINT_FILE"
-  echo "scrub: $ERA_COUNT auto-load file(s) kept at pre-tip (trusted-era) states — era notes recorded for the agent."
+  printf '%s\n' "$ERA_NOTES" | sed '/^$/d' > "$ERA_FILE"
+  cat "$ERA_FILE" >> "$TAINT_FILE"
+  echo "scrub: $ERA_COUNT auto-load file(s) kept at pre-tip (trusted-era) states — era notes recorded for the agent (${ERA_FILE})."
+else
+  rm -f "$ERA_FILE"
 fi
 
 quar_note=""

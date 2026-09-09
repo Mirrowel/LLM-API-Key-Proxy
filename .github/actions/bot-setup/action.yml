@@ -120,6 +120,12 @@ runs:
         echo "token=$ACCOUNT_TOKEN" >> "$GITHUB_OUTPUT"
         echo "login=$login" >> "$GITHUB_OUTPUT"
         echo "account_id=$account_id" >> "$GITHUB_OUTPUT"
+        # Identity auto-detection for bot-config.sh: the account login joins
+        # the resolved identity set (and derives trigger stems when no
+        # BOT_TRIGGERS variable is set). App mode cannot self-detect
+        # (installation tokens 403 on /user) - it relies on the variable
+        # or the stock fallback.
+        echo "BOT_DETECTED_LOGIN=$login" >> "$GITHUB_ENV"
 
         # Scope contract (classic PAT): public_repo (or repo) required for the
         # bot's work; `workflow` FORBIDDEN - without that scope GitHub

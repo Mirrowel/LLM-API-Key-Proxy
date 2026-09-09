@@ -134,6 +134,10 @@ jobs:
           # Empty for non-review_requested events; the requested reviewer's
           # login otherwise (checked against our identity family below).
           REQUESTED_LOGIN: ${{ github.event.requested_reviewer.login || '' }}
+          # Identity for the reviewer gate (the DECIDE step consumes it):
+          # variable with the stock fallback (no bot token here to
+          # /user-detect with).
+          BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
         run: |
           review=false
           if [ "$DRAFT" != "true" ]; then
@@ -143,14 +147,23 @@ jobs:
                 ;;
               review_requested)
                 # Fires for EVERY reviewer addition; act only when WE are
-                # the requested reviewer (case-insensitive identity match).
-                rl=$(printf '%s' "$REQUESTED_LOGIN" | tr 'A-Z' 'a-z')
-                case "$rl" in
-                  mirrobot-agent|mirrobot-agent\[bot\]) review=true ;;
-                  *)
-                    echo "Review requested of '@${REQUESTED_LOGIN}' - not our identity; no-op."
-                    ;;
+                # the requested reviewer.
+                # BOT_NAMES_JSON arrives as a FLAT comma list (variable and
+                # stock fallback; platform format doctrine). Normalize for
+                # the jq membership check below. The stub holds no bot
+                # token (no /user detection); the variable is
+                # authoritative here.
+                case "$BOT_NAMES_JSON" in
+                  '['*) ;;
+                  *) BOT_NAMES_JSON=$(printf '%s' "${BOT_IDENTITIES_INPUT:-$BOT_NAMES_JSON}" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .) ;;
                 esac
+                rl=$(printf '%s' "$REQUESTED_LOGIN" | tr 'A-Z' 'a-z')
+                if printf '%s' "$BOT_NAMES_JSON" | jq -e --arg r "$rl" \
+                     'map(ascii_downcase) | index($r) != null' >/dev/null 2>&1; then
+                  review=true
+                else
+                  echo "Review requested of '@${REQUESTED_LOGIN}' - not our identity; no-op."
+                fi
                 ;;
               synchronize)
                 # Only re-review labeled PRs on push (original auto rule)
@@ -191,10 +204,25 @@ jobs:
           ACTION: ${{ github.event.action }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           AGENT_PAUSED: ${{ vars.AGENT_PAUSED }}
+          AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
         run: |
           if [ "$AGENT_PAUSED" = "true" ]; then
             echo "::notice::Agent is paused (AGENT_PAUSED=true) - review dispatch suppressed; pending compliance status keeps blocking merges."
             exit 0
+          fi
+          # Per-part pause (pr-review only - this stub's part): the pending
+          # compliance status still posted above; pausing a part never makes
+          # a PR mergeable. Malformed variable = loud fail.
+          _pp="${AGENT_PAUSED_PARTS_JSON:-}"
+          if [ -n "$_pp" ]; then
+            if ! printf '%s' "$_pp" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              echo "::error::AGENT_PAUSED_PARTS_JSON is not a JSON object - fix the variable."
+              exit 1
+            fi
+            if printf '%s' "$_pp" | jq -e '.["pr-review"] == true' >/dev/null 2>&1; then
+              echo "::notice::pr-review is paused (AGENT_PAUSED_PARTS_JSON) - dispatch suppressed; pending status keeps blocking merges."
+              exit 0
+            fi
           fi
           for attempt in 1 2 3; do
             if gh workflow run pr-review.yml \

@@ -2,6 +2,7 @@ trigger-message
 on-topic-guardrail
 scope-of-action
 identity
+voice
 role
 tool-restrictions
 tools

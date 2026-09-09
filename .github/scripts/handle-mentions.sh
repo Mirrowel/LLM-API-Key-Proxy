@@ -98,19 +98,25 @@ is_bot() { # $1 = login — this agent's identity family, case-insensitive
     '$bots | index(input | ascii_downcase) != null'
 }
 
-has_mention_token() { # $1 = body — contains @<user-identity> (not the [bot]
-  # app form, not bare name text), case-insensitive. Command substitution +
-  # herestring (NOT process substitution: inside the main read-loop a
-  # proc-sub feed proved unreliable on this runner family - silent EOF).
-  local b_lc="$1" name names
+has_mention_token() { # $1 = body — contains @<declared user identity>
+  # (case-insensitive, FIXED-STRING match — never regex: an identity with
+  # metacharacters must not over-match strangers). Dual-form, mirroring the
+  # bot-reply guest gate: every identity matches its full @<login> AND an
+  # app form additionally matches the bare @<name-without-[bot]> spelling.
+  # Command substitution + herestring (NOT process substitution: inside the
+  # main read-loop a proc-sub feed proved unreliable on this runner family
+  # - silent EOF).
+  local b_lc="$1" tokens
   b_lc=$(printf '%s' "$b_lc" | tr 'A-Z' 'a-z')
-  names=$(printf '%s' "${BOT_NAMES_JSON:-[]}" | jq -r '.[] | select(endswith("[bot]") | not)' 2>/dev/null)
+  tokens=$(printf '%s' "${BOT_NAMES_JSON:-[]}" | jq -r '.[] | "@" + ltrimstr("@") | (., sub("\\[bot\\]$"; ""))' 2>/dev/null | tr -d '\r' | awk 'NF' | sort -u)
   while read -r name; do
-    [ -n "$name" ] || continue
-    if printf '%s' "$b_lc" | grep -qi "@$name"; then
+    # awk index() = literal substring, case pre-lowered on both sides —
+    # no regex, no glob, no grep -F platform quirks. Tokens already carry
+    # their @ prefix (emitted by the jq above).
+    if printf '%s' "$b_lc" | awk -v t="$name" 'index($0,t){found=1} END{exit found?0:1}'; then
       return 0
     fi
-  done <<< "$names"
+  done <<< "$tokens"
   return 1
 }
 
@@ -191,6 +197,73 @@ while read -r n; do
   # Thread number ALWAYS from the subject (issue) URL; the comment id (when
   # the trigger is a comment) separately from latest_comment_url — the
   # combined form ".../issues/comments/N" defeats a single digit pattern.
+  # DISCUSSIONS are their own branch: subject.type "Discussion", REST-shaped
+  # URL with NO REST endpoints behind it (probe-verified 2026-09-09) — one
+  # GraphQL fetch reconstructs trigger + authority. Notifications for
+  # discussions carry no comment id, so authority = author of the NEWEST
+  # mentioning content (body or comment); bot-reply's resolve re-verifies
+  # the full thread independently.
+  if [ "$subject_type" = "Discussion" ]; then
+    number=$(printf '%s' "$subject_url" | sed -n 's:.*/discussions/\([0-9][0-9]*\)$:\1:p')
+    if [ -z "$number" ]; then
+      log "decline: could not derive discussion number for $repo"
+      declined=$((declined + 1)); continue
+    fi
+    if [ "$reason" = "review_requested" ]; then
+      log "decline: review_requested on a discussion makes no sense ($repo#$number)"
+      declined=$((declined + 1)); continue
+    fi
+    d_owner="${repo%%/*}"; d_name="${repo##*/}"
+    disc_json=$(gh api graphql -f owner="$d_owner" -f name="$d_name" -F n="$number" -F ccount=25 \
+      -f query='query($owner:String!,$name:String!,$n:Int!,$ccount:Int!) { repository(owner:$owner,name:$name) { discussion(number:$n) { body author { login } comments(last:$ccount) { nodes { author { login } body createdAt replies(last:5) { nodes { author { login } body createdAt } } } } } } }' \
+      --jq '.data.repository.discussion' 2>/dev/null) || disc_json=""
+    if [ -z "$disc_json" ] || [ "$disc_json" = "null" ]; then
+      log "decline: discussion $repo#$number not readable via GraphQL"
+      declined=$((declined + 1)); continue
+    fi
+    # Newest mentioning content wins (body or any comment/reply; flattened
+    # bodies — mention tokens never span lines). has_mention_token provides
+    # the fixed-string identity matching, same as every other lane.
+    # Command substitution + herestring, NOT process substitution (the
+    # read-loop proc-sub EOF trap is documented in has_mention_token).
+    cand_list=$(printf '%s' "$disc_json" | jq -r '
+      [ {a: (.author.login // ""), b: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: "0"} ]
+      + [ .comments.nodes[] | {a: (.author.login // ""), b: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: .createdAt} ]
+      + [ .comments.nodes[] | ((.replies.nodes // [])[]) | {a: (.author.login // ""), b: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: .createdAt} ]
+      | sort_by(.at) | reverse | .[] | [.a, .b, .at] | @tsv' 2>/dev/null)
+    trig_author=""; trig_body=""
+    while IFS=$'\t' read -r c_author c_flat _at; do
+      [ -n "$c_author" ] || continue
+      if has_mention_token "$c_flat"; then
+        trig_author="$c_author"; trig_body="$c_flat"; break
+      fi
+    done <<< "$cand_list"
+    if [ -z "$trig_author" ] || [ -z "$trig_body" ]; then
+      log "decline: no genuine mention found in discussion $repo#$number body or recent comments"
+      declined=$((declined + 1)); continue
+    fi
+    if [ "$(is_bot "$trig_author")" = true ]; then
+      declined=$((declined + 1)); continue
+    fi
+    if ! in_roster "$trig_author"; then
+      log "decline: discussion summoner @$trig_author not on the cross-repo allowlist ($repo#$number)"
+      declined=$((declined + 1)); continue
+    fi
+    if [ "$dispatched" -ge "$MAX_DISPATCH" ]; then
+      log "cap reached ($MAX_DISPATCH) - @$trig_author's $reason in $repo#$number skipped this run (already acked; re-mention to retry)."
+      continue
+    fi
+    if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+         -f "targetRepo=$repo" -f "threadNumber=$number" \
+         -f "commentId=" -f "triggerKind=mention" -f "threadType=discussion"; then
+      dispatched=$((dispatched + 1))
+      log "DISPATCHED guest bot-reply: @$trig_author discussion $repo#$number"
+    else
+      log "dispatch FAILED for @$trig_author discussion $repo#$number"
+      failures=$((failures + 1))
+    fi
+    continue
+  fi
   number=$(printf '%s' "$subject_url" | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
   [ -n "$number" ] || number=$(printf '%s' "$latest_url" | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
   if [ -z "$number" ]; then

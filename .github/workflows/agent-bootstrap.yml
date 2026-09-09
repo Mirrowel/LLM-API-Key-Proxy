@@ -112,7 +112,7 @@ jobs:
             [AGENT_MODELS_JSON]='{"pr-review":{"model":"","fast":""},"bot-reply":{"model":"","fast":""},"compliance-check":{"model":"","fast":""},"issue-comment":{"model":"","fast":""}}'
             [BOT_IDENTITIES]="$IDENT_SEED"
             [BOT_TRIGGERS]="mirrobot, mirrobot-agent"
-            [CONTEXT_LIMITS_JSON]='{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10}'
+            [CONTEXT_LIMITS_JSON]='{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-comments":70,"body-chars":3000}'
             [CONTEXT_FILTER_PATTERNS_JSON]="[]"
             [FOREIGN_MENTIONS_ENABLED]="false"
             [OPEN_TRIGGERING]="true"
@@ -264,7 +264,7 @@ jobs:
           gh variable set AGENT_MODELS_JSON -R <owner>/<repo> --body '{"pr-review":{"model":"","fast":""},"bot-reply":{"model":"","fast":""},"compliance-check":{"model":"","fast":""},"issue-comment":{"model":"","fast":""}}'
           gh variable set BOT_IDENTITIES -R <owner>/<repo> --body 'your-bot-name'
           gh variable set BOT_TRIGGERS -R <owner>/<repo> --body "your-bot-name, your-other-name"
-          gh variable set CONTEXT_LIMITS_JSON -R <owner>/<repo> --body '{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10}'
+          gh variable set CONTEXT_LIMITS_JSON -R <owner>/<repo> --body '{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-comments":70,"body-chars":3000}'
           gh variable set CONTEXT_FILTER_PATTERNS_JSON -R <owner>/<repo> --body "[]"
           gh variable set FOREIGN_MENTIONS_ENABLED -R <owner>/<repo> --body "false"
           gh variable set OPENCODE_PLUGINS_JSON -R <owner>/<repo> --body "{}"

@@ -197,7 +197,16 @@
       "unzip *.github/*": "deny",
       "zip *.github/*": "deny",
       "python *.github/*": "deny",
-      "python3 *.github/*": "deny"
+      "python3 *.github/*": "deny",
+      "gh variable*": "deny",
+      "gh api *variables*": "deny",
+      "gh api *secrets*": "deny",
+      "*opencode.json*": "deny",
+      "*.mirrobot-plugins*": "deny",
+      "*/proc/*": "deny",
+      "*os.environ*": "deny",
+      "*ENVIRON*": "deny",
+      "*expanduser*": "deny"
     },
     "read": {
       "*": "allow",
