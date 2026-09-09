@@ -42,7 +42,14 @@ from .errors import (
     get_retry_after,
 )
 
-from .config import ConfigLoader
+# ConfigLoader stays lazy: core.config reaches up into the usage package
+# (ProviderUsageConfig), and usage.types imports core.constants — an
+# eager edge here closes that cycle for any cold `import
+# rotator_library.usage` / `rotator_library.core.*` entry.
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .config import ConfigLoader
 
 __all__ = [
     # Types
@@ -73,3 +80,11 @@ __all__ = [
     # Config
     "ConfigLoader",
 ]
+
+
+def __getattr__(name):
+    if name == "ConfigLoader":
+        from .config import ConfigLoader
+
+        return ConfigLoader
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

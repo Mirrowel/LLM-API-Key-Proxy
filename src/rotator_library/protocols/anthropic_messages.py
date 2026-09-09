@@ -1,0 +1,1298 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""Anthropic Messages protocol adapter.
+
+This adapter captures the native Messages shape as a reusable base. The existing
+compatibility routes remain active; this module gives future provider-native
+execution a loss-conscious parser/builder with thinking and tool block support.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from copy import deepcopy
+from typing import Any, ClassVar, Iterable
+
+from .base import ProtocolAdapter
+from .canonical import (
+    record_instruction_merge,
+    add_conversion_warning,
+    disclose_response_drops,
+    format_reasoning_controls,
+    attach_conversion_summary,
+    STOP_REASON_CONTENT_FILTER,
+    canonical_stop_reason,
+    canonical_structured_output,
+    canonical_tool_arguments,
+    canonical_tool_choice,
+    coalesce_assistant_message,
+    conversation_messages,
+    format_stop_reason,
+    format_structured_output,
+    format_tool_choice,
+    instruction_blocks,
+    is_same_protocol,
+    message_reasoning,
+    message_tool_calls,
+    message_tool_results,
+    may_emit_opaque_provider_state,
+    normalize_tool_result_messages,
+    ordered_message_blocks,
+    retain_supported_generation_params,
+    resolve_tool_result_names,
+    source_extensions,
+    tool_arguments_object,
+    tool_result_text,
+)
+from .operation import OPERATION_COUNT_TOKENS, OPERATION_GENERATE, OPERATION_MESSAGES, OPERATION_UNKNOWN, normalize_operation
+from .validation import validate_generative_request, validate_generative_response
+from .types import (
+    Annotation,
+    ContentBlock,
+    ConversionWarning,
+    MediaSource,
+    ProtocolContext,
+    ProtocolError,
+    ReasoningBlock,
+    ToolCall,
+    ToolDefinition,
+    ToolResult,
+    UnifiedMessage,
+    UnifiedRequest,
+    UnifiedResponse,
+    UnifiedStreamEvent,
+    Usage,
+    first_text,
+    text_blocks,
+)
+
+_GENERATION_PARAMS = {
+    "max_tokens",
+    "metadata",
+    "output_config",
+    "stop_sequences",
+    "temperature",
+    "thinking",
+    "tool_choice",
+    "top_k",
+    "top_p",
+}
+
+_REQUEST_CORE_FIELDS = {"model", "messages", "system", "tools", "stream", *_GENERATION_PARAMS}
+
+
+# Documented Anthropic server/hosted content-block types (hoisted so rule
+# sets stay single-sourced).
+lib_logger = logging.getLogger("rotator_library.protocols.anthropic_messages")
+
+_SERVER_TOOL_TYPES = {
+    "server_tool_use",
+    # Result families of the current server-tool catalog: versioned tool
+    # names share the *_tool_result suffix grammar — matched by suffix
+    # below, this set pins the KNOWN families (web_search, web_fetch,
+    # code_execution incl. bash/text-editor variants, memory,
+    # tool_search, advisor, mcp_toolset).
+    "web_search_tool_result",
+    "web_fetch_tool_result",
+    "code_execution_tool_result",
+    "text_editor_tool_result",
+    "bash_tool_result",
+    "bash_code_execution_tool_result",
+    "text_editor_code_execution_tool_result",
+    "memory_tool_result",
+    "tool_search_tool_result",
+    "advisor_tool_result",
+    "mcp_toolset_tool_result",
+}
+
+
+_SERVER_TOOL_STEMS = (
+    "web_search",
+    "web_fetch",
+    "code_execution",
+    "text_editor",
+    "bash",
+    "memory",
+    "tool_search_tool_regex",
+    "tool_search_tool_bm25",
+    "tool_search",
+    "advisor",
+    "mcp_toolset",
+)
+
+
+def _is_server_tool_result_type(block_type: str) -> bool:
+    """Server-tool result grammar: the known families, plus versioned
+    spellings (stem + YYYYMMDD) of the same families. A user's OWN tool
+    that happens to end in ``_tool_result`` (e.g. my_custom_tool_result)
+    stays a passthrough block — never a fabricated builtin."""
+
+    if block_type in _SERVER_TOOL_TYPES:
+        return True
+    for suffix in ("_tool_result", "_tool_result_error"):
+        if not block_type.endswith(suffix):
+            continue
+        stem = block_type[: -len(suffix)]
+        for known in _SERVER_TOOL_STEMS:
+            if stem == known:
+                return True
+            # Versioned: stem_YYYYMMDD (and _error variants nest fine).
+            if stem.startswith(known + "_"):
+                tail = stem[len(known) + 1 :]
+                if tail.isdigit() and len(tail) == 8:
+                    return True
+    return False
+
+
+class AnthropicMessagesProtocol(ProtocolAdapter):
+    """Adapter for Anthropic Messages requests, responses, and stream events.
+
+    Thinking and redacted-thinking blocks are represented as reasoning blocks so
+    later field-cache rules can extract signatures without relying on a bespoke
+    provider implementation.
+    """
+
+    name: ClassVar[str] = "anthropic_messages"
+    aliases: ClassVar[tuple[str, ...]] = ("anthropic", "messages", "claude_messages")
+    supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_MESSAGES, OPERATION_COUNT_TOKENS)
+
+    def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
+        request = dict(raw_request or {})
+        source_generation = {k: deepcopy(request[k]) for k in _GENERATION_PARAMS if k in request and k != "metadata"}
+        generation_params = _parse_anthropic_generation_params(source_generation)
+        if "tool_choice" in generation_params:
+            generation_params["tool_choice"] = canonical_tool_choice(generation_params["tool_choice"], self.name)
+        # output_config is fully handled inside the generation-params pass
+        # (effort -> reasoning, format -> structured output); the canonical
+        # structured view derives from that split.
+        structured_output = generation_params.get("structured_output")
+        messages = resolve_tool_result_names(
+            normalize_tool_result_messages([self._parse_message(message) for message in request.get("messages") or []])
+        )
+        return UnifiedRequest(
+            operation=_operation_from_context(context, OPERATION_MESSAGES),
+            logical_operation=OPERATION_GENERATE,
+            model=str(request.get("model") or getattr(context, "model", None) or ""),
+            messages=messages,
+            system=self._parse_system(request.get("system")),
+            tools=[self._parse_tool_definition(tool) for tool in request.get("tools") or []],
+            stream=bool(request.get("stream", False)),
+            generation_params=generation_params,
+            response_format=structured_output,
+            metadata=deepcopy(request.get("metadata") or {}),
+            source_protocol=self.name,
+            extensions={self.name: {"generation_params": source_generation}},
+            raw=deepcopy(raw_request),
+            extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
+        )
+
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+        validate_generative_request(unified_request, self.name, context)
+        preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
+        payload: dict[str, Any] = {
+            "model": unified_request.model,
+            "messages": self._format_messages(
+                conversation_messages(unified_request),
+                preserve_source=preserve_source,
+                emit_opaque_state=may_emit_opaque_provider_state(context, preserve_source=preserve_source),
+                warnings=unified_request.warnings,
+            ),
+        }
+        system = self._format_system(instruction_blocks(unified_request), preserve_source=preserve_source)
+        if system is not None:
+            payload["system"] = system
+        # D7 level 5: a single top-level system field mandates the ordered
+        # merge — recorded, never silent.
+        record_instruction_merge(unified_request, self.name)
+        generated_params = self._format_generation_params(unified_request, preserve_source=preserve_source)
+        tool_choice_param = unified_request.generation_params.get("tool_choice")
+        omit_tools = (
+            isinstance(tool_choice_param, dict)
+            and tool_choice_param.get("mode") == "none"
+            and "tool_choice" not in generated_params
+        )
+        if unified_request.tools and not omit_tools:
+            payload["tools"] = [self._format_tool_definition(tool, preserve_source=preserve_source) for tool in unified_request.tools]
+        if unified_request.stream:
+            payload["stream"] = True
+        if unified_request.metadata:
+            payload["metadata"] = deepcopy(unified_request.metadata)
+        payload.update(generated_params)
+        if "max_tokens" not in payload:
+            # max_tokens is REQUIRED on every Anthropic Messages request.
+            # Sources without an explicit cap (legal on Chat/Gemini) get a
+            # documented default with a recorded warning — never a silent
+            # omission and never a dead cross-protocol path.
+            payload["max_tokens"] = 4096
+            add_conversion_warning(
+                unified_request,
+                code="max_tokens_defaulted",
+                message="max_tokens is required by Anthropic Messages; defaulted to 4096 (source carried no cap)",
+                field="max_tokens",
+                target_protocol=self.name,
+            )
+        if not preserve_source:
+            messages_for_first_check = unified_request.messages
+            if messages_for_first_check and messages_for_first_check[0].role in {"assistant", "model"}:
+                # Anthropic requires a leading user turn (prefill is always
+                # the LAST assistant turn). A cross-protocol history tail
+                # that starts with an assistant turn is anomalous — record
+                # it and let the provider arbitrate (tails are legal when
+                # the omitted head carried the user turn).
+                add_conversion_warning(
+                    unified_request,
+                    code="first_turn_assistant",
+                    message="history starts with an assistant turn; Anthropic expects a leading user turn",
+                    field="messages",
+                    target_protocol=self.name,
+                )
+        payload.update(source_extensions(unified_request.extra, context, self.name, unified_request.source_protocol))
+        return payload
+
+    def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
+        response = _as_dict(raw_response)
+        if response.get("type") == "error" or isinstance(response.get("error"), dict):
+            # Provider error envelopes are structured failures, never empty
+            # successes (mirrors the chat parser; the executor's structured
+            # error path normally intercepts these earlier).
+            raise ProtocolError(
+                "anthropic_messages provider returned an error payload",
+                protocol=self.name,
+                pass_name="parse_response",
+                payload={"error": deepcopy(response.get("error"))},
+            )
+        operation = _response_operation(response, context)
+        native_stop = response.get("stop_reason")
+        if native_stop == "model_context_window_exceeded":
+            lib_logger.warning("anthropic stop_reason=model_context_window_exceeded mapped to max_tokens")
+        message = UnifiedMessage(
+            role=str(response.get("role") or "assistant"),
+            content=self._parse_content(response.get("content")),
+            raw=deepcopy(response),
+            extra={"type": response.get("type")},
+        )
+        self._promote_message_blocks(message)
+        return UnifiedResponse(
+            operation=operation,
+            logical_operation=OPERATION_GENERATE if operation != OPERATION_COUNT_TOKENS else OPERATION_UNKNOWN,
+            id=response.get("id"),
+            model=response.get("model") or getattr(context, "model", None),
+            messages=[] if operation == OPERATION_COUNT_TOKENS else [message] if response else [],
+            stop_reason=canonical_stop_reason(native_stop),
+            usage=self.extract_usage(response, context),
+            modalities=_anthropic_output_modalities(message.content),
+            metadata={"stop_sequence": response.get("stop_sequence"), "type": response.get("type"), "native_stop_reason": native_stop},
+            source_protocol=self.name,
+            raw=deepcopy(response),
+            extra={k: deepcopy(v) for k, v in response.items() if k not in {"id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"}},
+        )
+
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+        disclose_response_drops(unified_response, self.name)
+        if unified_response.operation == OPERATION_COUNT_TOKENS:
+            usage = unified_response.usage
+            payload = deepcopy(unified_response.extra)
+            # Normalized usage wins over raw preserved fields so later adapters
+            # can correct counts without stale provider keys shadowing them.
+            payload["input_tokens"] = usage.input_tokens if usage else 0
+            return payload
+        validate_generative_response(unified_response, self.name)
+        preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
+        assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
+        candidate_backed = len(assistants) > 1 and all(m.index is not None for m in assistants)
+        # D9 first-wins: Anthropic Messages carries exactly one response part.
+        # Candidate-backed alternatives select the first with a recorded
+        # summary; item-oriented output (reasoning item + message item) still
+        # coalesces.
+        if candidate_backed and not preserve_source:
+            _warn_once(
+                unified_response,
+                code="candidates_first_wins",
+                message=f"{len(assistants) - 1} additional candidate(s) dropped: single-response protocol (first candidate wins)",
+                target_protocol=self.name,
+            )
+            message = assistants[0]
+            stop_reason = assistants[0].stop_reason or unified_response.stop_reason
+        else:
+            message = unified_response.messages[0] if preserve_source and unified_response.messages else coalesce_assistant_message(unified_response.messages)
+            stop_reason = unified_response.stop_reason
+        refusal_text = "".join(
+            block.refusal or "" for block in message.content if block.type == "refusal" and block.refusal
+        )
+        has_annotations = any(block.annotations for block in message.content)
+        has_builtin = any(block.type == "builtin_tool" for block in message.content)
+        dropped_media = [
+            block.type
+            for block in message.content
+            if block.type in {"audio", "video", "image"} and not (preserve_source and isinstance(block.raw, dict))
+        ]
+        if not preserve_source and dropped_media:
+            _warn_once(
+                unified_response,
+                code="media_dropped",
+                message="media output has no Anthropic Messages assistant representation; dropped",
+                target_protocol=self.name,
+                field=f"content[{dropped_media[0]}]",
+            )
+        if not preserve_source:
+            if refusal_text:
+                stop_reason = STOP_REASON_CONTENT_FILTER
+            # Citations are native Anthropic (emitted by _format_content) —
+            # no annotations_dropped warning here anymore.
+            if has_builtin:
+                _warn_once(
+                    unified_response,
+                    code="builtin_tool_dropped",
+                    message="provider-executed tool records have no Anthropic Messages representation; dropped",
+                    target_protocol=self.name,
+                )
+            has_representable = any(
+                block.type in {"text", "reasoning", "tool_call", "tool_result", "image", "document", "refusal"}
+                for block in message.content
+            ) or bool(message.tool_calls or message.reasoning)
+            if has_builtin and not has_representable:
+                # D7: a provider-executed tool record the target cannot express
+                # is Required meaning — reject, never emit an empty success.
+                raise ProtocolError(
+                    "Anthropic Messages cannot represent a provider-executed tool record as a successful message",
+                    protocol=self.name,
+                    pass_name="format_response",
+                    payload={"dropped_blocks": ["builtin_tool"]},
+                )
+        stop_sequence_echo = unified_response.metadata.get("stop_sequence")
+        formatted_reason = format_stop_reason(stop_reason, self.name)
+        if formatted_reason == "end_turn" and stop_sequence_echo:
+            # The matched sequence distinguishes stop_sequence from end_turn.
+            formatted_reason = "stop_sequence"
+        if formatted_reason is None and stop_reason is not None:
+            _warn_once(
+                unified_response,
+                code="stop_reason_approximated",
+                message=f"native stop reason '{stop_reason}' has no Anthropic enum value; emitted 'end_turn'",
+                target_protocol=self.name,
+                field="stop_reason",
+            )
+            formatted_reason = "end_turn"
+        elif formatted_reason is None:
+            # Non-stream responses always carry a concrete stop_reason.
+            formatted_reason = "end_turn"
+        payload = {
+            "id": unified_response.id,
+            "type": unified_response.metadata.get("type", "message"),
+            "role": message.role,
+            "content": self._format_assistant_content(message, preserve_source=preserve_source, emit_opaque_state=may_emit_opaque_provider_state(context, preserve_source=preserve_source), warnings=unified_response.warnings, client_direction=True),
+            "model": unified_response.model,
+            "stop_reason": formatted_reason,
+            "stop_sequence": stop_sequence_echo,
+            "usage": self._format_usage(unified_response.usage),
+        }
+        payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
+        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
+
+    def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
+        event = _decode_sse_data(raw_event)
+        if event == "[DONE]":
+            return UnifiedStreamEvent(type="done", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="done", raw=deepcopy(raw_event))
+        data = _as_dict(event)
+        event_type = str(data.get("type") or "chunk")
+
+        if event_type == "error" or data.get("error") is not None:
+            return UnifiedStreamEvent(type="error", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, error=deepcopy(data.get("error", data)), raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type == "message_start":
+            response = self.parse_response(data.get("message") or {}, context)
+            return UnifiedStreamEvent(type="message_start", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, message=response.messages[0] if response.messages else None, usage=response.usage, raw=deepcopy(raw_event), extra={"payload": data})
+        if event_type == "message_delta":
+            delta_payload = data.get("delta") or {}
+            stop_reason = canonical_stop_reason(delta_payload.get("stop_reason"))
+            return UnifiedStreamEvent(type="message_delta", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=event_type, usage=self.extract_usage(data.get("usage") or {}, context), stop_reason=stop_reason, raw=deepcopy(raw_event), extra={"payload": data, "stop_reason": stop_reason, "stop_sequence": delta_payload.get("stop_sequence")})
+        if event_type in {"content_block_start", "content_block_delta", "content_block_stop"}:
+            return self._parse_content_stream_event(data, raw_event)
+        if event_type == "message_stop":
+            event_type = "done"
+        if event_type == "ping":
+            # Keep-alive: forwarded as a heartbeat the destination formatter
+            # swallows ("ping events... you may ignore them").
+            return UnifiedStreamEvent(type="heartbeat", operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type="ping", raw=deepcopy(raw_event), extra={"payload": data})
+        return UnifiedStreamEvent(type=event_type, operation=OPERATION_MESSAGES, logical_operation=OPERATION_GENERATE, source_protocol=self.name, native_type=str(data.get("type") or "chunk"), raw=deepcopy(raw_event), extra={"payload": data})
+
+    def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:
+        if isinstance(raw_or_unified, (UnifiedResponse, UnifiedStreamEvent)):
+            return raw_or_unified.usage
+        payload = _as_dict(raw_or_unified)
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else payload
+        if not isinstance(usage, dict) or not any(k.endswith("tokens") for k in usage):
+            return None
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        cache_write_flat = int(usage.get("cache_creation_input_tokens") or 0)
+        cache_creation = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else {}
+        if not cache_write_flat and cache_creation:
+            # Newer models report only the breakdown object — fold it into
+            # the flat canonical bucket (the object re-emits at format time).
+            cache_write_flat = sum(
+                int(v) for v in cache_creation.values() if isinstance(v, int)
+            )
+        cache_read = int(usage.get("cache_read_input_tokens") or 0)
+        extras: dict[str, Any] = {}
+        if cache_creation:
+            extras["cache_creation"] = deepcopy(cache_creation)
+        if isinstance(usage.get("server_tool_use"), dict):
+            extras["server_tool_use"] = deepcopy(usage["server_tool_use"])
+        if usage.get("service_tier") is not None:
+            extras["service_tier"] = usage.get("service_tier")
+        output_details = usage.get("output_tokens_details") if isinstance(usage.get("output_tokens_details"), dict) else {}
+        thinking_tokens = int(output_details.get("thinking_tokens") or 0)
+        return Usage(
+            # Canonical input_tokens is INCLUSIVE of cache reads/writes (the
+            # OpenAI/Gemini convention, H2): Anthropic reports them as
+            # siblings, so they fold in here and unfold at format time.
+            input_tokens=input_tokens + cache_read + cache_write_flat,
+            output_tokens=output_tokens,
+            total_tokens=int(usage.get("total_tokens") or input_tokens + cache_read + cache_write_flat + output_tokens),
+            cache_read_tokens=cache_read,
+            cache_write_tokens=cache_write_flat,
+            # The documented observability field (final message_delta on
+            # streams): thinking billing maps onto the canonical reasoning
+            # bucket so chat/responses render it in their native spellings.
+            reasoning_tokens=thinking_tokens,
+            raw=deepcopy(usage),
+            extra=extras,
+        )
+
+    def _parse_system(self, system: Any) -> list[ContentBlock]:
+        if system is None:
+            return []
+        if isinstance(system, str):
+            return text_blocks(system)
+        return self._parse_content(system)
+
+    def _format_system(self, blocks: Iterable[ContentBlock], *, preserve_source: bool = True) -> Any:
+        block_list = list(blocks)
+        if not block_list:
+            return None
+        if preserve_source and all(block.type == "text" and not isinstance(block.raw, dict) and not block.extra for block in block_list):
+            # Merged instruction turns keep a paragraph boundary.
+            texts = [block.text for block in block_list if block.text]
+            return "\n\n".join(texts) if texts else ""
+        return self._format_content(block_list, preserve_source=preserve_source)
+
+    def _parse_message(self, message: dict[str, Any]) -> UnifiedMessage:
+        payload = dict(message or {})
+        unified = UnifiedMessage(
+            role=str(payload.get("role") or "user"),
+            content=self._parse_content(payload.get("content")),
+            raw=deepcopy(message),
+            extra={k: deepcopy(v) for k, v in payload.items() if k not in {"role", "content"}},
+        )
+        self._promote_message_blocks(unified)
+        return unified
+
+    def _format_messages(
+        self,
+        messages: Iterable[UnifiedMessage],
+        *,
+        preserve_source: bool,
+        emit_opaque_state: bool,
+        warnings: list | None = None,
+    ) -> list[dict[str, Any]]:
+        """Format canonical turns and merge adjacent Anthropic roles."""
+
+        formatted: list[dict[str, Any]] = []
+        for message in messages:
+            role = "assistant" if message.role in {"assistant", "model"} else "user"
+            content = self._format_assistant_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings) if role == "assistant" else self._format_user_content(message, preserve_source=preserve_source, warnings=warnings)
+            if not content:
+                # Empty content is illegal wire (400): drops already recorded
+                # their warnings — omit the husk instead of sending it.
+                continue
+            payload = {"role": role, "content": content}
+            if preserve_source:
+                payload.update(deepcopy(message.extra))
+            if formatted and formatted[-1]["role"] == role:
+                previous = formatted[-1].get("content")
+                if not isinstance(previous, list):
+                    previous = [{"type": "text", "text": str(previous or "")}]
+                previous.extend(content)
+                formatted[-1]["content"] = previous
+            else:
+                formatted.append(payload)
+        return formatted
+
+    def _format_assistant_content(
+        self,
+        message: UnifiedMessage,
+        *,
+        preserve_source: bool,
+        emit_opaque_state: bool = True,
+        warnings: list | None = None,
+        client_direction: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Format reasoning, visible content, and tool calls in Anthropic order."""
+
+        blocks = ordered_message_blocks(message)
+        dropped = False
+        if not preserve_source:
+            # Assistant content is text/thinking/tool_use only: assistant
+            # images are dropped with a recorded media_dropped summary
+            # (never fabricated as image blocks in assistant output).
+            remaining = [block for block in blocks if block.type != "image"]
+            dropped = len(remaining) != len(blocks)
+            blocks = remaining
+        # Extended-thinking contract: thinking blocks must precede text and
+        # tool_use in the passed-back payload (stable — relative order of
+        # thinking blocks themselves is preserved).
+        thinking_blocks = [block for block in blocks if block.reasoning is not None]
+        if thinking_blocks:
+            reordered = thinking_blocks + [block for block in blocks if block.reasoning is None]
+            if reordered != blocks and warnings is not None:
+                _warn_list_once(
+                    warnings,
+                    code="thinking_order_normalized",
+                    message="thinking blocks reordered to precede text/tool_use (Anthropic contract)",
+                    field="content",
+                )
+            blocks = reordered
+        if not blocks:
+            if dropped and warnings is not None:
+                # Only warn when drops actually emptied the message — a
+                # natively-empty content array never "dropped" anything.
+                _warn_list_once(
+                    warnings,
+                    code="media_dropped",
+                    message="assistant content empty after conversion drops; message omitted",
+                    field="content",
+                )
+            return []
+        return self._format_content(
+            blocks,
+            preserve_source=preserve_source,
+            emit_opaque_state=emit_opaque_state,
+            warnings=warnings,
+            client_direction=client_direction,
+        )
+
+    def _format_user_content(self, message: UnifiedMessage, *, preserve_source: bool, warnings: list | None = None) -> list[dict[str, Any]]:
+        """Format user content and canonical tool results."""
+
+        return self._format_content(ordered_message_blocks(message), preserve_source=preserve_source, warnings=warnings)
+
+    def _format_message(
+        self,
+        message: UnifiedMessage,
+        *,
+        preserve_source: bool = True,
+        emit_opaque_state: bool = True,
+    ) -> dict[str, Any]:
+        role = "assistant" if message.role in {"assistant", "model"} else "user"
+        content = self._format_assistant_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state) if role == "assistant" else self._format_user_content(message, preserve_source=preserve_source)
+        payload = {"role": role, "content": content}
+        if preserve_source:
+            payload.update(deepcopy(message.extra))
+        return payload
+
+    def _parse_content(self, content: Any) -> list[ContentBlock]:
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return text_blocks(content)
+        if not isinstance(content, list):
+            return [ContentBlock(type="unknown", raw=deepcopy(content))]
+        return [self._parse_content_block(block, position) for position, block in enumerate(content)]
+
+    def _parse_content_block(self, block: Any, index: int = 0) -> ContentBlock:
+        if isinstance(block, str):
+            return ContentBlock(type="text", text=block, raw=block, index=index)
+        if not isinstance(block, dict):
+            return ContentBlock(type="unknown", raw=deepcopy(block), index=index)
+        block_type = str(block.get("type") or "text")
+        if block_type == "text":
+            return ContentBlock(
+                type="text",
+                text=block.get("text", ""),
+                annotations=_parse_anthropic_citations(block.get("citations")),
+                index=index,
+                raw=deepcopy(block),
+            )
+        if block_type in {"image", "document"}:
+            source = _parse_anthropic_media_source(block.get("source"), kind=block_type)
+            return ContentBlock(type=block_type, source=source, index=index, raw=deepcopy(block), extra=_without(block, {"type", "source"}))
+        if block_type in {"thinking", "redacted_thinking"}:
+            reasoning = ReasoningBlock(
+                type=block_type,
+                text=block.get("thinking"),
+                signature=block.get("signature"),
+                # redacted_thinking.data is Required opaque state (D8): the
+                # encrypted_content carrier survives canonical rebuilds and
+                # the field cache, never extra-only.
+                encrypted_content=block.get("data") if block_type == "redacted_thinking" else None,
+                redacted=block_type == "redacted_thinking",
+                raw=deepcopy(block),
+                extra=_without(block, {"type", "thinking", "signature", "data"}),
+            )
+            return ContentBlock(type="reasoning", reasoning=reasoning, index=index, raw=deepcopy(block))
+        if block_type == "tool_use":
+            return ContentBlock(
+                type="tool_call",
+                tool_call=ToolCall(id=block.get("id"), name=block.get("name"), arguments=canonical_tool_arguments(block.get("input")), type="function", raw=deepcopy(block)),
+                index=index,
+                raw=deepcopy(block),
+                extra=_without(block, {"type", "id", "name", "input"}),
+            )
+        if block_type == "tool_result":
+            return ContentBlock(
+                type="tool_result",
+                tool_result=ToolResult(tool_call_id=block.get("tool_use_id"), content=canonical_tool_arguments(block.get("content")), is_error=block.get("is_error"), raw=deepcopy(block)),
+                index=index,
+                raw=deepcopy(block),
+                extra=_without(block, {"type", "tool_use_id", "content", "is_error"}),
+            )
+        # Anthropic server-side tool invocations normalize into canonical
+        # builtin records (Responses-native shape); same-protocol formatting
+        # round-trips the raw block. Whitelist exactly the documented server
+        # tool types — a user block that merely ends in "_tool_result" stays
+        # a passthrough content block, never a fabricated builtin.
+        if _is_server_tool_result_type(block_type):
+            from ..protocols.types import BuiltinToolCall
+
+            builtin = BuiltinToolCall(
+                kind=str(block.get("name") or block_type),
+                call_id=block.get("id") or block.get("tool_use_id"),
+                status="completed",
+                output=block.get("content") if block_type.endswith("_tool_result") else None,
+                raw=deepcopy(block),
+            )
+            return ContentBlock(type="builtin_tool", builtin_tool=builtin, index=index, raw=deepcopy(block))
+        return ContentBlock(type=block_type, index=index, raw=deepcopy(block), extra=_without(block, {"type"}))
+
+    def _format_content(
+        self,
+        blocks: Iterable[ContentBlock],
+        *,
+        preserve_source: bool = True,
+        emit_opaque_state: bool = True,
+        warnings: list | None = None,
+        client_direction: bool = False,
+    ) -> list[dict[str, Any]]:
+        formatted = []
+        for block in blocks:
+            if block.type == "text":
+                payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "text"}
+                payload["type"] = "text"
+                payload["text"] = block.text or ""
+                if block.annotations:
+                    # Citations are native Anthropic: raw entries round-trip
+                    # verbatim; foreign (e.g. Chat url_citation) annotations
+                    # map onto the documented citation shapes — never dropped
+                    # while the target supports them.
+                    payload["citations"] = [
+                        deepcopy(annotation.raw)
+                        if preserve_source and isinstance(annotation.raw, dict)
+                        else _format_anthropic_citation(annotation)
+                        for annotation in block.annotations
+                    ]
+                formatted.append(payload)
+            elif block.type == "refusal" and block.refusal is not None:
+                # Anthropic has no refusal part; the refusal text survives as a
+                # text block and stop_reason maps to "refusal" upstream.
+                formatted.append({"type": "text", "text": block.refusal})
+            elif block.reasoning:
+                if block.reasoning.redacted:
+                    # redacted_thinking: one-shot block, data is the whole
+                    # payload; never emit a mutilated variant.
+                    if not emit_opaque_state:
+                        if warnings is not None:
+                            _warn_list_once(warnings, code="thinking_dropped_opaque", message="redacted thinking dropped: opaque state suppressed for this provider pair", field="content[redacted_thinking]")
+                        continue
+                    payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "redacted_thinking"}
+                    payload["type"] = "redacted_thinking"
+                    payload["data"] = block.reasoning.encrypted_content or ""
+                    formatted.append(payload)
+                    continue
+                if (
+                    not emit_opaque_state
+                    and block.reasoning.signature is not None
+                    and isinstance(block.raw, dict)
+                    and str(block.raw.get("type") or "") in {"thinking", "redacted_thinking"}
+                    and not client_direction
+                ):
+                    # Anthropic-native thinking (identified by its WIRE shape,
+                    # not the canonical type label) must pass back UNMODIFIED
+                    # upstream: without its own signature the block is a
+                    # guaranteed upstream 400 — drop the whole block
+                    # (recorded) instead. Foreign reasoning keeps its visible
+                    # text with the foreign signature stripped; client
+                    # responses always keep thinking text.
+                    if warnings is not None:
+                        _warn_list_once(warnings, code="thinking_dropped_opaque", message="thinking block dropped: signature cannot be emitted for this provider pair", field="content[thinking]")
+                    continue
+                payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": "thinking"}
+                payload["type"] = "thinking"
+                if block.reasoning.text is not None:
+                    payload["thinking"] = block.reasoning.text
+                if emit_opaque_state and block.reasoning.signature is not None:
+                    payload["signature"] = block.reasoning.signature
+                if preserve_source:
+                    payload.update(deepcopy(block.reasoning.extra))
+                formatted.append(payload)
+            elif block.tool_call:
+                formatted.append(self._format_tool_call(block.tool_call, preserve_source=preserve_source, warnings=warnings))
+            elif block.tool_result:
+                formatted.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source))
+            elif block.type in {"image", "document"}:
+                formatted.append(_format_anthropic_media(block, preserve_source=preserve_source, warnings=warnings))
+            elif preserve_source and isinstance(block.raw, dict):
+                formatted.append(deepcopy(block.raw))
+        return formatted
+
+    def _parse_tool_definition(self, tool: dict[str, Any]) -> ToolDefinition:
+        payload = dict(tool or {})
+        declared_type = str(payload.get("type") or "")
+        if declared_type and declared_type != "custom":
+            # Server/hosted tools (web_search_YYYYMMDD, bash, text_editor,
+            # computer, code_execution, ...): identity is the versioned type;
+            # they carry NO input_schema. Round-trip verbatim; cross-protocol
+            # consumers see type="server" and reject (no mapping exists).
+            return ToolDefinition(
+                name=str(payload.get("name") or declared_type),
+                description=payload.get("description"),
+                input_schema=deepcopy(payload.get("input_schema") or {}),
+                type="server",
+                extra={"raw": deepcopy(tool), "server_tool_type": declared_type, **_without(payload, {"name", "description", "input_schema", "type"})},
+            )
+        return ToolDefinition(
+            name=str(payload.get("name") or ""),
+            description=payload.get("description"),
+            input_schema=deepcopy(payload.get("input_schema") or {}),
+            type="function",
+            extra=_without(payload, {"name", "description", "input_schema"}),
+        )
+
+    def _format_tool_definition(self, tool: ToolDefinition, *, preserve_source: bool = True) -> dict[str, Any]:
+        if tool.extra.get("server_tool_type"):
+            raw = tool.extra.get("raw")
+            if preserve_source and isinstance(raw, dict):
+                return deepcopy(raw)
+            # Rebuilt server tool: the versioned type IS the identity —
+            # never inject input_schema (guaranteed upstream 400).
+            payload: dict[str, Any] = {"type": tool.extra["server_tool_type"]}
+            if tool.name and tool.name != tool.extra["server_tool_type"]:
+                payload["name"] = tool.name
+            payload.update(deepcopy(_without(tool.extra, {"raw", "server_tool_type"})))
+            return payload
+        payload = {"name": tool.name, "input_schema": deepcopy(tool.input_schema)}
+        if tool.description is not None:
+            payload["description"] = tool.description
+        if preserve_source:
+            payload.update(deepcopy(tool.extra))
+        return payload
+
+    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
+        if call.type in {"custom", "custom_tool_call"} and warnings is not None and not preserve_source:
+            # Custom tool calls narrow to plain tool_use cross-protocol —
+            # disclosed (the provider pairs custom outputs differently).
+            _warn_list_once(
+                warnings,
+                code="custom_tool_narrowed",
+                message="custom tool call narrows to a plain tool_use block (custom calling is Chat/Responses-only)",
+                field="tool_calls",
+            )
+        payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
+        payload.update({"type": "tool_use", "id": call.id or "", "name": call.name or "", "input": tool_arguments_object(call.arguments)})
+        return payload
+
+    def _format_tool_result(self, result: ToolResult, *, preserve_source: bool) -> dict[str, Any]:
+        payload = deepcopy(result.raw) if preserve_source and isinstance(result.raw, dict) else {}
+        if isinstance(result.content, list):
+            # Anthropic tool_result.content is string-or-blocks: block arrays
+            # stay blocks on every path (never stringified cross-protocol).
+            content = deepcopy(result.content)
+        elif isinstance(result.content, str):
+            content = result.content
+        else:
+            content = tool_result_text(result.content)
+        payload.update({"type": "tool_result", "tool_use_id": result.tool_call_id or "", "content": content})
+        if result.is_error is not None:
+            payload["is_error"] = result.is_error
+        return payload
+
+    def _format_generation_params(self, request: UnifiedRequest, *, preserve_source: bool) -> dict[str, Any]:
+        params = deepcopy(request.generation_params)
+        original = request.extensions.get(self.name, {}).get("generation_params") if preserve_source else None
+        payload = deepcopy(original) if isinstance(original, dict) else {}
+        if "max_output_tokens" in params:
+            payload["max_tokens"] = params.pop("max_output_tokens")
+        if "stop_sequences" in params:
+            payload["stop_sequences"] = params.pop("stop_sequences")
+        if "tool_choice" in params:
+            choice = params.pop("tool_choice")
+            if preserve_source and "tool_choice" in payload and not (isinstance(payload["tool_choice"], dict) and payload["tool_choice"].get("type") == "none"):
+                # Same-protocol: the client's original spelling (including
+                # disable_parallel_tool_use) is restored verbatim — except
+                # the illegal {"type":"none"} shape, which Anthropic cannot
+                # accept in any case.
+                pass
+            else:
+                if preserve_source and isinstance(payload.get("tool_choice"), dict) and payload["tool_choice"].get("type") == "none":
+                    payload.pop("tool_choice", None)
+                if isinstance(choice, dict) and choice.get("namespaced") is not None:
+                    add_conversion_warning(
+                        request,
+                        code="unsupported_optional_control",
+                        message=f"namespaced tool_choice ({choice['namespaced'].get('type')}) has no Anthropic representation; narrowed to the mode",
+                        field="tool_choice",
+                        target_protocol=self.name,
+                    )
+                exact_narrowed = False
+                if isinstance(choice, dict) and choice.get("allowed_names"):
+                    allowed = choice["allowed_names"]
+                    declared = {tool.name for tool in request.tools}
+                    if (
+                        choice.get("mode") == "required"
+                        and len(allowed) == 1
+                        and str(allowed[0]) in declared
+                    ):
+                        # Exact narrowing: one allowed name that IS a declared
+                        # tool equals the native single-tool force — emit it
+                        # exactly, no warning, no widening.
+                        payload["tool_choice"] = {"type": "tool", "name": str(allowed[0])}
+                        if choice.get("disable_parallel_tool_use") is True:
+                            payload["tool_choice"]["disable_parallel_tool_use"] = True
+                        params.pop("tool_choice", None)
+                        exact_narrowed = True
+                    else:
+                        add_conversion_warning(
+                            request,
+                            code="unsupported_optional_control",
+                            message="tool-choice allowlist has no Anthropic representation; narrowed to the mode (declare allowed tools as separate tool definitions)",
+                            field="tool_choice",
+                            target_protocol=self.name,
+                        )
+                if not exact_narrowed:
+                    formatted_choice = format_tool_choice(choice, self.name)
+                else:
+                    formatted_choice = None
+                if formatted_choice is None and isinstance(choice, dict) and choice.get("mode") == "none":
+                    # Anthropic disables tools by omitting them entirely.
+                    payload.pop("tool_choice", None)
+                    add_conversion_warning(request, code='unsupported_optional_control', message="tool_choice none has no Anthropic field; omitting tool_choice and the tools array", field="tool_choice", target_protocol=self.name)
+                elif formatted_choice is not None:
+                    payload["tool_choice"] = formatted_choice
+        if "structured_output" in params:
+            structured = params.pop("structured_output")
+            if preserve_source and isinstance(payload.get("output_config"), dict):
+                # Same-protocol: the original output_config (effort + format
+                # together) is restored verbatim — never force a JSON format.
+                pass
+            else:
+                formatted_output = format_structured_output(structured, self.name)
+                if formatted_output is not None:
+                    if structured.get("type") == "json_object":
+                        # json_object carries NO schema; the Anthropic shape
+                        # requires one — the {"type":"object"} placeholder is
+                        # a documented approximation, never silent.
+                        add_conversion_warning(
+                            request,
+                            code="structured_output_approximated",
+                            message="json_object has no Anthropic spelling without a schema; synthesized {type: object}",
+                            field="structured_output",
+                            target_protocol=self.name,
+                        )
+                    # The canonical helper already returns the full
+                    # output_config envelope shape — assign directly.
+                    payload["output_config"] = formatted_output
+        reasoning = params.pop("reasoning", None)
+        if not preserve_source:
+            # Cross-protocol: map canonical controls onto Anthropic spellings.
+            # Same-protocol passthrough keeps the preserved original verbatim
+            # (no normalization, no warnings).
+            reasoning_emissions = format_reasoning_controls(reasoning, self.name, request)
+            effort_config = reasoning_emissions.pop("output_config", None)
+            if effort_config and isinstance(payload.get("output_config"), dict):
+                # Adaptive effort merges into an existing structured-output
+                # envelope — never replaces the format requirement.
+                payload["output_config"] = {**deepcopy(effort_config), **payload["output_config"]}
+            elif effort_config:
+                payload["output_config"] = effort_config
+            payload.update(reasoning_emissions)
+        supported = {"temperature", "top_k", "top_p"}
+        payload.update(
+            retain_supported_generation_params(
+                request,
+                params,
+                supported=supported,
+                target_protocol=self.name,
+            )
+        )
+        if not preserve_source:
+            # Anthropic ranges: temperature/top_p in [0,1], top_k positive.
+            temperature = payload.get("temperature")
+            if isinstance(temperature, (int, float)) and not 0 <= float(temperature) <= 1:
+                clamped_temp = max(0.0, min(1.0, float(temperature)))
+                add_conversion_warning(request, code='generation_control_clamped', message=f"temperature {temperature} outside Anthropic's [0,1] range; clamped to {clamped_temp}", field="temperature", target_protocol=self.name)
+                payload["temperature"] = clamped_temp
+            top_p = payload.get("top_p")
+            if isinstance(top_p, (int, float)) and not 0 <= float(top_p) <= 1:
+                clamped_p = max(0.0, min(1.0, float(top_p)))
+                add_conversion_warning(request, code='generation_control_clamped', message=f"top_p {top_p} outside Anthropic's [0,1] range; clamped to {clamped_p}", field="top_p", target_protocol=self.name)
+                payload["top_p"] = clamped_p
+            top_k = payload.get("top_k")
+            if isinstance(top_k, int) and top_k <= 0:
+                payload.pop("top_k")
+                add_conversion_warning(request, code='generation_control_clamped', message=f"top_k {top_k} is not positive; dropped (Anthropic requires a positive integer)", field="top_k", target_protocol=self.name)
+            # NOTE: provider-bound envelope fields (container, service_tier,
+            # context_management, mcp_servers) dropping at FOREIGN targets is
+            # recorded by those targets' extra handling — same-protocol
+            # replay here keeps them verbatim.
+        return payload
+
+    def _format_usage(self, usage: Usage | None) -> dict[str, int] | None:
+        if usage is None:
+            return None
+        # Anthropic reports cache tokens as SIBLINGS of input_tokens; the
+        # canonical input_tokens is inclusive (H2) — unfold, never negative.
+        input_tokens = max(0, usage.input_tokens - usage.cache_read_tokens - usage.cache_write_tokens)
+        payload: dict[str, Any] = {"input_tokens": input_tokens, "output_tokens": usage.output_tokens}
+        if usage.cache_write_tokens:
+            payload["cache_creation_input_tokens"] = usage.cache_write_tokens
+        if usage.cache_read_tokens:
+            payload["cache_read_input_tokens"] = usage.cache_read_tokens
+        if isinstance(usage.extra.get("cache_creation"), dict):
+            payload["cache_creation"] = deepcopy(usage.extra["cache_creation"])
+        if isinstance(usage.extra.get("server_tool_use"), dict):
+            payload["server_tool_use"] = deepcopy(usage.extra["server_tool_use"])
+        if usage.extra.get("service_tier") is not None:
+            payload["service_tier"] = usage.extra["service_tier"]
+        if usage.reasoning_tokens:
+            # The documented observability field: the canonical reasoning
+            # bucket re-emits as output_tokens_details.thinking_tokens.
+            payload["output_tokens_details"] = {"thinking_tokens": usage.reasoning_tokens}
+        return payload
+
+    def _promote_message_blocks(self, message: UnifiedMessage) -> None:
+        for block in message.content:
+            if block.tool_call:
+                message.tool_calls.append(block.tool_call)
+            if block.reasoning:
+                message.reasoning.append(block.reasoning)
+
+    def _parse_content_stream_event(self, data: dict[str, Any], raw_event: Any) -> UnifiedStreamEvent:
+        block = data.get("content_block") if isinstance(data.get("content_block"), dict) else None
+        delta = data.get("delta") if isinstance(data.get("delta"), dict) else None
+        content_block = None
+        if block:
+            content_block = self._parse_content_block(block)
+            if content_block.tool_call:
+                content_block.tool_call.index = data.get("index")
+                if content_block.tool_call.arguments == {}:
+                    content_block.tool_call.arguments = None
+        elif delta:
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                content_block = ContentBlock(type="text", text=delta.get("text"), raw=deepcopy(delta))
+            elif delta_type in {"thinking_delta", "signature_delta"}:
+                reasoning = ReasoningBlock(type=str(delta_type), text=delta.get("thinking"), signature=delta.get("signature"), extra=_without(delta, {"type", "thinking", "signature"}))
+                content_block = ContentBlock(type=str(delta_type), reasoning=reasoning, raw=deepcopy(delta))
+            elif delta_type == "input_json_delta":
+                call = ToolCall(index=data.get("index"), arguments=delta.get("partial_json") or "")
+                content_block = ContentBlock(type="tool_call", tool_call=call, raw=deepcopy(delta))
+            elif delta_type == "citations_delta":
+                # Citations stream as full citation objects on the open text
+                # block — parsed to annotations so targets can render them
+                # (anthropic replays the raw shape; others map or warn).
+                citation = delta.get("citation")
+                if isinstance(citation, dict):
+                    content_block = ContentBlock(type="citations_delta", annotations=_parse_anthropic_citations([citation]), raw=deepcopy(delta))
+        message = UnifiedMessage(role="assistant", content=[content_block] if content_block else [])
+        self._promote_message_blocks(message)
+        block_index = data.get("index")
+        return UnifiedStreamEvent(
+            type=str(data.get("type") or "content_block_delta"),
+            operation=OPERATION_MESSAGES,
+            logical_operation=OPERATION_GENERATE,
+            source_protocol=self.name,
+            native_type=str(data.get("type") or "content_block_delta"),
+            delta=message,
+            content_index=block_index if isinstance(block_index, int) else None,
+            raw=deepcopy(raw_event),
+            extra={"payload": data, "index": data.get("index")},
+        )
+
+
+def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
+    supported = {OPERATION_MESSAGES, OPERATION_COUNT_TOKENS}
+    if context and isinstance(context.provider_options, dict):
+        operation = normalize_operation(context.provider_options.get("operation"))
+        if operation in supported:
+            return operation
+    if context and isinstance(context.metadata, dict):
+        operation = normalize_operation(context.metadata.get("operation"))
+        if operation in supported:
+            return operation
+    return default
+
+
+def _response_operation(response: dict[str, Any], context: ProtocolContext | None) -> str:
+    requested = _operation_from_context(context, OPERATION_MESSAGES)
+    if requested == OPERATION_COUNT_TOKENS:
+        return OPERATION_COUNT_TOKENS
+    if "input_tokens" in response and not response.get("content") and not response.get("id"):
+        return OPERATION_COUNT_TOKENS
+    return OPERATION_MESSAGES
+
+
+def _as_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return deepcopy(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if hasattr(value, "dict"):
+        return value.dict()
+    return {}
+
+
+def _decode_sse_data(raw_event: Any) -> Any:
+    from .streaming import decode_sse_data
+
+    return decode_sse_data(raw_event)
+
+
+def _without(payload: dict[str, Any], keys: set[str]) -> dict[str, Any]:
+    return {k: deepcopy(v) for k, v in payload.items() if k not in keys}
+
+
+def _parse_anthropic_generation_params(source: dict[str, Any]) -> dict[str, Any]:
+    """Normalize Anthropic controls into canonical names."""
+
+    params = deepcopy(source)
+    max_tokens = params.pop("max_tokens", None)
+    if max_tokens is not None:
+        params["max_output_tokens"] = max_tokens
+    stop_sequences = params.pop("stop_sequences", None)
+    if stop_sequences is not None:
+        params["stop_sequences"] = deepcopy(stop_sequences)
+    thinking = params.pop("thinking", None)
+    if isinstance(thinking, dict):
+        # thinking_type: enabled|adaptive|disabled survives distinctly
+        # (adaptive is the only legal mode on current flagships; enabled
+        # with budget_tokens is rejected there) + display controls whether
+        # thinking deltas stream at all.
+        thinking_type = str(thinking.get("type") or "enabled")
+        params["reasoning"] = {
+            "enabled": thinking_type != "disabled",
+            "budget_tokens": thinking.get("budget_tokens"),
+            "thinking_type": thinking_type if thinking_type != "enabled" else None,
+            "display": thinking.get("display"),
+        }
+    output_config = params.pop("output_config", None)
+    if isinstance(output_config, dict):
+        # output_config carries two unrelated concerns: effort (the adaptive
+        # steering lever) and format (structured output). Split cleanly —
+        # the envelope itself round-trips via extensions.
+        if output_config.get("effort") is not None:
+            reasoning = params.setdefault("reasoning", {})
+            reasoning["effort"] = output_config["effort"]
+        structured = canonical_structured_output(output_config.get("format"), "anthropic_messages")
+        if structured:
+            params["structured_output"] = structured
+    return params
+
+
+def _anthropic_output_modalities(blocks: list[ContentBlock]) -> list[str]:
+    """Declare output modalities the message actually carries (W2)."""
+
+    modalities: list[str] = []
+    if any(block.type == "text" and block.text for block in blocks):
+        modalities.append("text")
+    if any(block.type == "image" for block in blocks):
+        modalities.append("image")
+    return modalities
+
+
+def _warn_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
+    """Append a deduplicated ConversionWarning to a plain list sink."""
+
+    if warnings is None:
+        return
+    for warning in warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="anthropic_messages"))
+
+
+def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, target_protocol: str, field: str | None = None) -> None:
+    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+
+    for warning in unified_response.warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    unified_response.warnings.append(
+        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol=target_protocol)
+    )
+
+
+def _parse_anthropic_citations(payload: Any) -> list[Annotation]:
+    """Normalize Anthropic text-block citations to canonical annotations."""
+
+    if not isinstance(payload, list):
+        return []
+    annotations: list[Annotation] = []
+    for entry in payload:
+        if not isinstance(entry, dict):
+            continue
+        annotations.append(
+            Annotation(
+                type=str(entry.get("type") or "citation"),
+                url=entry.get("url"),
+                title=entry.get("title") or entry.get("document_title"),
+                citation=entry.get("cited_text") or entry.get("quote"),
+                start_index=_int_or_none(entry.get("start_char_index") if "start_char_index" in entry else entry.get("start_index")),
+                end_index=_int_or_none(entry.get("end_char_index") if "end_char_index" in entry else entry.get("end_index")),
+                document_index=_int_or_none(entry.get("document_index")),
+                raw=deepcopy(entry),
+            )
+        )
+    return annotations
+
+
+def _format_anthropic_citation(annotation: Annotation) -> dict[str, Any]:
+    """Map a canonical annotation onto Anthropic's citation shapes."""
+    raw = annotation.raw if isinstance(annotation.raw, dict) else None
+    if raw and str(raw.get("type") or "").endswith("_location"):
+        return deepcopy(raw)
+    if annotation.document_index is not None or (raw and "document_index" in raw):
+        citation: dict[str, Any] = {
+            "type": "page_location" if raw and raw.get("type") == "page_location" else "char_location",
+            "cited_text": annotation.citation,
+            "document_index": annotation.document_index if annotation.document_index is not None else (raw or {}).get("document_index"),
+        }
+        if annotation.start_index is not None:
+            citation["start_char_index"] = annotation.start_index
+        if annotation.end_index is not None:
+            citation["end_char_index"] = annotation.end_index
+        return {k: v for k, v in citation.items() if v is not None}
+    return {
+        key: value
+        for key, value in {
+            "type": "web_search_result_location",
+            "url": annotation.url,
+            "title": annotation.title,
+            "cited_text": annotation.citation,
+        }.items()
+        if value is not None
+    }
+
+
+def _int_or_none(value: Any) -> int | None:
+    return value if isinstance(value, int) else None
+
+
+def _parse_anthropic_media_source(value: Any, *, kind: str) -> MediaSource:
+    """Normalize Anthropic image/document source objects."""
+
+    payload = value if isinstance(value, dict) else {}
+    source_type = str(payload.get("type") or "")
+    if source_type == "base64":
+        source_kind = "base64"
+    elif source_type in {"url", "text"}:
+        source_kind = "url" if source_type == "url" else "text"
+    elif payload.get("file_id"):
+        source_kind = "file"
+    else:
+        source_kind = source_type or kind
+    return MediaSource(
+        kind=source_kind,
+        media_type=payload.get("media_type"),
+        url=payload.get("url"),
+        data=payload.get("data") or payload.get("text"),
+        file_id=payload.get("file_id"),
+        raw=deepcopy(value),
+        extra=_without(payload, {"type", "media_type", "url", "data", "text", "file_id"}),
+    )
+
+
+def _coerce_media_source(value: Any) -> MediaSource:
+    """Coerce legacy media dictionaries into canonical form."""
+
+    if isinstance(value, MediaSource):
+        return value
+    if isinstance(value, str):
+        return MediaSource(kind="url", url=value, raw=value)
+    payload = value if isinstance(value, dict) else {}
+    url = payload.get("url")
+    data = payload.get("data")
+    file_id = payload.get("file_id")
+    return MediaSource(
+        kind="file" if file_id else "base64" if data else "url",
+        media_type=payload.get("media_type") or payload.get("mime_type"),
+        url=url,
+        data=data,
+        file_id=file_id,
+        detail=payload.get("detail"),
+        raw=deepcopy(value),
+    )
+
+
+_ANTHROPIC_IMAGE_MEDIA_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+_ANTHROPIC_DOCUMENT_MEDIA_TYPES = {"application/pdf", "text/plain"}
+
+
+def _format_anthropic_media(block: ContentBlock, *, preserve_source: bool, warnings: list | None = None) -> dict[str, Any]:
+    """Format canonical media as an Anthropic content block."""
+
+    source = _coerce_media_source(block.source)
+    payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {"type": block.type}
+    media_type = source.media_type
+    if block.type == "image" and media_type and media_type not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
+        # Anthropic accepts exactly jpeg|png|gif|webp base64 images — an
+        # unsupported type is a guaranteed 400 (never a silent default).
+        raise ProtocolError(
+            f"Anthropic Messages does not accept image media_type '{media_type}' (supported: jpeg, png, gif, webp)",
+            protocol="anthropic_messages",
+            pass_name="build_request",
+            payload={"media_type": media_type},
+        )
+    if block.type == "document" and media_type and media_type not in _ANTHROPIC_DOCUMENT_MEDIA_TYPES:
+        raise ProtocolError(
+            f"Anthropic Messages does not accept document media_type '{media_type}' (supported: application/pdf, text/plain)",
+            protocol="anthropic_messages",
+            pass_name="build_request",
+            payload={"media_type": media_type},
+        )
+    if source.kind == "base64":
+        payload["source"] = {
+            "type": "base64",
+            "media_type": media_type or ("image/png" if block.type == "image" else "application/pdf"),
+            "data": source.data or "",
+        }
+    elif source.file_id:
+        payload["source"] = {"type": "file", "file_id": source.file_id}
+    elif source.url:
+        payload["source"] = {"type": "url", "url": source.url}
+    elif source.data and block.type == "document":
+        payload["source"] = {"type": "text", "media_type": media_type or "text/plain", "data": source.data}
+    else:
+        payload["source"] = {"type": source.kind, "data": source.data or ""}
+    if preserve_source and isinstance(source.extra, dict) and source.extra:
+        # D4 identity: source-inner extension fields (e.g. future subfields,
+        # source-scoped cache_control) ride back verbatim — the typed rebuild
+        # must not clobber what the raw replay preserved.
+        payload["source"] = {**deepcopy(source.extra), **payload["source"]}
+    payload["type"] = block.type
+    # Cache/citation/transform hints on the block extras are provider
+    # policy, not portable semantics — cross-protocol drops are recorded.
+    if not preserve_source and warnings is not None:
+        for dropped_hint in ("cache_control", "citations", "transformations"):
+            if dropped_hint in (block.extra or {}) or (isinstance(block.raw, dict) and dropped_hint in block.raw):
+                warnings.append(
+                    ConversionWarning(
+                        code="unsupported_optional_control",
+                        message=f"{dropped_hint} hint has no cross-protocol representation; dropped",
+                        field=dropped_hint,
+                        source_protocol=None,
+                        target_protocol="anthropic_messages",
+                    )
+                )
+    return payload

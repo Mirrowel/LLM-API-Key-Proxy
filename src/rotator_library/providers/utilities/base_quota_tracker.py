@@ -5,7 +5,7 @@
 Base Quota Tracking Mixin
 
 Provides shared quota tracking infrastructure for providers that use OAuth
-credentials with quota-based rate limiting (e.g., Gemini CLI).
+credentials with quota-based rate limiting.
 
 This base class handles:
 - Learned costs management (load/save/lookup)
@@ -17,7 +17,7 @@ This base class handles:
 Subclasses must implement:
 - _fetch_quota_for_credential() - Provider-specific quota API call
 - _extract_model_quota_from_response() - Parse provider-specific response format
-- _get_provider_prefix() - Return provider prefix for model names (e.g., "gemini_cli")
+- _get_provider_prefix() - Return provider prefix for model names (e.g., "nanogpt")
 
 Required from provider (via mixin inheritance):
     - self.project_id_cache: Dict[str, str]
@@ -66,8 +66,8 @@ class BaseQuotaTracker:
     Base mixin class providing shared quota tracking functionality.
 
     Subclasses provide:
-    - provider_env_prefix: str (e.g., "GEMINI_CLI")
-    - cache_subdir: str (e.g., "gemini_cli")
+    - provider_env_prefix: str (e.g., "NANOGPT")
+    - cache_subdir: str (e.g., "nanogpt")
     - default_quota_costs: Dict[str, Dict[str, float]] - tier -> model -> cost%
     - default_quota_cost_unknown: float - fallback cost for unknown models
     - user_to_api_model_map: Dict[str, str] - optional model name mappings
@@ -84,7 +84,7 @@ class BaseQuotaTracker:
     # =========================================================================
 
     # Environment variable prefix for credential discovery
-    # e.g., "GEMINI_CLI" looks for GEMINI_CLI_1_ACCESS_TOKEN, etc.
+    # e.g., "NANOGPT" looks for NANOGPT_1_ACCESS_TOKEN, etc.
     provider_env_prefix: str = ""
 
     # Cache subdirectory name for learned costs file
@@ -166,7 +166,7 @@ class BaseQuotaTracker:
         Get the provider prefix for model names.
 
         Returns:
-            Provider prefix (e.g., "gemini_cli")
+            Provider prefix (e.g., "nanogpt")
         """
         pass
 
@@ -378,7 +378,7 @@ class BaseQuotaTracker:
         # 2. Env-based credentials
         # Check for {PREFIX}_1_ACCESS_TOKEN, {PREFIX}_2_ACCESS_TOKEN, etc.
         env_prefix = self.provider_env_prefix
-        provider_name = self.cache_subdir  # e.g., "gemini_cli"
+        provider_name = self.cache_subdir  # e.g., "nanogpt"
 
         for i in range(1, ENV_CREDENTIAL_DISCOVERY_LIMIT):  # Upper limit
             if os.getenv(f"{env_prefix}_{i}_ACCESS_TOKEN"):
@@ -559,6 +559,7 @@ class BaseQuotaTracker:
                 bucket = self._find_bucket_for_model(quota_data, user_model)
                 reset_timestamp = bucket.get("reset_timestamp") if bucket else None
                 valid_reset_ts = reset_timestamp if remaining < 1.0 else None
+                exhaustion_reason = bucket.get("exhaustion_reason") if bucket else None
 
                 # DEFAULT: Always apply exhaustion if remaining == 0.0 exactly
                 # (API is authoritative for most providers)
@@ -573,6 +574,7 @@ class BaseQuotaTracker:
                     quota_group=quota_group,
                     force=force,
                     apply_exhaustion=apply_exhaustion,
+                    exhaustion_reason=exhaustion_reason,
                 )
                 stored_count += 1
 

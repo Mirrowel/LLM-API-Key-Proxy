@@ -1,0 +1,163 @@
+# SPDX-License-Identifier: LGPL-3.0-only
+# Copyright (c) 2026 Mirrowel
+
+"""Data types for provider field-cache rules."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any, Literal, Optional
+
+FieldCacheSource = Literal[
+    "request",
+    "response",
+    "stream_event",
+    "unified_request",
+    "unified_response",
+    "unified_stream_event",
+]
+FieldCacheTarget = Literal["request", "unified_request", "metadata"]
+FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"]
+FieldCacheScope = Literal["provider", "model", "credential", "session", "classifier"]
+
+DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
+# D11: provider+model are the REQUIRED identity for cached provider state;
+# credential and session are optional refinements (single-operator proxy —
+# tightened additively for multi-user later). Missing optional dimensions
+# never disable caching.
+OPTIONAL_SCOPE_DIMENSIONS = frozenset({"credential", "session"})
+_VALID_COMPATIBILITY = {"bound", "portable"}
+_VALID_SOURCES = {"request", "response", "stream_event", "unified_request", "unified_response", "unified_stream_event"}
+_VALID_TARGETS = {"request", "unified_request", "metadata"}
+_VALID_SCOPES = {"provider", "model", "credential", "session", "classifier"}
+
+
+@dataclass(frozen=True)
+class FieldCacheInjection:
+    """Where and how a cached value should be injected into a later payload."""
+
+    target: FieldCacheTarget
+    path: str
+    when_missing_only: bool = False
+    insert: bool = False
+    as_list: bool = False
+
+
+@dataclass(frozen=True)
+class FieldCacheRule:
+    """Declarative rule for extracting and re-injecting provider state.
+
+    Rules are protocol/provider extensions, not session-affinity logic. Session
+    tracking decides continuity; field-cache rules preserve protocol state such
+    as reasoning content, thought signatures, prompt cache keys, and response IDs.
+    """
+
+    name: str
+    source: FieldCacheSource
+    path: str
+    mode: FieldCacheMode = "last"
+    scope: tuple[FieldCacheScope, ...] = DEFAULT_SCOPE
+    inject: Optional[FieldCacheInjection] = None
+    enabled: bool = True
+    ttl_seconds: Optional[int] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    allow_missing_session: bool = False
+    cache_key: Optional[str] = None
+    max_values: Optional[int] = 1024
+    max_bytes: Optional[int] = 4 * 1024 * 1024
+
+    def __post_init__(self) -> None:
+        if not self.name or any(char in self.name for char in "/\\:"):
+            raise ValueError("FieldCacheRule.name must be non-empty and filesystem-safe")
+        if self.cache_key is not None and (
+            not self.cache_key or any(char in self.cache_key for char in "/\\:")
+        ):
+            raise ValueError("FieldCacheRule.cache_key must be non-empty and filesystem-safe")
+        if self.mode not in {"last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"}:
+            raise ValueError(f"Unsupported field-cache mode: {self.mode}")
+        if self.source not in _VALID_SOURCES:
+            raise ValueError(f"Unsupported field-cache source: {self.source}")
+        if self.inject and self.inject.target not in _VALID_TARGETS:
+            raise ValueError(f"Unsupported field-cache injection target: {self.inject.target}")
+        if not self.scope:
+            raise ValueError("FieldCacheRule.scope must contain at least one dimension")
+        invalid_scopes = [scope for scope in self.scope if scope not in _VALID_SCOPES]
+        if invalid_scopes:
+            raise ValueError(f"Unsupported field-cache scope: {invalid_scopes[0]}")
+        if self.max_values is not None and self.max_values <= 0:
+            raise ValueError("FieldCacheRule.max_values must be positive")
+        if self.max_bytes is not None and self.max_bytes <= 0:
+            raise ValueError("FieldCacheRule.max_bytes must be positive")
+        if self.inject and is_provider_continuation_path(self.inject.path):
+            if self.metadata.get("provider_continuation") is not True:
+                raise ValueError(
+                    "Continuation field-cache injection requires metadata.provider_continuation=true"
+                )
+        compatibility = self.metadata.get("compatibility")
+        if compatibility is not None and compatibility not in _VALID_COMPATIBILITY:
+            raise ValueError(
+                f"FieldCacheRule.metadata.compatibility must be 'bound' or 'portable', not {compatibility!r}"
+            )
+        transform = self.metadata.get("transform")
+        if transform is not None:
+            if not isinstance(transform, str) or not transform:
+                raise ValueError("FieldCacheRule.metadata.transform must be a registered transform name")
+            if compatibility != "portable":
+                raise ValueError(
+                    "Transform-on-inject applies to portable fields only; bound opaque state never changes shape (D8)"
+                )
+            # Fail at construction (startup/config), never mid-request.
+            from ..protocols.transforms import get_transform
+
+            try:
+                get_transform(transform)
+            except KeyError as exc:
+                raise ValueError(f"Unknown transform {transform!r}") from exc
+        if self.mode == "per_tool_call" and not self.metadata.get("tool_call_id_path"):
+            raise ValueError("per_tool_call rules require metadata.tool_call_id_path")
+        # Constructor-owned dict: callers never share the passed mapping,
+        # and stdlib copy/pickle/asdict keep working (the rule is shared
+        # across requests via compiled caches — mutating a rule's metadata
+        # after construction is a contract violation, enforced nowhere
+        # else by design).
+        object.__setattr__(self, "metadata", dict(self.metadata))
+
+
+def is_provider_continuation_path(path: str) -> bool:
+    normalized = path.replace("[", ".").replace("]", "")
+    leaf = normalized.rsplit(".", 1)[-1]
+    leaf = "".join(character for character in leaf.lower() if character.isalnum())
+    return leaf in {
+        "previousresponseid",
+        "providerresponseid",
+        "continuationid",
+        "conversationid",
+    }
+
+
+@dataclass(frozen=True)
+class FieldCacheContext:
+    """Scope values used to isolate cached provider fields."""
+
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    credential_id: Optional[str] = None
+    session_id: Optional[str] = None
+    # Trace-correlation only ("conversation" scope retired per D11:
+    # session IS the conversation).
+    conversation_id: Optional[str] = None
+    classifier: Optional[str] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def value_for_scope(self, scope: FieldCacheScope) -> Optional[str]:
+        if scope == "provider":
+            return self.provider
+        if scope == "model":
+            return self.model
+        if scope == "credential":
+            return self.credential_id
+        if scope == "session":
+            return self.session_id
+        if scope == "classifier":
+            return self.classifier
+        raise ValueError(f"Unsupported field-cache scope: {scope}")

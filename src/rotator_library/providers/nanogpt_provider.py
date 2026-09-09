@@ -60,6 +60,14 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
     Supports subscription-based usage tracking with daily/monthly limits.
     All models share the same usage pool at the credential level.
     """
+    protocol_name = "openai_chat"
+    native_streaming_supported = True
+    default_api_base = "https://nano-gpt.com/api/v1"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        base = self.get_provider_api_base()
+        return f"{base}/chat/completions"
+
 
     # Skip cost calculation - NanoGPT uses "usage units", not tokens
     skip_cost_calculation = True

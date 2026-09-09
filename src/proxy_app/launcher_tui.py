@@ -10,6 +10,10 @@ import json
 import os
 import sys
 from pathlib import Path
+
+# NOTE: keep this module stdlib-light — it loads before the TUI renders and
+# must not drag the rotator_library import chain (litellm, ~8s) with it.
+# proxy_app.key_policy and friends import lazily inside their call sites.
 from rich.console import Console
 from rich.prompt import IntPrompt, Prompt
 from rich.panel import Panel
@@ -102,8 +106,9 @@ class LauncherConfig:
     @staticmethod
     def update_proxy_api_key(new_key: str):
         """Update PROXY_API_KEY in .env only"""
-        env_file = _get_env_file()
-        set_key(str(env_file), "PROXY_API_KEY", new_key)
+        from proxy_app.key_policy import save_proxy_api_key
+
+        env_file = save_proxy_api_key(new_key)
         load_dotenv(dotenv_path=env_file, override=True)
 
 
@@ -185,9 +190,7 @@ class SettingsDetector:
         # Scan for env-based OAuth credentials
         # Maps provider name to the ENV_PREFIX used by the provider
         # (duplicated from credential_manager to avoid heavy imports)
-        env_oauth_providers = {
-            "gemini_cli": "GEMINI_CLI",
-        }
+        env_oauth_providers = {}
 
         for provider, env_prefix in env_oauth_providers.items():
             oauth_count = 0
@@ -313,7 +316,7 @@ class SettingsDetector:
 
     @staticmethod
     def detect_provider_settings() -> dict:
-        """Detect provider-specific settings (Gemini CLI)"""
+        """Detect provider-specific settings."""
         try:
             from proxy_app.settings_tool import PROVIDER_SETTINGS_MAP
         except ImportError:
@@ -730,7 +733,9 @@ class LauncherTUI:
                 default_port = 8000
                 default_logging = False
                 default_raw_logging = False
-                default_api_key = "VerysecretKey"
+                from proxy_app.key_policy import DEFAULT_PROXY_API_KEY
+
+                default_api_key = DEFAULT_PROXY_API_KEY
 
                 # Get current values
                 current_host = self.config.config["host"]

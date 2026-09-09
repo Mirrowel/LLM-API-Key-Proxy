@@ -58,7 +58,7 @@ def get_cache_dir(
 
     Args:
         root: Optional root directory. If None, uses get_default_root().
-        subdir: Optional subdirectory name (e.g., "gemini_cli")
+        subdir: Optional subdirectory name (e.g., "provider_cache")
 
     Returns:
         Path to the cache directory (or subdirectory)

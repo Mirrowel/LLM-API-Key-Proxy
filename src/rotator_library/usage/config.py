@@ -510,6 +510,12 @@ class ProviderUsageConfig:
     # Exhaustion threshold (cooldown must exceed this to count as "exhausted")
     exhaustion_cooldown_threshold: int = DEFAULT_EXHAUSTION_COOLDOWN_THRESHOLD
 
+    # Policy for authoritative quota APIs that report exhaustion without a reset
+    # timestamp. Defaults to legacy warn-only behavior; providers with known
+    # entitlement-style semantics can opt into a fallback cooldown.
+    no_reset_exhaustion_policy: str = "warn_only"
+    no_reset_exhaustion_cooldown_seconds: int = 0
+
     # Window limits blocking (if True, block credentials when window quota exhausted locally)
     # Default False: only API errors (cooldowns) should block, not local tracking
     window_limits_enabled: bool = False
@@ -521,7 +527,9 @@ class ProviderUsageConfig:
     # is only blocked by concurrency. Configuring this keeps cache-locality
     # deployments from forcing the same latency tradeoff on low-latency ones.
     session_sticky_wait_seconds: float = 15.0
-    session_sticky_entry_ttl_seconds: int = 3600
+    # Five minutes matches the common idle lifetime of upstream prompt caches.
+    # Providers and per-provider environment settings can override this default.
+    session_sticky_entry_ttl_seconds: int = 300
     session_sticky_max_entries: int = 10000
 
     def get_effective_multiplier(self, priority: int) -> int:
@@ -689,12 +697,26 @@ def load_provider_usage_config(
         if hasattr(plugin_class, "default_session_sticky_entry_ttl_seconds"):
             sticky_ttl = plugin_class.default_session_sticky_entry_ttl_seconds
             if sticky_ttl is not None:
-                config.session_sticky_entry_ttl_seconds = max(1, int(sticky_ttl))
+                config.session_sticky_entry_ttl_seconds = max(0, int(sticky_ttl))
 
         if hasattr(plugin_class, "default_session_sticky_max_entries"):
             sticky_max = plugin_class.default_session_sticky_max_entries
             if sticky_max is not None:
                 config.session_sticky_max_entries = max(100, int(sticky_max))
+
+        if hasattr(plugin_class, "default_no_reset_exhaustion_policy"):
+            config.no_reset_exhaustion_policy = str(
+                plugin_class.default_no_reset_exhaustion_policy
+            ).lower()
+
+        if hasattr(plugin_class, "default_no_reset_exhaustion_cooldown_seconds"):
+            try:
+                config.no_reset_exhaustion_cooldown_seconds = max(
+                    0,
+                    int(plugin_class.default_no_reset_exhaustion_cooldown_seconds),
+                )
+            except (TypeError, ValueError):
+                pass
 
         # Fair cycle
         if hasattr(plugin_class, "default_fair_cycle_config"):
@@ -818,7 +840,7 @@ def load_provider_usage_config(
         env_sticky_ttl = os.getenv("SESSION_STICKY_ENTRY_TTL_SECONDS")
     if env_sticky_ttl:
         try:
-            config.session_sticky_entry_ttl_seconds = max(1, int(env_sticky_ttl))
+            config.session_sticky_entry_ttl_seconds = max(0, int(env_sticky_ttl))
         except ValueError:
             lib_logger.warning(
                 f"Invalid session sticky entry TTL value '{env_sticky_ttl}'. Keeping default."
@@ -914,6 +936,33 @@ def load_provider_usage_config(
             config.exhaustion_cooldown_threshold = int(env_threshold)
         except ValueError:
             pass
+
+    env_no_reset_policy = os.getenv(f"QUOTA_NO_RESET_EXHAUSTION_POLICY_{provider_upper}")
+    if env_no_reset_policy is None:
+        env_no_reset_policy = os.getenv("QUOTA_NO_RESET_EXHAUSTION_POLICY")
+    if env_no_reset_policy:
+        policy = env_no_reset_policy.strip().lower()
+        if policy in {"warn_only", "cooldown", "disable_scope"}:
+            config.no_reset_exhaustion_policy = policy
+        else:
+            lib_logger.warning(
+                f"Invalid QUOTA_NO_RESET_EXHAUSTION_POLICY_{provider_upper}='{env_no_reset_policy}'. "
+                f"Keeping default '{config.no_reset_exhaustion_policy}'."
+            )
+
+    env_no_reset_cooldown = os.getenv(f"QUOTA_NO_RESET_COOLDOWN_SECONDS_{provider_upper}")
+    if env_no_reset_cooldown is None:
+        env_no_reset_cooldown = os.getenv("QUOTA_NO_RESET_COOLDOWN_SECONDS")
+    if env_no_reset_cooldown:
+        try:
+            config.no_reset_exhaustion_cooldown_seconds = max(
+                0, int(env_no_reset_cooldown)
+            )
+        except ValueError:
+            lib_logger.warning(
+                f"Invalid QUOTA_NO_RESET_COOLDOWN_SECONDS_{provider_upper}='{env_no_reset_cooldown}'. "
+                "Keeping default."
+            )
 
     # Priority multipliers from env
     # Format: CONCURRENCY_MULTIPLIER_{PROVIDER}_PRIORITY_{N}=value

@@ -2,7 +2,6 @@
 # Copyright (c) 2026 Mirrowel
 
 import time
-import uuid
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
@@ -35,6 +34,16 @@ parser.add_argument(
 )
 args, _ = parser.parse_known_args()
 
+# Keep startup output deliverable on any console: Windows pipes default to
+# a legacy codepage that cannot encode the banner's unicode, which crashed
+# headless launches before the key policy could speak.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # Add the 'src' directory to the Python path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -61,7 +70,7 @@ _start_time = time.time()
 
 # Load all .env files from root folder (main .env first, then any additional *.env files)
 from dotenv import load_dotenv
-from glob import glob
+from proxy_app.startup_display import mask_secret_for_display as _mask_secret_for_display
 
 # Get the application root directory (EXE dir if frozen, else CWD)
 # Inlined here to avoid triggering heavy rotator_library imports before loading screen
@@ -73,7 +82,7 @@ else:
 # Load main .env first
 load_dotenv(_root_dir / ".env")
 
-# Load any additional .env files (e.g., gemini_cli_all_combined.env)
+# Load any additional .env files (e.g., provider_credentials.env)
 _env_files_found = list(_root_dir.glob("*.env"))
 for _env_file in sorted(_root_dir.glob("*.env")):
     if _env_file.name != ".env":  # Skip main .env (already loaded)
@@ -84,10 +93,27 @@ if _env_files_found:
     _env_names = [_ef.name for _ef in _env_files_found]
     print(f"📁 Loaded {len(_env_files_found)} .env file(s): {', '.join(_env_names)}")
 
+
+# Default-key policy: the well-known default is only acceptable on a
+# localhost bind — otherwise prompt (enter/generate/skip) or block when
+# no terminal can answer. Enforcement matches the launch mode: script
+# runs (TUI, direct, flags, Docker CMD) use the parsed host; an ASGI
+# server launching this module is detected via its argv; plain library
+# imports (tests, tooling) never enforce.
+from proxy_app import key_policy as _key_policy
+
+if __name__ == "__main__":
+    _bind_host: str | None = args.host
+else:
+    _bind_host = _key_policy.uvicorn_bind_host()
+_adopted_key = (
+    _key_policy.enforce_proxy_key_policy(_bind_host) if _bind_host is not None else None
+)
+
 # Get proxy API key for display
-proxy_api_key = os.getenv("PROXY_API_KEY")
+proxy_api_key = _adopted_key or os.getenv("PROXY_API_KEY")
 if proxy_api_key:
-    key_display = f"✓ {proxy_api_key}"
+    key_display = f"✓ {_mask_secret_for_display(proxy_api_key)}"
 else:
     key_display = "✗ Not Set (INSECURE - anyone can access!)"
 
@@ -108,17 +134,16 @@ _console = Console()
 print("  → Loading FastAPI framework...")
 with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
-    from fastapi import FastAPI, Request, HTTPException, Depends
+    from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import StreamingResponse, JSONResponse
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
 with _console.status("[dim]Loading core dependencies...", spinner="dots"):
-    from dotenv import load_dotenv
     import colorlog
     import json
-    from typing import AsyncGenerator, Any, List, Optional, Union
+    from typing import AsyncGenerator, Any, List, Optional
     from pydantic import BaseModel, ConfigDict, Field
 
     # --- Early Log Level Configuration ---
@@ -134,12 +159,15 @@ litellm.suppress_debug_info = True
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
+    from rotator_library.client.protocol_selection import format_client_protocol_error
     from rotator_library.credential_manager import CredentialManager
-    from rotator_library.background_refresher import BackgroundRefresher
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
+    from rotator_library.responses import ResponsesService, ResponsesServiceError
+    from rotator_library.core.errors import StructuredAPIResponseError
+    from rotator_library.transaction_logger import TransactionLogger
 
 print("  → Discovering provider plugins...")
 # Provider lazy loading happens during import, so time it here
@@ -155,14 +183,6 @@ _plugin_count = len(PROVIDER_PLUGINS)
 
 
 # --- Pydantic Models ---
-class EmbeddingRequest(BaseModel):
-    model: str
-    input: Union[str, List[str]]
-    input_type: Optional[str] = None
-    dimensions: Optional[int] = None
-    user: Optional[str] = None
-
-
 class ModelCard(BaseModel):
     """Basic model card for minimal response."""
 
@@ -224,13 +244,6 @@ class EnrichedModelList(BaseModel):
 
     object: str = "list"
     data: List[EnrichedModelCard]
-
-
-# --- Anthropic API Models (imported from library) ---
-from rotator_library.anthropic_compat import (
-    AnthropicMessagesRequest,
-    AnthropicCountTokensRequest,
-)
 
 
 # Calculate total loading time
@@ -414,159 +427,13 @@ async def lifespan(app: FastAPI):
     cred_manager = CredentialManager(os.environ)
     oauth_credentials = cred_manager.discover_and_prepare()
 
-    if not skip_oauth_init and oauth_credentials:
-        logging.info("Starting OAuth credential validation and deduplication...")
-        processed_emails = {}  # email -> {provider: path}
-        credentials_to_initialize = {}  # provider -> [paths]
-        final_oauth_credentials = {}
-
-        # --- Pass 1: Pre-initialization Scan & Deduplication ---
-        # logging.info("Pass 1: Scanning for existing metadata to find duplicates...")
-        for provider, paths in oauth_credentials.items():
-            if provider not in credentials_to_initialize:
-                credentials_to_initialize[provider] = []
-            for path in paths:
-                # Skip env-based credentials (virtual paths) - they don't have metadata files
-                if path.startswith("env://"):
-                    credentials_to_initialize[provider].append(path)
-                    continue
-
-                try:
-                    with open(path, "r") as f:
-                        data = json.load(f)
-                    metadata = data.get("_proxy_metadata", {})
-                    email = metadata.get("email")
-
-                    if email:
-                        if email not in processed_emails:
-                            processed_emails[email] = {}
-
-                        if provider in processed_emails[email]:
-                            original_path = processed_emails[email][provider]
-                            logging.warning(
-                                f"Duplicate for '{email}' on '{provider}' found in pre-scan: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
-                            )
-                            continue
-                        else:
-                            processed_emails[email][provider] = path
-
-                    credentials_to_initialize[provider].append(path)
-
-                except (FileNotFoundError, json.JSONDecodeError) as e:
-                    logging.warning(
-                        f"Could not pre-read metadata from '{path}': {e}. Will process during initialization."
-                    )
-                    credentials_to_initialize[provider].append(path)
-
-        # --- Pass 2: Parallel Initialization of Filtered Credentials ---
-        # logging.info("Pass 2: Initializing unique credentials and performing final check...")
-        async def process_credential(provider: str, path: str, provider_instance):
-            """Process a single credential: initialize and fetch user info."""
-            try:
-                await provider_instance.initialize_token(path)
-
-                if not hasattr(provider_instance, "get_user_info"):
-                    return (provider, path, None, None)
-
-                user_info = await provider_instance.get_user_info(path)
-                email = user_info.get("email")
-                return (provider, path, email, None)
-
-            except Exception as e:
-                logging.error(
-                    f"Failed to process OAuth token for {provider} at '{path}': {e}"
-                )
-                return (provider, path, None, e)
-
-        # Collect all tasks for parallel execution
-        tasks = []
-        for provider, paths in credentials_to_initialize.items():
-            if not paths:
-                continue
-
-            provider_plugin_class = PROVIDER_PLUGINS.get(provider)
-            if not provider_plugin_class:
-                continue
-
-            provider_instance = provider_plugin_class()
-
-            for path in paths:
-                tasks.append(process_credential(provider, path, provider_instance))
-
-        # Execute all credential processing tasks in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # --- Pass 3: Sequential Deduplication and Final Assembly ---
-        for result in results:
-            # Handle exceptions from gather
-            if isinstance(result, Exception):
-                logging.error(f"Credential processing raised exception: {result}")
-                continue
-
-            provider, path, email, error = result
-
-            # Skip if there was an error
-            if error:
-                continue
-
-            # If provider doesn't support get_user_info, add directly
-            if email is None:
-                if provider not in final_oauth_credentials:
-                    final_oauth_credentials[provider] = []
-                final_oauth_credentials[provider].append(path)
-                continue
-
-            # Handle empty email
-            if not email:
-                logging.warning(
-                    f"Could not retrieve email for '{path}'. Treating as unique."
-                )
-                if provider not in final_oauth_credentials:
-                    final_oauth_credentials[provider] = []
-                final_oauth_credentials[provider].append(path)
-                continue
-
-            # Deduplication check
-            if email not in processed_emails:
-                processed_emails[email] = {}
-
-            if (
-                provider in processed_emails[email]
-                and processed_emails[email][provider] != path
-            ):
-                original_path = processed_emails[email][provider]
-                logging.warning(
-                    f"Duplicate for '{email}' on '{provider}' found post-init: '{Path(path).name}'. Original: '{Path(original_path).name}'. Skipping."
-                )
-                continue
-            else:
-                processed_emails[email][provider] = path
-                if provider not in final_oauth_credentials:
-                    final_oauth_credentials[provider] = []
-                final_oauth_credentials[provider].append(path)
-
-                # Update metadata (skip for env-based credentials - they don't have files)
-                if not path.startswith("env://"):
-                    try:
-                        with open(path, "r+") as f:
-                            data = json.load(f)
-                            metadata = data.get("_proxy_metadata", {})
-                            metadata["email"] = email
-                            metadata["last_check_timestamp"] = time.time()
-                            data["_proxy_metadata"] = metadata
-                            f.seek(0)
-                            json.dump(data, f, indent=2)
-                            f.truncate()
-                    except Exception as e:
-                        logging.error(f"Failed to update metadata for '{path}': {e}")
-
-        logging.info("OAuth credential processing complete.")
-        oauth_credentials = final_oauth_credentials
-
-    # [NEW] Load provider-specific params
-    litellm_provider_params = {
-        "gemini_cli": {"project_id": os.getenv("GEMINI_CLI_PROJECT_ID")}
-    }
+    oauth_credentials = await bootstrap_oauth_credentials(
+        oauth_credentials,
+        skip=skip_oauth_init,
+    )
+    # Provider-specific LiteLLM params. API-key Gemini remains configured through
+    # normal provider environment keys.
+    litellm_provider_params = {}
 
     # Load global timeout from environment (default 30 seconds)
     global_timeout = int(os.getenv("GLOBAL_TIMEOUT", "30"))
@@ -592,6 +459,13 @@ async def lifespan(app: FastAPI):
     # print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
+    # Phase 4 Responses API compatibility service. It currently bridges through
+    # the existing chat-completions client path; later native providers can reuse
+    # the same route/storage surface without changing clients.
+    from rotator_library.config.experimental import get_responses_store_settings
+    from rotator_library.responses import create_configured_responses_store
+
+    app.state.responses_service = ResponsesService(store=create_configured_responses_store(), store_settings=get_responses_store_settings())
 
     # Warn if no provider credentials are configured
     if not client.all_credentials:
@@ -627,6 +501,9 @@ async def lifespan(app: FastAPI):
     await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()
+    responses_service = getattr(app.state, "responses_service", None)
+    if responses_service:
+        await responses_service.close()
     await client.close()
 
     # Stop model info service
@@ -663,6 +540,19 @@ def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
     return request.app.state.embedding_batcher
 
 
+def get_responses_service(request: Request) -> ResponsesService:
+    """Dependency to get the Responses API service instance from app state."""
+
+    service = getattr(request.app.state, "responses_service", None)
+    if service is None:
+        from rotator_library.config.experimental import get_responses_store_settings
+        from rotator_library.responses import create_configured_responses_store
+
+        service = ResponsesService(store=create_configured_responses_store(), store_settings=get_responses_store_settings())
+        request.app.state.responses_service = service
+    return service
+
+
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
     # If PROXY_API_KEY is not set or empty, skip verification (open access)
@@ -675,6 +565,7 @@ async def verify_api_key(auth: str = Depends(api_key_header)):
 
 # --- Anthropic API Key Header ---
 anthropic_api_key_header = APIKeyHeader(name="x-api-key", auto_error=False)
+gemini_api_key_header = APIKeyHeader(name="x-goog-api-key", auto_error=False)
 
 
 async def verify_anthropic_api_key(
@@ -685,6 +576,8 @@ async def verify_anthropic_api_key(
     Dependency to verify API key for Anthropic endpoints.
     Accepts either x-api-key header (Anthropic style) or Authorization Bearer (OpenAI style).
     """
+    if not PROXY_API_KEY:
+        return x_api_key or auth
     # Check x-api-key first (Anthropic style)
     if x_api_key and x_api_key == PROXY_API_KEY:
         return x_api_key
@@ -694,184 +587,34 @@ async def verify_anthropic_api_key(
     raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
-async def streaming_response_wrapper(
+async def verify_gemini_api_key(
     request: Request,
-    request_data: dict,
-    response_stream: AsyncGenerator[str, None],
-    logger: Optional[RawIOLogger] = None,
-) -> AsyncGenerator[str, None]:
-    """
-    Wraps a streaming response to log the full response after completion
-    and ensures any errors during the stream are sent to the client.
-    """
-    response_chunks = []
-    full_response = {}
+    x_api_key: str = Depends(gemini_api_key_header),
+    auth: str = Depends(api_key_header),
+):
+    """Accept Gemini header/query authentication or the shared Bearer form."""
 
-    try:
-        async for chunk_str in response_stream:
-            if await request.is_disconnected():
-                logging.warning("Client disconnected, stopping stream.")
-                break
-            yield chunk_str
-            if chunk_str.strip() and chunk_str.startswith("data:"):
-                content = chunk_str[len("data:") :].strip()
-                if content != "[DONE]":
-                    try:
-                        chunk_data = json.loads(content)
-                        response_chunks.append(chunk_data)
-                        if logger:
-                            logger.log_stream_chunk(chunk_data)
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as e:
-        logging.error(f"An error occurred during the response stream: {e}")
-        # Yield a final error message to the client to ensure they are not left hanging.
-        error_payload = {
-            "error": {
-                "message": f"An unexpected error occurred during the stream: {str(e)}",
-                "type": "proxy_internal_error",
-                "code": 500,
-            }
-        }
-        yield f"data: {json.dumps(error_payload)}\n\n"
-        yield "data: [DONE]\n\n"
-        # Also log this as a failed request
-        if logger:
-            logger.log_final_response(
-                status_code=500, headers=None, body={"error": str(e)}
-            )
-        return  # Stop further processing
-    finally:
-        if response_chunks:
-            # --- Aggregation Logic ---
-            final_message = {"role": "assistant"}
-            aggregated_tool_calls = {}
-            usage_data = None
-            finish_reason = None
+    if not PROXY_API_KEY:
+        return x_api_key or auth or request.query_params.get("key")
+    query_key = request.query_params.get("key")
+    if (
+        x_api_key == PROXY_API_KEY
+        or query_key == PROXY_API_KEY
+        or auth == f"Bearer {PROXY_API_KEY}"
+    ):
+        return x_api_key or query_key or auth
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
-            for chunk in response_chunks:
-                if "choices" in chunk and chunk["choices"]:
-                    choice = chunk["choices"][0]
-                    delta = choice.get("delta", {})
 
-                    # Dynamically aggregate all fields from the delta
-                    for key, value in delta.items():
-                        if value is None:
-                            continue
-
-                        if key == "content":
-                            if "content" not in final_message:
-                                final_message["content"] = ""
-                            if value:
-                                final_message["content"] += value
-
-                        elif key == "tool_calls":
-                            for tc_chunk in value:
-                                index = tc_chunk["index"]
-                                if index not in aggregated_tool_calls:
-                                    aggregated_tool_calls[index] = {
-                                        "type": "function",
-                                        "function": {"name": "", "arguments": ""},
-                                    }
-                                # Ensure 'function' key exists for this index before accessing its sub-keys
-                                if "function" not in aggregated_tool_calls[index]:
-                                    aggregated_tool_calls[index]["function"] = {
-                                        "name": "",
-                                        "arguments": "",
-                                    }
-                                if tc_chunk.get("id"):
-                                    aggregated_tool_calls[index]["id"] = tc_chunk["id"]
-                                if "function" in tc_chunk:
-                                    if "name" in tc_chunk["function"]:
-                                        if tc_chunk["function"]["name"] is not None:
-                                            aggregated_tool_calls[index]["function"][
-                                                "name"
-                                            ] += tc_chunk["function"]["name"]
-                                    if "arguments" in tc_chunk["function"]:
-                                        if (
-                                            tc_chunk["function"]["arguments"]
-                                            is not None
-                                        ):
-                                            aggregated_tool_calls[index]["function"][
-                                                "arguments"
-                                            ] += tc_chunk["function"]["arguments"]
-
-                        elif key == "function_call":
-                            if "function_call" not in final_message:
-                                final_message["function_call"] = {
-                                    "name": "",
-                                    "arguments": "",
-                                }
-                            if "name" in value:
-                                if value["name"] is not None:
-                                    final_message["function_call"]["name"] += value[
-                                        "name"
-                                    ]
-                            if "arguments" in value:
-                                if value["arguments"] is not None:
-                                    final_message["function_call"]["arguments"] += (
-                                        value["arguments"]
-                                    )
-
-                        else:  # Generic key handling for other data like 'reasoning'
-                            # FIX: Role should always replace, never concatenate
-                            if key == "role":
-                                final_message[key] = value
-                            elif key not in final_message:
-                                final_message[key] = value
-                            elif isinstance(final_message.get(key), str) and isinstance(
-                                value, str
-                            ):
-                                final_message[key] += value
-                            elif isinstance(final_message.get(key), list) and isinstance(
-                                value, list
-                            ):
-                                final_message[key].extend(value)
-                            else:
-                                # Provider extension fields can change shape across
-                                # chunks; replacing is safer than crashing the stream.
-                                final_message[key] = value
-
-                    if "finish_reason" in choice and choice["finish_reason"]:
-                        finish_reason = choice["finish_reason"]
-
-                if "usage" in chunk and chunk["usage"]:
-                    usage_data = chunk["usage"]
-
-            # --- Final Response Construction ---
-            if aggregated_tool_calls:
-                final_message["tool_calls"] = list(aggregated_tool_calls.values())
-                # CRITICAL FIX: Override finish_reason when tool_calls exist
-                # This ensures OpenCode and other agentic systems continue the conversation loop
-                finish_reason = "tool_calls"
-
-            # Ensure standard fields are present for consistent logging
-            for field in ["content", "tool_calls", "function_call"]:
-                if field not in final_message:
-                    final_message[field] = None
-
-            first_chunk = response_chunks[0]
-            final_choice = {
-                "index": 0,
-                "message": final_message,
-                "finish_reason": finish_reason,
-            }
-
-            full_response = {
-                "id": first_chunk.get("id"),
-                "object": "chat.completion",
-                "created": first_chunk.get("created"),
-                "model": first_chunk.get("model"),
-                "choices": [final_choice],
-                "usage": usage_data,
-            }
-
-        if logger:
-            logger.log_final_response(
-                status_code=200,
-                headers=None,  # Headers are not available at this stage
-                body=full_response,
-            )
+# Stream wrapping, request overrides, and embedding fan-out live in route_helpers.
+from proxy_app.route_helpers import (  # noqa: E402
+    SSE_HEADERS,
+    apply_temperature_override,
+    execute_embeddings,
+    streaming_response_wrapper,
+)
+# OAuth credential bootstrap lives in startup.
+from proxy_app.startup import bootstrap_oauth_credentials  # noqa: E402
 
 
 @app.post("/v1/chat/completions")
@@ -886,36 +629,22 @@ async def chat_completions(
     """
     # Raw I/O logger captures unmodified HTTP data at proxy boundary (disabled by default)
     raw_logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    request_data: dict[str, Any] = {}
     try:
         # Read and parse the request body only once at the beginning.
         try:
             request_data = await request.json()
         except json.JSONDecodeError:
-            raise HTTPException(status_code=400, detail="Invalid JSON in request body.")
+            status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+                error="Invalid JSON in request body.",
+                error_type="invalid_request",
+                status_code=400,
+            )
+            return JSONResponse(status_code=status, content=content)
 
         # Global temperature=0 override (controlled by .env variable, default: OFF)
-        # Low temperature makes models deterministic and prone to following training data
-        # instead of actual schemas, which can cause tool hallucination
-        # Modes: "remove" = delete temperature key, "set" = change to 1.0, "false" = disabled
-        override_temp_zero = os.getenv("OVERRIDE_TEMPERATURE_ZERO", "false").lower()
-
-        if (
-            override_temp_zero in ("remove", "set", "true", "1", "yes")
-            and "temperature" in request_data
-            and request_data["temperature"] == 0
-        ):
-            if override_temp_zero == "remove":
-                # Remove temperature key entirely
-                del request_data["temperature"]
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=remove: Removed temperature=0 from request"
-                )
-            else:
-                # Set to 1.0 (for "set", "true", "1", "yes")
-                request_data["temperature"] = 1.0
-                logging.debug(
-                    "OVERRIDE_TEMPERATURE_ZERO=set: Converting temperature=0 to temperature=1.0"
-                )
+        apply_temperature_override(request_data)
 
         # If raw logging is enabled, capture the unmodified request data.
         if raw_logger:
@@ -946,8 +675,10 @@ async def chat_completions(
         is_streaming = request_data.get("stream", False)
 
         if is_streaming:
-            response_generator = await client.acompletion(
-                request=request, **request_data
+            response_generator = await client.agenerate(
+                request_data,
+                input_protocol="openai_chat",
+                request=request,
             )
             return StreamingResponse(
                 streaming_response_wrapper(
@@ -956,15 +687,11 @@ async def chat_completions(
                 media_type="text/event-stream",
             )
         else:
-            response = await client.acompletion(request=request, **request_data)
-
-            if isinstance(response, dict):
-                if raw_logger:
-                    raw_logger.log_final_response(
-                        status_code=429, headers=None, body=response
-                    )
-                error_detail = response.get("error", {}).get("message", str(response))
-                raise HTTPException(status_code=429, detail=error_detail)
+            response = await client.agenerate(
+                request_data,
+                input_protocol="openai_chat",
+                request=request,
+            )
 
             if raw_logger:
                 response_headers = (
@@ -976,26 +703,58 @@ async def chat_completions(
                 raw_logger.log_final_response(
                     status_code=status_code,
                     headers=response_headers,
-                    body=response.model_dump(),
+                    body=response if isinstance(response, dict) else response.model_dump(),
                 )
             return response
 
+    except StructuredAPIResponseError as e:
+        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("openai_chat"))
     except (
         litellm.InvalidRequestError,
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e,
+            error_type=(
+                "context_window_exceeded"
+                if isinstance(e, litellm.ContextWindowExceededError)
+                else "invalid_request"
+            ),
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e, error_type="authentication", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e, error_type="rate_limit", status_code=429,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e, error_type="server_error", status_code=503,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e, error_type="proxy_timeout", status_code=504,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e, error_type="server_error", status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Request failed after all retries: {e}")
         # Optionally log the failed request
@@ -1008,25 +767,255 @@ async def chat_completions(
                 raw_logger.log_final_response(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat",
+            error=e,
+            error_type="server_error",
+            status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
+
+
+def _responses_error_response(
+    error: ResponsesServiceError,
+    protocol: str = "responses",
+) -> dict[str, Any]:
+    """Return a Responses service failure in the route's own protocol."""
+
+    return error.to_protocol_payload(protocol)
+
+
+@app.post("/v1/responses")
+async def responses_create(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Create, store, and optionally reformat an OpenAI Responses object."""
+
+    logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
+    try:
+        request_data = await request.json()
+    except json.JSONDecodeError:
+        status, content = format_client_protocol_error(
+            input_protocol="responses",
+            error="Invalid JSON in request body.",
+            error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    if logger:
+        logger.log_request(
+            headers=dict(request.headers),
+            body=service.redact_request_for_logging(request_data),
+        )
+    transaction_logger = TransactionLogger("responses", request_data.get("model", "unknown")) if ENABLE_REQUEST_LOGGING else None
+    try:
+        request_scope = service.prepare_request_scope(request_data)
+        previous_response_access_token = request.headers.get(
+            "X-Proxy-Session-Domain"
+        )
+        if request_data.get("stream"):
+            await service.validate_stream_request(
+                request_data,
+                request_scope=request_scope,
+                previous_response_access_token=previous_response_access_token,
+            )
+            return StreamingResponse(
+                service.stream_response(
+                    request_data,
+                    client,
+                    request=request,
+                    transaction_logger=transaction_logger,
+                    request_scope=request_scope,
+                    previous_response_access_token=previous_response_access_token,
+                ),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "X-Proxy-Session-Domain": request_scope.access_token,
+                },
+            )
+        result = await service.create_response(
+            request_data,
+            client,
+            request=request,
+            transaction_logger=transaction_logger,
+            request_scope=request_scope,
+            previous_response_access_token=previous_response_access_token,
+        )
+        if logger:
+            logger.log_final_response(status_code=200, headers=None, body=result)
+        return JSONResponse(
+            content=result,
+            headers={"X-Proxy-Session-Domain": request_scope.access_token},
+        )
+    except ResponsesServiceError as e:
+        payload = _responses_error_response(e, "responses")
+        if logger:
+            logger.log_final_response(status_code=e.status_code, headers=None, body=payload)
+        return JSONResponse(status_code=e.status_code, content=payload)
+    except ValueError as e:
+        payload = _responses_error_response(
+            ResponsesServiceError(str(e), status_code=400),
+            "responses",
+        )
+        return JSONResponse(status_code=400, content=payload)
+    except Exception as e:
+        logging.error(f"Responses endpoint error: {e}")
+        payload = _responses_error_response(
+            ResponsesServiceError(str(e), status_code=500, error_type="server_error"),
+            "responses",
+        )
+        if logger:
+            logger.log_final_response(status_code=500, headers=None, body=payload)
+        return JSONResponse(status_code=500, content=payload)
+
+
+@app.get("/v1/responses/{response_id}")
+async def responses_get(
+    response_id: str,
+    request: Request,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Retrieve a stored Responses object by ID."""
+
+    try:
+        return JSONResponse(
+            content=await service.get_response_with_access_token(
+                response_id,
+                request.headers.get("X-Proxy-Session-Domain", "public"),
+            )
+        )
+    except ResponsesServiceError as e:
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
+
+
+@app.delete("/v1/responses/{response_id}")
+async def responses_delete(
+    response_id: str,
+    request: Request,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Delete a stored Responses object by ID."""
+
+    try:
+        return JSONResponse(
+            content=await service.delete_response_with_access_token(
+                response_id,
+                request.headers.get("X-Proxy-Session-Domain", "public"),
+            )
+        )
+    except ResponsesServiceError as e:
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
+
+
+@app.get("/v1/responses/{response_id}/input_items")
+async def responses_input_items(
+    response_id: str,
+    request: Request,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Return stored input items for a Responses object."""
+
+    try:
+        return JSONResponse(
+            content=await service.list_input_items_with_access_token(
+                response_id,
+                request.headers.get("X-Proxy-Session-Domain", "public"),
+            )
+        )
+    except ResponsesServiceError as e:
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
+
+
+@app.websocket("/v1/responses")
+async def responses_websocket(websocket: WebSocket):
+    """WebSocket Mode for the Responses API (persistent connection, turns
+    as response.create frames, standard streaming events as JSON frames).
+
+    Thin shell: the session driver lives in rotator_library
+    (ResponsesWebSocketSession) per the shell-plus-library pattern.
+    Unauthenticated upgrades are denied at the handshake (Starlette sends
+    HTTP 403 on close-before-accept — the deliberate security shape: no
+    socket for unauthenticated peers; there is no official auth close code).
+    """
+
+    from rotator_library.responses.websocket import DEFAULT_MAX_CONNECTION_SECONDS, ResponsesWebSocketSession
+
+    if PROXY_API_KEY:
+        auth_header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
+        if auth_header != f"Bearer {PROXY_API_KEY}":
+            await websocket.close()
+            return
+    service = getattr(websocket.app.state, "responses_service", None)
+    rotating_client = getattr(websocket.app.state, "rotating_client", None)
+    if service is None or rotating_client is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "status": 503, "error": {"type": "server_error", "code": "responses_service_unavailable", "message": "Responses service unavailable"}})
+        await websocket.close(code=1011)
+        return
+    try:
+        max_seconds = float(os.getenv("RESPONSES_WEBSOCKET_MAX_CONNECTION_SECONDS") or DEFAULT_MAX_CONNECTION_SECONDS)
+        if max_seconds <= 0:
+            max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
+    except (TypeError, ValueError):
+        max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
+    transaction_logger_factory = None
+    if ENABLE_REQUEST_LOGGING:
+        def transaction_logger_factory(model: str):  # noqa: F811
+            return TransactionLogger("responses_ws", model)
+    session = ResponsesWebSocketSession(
+        service=service,
+        client=rotating_client,
+        max_connection_seconds=max_seconds,
+        transaction_logger_factory=transaction_logger_factory,
+    )
+    await websocket.accept()
+    await session.run(websocket)
 
 
 # --- Anthropic Messages API Endpoint ---
 @app.post("/v1/messages")
 async def anthropic_messages(
     request: Request,
-    body: AnthropicMessagesRequest,
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_anthropic_api_key),
 ):
     """
     Anthropic-compatible Messages API endpoint.
 
-    Accepts requests in Anthropic's format and returns responses in Anthropic's format.
-    Internally translates to OpenAI format for processing via LiteLLM.
+    Accepts the raw /v1/messages payload; the anthropic_messages protocol
+    adapter owns validation and conversion, and the response returns in the
+    request's protocol (unknown fields transport verbatim on the raw path).
 
     This endpoint is compatible with Claude Code and other Anthropic API clients.
     """
+    try:
+        body = await request.json()
+    except Exception as exc:
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages",
+            error=exc,
+            error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(body, dict):
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages",
+            error=ValueError("request body must be a JSON object"),
+            error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+
     # Initialize raw I/O logger if enabled (for debugging proxy boundary)
     logger = RawIOLogger() if ENABLE_RAW_LOGGING else None
 
@@ -1034,7 +1023,7 @@ async def anthropic_messages(
     if logger:
         logger.log_request(
             headers=dict(request.headers),
-            body=body.model_dump(exclude_none=True),
+            body=body,
         )
 
     try:
@@ -1046,22 +1035,19 @@ async def anthropic_messages(
                 request.client.host if request.client else "unknown",
                 request.client.port if request.client else 0,
             ),
-            request_data=body.model_dump(exclude_none=True),
+            request_data=body,
         )
 
         # Use the library method to handle the request
         result = await client.anthropic_messages(body, raw_request=request)
 
-        if body.stream:
-            # Streaming response
+        if body.get("stream"):
+            # Streaming response — wrapped so post-start failures end in an
+            # Anthropic error event instead of an aborted SSE stream.
             return StreamingResponse(
-                result,
+                streaming_response_wrapper(request, body, result, logger, input_protocol="anthropic_messages"),
                 media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
+                headers=SSE_HEADERS,
             )
         else:
             # Non-streaming response
@@ -1073,40 +1059,43 @@ async def anthropic_messages(
                 )
             return JSONResponse(content=result)
 
+    except StructuredAPIResponseError as e:
+        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("anthropic_messages"))
     except (
         litellm.InvalidRequestError,
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=400, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type=("context_window_exceeded" if isinstance(e, litellm.ContextWindowExceededError) else "invalid_request"),
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "authentication_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=401, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="authentication", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "rate_limit_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=429, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="rate_limit", status_code=429,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=503, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="server_error", status_code=503,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": f"Request timed out: {str(e)}"},
-        }
-        raise HTTPException(status_code=504, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="proxy_timeout", status_code=504,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Anthropic messages endpoint error: {e}")
         if logger:
@@ -1115,18 +1104,17 @@ async def anthropic_messages(
                 headers=None,
                 body={"error": str(e)},
             )
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=500, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="server_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 # --- Anthropic Count Tokens Endpoint ---
 @app.post("/v1/messages/count_tokens")
 async def anthropic_count_tokens(
     request: Request,
-    body: AnthropicCountTokensRequest,
     client: RotatingClient = Depends(get_rotating_client),
     _=Depends(verify_anthropic_api_key),
 ):
@@ -1139,39 +1127,149 @@ async def anthropic_count_tokens(
     Accepts requests in Anthropic's format and returns token count in Anthropic's format.
     """
     try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("request body must be a JSON object")
+    except Exception as e:
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
         # Use the library method to handle the request
         result = await client.anthropic_count_tokens(body)
         return JSONResponse(content=result)
 
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "invalid_request_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=400, detail=error_response)
+    except (ValueError, litellm.InvalidRequestError) as e:
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        error_response = {
-            "type": "error",
-            "error": {"type": "authentication_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=401, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="authentication", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Anthropic count_tokens endpoint error: {e}")
-        error_response = {
-            "type": "error",
-            "error": {"type": "api_error", "message": str(e)},
-        }
-        raise HTTPException(status_code=500, detail=error_response)
+        status, content = format_client_protocol_error(
+            input_protocol="anthropic_messages", error=e,
+            error_type="api_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
+
+
+@app.post("/v1beta/models/{model:path}:generateContent")
+@app.post("/v1/models/{model:path}:generateContent")
+async def gemini_generate_content(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-compatible generation endpoint using protocol-native routing."""
+
+    payload: dict[str, Any] = {}
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        status, content = format_client_protocol_error(
+            input_protocol="gemini",
+            error="Invalid JSON in request body.", error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
+        if payload.get("stream"):
+            raise ValueError(
+                "Gemini generateContent does not accept stream=true; use streamGenerateContent"
+            )
+        result = await client.gemini_generate(payload, model=model, raw_request=request)
+        return JSONResponse(content=result)
+    except StructuredAPIResponseError as error:
+        return JSONResponse(status_code=error.http_status, content=error.to_protocol_payload("gemini"))
+    except (ValueError, litellm.InvalidRequestError) as error:
+        status, content = format_client_protocol_error(
+            input_protocol="gemini", error=error, error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    except Exception as error:
+        status, content = format_client_protocol_error(
+            input_protocol="gemini", error=error, error_type="server_error",
+            status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
+
+
+@app.post("/v1beta/models/{model:path}:streamGenerateContent")
+@app.post("/v1/models/{model:path}:streamGenerateContent")
+async def gemini_stream_generate_content(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-compatible streaming generation through canonical routing."""
+
+    payload: dict[str, Any] = {}
+    try:
+        payload = await request.json()
+        response_stream = await client.gemini_stream_generate(
+            payload,
+            model=model,
+            raw_request=request,
+        )
+        return StreamingResponse(
+            streaming_response_wrapper(request, payload, response_stream, input_protocol="gemini"),
+            media_type="text/event-stream",
+            headers=SSE_HEADERS,
+        )
+    except (json.JSONDecodeError, ValueError, litellm.InvalidRequestError) as error:
+        status, content = format_client_protocol_error(
+            input_protocol="gemini", error=error, error_type="invalid_request",
+            status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    except StructuredAPIResponseError as error:
+        return JSONResponse(
+            status_code=error.http_status,
+            content=error.to_protocol_payload("gemini"),
+        )
+    except Exception as error:
+        status, content = format_client_protocol_error(
+            input_protocol="gemini", error=error, error_type="server_error",
+            status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
+
+
+@app.post("/v1beta/models/{model:path}:countTokens")
+@app.post("/v1/models/{model:path}:countTokens")
+async def gemini_count_tokens(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-compatible token counting endpoint."""
+
+    try:
+        payload = await request.json()
+        return JSONResponse(content=client.gemini_count_tokens(payload, model=model))
+    except (json.JSONDecodeError, ValueError) as error:
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
+        )
 
 
 @app.post("/v1/embeddings")
 async def embeddings(
     request: Request,
-    body: EmbeddingRequest,
     client: RotatingClient = Depends(get_rotating_client),
     batcher: Optional[EmbeddingBatcher] = Depends(get_embedding_batcher),
     _=Depends(verify_api_key),
@@ -1183,55 +1281,32 @@ async def embeddings(
     - False: Passes requests directly to the provider.
     """
     try:
-        request_data = body.model_dump(exclude_none=True)
+        request_data = await request.json()
+        if not isinstance(request_data, dict):
+            raise ValueError("request body must be a JSON object")
+        if not request_data.get("model"):
+            raise ValueError("Field required: 'model'")
+        if "input" not in request_data:
+            raise ValueError("Field required: 'input'")
+    except Exception as e:
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
         log_request_to_console(
             url=str(request.url),
             headers=dict(request.headers),
             client_info=(request.client.host, request.client.port),
             request_data=request_data,
         )
-        if USE_EMBEDDING_BATCHER and batcher:
-            # --- Server-Side Batching Logic ---
-            request_data = body.model_dump(exclude_none=True)
-            inputs = request_data.get("input", [])
-            if isinstance(inputs, str):
-                inputs = [inputs]
-
-            tasks = []
-            for single_input in inputs:
-                individual_request = request_data.copy()
-                individual_request["input"] = single_input
-                tasks.append(batcher.add_request(individual_request))
-
-            results = await asyncio.gather(*tasks)
-
-            all_data = []
-            total_prompt_tokens = 0
-            total_tokens = 0
-            for i, result in enumerate(results):
-                result["data"][0]["index"] = i
-                all_data.extend(result["data"])
-                total_prompt_tokens += result["usage"]["prompt_tokens"]
-                total_tokens += result["usage"]["total_tokens"]
-
-            final_response_data = {
-                "object": "list",
-                "model": results[0]["model"],
-                "data": all_data,
-                "usage": {
-                    "prompt_tokens": total_prompt_tokens,
-                    "total_tokens": total_tokens,
-                },
-            }
-            response = litellm.EmbeddingResponse(**final_response_data)
-
-        else:
-            # --- Direct Pass-Through Logic ---
-            request_data = body.model_dump(exclude_none=True)
-            if isinstance(request_data.get("input"), str):
-                request_data["input"] = [request_data["input"]]
-
-            response = await client.aembedding(request=request, **request_data)
+        response = await execute_embeddings(
+            batcher if USE_EMBEDDING_BATCHER else None,
+            client,
+            request_data,
+            raw_request=request,
+        )
 
         return response
 
@@ -1243,20 +1318,48 @@ async def embeddings(
         ValueError,
         litellm.ContextWindowExceededError,
     ) as e:
-        raise HTTPException(status_code=400, detail=f"Invalid Request: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.AuthenticationError as e:
-        raise HTTPException(status_code=401, detail=f"Authentication Error: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="authentication", status_code=401,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.RateLimitError as e:
-        raise HTTPException(status_code=429, detail=f"Rate Limit Exceeded: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="rate_limit", status_code=429,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        raise HTTPException(status_code=503, detail=f"Service Unavailable: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="server_error", status_code=503,
+        )
+        return JSONResponse(status_code=status, content=content)
     except litellm.Timeout as e:
-        raise HTTPException(status_code=504, detail=f"Gateway Timeout: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="proxy_timeout", status_code=504,
+        )
+        return JSONResponse(status_code=status, content=content)
     except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        raise HTTPException(status_code=502, detail=f"Bad Gateway: {str(e)}")
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="server_error", status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="server_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.get("/")
@@ -1406,8 +1509,8 @@ async def refresh_quota_stats(
         {
             "action": "reload" | "force_refresh",
             "scope": "all" | "provider" | "credential",
-            "provider": "gemini_cli",  // required if scope != "all"
-            "credential": "gemini_cli_oauth_1.json"  // required if scope == "credential"
+            "provider": "openai",  // required if scope != "all"
+            "credential": "openai_key_1"  // required if scope == "credential"
         }
 
     Actions:
@@ -1503,16 +1606,24 @@ async def token_count(
         messages = data.get("messages")
 
         if not model or not messages:
-            raise HTTPException(
-                status_code=400, detail="'model' and 'messages' are required."
-            )
+            raise ValueError("'model' and 'messages' are required.")
 
         count = client.token_count(**data)
         return {"token_count": count}
 
+    except ValueError as e:
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="invalid_request", status_code=400,
+        )
+        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Token count failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = format_client_protocol_error(
+            input_protocol="openai_chat", error=e,
+            error_type="server_error", status_code=500,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1/cost-estimate")
@@ -1550,58 +1661,48 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
         cache_creation_tokens = data.get("cache_creation_tokens", 0)
 
         if not model:
-            raise HTTPException(status_code=400, detail="'model' is required.")
+            status, content = format_client_protocol_error(
+                input_protocol="openai_chat",
+                error=ValueError("'model' is required."),
+                error_type="invalid_request",
+                status_code=400,
+            )
+            return JSONResponse(status_code=status, content=content)
 
-        result = {
+        model_info_service = getattr(request.app.state, "model_info_service", None)
+        if model_info_service is not None:
+            result = {"model": model}
+            try:
+                result.update(
+                    model_info_service.estimate_cost(
+                        model,
+                        prompt_tokens,
+                        completion_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                    )
+                )
+            except Exception as e:
+                logging.error(f"Cost estimation error: {e}")
+                result.update(
+                    {
+                        "cost": None,
+                        "currency": "USD",
+                        "pricing": {},
+                        "source": "unknown",
+                        "error": "Pricing data not available for this model",
+                    }
+                )
+            return result
+
+        return {
             "model": model,
             "cost": None,
             "currency": "USD",
             "pricing": {},
-            "source": None,
+            "source": "unknown",
+            "error": "Pricing data not available for this model",
         }
-
-        # Try model info service first
-        if hasattr(request.app.state, "model_info_service"):
-            model_info_service = request.app.state.model_info_service
-            if model_info_service.is_ready:
-                cost = model_info_service.calculate_cost(
-                    model,
-                    prompt_tokens,
-                    completion_tokens,
-                    cache_read_tokens,
-                    cache_creation_tokens,
-                )
-                if cost is not None:
-                    cost_info = model_info_service.get_cost_info(model)
-                    result["cost"] = cost
-                    result["pricing"] = cost_info or {}
-                    result["source"] = "model_info_service"
-                    return result
-
-        # Fallback to litellm
-        try:
-            import litellm
-
-            # Create a mock response for cost calculation
-            model_info = litellm.get_model_info(model)
-            input_cost = model_info.get("input_cost_per_token", 0)
-            output_cost = model_info.get("output_cost_per_token", 0)
-
-            if input_cost or output_cost:
-                cost = (prompt_tokens * input_cost) + (completion_tokens * output_cost)
-                result["cost"] = cost
-                result["pricing"] = {
-                    "input_cost_per_token": input_cost,
-                    "output_cost_per_token": output_cost,
-                }
-                result["source"] = "litellm_fallback"
-                return result
-        except Exception:
-            pass
-
-        result["source"] = "unknown"
-        result["error"] = "Pricing data not available for this model"
-        return result
 
     except HTTPException:
         raise

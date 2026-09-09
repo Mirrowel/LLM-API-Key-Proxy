@@ -5,7 +5,7 @@ A robust, asynchronous, and thread-safe Python library for managing a pool of AP
 ## Key Features
 
 -   **Asynchronous by Design**: Built with `asyncio` and `httpx` for high-performance, non-blocking I/O.
--   **Anthropic API Compatibility**: Built-in translation layer (`anthropic_compat`) enables Anthropic API clients (like Claude Code) to use any supported provider.
+-   **Anthropic API Compatibility**: The `anthropic_messages` protocol adapter serves Anthropic API clients (like Claude Code) on any supported provider through the canonical runtime.
 -   **Advanced Concurrency Control**: A single API key can be used for multiple concurrent requests. `OPTIMAL_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` is the soft spread-before-stacking target, while `MAX_CONCURRENT_REQUESTS_PER_KEY_<PROVIDER>` is the hard safety ceiling. Balanced mode defaults to optimal=1/max=unlimited; sequential defaults to sticky/unlimited. `0` or negative values mean unlimited.
 -   **Smart Key Management**: Selects the optimal key for each request using a capacity-phase, model-aware locking strategy to maximize availability while preserving provider-side cache locality.
 -   **Configurable Rotation Strategy**: Sequential selection is the default. Balanced selection can be enabled for providers where even distribution is preferred.
@@ -262,7 +262,7 @@ For full examples and edge cases, see [Classifier-Scoped Routing](../../docs/CLA
 Handle Anthropic Messages API requests. Accepts requests in Anthropic's format, translates them to OpenAI format internally, processes them through `acompletion`, and returns responses in Anthropic's format.
 
 -   **Parameters**:
-    -   `request`: An `AnthropicMessagesRequest` object (from `anthropic_compat.models`)
+    -   `request`: The raw `/v1/messages` payload dict
     -   `raw_request`: Optional raw request object for client disconnect checks
     -   `pre_request_callback`: Optional async callback before each API request
 -   **Returns**:
@@ -278,30 +278,13 @@ Handle Anthropic count_tokens API requests. Counts the number of tokens that wou
 
 ## Anthropic API Compatibility
 
-The library includes a translation layer (`anthropic_compat`) that enables Anthropic API clients to use any OpenAI-compatible provider.
-
-### Usage
+Anthropic API clients are served by the `anthropic_messages` protocol
+adapter through the canonical runtime — no separate translation layer:
 
 ```python
-from rotator_library.anthropic_compat import (
-    AnthropicMessagesRequest,
-    AnthropicCountTokensRequest,
-    translate_anthropic_request,
-    openai_to_anthropic_response,
-    anthropic_streaming_wrapper,
+response = await client.anthropic_messages(
+    {"model": "openai/gpt-5", "max_tokens": 1024, "messages": [...]},
 )
-
-# Create an Anthropic-format request
-request = AnthropicMessagesRequest(
-    model="gemini/gemini-2.5-flash",
-    max_tokens=1024,
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-
-# Use with RotatingClient
-async with RotatingClient(api_keys=api_keys) as client:
-    response = await client.anthropic_messages(request)
-    print(response["content"][0]["text"])
 ```
 
 ### Features

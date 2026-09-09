@@ -15,6 +15,14 @@ class OpenRouterProvider(ProviderInterface):
     """
     Provider implementation for the OpenRouter API.
     """
+    protocol_name = "openai_chat"
+    native_streaming_supported = True
+    default_api_base = "https://openrouter.ai/api/v1"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        base = self.get_provider_api_base()
+        return f"{base}/chat/completions"
+
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
         Fetches the list of available models from the OpenRouter API.

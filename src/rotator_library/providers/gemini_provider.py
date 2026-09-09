@@ -17,6 +17,24 @@ class GeminiProvider(ProviderInterface):
     Provider implementation for the Google Gemini API.
     """
 
+    protocol_name = "gemini"
+    native_streaming_supported = True
+    default_api_base = "https://generativelanguage.googleapis.com"
+
+    def get_native_operation(self, model: str = "", request=None, stream: bool = False) -> str:
+        return "stream_generate" if stream else "generate"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        base = self.get_provider_api_base()
+        if operation == "count_tokens":
+            # Token counting is its own action (never :generateContent).
+            return f"{base}/v1beta/models/{model}:countTokens"
+        action = "streamGenerateContent?alt=sse" if operation == "stream_generate" else "generateContent"
+        return f"{base}/v1beta/models/{model}:{action}"
+
+    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
+        return {"x-goog-api-key": credential_identifier}
+
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
         Fetches the list of available models from the Google Gemini API.
