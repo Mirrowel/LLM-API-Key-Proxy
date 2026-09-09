@@ -74,7 +74,7 @@ jobs:
     # paused runs skip entirely (visible gray skip); the stub and
     # compliance-gate keep posting the pending status so merges stay
     # blocked while paused.
-    if: github.event_name == 'workflow_dispatch' && vars.AGENT_PAUSED != 'true'
+    if: github.event_name == 'workflow_dispatch' && vars.AGENT_PAUSED != 'true' && !fromJSON(vars.AGENT_PAUSED_PARTS_JSON || '{}')['pr-review']
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,6 +88,9 @@ jobs:
       # Every run is a dispatch carrying prNumber explicitly (router, stub,
       # or manual) - no event-payload parsing needed.
       PR_NUMBER: ${{ inputs.prNumber }}
+      # Diff truncation ceiling (bytes) - oversized diffs are cut to protect
+      # the first prompt. 500000 = ~500KB.
+      DIFF_SPLIT_BYTES: '1000000'
       # PR-TARGET context only ("is the base a maintained branch?" for the
       # trust-context line) — NOT the scrub anchor. Scrub trust is SPLIT:
       # .github taint anchors to MAIN alone; auto-load content trusts
@@ -97,7 +100,19 @@ jobs:
       # NOTE: bare "mirrobot" is the NAME, not an identity - a human user
       # named mirrobot is NOT the agent (name vs identity, like two people
       # sharing a name). Mention-routing still accepts @mirrobot.
-      BOT_NAMES_JSON: '["mirrobot-agent", "mirrobot-agent[bot]"]'
+      # Identity + triggers (resolved at runtime by bot-config.sh from these
+      # inputs, the repo variables, and account-mode /user detection):
+      #   identities = BOT_IDENTITIES variable (this agent + its [bot] app
+      #               form) (+) the /user-detected account login; fallback only
+      #               when both are absent.
+      #   trigger stems = BOT_TRIGGERS variable, else identity-derived
+      #               (@stem, /stem-review, /stem-check), else the mirrobot words.
+      BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+      BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
+      # Early-consumer fallback (bot-config.sh upgrades this with the
+      # /user-detected login once it runs, post-artifacts):
+      BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
+      AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
       # Noise filtering for thread context (see fetch-pr-discussion.sh):
       # CONTEXT_IGNORE_AUTHORS - comma logins dropped outright (repo variable)
       # CONTEXT_FILTER_PATTERNS_JSON - JSON array of body regexes dropping
@@ -114,12 +129,27 @@ jobs:
       # (secrets)". Deriving the boolean here (job env, where secrets IS
       # valid) and branching on env.X in step ifs is the sanctioned pattern.
       ACCOUNT_TOKEN_SET: ${{ secrets.ACCOUNT_GH_TOKEN != '' }}
-      COMMENT_FETCH_LIMIT: '20'
-      REVIEW_FETCH_LIMIT: '30'
-      REVIEW_THREAD_FETCH_LIMIT: '40'
-      THREAD_COMMENT_FETCH_LIMIT: '10'
+      # Context budget (CONTEXT_LIMITS_JSON variable, per-key defaults in
+      # fetch-pr-discussion.sh): comments/reviews/own-reviews/
+      # threads-per-review/thread-comments/orphan-threads/
+      # orphan-thread-comments. Newest-first, filter-before-cap.
+      CONTEXT_LIMITS_JSON: ${{ vars.CONTEXT_LIMITS_JSON || '' }}
 
     steps:
+      # Kill-switch shape validation: job-level if-expressions cannot
+      # type-check (fromJSON of a VALID-but-wrong-shape value — e.g. `[]`,
+      # `3` — silently evaluates the part as not-paused). This step makes
+      # a broken AGENT_PAUSED_PARTS_JSON fail LOUDLY, matching the
+      # router/stub gates: a kill switch you cannot see working is a
+      # kill switch you cannot trust.
+      - name: Validate pause config
+        env:
+          PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '{}' }}
+        run: |
+          printf '%s' "$PARTS_JSON" | jq -e 'type == "object"' >/dev/null || {
+            echo "::error::AGENT_PAUSED_PARTS_JSON must be a JSON object like {\"pr-review\": true} — got a different shape. Refusing to run with a broken kill switch (fix or delete the variable)."
+            exit 1
+          }
       # Runtime enforcement of the dispatch contract (schema-required is
       # impossible - see the inputs comment for the platform bug).
       - name: Validate dispatch inputs
@@ -186,15 +216,27 @@ jobs:
           fi
           author=$(printf '%s' "$comment_json" | jq -r '.user.login')
           association=$(printf '%s' "$comment_json" | jq -r '.author_association')
+          # BOT_NAMES_JSON arrives as a FLAT comma list (the variable and the
+          # stock fallback are both flat; platform format doctrine).
+          # Normalize to a JSON array once for every jq consumer this run;
+          # the artifacts step re-exports the authoritative array via
+          # bot-config.sh.
+          case "$BOT_NAMES_JSON" in
+            '['*) ;;
+            *) BOT_NAMES_JSON=$(printf '%s' "${BOT_IDENTITIES_INPUT:-$BOT_NAMES_JSON}" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)
+               printf 'BOT_NAMES_JSON=%s\n' "$BOT_NAMES_JSON" >> "$GITHUB_ENV" ;;
+          esac
+
           # Case-insensitive bot-loop guard (logins are case-insensitive;
           # canonical casing follows renames)
           author_lc=$(printf '%s' "$author" | tr 'A-Z' 'a-z')
-          case "$author_lc" in
-            *'[bot]'|mirrobot|mirrobot-agent)
+          # Bot/agent loop guard: generic [bot] suffix OR resolved identity
+          # membership (BOT_NAMES_JSON, case-insensitive - set by bot-config.sh).
+          if printf '%s' "$author_lc" | grep -q '\[bot\]$' \
+             || printf '%s' "$BOT_NAMES_JSON" | jq -e --arg a "$author_lc" 'map(ascii_downcase) | index($a) != null' >/dev/null 2>&1; then
               echo "::notice::Routed comment authored by ${author} (bot/agent); ignoring its identity."
               exit 0
-              ;;
-          esac
+          fi
           {
             echo "RESOLVED_COMMENT_AUTHOR=${author}"
             echo "RESOLVED_ASSOCIATION=${association}"
@@ -294,7 +336,6 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           pending_review_ids=$(gh api --paginate \
@@ -379,12 +420,15 @@ jobs:
           if [ -z "$issue_numbers" ]; then
             linked_issues="No issues are formally linked for closure by this PR."
           else
-            for number in $issue_numbers; do
-              issue_details_json=$(gh issue view "$number" --repo "${{ github.repository }}" --json title,body 2>/dev/null || echo "{}")
-              issue_title=$(echo "$issue_details_json" | jq -r '.title // "Title not available"')
-              issue_body=$(echo "$issue_details_json" | jq -r '.body // "Body not available"')
-              linked_issues_content+=$(printf "<issue>\n <number>#%s</number>\n <title>%s</title>\n <body>\n%s\n</body>\n</issue>\n" "$number" "$issue_title" "$issue_body")
-            done
+             for number in $issue_numbers; do
+               issue_details_json=$(gh issue view "$number" --repo "${{ github.repository }}" --json title,body 2>/dev/null || echo "{}")
+               issue_title=$(echo "$issue_details_json" | jq -r '.title // "Title not available"')
+               # Body capped: linked issues are CONTEXT (the agent can read
+               # the full issue on demand) - a 64KB body x N linked issues
+               # must not silently eat the prompt.
+               issue_body=$(echo "$issue_details_json" | jq -r --argjson bc 4000 '(.body // "Body not available") | if length > $bc then .[0:$bc] + "\n[linked-issue body truncated - read the full issue if it matters]" else . end')
+               linked_issues_content+=$(printf "<issue>\n <number>#%s</number>\n <title>%s</title>\n <body>\n%s\n</body>\n</issue>\n" "$number" "$issue_title" "$issue_body")
+             done
             linked_issues=$linked_issues_content
           fi
 
@@ -458,7 +502,6 @@ jobs:
         id: review_type
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
         run: |
           # Robust last summary detection:
@@ -508,7 +551,7 @@ jobs:
             echo "Latest summary lacks marker; attempting commit_id from latest bot review..."
             reviews_rest=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" || echo '[]')
             resolved_sha=$(echo "$reviews_rest" | jq -r --argjson bots "$BOT_NAMES_JSON" '
-              map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u))))
+              map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
               | sort_by(.submitted_at)
               | last
               | .commit_id // ""
@@ -552,10 +595,15 @@ jobs:
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
+          cp .github/scripts/bot-config.sh /tmp/bot-config.sh
           cp .github/scripts/react.sh /tmp/react.sh
+          cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/share-filter.sh
+          cp .github/scripts/split-diff.sh /tmp/split-diff.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh
           bash /tmp/assemble-prompt.sh --verify
+          # Resolve identity + trigger stems (exports BOT_NAMES_JSON / BOT_TRIGGER_STEMS)
+          bash /tmp/bot-config.sh
 
       - name: Checkout PR head
         if: github.event_name == 'workflow_dispatch'
@@ -612,10 +660,23 @@ jobs:
             # scrub). Never flatten the whole file: the per-commit bullets
             # below line 1 are what /tmp/scrub-taint.txt exists for.
             taint_summary=$(head -1 /tmp/scrub-taint.txt)
+            TAINT_DELIM="TAINT_EOF_$(openssl rand -hex 8)"
             {
-              echo "TRUST_CONTEXT_WARNING<<TAINT_EOF"
+              echo "TRUST_CONTEXT_WARNING<<$TAINT_DELIM"
               echo "$taint_summary"
-              echo "TAINT_EOF"
+              echo "$TAINT_DELIM"
+            } >> "$GITHUB_ENV"
+          fi
+          if [ -s /tmp/scrub-era.txt ]; then
+            # Dated-context notes surface independently of taint line 1 —
+            # trusted-era auto-load keeps must stay visible to the agent
+            # even when a TAINT alert occupies the taint summary. Unguessable
+            # delimiter: era content embeds file paths from PR-adjacent trees.
+            ERA_DELIM="ERA_EOF_$(openssl rand -hex 8)"
+            {
+              echo "TRUST_CONTEXT_ERA<<$ERA_DELIM"
+              cat /tmp/scrub-era.txt
+              echo "$ERA_DELIM"
             } >> "$GITHUB_ENV"
           fi
 
@@ -641,25 +702,18 @@ jobs:
             if MERGE_BASE=$(git merge-base origin/"$BASE_BRANCH" "$CURRENT_SHA" 2>/dev/null); then
               echo "Found merge base: $MERGE_BASE"
               
-              # Generate diff from merge base to current commit
-              if DIFF_CONTENT=$(git diff --patch "$MERGE_BASE".."$CURRENT_SHA" 2>/dev/null); then
-                DIFF_SIZE=${#DIFF_CONTENT}
-                DIFF_LINES=$(echo "$DIFF_CONTENT" | wc -l)
-                echo "Generated PR diff: $DIFF_LINES lines, $DIFF_SIZE characters"
-                
-                # Truncate if too large (500KB limit to avoid context overflow)
-                if [ $DIFF_SIZE -gt 500000 ]; then
-                  echo "::warning::PR diff is very large ($DIFF_SIZE chars). Truncating to 500KB."
-                  TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - PR is very large. Showing first 500KB only. Review scaled to high-impact areas.]'
-                  DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
-                fi
-                # Write diff directly into the repository workspace in the dedicated folder
-                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+              # Generate diff from merge base to current commit.
+              # Written straight to the file (never a shell var - huge diffs
+              # would balloon runner memory) then handed to the splitter:
+              # oversized diffs are SPLIT into navigable parts + an index at
+              # this path, never truncated.
+              DIFF_OUT="$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+              if git diff --patch "$MERGE_BASE".."$CURRENT_SHA" > "$DIFF_OUT" 2>/dev/null; then
+                echo "Generated PR diff: $(wc -l < "$DIFF_OUT") lines, $(wc -c < "$DIFF_OUT") bytes"
+                bash /tmp/split-diff.sh "$DIFF_OUT" "${DIFF_SPLIT_BYTES:-1000000}"
               else
                 echo "::warning::Could not generate diff. Using changed files list only."
-                DIFF_CONTENT="(Diff generation failed. Please refer to the changed files list above.)"
-                # Write fallback diff directly into the workspace folder
-                echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/first_review_diff.txt"
+                echo "(Diff generation failed. Please refer to the changed files list above.)" > "$DIFF_OUT"
               fi
             else
             echo "::warning::Could not find merge base between $BASE_BRANCH and $CURRENT_SHA."
@@ -718,23 +772,15 @@ jobs:
           if git fetch origin $LAST_SHA 2>/dev/null || git cat-file -e $LAST_SHA^{commit} 2>/dev/null; then
             echo "Successfully located $LAST_SHA."
             # Generate diff, fallback to empty if git diff fails (e.g., no common ancestor)
-            if DIFF_CONTENT=$(git diff --patch $LAST_SHA..$CURRENT_SHA 2>/dev/null); then
-              DIFF_SIZE=${#DIFF_CONTENT}
-              DIFF_LINES=$(echo "$DIFF_CONTENT" | wc -l)
-              echo "Generated incremental diff: $DIFF_LINES lines, $DIFF_SIZE characters"
-              
-              # Truncate if too large (500KB limit)
-              if [ $DIFF_SIZE -gt 500000 ]; then
-                echo "::warning::Incremental diff is very large ($DIFF_SIZE chars). Truncating to 500KB."
-                TRUNCATION_MSG=$'\n\n[DIFF TRUNCATED - Changes are very large. Showing first 500KB only.]'
-                DIFF_CONTENT="${DIFF_CONTENT:0:500000}${TRUNCATION_MSG}"
-              fi
-              # Write incremental diff directly into the repository workspace folder
-              echo "$DIFF_CONTENT" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+            # Same split-not-truncate contract as the full diff above.
+            INC_OUT="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+            if git diff --patch $LAST_SHA..$CURRENT_SHA > "$INC_OUT" 2>/dev/null; then
+              echo "Generated incremental diff: $(wc -l < "$INC_OUT") lines, $(wc -c < "$INC_OUT") bytes"
+              bash /tmp/split-diff.sh "$INC_OUT" "${DIFF_SPLIT_BYTES:-1000000}"
             else
               echo "::warning::Could not generate diff between $LAST_SHA and $CURRENT_SHA. Possible rebase/force-push. AI will perform full review."
               # Ensure an empty incremental diff file exists in the workspace folder as fallback
-              echo "" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+              echo "" > "$INC_OUT"
             fi
           else
             echo "::warning::Failed to fetch last reviewed SHA: $LAST_SHA. This can happen if the commit was part of a force-push or rebase. The AI will perform a full review as a fallback."
@@ -759,6 +805,7 @@ jobs:
           REQUESTER_CONTEXT: ${{ steps.requester.outputs.requester_context }}
           TRUST_CONTEXT: ${{ env.TRUST_CONTEXT }}
           TRUST_CONTEXT_WARNING: ${{ env.TRUST_CONTEXT_WARNING }}
+          TRUST_CONTEXT_ERA: ${{ env.TRUST_CONTEXT_ERA }}
           TRUSTED_PEOPLE: ${{ env.TRUSTED_PEOPLE }}
         run: |
           # Build DIFF_FILE_PATH pointing to the generated diff in the repository
@@ -774,9 +821,9 @@ jobs:
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT}'
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}'
           # Prepend the security brief (with the verified requester + trust context lines)
-          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh "$MANIFEST" | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
+          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh "$MANIFEST" | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
           echo "PULL_REQUEST_CONTEXT=" >> "$GITHUB_ENV"
 
@@ -810,15 +857,11 @@ jobs:
           # sensitive files shortly after. Hard timeout so a hung boot
           # cannot pin them for the whole run; the post-run step is the
           # belt for fast exits and killed waiters.
-          ( for _ in $(seq 1 180); do [ -f /tmp/.oc-booted ] && break; sleep 1; done
-            sleep 2
-            rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
-            rm -rf ~/.mirrobot-plugins ) &
+          ( bash /tmp/opencode-cleanup.sh waiter ) &
           opencode run --share - < "$TMP_DIR/assembled_prompt.txt" 2>&1 | bash /tmp/share-filter.sh
           # Fast-exit belt (the step runs under -e; on failure the
           # always() post-run step below is the cleanup guarantee).
-          rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
-          rm -rf ~/.mirrobot-plugins
+          bash /tmp/opencode-cleanup.sh now
 
       - name: Post-run cleanup and usage stats
         # Guaranteed removal of the config/plugin files on every path
@@ -827,8 +870,7 @@ jobs:
         # default (the --models flag would expose model names).
         if: always()
         run: |
-          rm -f ~/.config/opencode/opencode.json /tmp/.oc-booted
-          rm -rf ~/.mirrobot-plugins
+          bash /tmp/opencode-cleanup.sh now
           OC="$(command -v opencode || true)"
           if [ -z "$OC" ] && [ -x "$HOME/.local/bin/opencode" ]; then OC="$HOME/.local/bin/opencode"; fi
           if [ -n "$OC" ]; then
@@ -878,7 +920,6 @@ jobs:
         # repair failure would leave the repo believing footers are hardened.
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
           BOT_NAMES_JSON: ${{ env.BOT_NAMES_JSON }}
           PR_HEAD_SHA: ${{ env.PR_HEAD_SHA }}
         run: |

@@ -26,7 +26,8 @@ jobs:
     # AGENT_PAUSED variable: kill switch - paused runs skip entirely
     # (visible gray skip); the stub and compliance-gate keep the pending
     # status posted so merges stay blocked while paused.
-    if: vars.AGENT_PAUSED != 'true'
+    # Per-part pause (job-level; malformed variable = loud fail; missing = runs).
+    if: vars.AGENT_PAUSED != 'true' && !fromJSON(vars.AGENT_PAUSED_PARTS_JSON || '{}')['issue-analysis']
     runs-on: ubuntu-latest
     # Least privilege for the built-in GITHUB_TOKEN: only the initial
     # actions/checkout uses it. The reaction, comments, and all bot operations
@@ -43,6 +44,16 @@ jobs:
       # If triggered by 'issues', it uses github.event.issue.number.
       # If triggered by 'workflow_dispatch', it uses the number you provided in the form.
       ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issueNumber }}
+      # Identity + triggers (resolved by bot-config.sh): identities =
+      # BOT_IDENTITIES variable (+) the /user-detected account login;
+      # fallback only when both are absent. Trigger stems = BOT_TRIGGERS
+      # variable, else identity-derived, else the mirrobot words.
+      BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+      BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
+      # Early-consumer fallback (bot-config.sh upgrades this with the
+      # /user-detected login once it runs, post-artifacts):
+      BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
+      AGENT_PAUSED_PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '' }}
       # Noise filtering for thread context (see fetch-pr-discussion.sh):
       # CONTEXT_IGNORE_AUTHORS - comma logins dropped outright (repo variable)
       # CONTEXT_FILTER_PATTERNS_JSON - JSON array of body regexes dropping
@@ -51,6 +62,20 @@ jobs:
       CONTEXT_FILTER_PATTERNS_JSON: ${{ vars.CONTEXT_FILTER_PATTERNS_JSON || '' }}
 
     steps:
+      # Kill-switch shape validation: job-level if-expressions cannot
+      # type-check (fromJSON of a VALID-but-wrong-shape value — e.g. `[]`,
+      # `3` — silently evaluates the part as not-paused). This step makes
+      # a broken AGENT_PAUSED_PARTS_JSON fail LOUDLY, matching the
+      # router/stub gates: a kill switch you cannot see working is a
+      # kill switch you cannot trust.
+      - name: Validate pause config
+        env:
+          PARTS_JSON: ${{ vars.AGENT_PAUSED_PARTS_JSON || '{}' }}
+        run: |
+          printf '%s' "$PARTS_JSON" | jq -e 'type == "object"' >/dev/null || {
+            echo "::error::AGENT_PAUSED_PARTS_JSON must be a JSON object like {\"pr-review\": true} — got a different shape. Refusing to run with a broken kill switch (fix or delete the variable)."
+            exit 1
+          }
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -94,7 +119,6 @@ jobs:
       - name: Add reaction to issue
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
         run: |
           gh api \
             --method POST \
@@ -119,9 +143,13 @@ jobs:
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
+          cp .github/scripts/bot-config.sh /tmp/bot-config.sh
           cp .github/scripts/react.sh /tmp/react.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/share-filter.sh
+          cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh
           bash /tmp/assemble-prompt.sh --verify
+          # Resolve identity + trigger stems (exports BOT_NAMES_JSON / BOT_TRIGGER_STEMS)
+          bash /tmp/bot-config.sh
 
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -150,7 +178,6 @@ jobs:
         id: issue_details
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
-          EXTRA_TRUSTED_USERS: ${{ vars.TRUSTED_AGENT_USERS }}
         run: |
           # Fetch all necessary data in one call
           issue_data=$(gh issue view $ISSUE_NUMBER --json author,title,body,createdAt,state,comments)
@@ -256,20 +283,16 @@ jobs:
         run: |
             set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
-            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY}'
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}'
             # Config lifecycle: opencode reads config + plugins once at boot.
             # The share filter touches /tmp/.oc-booted on the first output
             # line (= boot complete, config consumed); this waiter deletes
             # the sensitive files shortly after. Hard timeout so a hung
             # boot cannot pin them; the always() post-run step is the belt.
-            ( for _ in $(seq 1 180); do [ -f /tmp/.oc-booted ] && break; sleep 1; done
-              sleep 2
-              rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
-              rm -rf ~/.mirrobot-plugins ) &
+            ( bash /tmp/opencode-cleanup.sh waiter ) &
             # Prepend the security brief (with the verified requester + trust context lines)
             { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
-            rm -f /tmp/.oc-booted ~/.config/opencode/opencode.json
-            rm -rf ~/.mirrobot-plugins
+            bash /tmp/opencode-cleanup.sh now
 
       - name: Post-run cleanup and usage stats
         # Guaranteed removal of the config/plugin files on every path plus
@@ -278,9 +301,8 @@ jobs:
         # expose model names).
         if: always()
         run: |
-            rm -f ~/.config/opencode/opencode.json /tmp/.oc-booted
-            rm -rf ~/.mirrobot-plugins
-            OC="$(command -v opencode || true)"
+            bash /tmp/opencode-cleanup.sh now
+              OC="$(command -v opencode || true)"
             if [ -z "$OC" ] && [ -x "$HOME/.local/bin/opencode" ]; then OC="$HOME/.local/bin/opencode"; fi
             if [ -n "$OC" ]; then
               { echo "### Agent usage (this run)"; echo '```'; "$OC" stats 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"

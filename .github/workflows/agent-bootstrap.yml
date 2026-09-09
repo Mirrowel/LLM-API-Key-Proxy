@@ -28,6 +28,11 @@
 #   secrets API needs a user token, which no workflow here holds).
 # - NEVER OVERWRITES: existing variables are left byte-for-byte intact;
 #   only absent ones are created.
+# - IDENTITY SEEDING: in account mode the resolved /user login seeds
+#   BOT_IDENTITIES; in app mode the stock fallback identities seed it
+#   (the App cannot self-discover - edit the variable after an App rename).
+#   BOT_TRIGGERS always seeds BOTH stock stems (mirrobot, mirrobot-agent)
+#   so the multi-stem shape is visible and every derived command works.
 
 name: Agent Bootstrap
 run-name: "Agent Bootstrap - seed defaults"
@@ -82,6 +87,19 @@ jobs:
             echo "::notice::No bot token available in repo secrets - printing manual seeding instructions instead."
             exit 0
           fi
+          # Account mode: derive the login for the identity seed (the token
+          # is validated by /user in bot-setup on every run anyway). The
+          # account login is seeded ALONE: never a [bot] twin (separate
+          # namespace — shape proves nothing; an operator who also runs a
+          # same-named App adds its full "name[bot]" login to the variable
+          # themselves, as an explicit claim of control).
+          IDENT_SEED='mirrobot-agent, mirrobot-agent[bot]'
+          if [ "$MODE" = "account" ]; then
+            login=$(gh api /user --jq .login 2>/dev/null || true)
+            if [ -n "$login" ]; then
+              IDENT_SEED="$login"
+            fi
+          fi
           # Safe-off defaults / prefilled templates. Values are committed
           # repo content = public and trusted; nothing secret ever passes
           # through this workflow. EMPTY-DEFAULT VARIABLES ARE DELIBERATELY
@@ -90,9 +108,14 @@ jobs:
           # state for every consumer - set them only when you have content.
           declare -A DEFAULTS=(
             [AGENT_PAUSED]="false"
+            [AGENT_PAUSED_PARTS_JSON]='{"pr-review":false,"bot-reply":false,"compliance-check":false,"issue-analysis":false}'
             [AGENT_MODELS_JSON]='{"pr-review":{"model":"","fast":""},"bot-reply":{"model":"","fast":""},"compliance-check":{"model":"","fast":""},"issue-comment":{"model":"","fast":""}}'
+            [BOT_IDENTITIES]="$IDENT_SEED"
+            [BOT_TRIGGERS]="mirrobot, mirrobot-agent"
+            [CONTEXT_LIMITS_JSON]='{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-comments":70,"body-chars":3000}'
             [CONTEXT_FILTER_PATTERNS_JSON]="[]"
             [FOREIGN_MENTIONS_ENABLED]="false"
+            [OPEN_TRIGGERING]="true"
             [OPENCODE_PLUGINS_JSON]="{}"
             [PREVIOUS_BOT_REVIEWS_COUNT]="1"
           )
@@ -113,6 +136,64 @@ jobs:
           fi
           echo "Bootstrap complete."
 
+      - name: Seed label vocabulary (create-if-missing)
+        # Labels are public repo metadata (unlike variables) - naming what
+        # was created is fine and useful. Existing labels are NEVER touched:
+        # a repo's own label customs always win over the seeded palette.
+        env:
+          GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN || steps.app_token.outputs.token }}
+          REPO: ${{ github.repository }}
+          MODE: ${{ steps.token.outputs.mode }}
+        run: |
+          set -u
+          if [ "$MODE" = "manual" ]; then
+            echo "::notice::No bot token available - labels not seeded (re-run bootstrap after adding a bot identity, or create them from the run summary's label table)."
+            exit 0
+          fi
+          # name|color|description (GitHub-standard labels keep their
+          # canonical colors/descriptions; the rest follow the prefix
+          # conventions of the agent's triage vocabulary). Quoted heredoc:
+          # descriptions may contain apostrophes.
+          EXISTING=$(gh label list -R "$REPO" --limit 200 --json name --jq '.[].name')
+          CREATED=0
+          while IFS='|' read -r name color desc; do
+            [ -z "$name" ] && continue
+            if printf '%s\n' "$EXISTING" | grep -qxF "$name"; then
+              continue
+            fi
+            if gh label create "$name" -R "$REPO" --color "$color" --description "$desc" >/dev/null 2>&1; then
+              CREATED=$((CREATED+1))
+            else
+              LABEL_FAILED=1
+            fi
+          done <<'LABELS_EOF'
+          bug|d73a4a|Something isn't working
+          duplicate|cfd3d7|This issue or pull request already exists
+          enhancement|a2eeef|New feature or request
+          documentation|0075ca|Improvements or additions to documentation
+          question|d876e3|Support ask or clarification
+          invalid|e4e669|This doesn't seem right
+          wontfix|ffffff|This will not be worked on
+          help wanted|008672|Extra attention is needed
+          good first issue|7057ff|Good for newcomers
+          severity: critical|b60205|Agent severity: critical
+          severity: major|ff7518|Agent severity: major
+          severity: minor|fbca04|Agent severity: minor
+          severity: info|1d76db|Agent severity: info
+          confirmed|0e8a16|Verified by the agent's analysis
+          as-designed|9e9e9e|Behavior is intended; not a bug
+          needs-info|fef2c0|Blocked on more information from the filer
+          needs-decision|d4c5f9|Awaiting a maintainer decision
+          already-fixed|bfd4f2|Fixed on a branch, PR, or release; nothing left to do here
+          accepted|207de5|Feature request evaluated and worth building
+          wish|bfe5bf|Not on the roadmap; maybe someday
+          Agent Monitored|5319e7|Collaborator-applied: PR watched by the agent (the agent never applies this)
+          LABELS_EOF
+          if [ "${LABEL_FAILED:-0}" = "1" ]; then
+            echo "::warning::Some labels could not be added (token may lack label access). Existing labels were untouched."
+          fi
+          echo "Label seeding done. New labels: $CREATED (existing untouched)."
+
       - name: Static configuration checklist
         # STATIC documentation only - identical output on every repo, every
         # run. Reveals nothing about actual state (by design AND by
@@ -129,15 +210,19 @@ jobs:
 
           | Variable | Default | What it does |
           |---|---|---|
-          | `AGENT_PAUSED` | `false` | Kill switch: `true` pauses the agent's brain (router, poller, all agent workflows). The stub + compliance-gate keep blocking merges while paused. |
+          | `AGENT_PAUSED` | `false` | Global kill switch: `true` pauses everything (router, poller, all agent workflows). The stub + compliance-gate keep blocking merges while paused. |
+          | `AGENT_PAUSED_PARTS_JSON` | all `false` | Per-part pause: `{"pr-review":true}` pauses ONE agent part (visible green skip; router stops dispatching it). Missing keys = not paused; malformed = loud fail. |
           | `AGENT_MODELS_JSON` | empty template | Per-agent models: `{"pr-review": {"model": "provider/model", "fast": "provider/model"}, ...}`. Empty strings fall back to the global `OPENCODE_MODEL` secret. |
+          | `BOT_IDENTITIES` | account login (app: stock names) | WHO the agent is: comma-separated logins treated as self for loop guards, review attribution, footer verification. Union of this variable and account-mode /user detection; the mirrobot fallback applies only when both are absent. |
+          | `BOT_TRIGGERS` | `mirrobot, mirrobot-agent` | WHAT summons the agent: comma-separated raw names (no @ or / prefixes). Each stem derives `@<stem>`, `/<stem>-review`, `/<stem>_review`, `/<stem>-check`, `/<stem>_check`. Renaming the bot? Set this + `BOT_IDENTITIES`. |
+          | `CONTEXT_LIMITS_JSON` | full budget template | Context budget (newest-first, filter-before-cap): `comments`, `reviews`, `own-reviews` (always-include safeguard), `threads-per-review`, `thread-comments`, `orphan-threads`, `orphan-thread-comments`. Lower values = smaller first prompts on noisy repos. |
           | `CONTEXT_IGNORE_AUTHORS` | empty | Comma-separated authors whose posts are filtered from agent context (AI-reviewer noise, bots). |
-          | `CONTEXT_FILTER_PATTERNS_JSON` | `[]` | JSON array of regex patterns; matching posts are filtered from context. |
-          | `TRUSTED_AGENT_USERS` | empty | Extra trusted users (comma-separated) beyond direct collaborators. |
+          | `CONTEXT_FILTER_PATTERNS_JSON` | `[]` | JSON array of regex patterns; matching posts are filtered from context. REPLACES the baked defaults. |
+          | `TRUSTED_AGENT_USERS` | empty | Extra trusted users (comma-separated) beyond direct collaborators (who already count as friendly). |
           | `FOREIGN_MENTIONS_ENABLED` | `false` | Cross-repo guest mode master switch. |
           | `FOREIGN_MENTIONS_USERS` | empty | Allowlist for cross-repo summons (comma-separated logins). |
           | `OPENCODE_PLUGINS_JSON` | `{}` | Plugin files: `{"<relative-path>": "<file content>"}` materialized to `~/.mirrobot-plugins/`. Reference by absolute path in the config secret's `plugin` array. For multiple plugins use `OPENCODE_PLUGINS_JSON_1` .. `_5`. |
-          | `PREVIOUS_BOT_REVIEWS_COUNT` | `1` | How many of the agent's own past reviews to include as review memory. |
+          | `PREVIOUS_BOT_REVIEWS_COUNT` | `1` | How many of the agent's own newest reviews are ELEVATED (unfiltered memory). Older own reviews still appear - filtered - in the history block. |
 
           ### Secrets (Settings → Secrets and variables → Actions → Secrets)
 
@@ -147,7 +232,7 @@ jobs:
           | `BOT_APP_ID` + `BOT_PRIVATE_KEY` | identity B (pick A or B) | GitHub App credentials (fallback identity when no account token). For bootstrap seeding the App also needs its Variables: write permission. |
           | `OPENCODE_MODEL` | yes | Global model in `provider/model` format; used by every agent without a per-agent override. |
           | `OPENCODE_CONFIG_JSON` | strongly recommended | Complete opencode config (providers with API keys, mcp, plugins, permission block). Template: `.github/actions/bot-setup/permissions.example.json`. The permission block is the agent's security profile - without it the agent runs on permissive defaults. |
-          | `OPENCODE_FAST_MODEL` | optional | Global fast/small model. |
+          | `OPENCODE_FAST_MODEL` | optional | Global small_model (session-title generation). |
           | `OPENCODE_API_KEY` | optional | API key applied to the main model's provider (redundant when keys live inside `OPENCODE_CONFIG_JSON`). |
           | `SHARE_LINK_PUBKEY` | optional | RSA public key enabling encrypted session share links (see `decrypt_share_link.py`). |
 
@@ -157,13 +242,29 @@ jobs:
           gh secret set OPENCODE_CONFIG_JSON  -R <owner>/<repo> < config.min.json
           ```
 
+          ### Labels
+
+          The bootstrap also seeds the triage label vocabulary (existing labels untouched — your repo's own labels always win). The issue-analysis agent applies these automatically; maintainers can use them freely:
+
+          - **Kind:** `bug` `duplicate` `enhancement` `documentation` `question` `invalid` `wontfix` (+ `help wanted`, `good first issue` for contributors)
+          - **Severity (agent-applied with the verdict):** `severity: critical` `severity: major` `severity: minor` `severity: info`
+          - **Triage state:** `confirmed` `as-designed` `needs-info` `needs-decision` `already-fixed` `accepted` `wish`
+          - **Collaborator-only:** `Agent Monitored` (marks PRs watched by the agent — the agent itself never applies it)
+
           ### Manual variable seeding (if the seeding step could not run)
 
           Variables that default to empty (`CONTEXT_IGNORE_AUTHORS`, `TRUSTED_AGENT_USERS`, `FOREIGN_MENTIONS_USERS`) are intentionally NOT created - GitHub variables cannot hold empty values, and absence already means empty. Create them only when you have content.
 
+          For `BOT_IDENTITIES`, list ONLY identities you control. The `[bot]` form is a SEPARATE GitHub namespace (app slugs vs usernames): include `your-bot-name[bot]` ONLY if you registered the GitHub App of that name - the platform never assumes a `[bot]` twin is yours, and neither should you.
+
           ```bash
           gh variable set AGENT_PAUSED -R <owner>/<repo> --body "false"
+          gh variable set OPEN_TRIGGERING -R <owner>/<repo> --body "true"
+          gh variable set AGENT_PAUSED_PARTS_JSON -R <owner>/<repo> --body '{"pr-review":false,"bot-reply":false,"compliance-check":false,"issue-analysis":false}'
           gh variable set AGENT_MODELS_JSON -R <owner>/<repo> --body '{"pr-review":{"model":"","fast":""},"bot-reply":{"model":"","fast":""},"compliance-check":{"model":"","fast":""},"issue-comment":{"model":"","fast":""}}'
+          gh variable set BOT_IDENTITIES -R <owner>/<repo> --body 'your-bot-name'
+          gh variable set BOT_TRIGGERS -R <owner>/<repo> --body "your-bot-name, your-other-name"
+          gh variable set CONTEXT_LIMITS_JSON -R <owner>/<repo> --body '{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-comments":70,"body-chars":3000}'
           gh variable set CONTEXT_FILTER_PATTERNS_JSON -R <owner>/<repo> --body "[]"
           gh variable set FOREIGN_MENTIONS_ENABLED -R <owner>/<repo> --body "false"
           gh variable set OPENCODE_PLUGINS_JSON -R <owner>/<repo> --body "{}"

@@ -1,6 +1,6 @@
 ### Protocol for FIRST Compliance Check
 
-This is the FIRST compliance check on this PR: no previous compliance report exists - perform the full audit over the entire PR diff.
+This is the FIRST compliance check on this PR: no previous compliance report exists - audit the full scope of PR changes (the diff file may be a split index; the orientation rules apply).
 
 **Your scope:** the full diff at `${DIFF_PATH}` — everything the PR changes is yours to verify.
 

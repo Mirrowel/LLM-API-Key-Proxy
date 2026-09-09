@@ -117,11 +117,21 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           HOME_OWNER: ${{ github.repository_owner }}
           FOREIGN_MENTIONS_USERS: ${{ vars.FOREIGN_MENTIONS_USERS || '' }}
-          BOT_NAMES_JSON: '["mirrobot-agent", "mirrobot-agent[bot]"]'
+          # Identity + triggers (resolved below by bot-config.sh): identities =
+          # BOT_IDENTITIES variable (+) the /user-detected account login;
+          # fallback only when both are absent. Trigger stems = BOT_TRIGGERS
+          # variable, else identity-derived, else the mirrobot words.
+          BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
+          BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS || '' }}
+          BOT_NAMES_JSON: ${{ vars.BOT_IDENTITIES || 'mirrobot-agent, mirrobot-agent[bot]' }}
           MAX_DISPATCH: '3'
         run: |
           set -euo pipefail
           chmod +x .github/scripts/*.sh
+          # Resolve identity + trigger stems for the gauntlet below (same-step
+          # consumption via --export). Workspace copy is trusted here: this
+          # workflow always runs from the default branch.
+          eval "$(bash .github/scripts/bot-config.sh --export)"
           # Relay payload comes from the event file, NEVER via env expressions:
           # client_payload.notifications is a JSON ARRAY, and injecting an
           # array into an env value makes the whole template invalid

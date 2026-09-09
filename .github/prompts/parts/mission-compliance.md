@@ -44,6 +44,7 @@ ${INCREMENTAL_DIFF_PATH}
 ```
 
 **Work the diff as a file, not a single ingest.** It is a file precisely because it may be far too large to read at once:
+- If the file starts with `[DIFF SPLIT`, it is an INDEX, not the diff: read it (small), pick the parts relevant to each file group, and audit those parts. Oversized diffs are split, never truncated — every change exists in the parts.
 - Start with its shape: `wc -l`, then a file index: `grep -n '^diff --git' ${DIFF_PATH}` (each hit is a line offset where that file's section starts).
 - If it is small, read it whole. If it is large, work through it file-by-file with `sed -n 'START,ENDp'` ranges taken from the index. Never paste the whole diff into your context or output.
 

@@ -1,0 +1,53 @@
+# compliance-groups.json - repo-specific file groups for the compliance check
+#
+# HOW IT WORKS
+#   If this file exists as "compliance-groups.json" (same directory as the
+#   compliance-check.yml workflow), it REPLACES the inline FILE_GROUPS_JSON
+#   default baked into that workflow. When it is absent or invalid, the
+#   workflow default applies. Nothing else changes.
+#
+#   This .EXAMPLE.json file is never loaded - it exists to be copied.
+#
+# WHY
+#   The platform syncs wholesale from the agent repository, so repo-specific
+#   values must not live inside the workflow files themselves. Your groups
+#   live in YOUR compliance-groups.json; syncs overwrite only machinery.
+#
+# SCHEMA (one array entry per group)
+#   name        - display name shown in the compliance report
+#   description - what the agent should verify when files in this group change
+#   files       - glob patterns (e.g. "docs/**/*.md"); a change in one file
+#                 of a group prompts a consistency check against the others
+#
+# TO USE
+#   1. Copy this file to compliance-groups.json (drop the .EXAMPLE).
+#   2. Delete these comment lines - the live file must be pure JSON.
+#   3. Replace the groups below with your repository's consistency surfaces.
+#
+# The JSON below is the generic platform default, kept here as a working
+# starting point:
+[
+  {
+    "name": "Agent Platform",
+    "description": "When workflows or actions change, verify referenced scripts, prompts, and artifacts still exist and steps stay consistent with the assembly pipeline (parts, manifests, envsubst variables).",
+    "files": [
+      ".github/workflows/*.yml",
+      ".github/actions/**/*.yml"
+    ]
+  },
+  {
+    "name": "Prompts and Scripts",
+    "description": "When prompt parts or manifests change, verify manifest part references resolve, battery pins stay accurate, and scripts referenced by prompts still exist.",
+    "files": [
+      ".github/prompts/**",
+      ".github/scripts/**"
+    ]
+  },
+  {
+    "name": "Documentation",
+    "description": "Ensure README.md reflects changes to workflows, prompts, setup steps, and secrets configuration.",
+    "files": [
+      "README.md"
+    ]
+  }
+]

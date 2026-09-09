@@ -30,3 +30,17 @@ Failing to use the file-based form will get the command denied or cause the shel
 
 **The same rule applies to EVERYTHING that carries a body**: `gh pr comment`, `gh issue comment`, `gh pr create` (`--body-file /tmp/pr-body.md`), `gh issue create`, and `gh api` payloads (`--input /tmp/payload.json`). Write the full content to a /tmp file with your file tools and pass the file - this preserves markdown, code blocks, backticks, `$` signs, and newlines byte-perfectly, with zero escaping problems. Never build bodies inline.
 
+## Discussion threads (GraphQL only)
+
+Discussions have NO REST endpoints — every read and write goes through `gh api graphql`. The file-based body mandate applies identically: the body variable is fed with `-f body=@/tmp/comment-body.md` (gh reads the file's contents into the variable), never inlined.
+
+Post a top-level discussion comment (the node id arrives in `$DISCUSSION_NODE_ID`):
+```bash
+gh api graphql -f query='mutation($b: String!, $d: ID!) { addDiscussionComment(input: {discussionId: $d, body: $b}) { comment { id databaseId } } }' -f body=@/tmp/comment-body.md -f id="$DISCUSSION_NODE_ID"
+```
+The mutation returns your comment's node `id` — remember it for edits. Edit your own comment (living ack):
+```bash
+gh api graphql -f query='mutation($b: String!, $c: ID!) { updateDiscussionComment(input: {commentId: $c, body: $b}) { comment { id } } }' -f body=@/tmp/comment-body.md -f c="<your comment node id>"
+```
+Reply to a specific comment: add `replyToId: "<comment node id>"` inside the `addDiscussionComment` input. Rules that follow from the API: a FORBIDDEN error means the thread is locked (say so in the run summary, post nothing); never mark answers yourself — suggest the author accept one when the thread clearly resolved, and only in answerable (Q&A) categories.
+

@@ -1,0 +1,50 @@
+name: Support Request
+description: Get help configuring, deploying, or using the project
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Stuck on something? Describe what you're trying to do and where it goes sideways.
+
+        An AI support agent answers new requests automatically — no need to @mention anyone.
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: What are you trying to do?
+      description: The outcome you want, not just the step that failed
+      placeholder: I want to ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's happening instead?
+      description: Where does it go wrong? Include exact commands and messages if you can.
+      placeholder: When I run ... I get ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Branch/version, OS, deployment method (Docker, binary, source) — anything already set up differently from the defaults.
+      placeholder: e.g., latest release, Docker on Ubuntu 22.04, custom config.yml with ...
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant Logs (optional)
+      description: Paste as-is if you have them. REDACT API keys and tokens before pasting — this issue is public.
+      render: text
+
+  - type: checkboxes
+    id: searched
+    attributes:
+      label: Pre-submission Checklist
+      options:
+        - label: I have searched existing issues and discussions to ensure this is not a duplicate
+          required: true

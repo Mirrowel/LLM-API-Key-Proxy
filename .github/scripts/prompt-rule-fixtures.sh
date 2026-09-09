@@ -14,13 +14,15 @@ export THREAD_CONTEXT='<tc>' NEW_COMMENT_AUTHOR=someone NEW_COMMENT_BODY='<b>'
 export THREAD_NUMBER=42 THREAD_AUTHOR=octo IS_FIRST_REVIEW=true
 export FULL_DIFF_PATH=/tmp/f.txt INCREMENTAL_DIFF_PATH=/tmp/i.txt LAST_REVIEWED_SHA=abc123
 export ISSUE_CONTEXT='<ic>' ISSUE_NUMBER=7 ISSUE_AUTHOR=octo REVIEW_TYPE=FIRST
+export DISCUSSION_NODE_ID=D_kwDO_123 DISCUSSION_TITLE='Disc Title'
 export PR_TITLE=t PR_BODY=b PR_LABELS=l FILE_GROUPS=g REPORT_TEMPLATE=r DIFF_PATH=/tmp/c.txt CHANGED_FILES=c CHANGED_FILES_JSON=cj
 export TRIGGER_MESSAGE='<tm>' PREVIOUS_BOT_REVIEWS='<pbr>' AGENT_REVIEW_HISTORY='<arh>' PREVIOUS_COMPLIANCE_REPORT='<pcr>'
 export REVIEW_KIT_SUMMARY='PR #42: Review type: FOLLOW-UP | Instructions: /tmp/instructions/review-followup.md | Incremental diff: /tmp/kit/42/incremental_diff.patch (120 lines)'
-RV='$REVIEW_TYPE $PR_AUTHOR $PR_NUMBER $GITHUB_REPOSITORY $PR_HEAD_SHA $PULL_REQUEST_CONTEXT $DIFF_FILE_PATH $TRIGGER_MESSAGE $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $THREAD_CONTEXT'
-BV='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY'
-IV='$ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR $TRIGGER_MESSAGE $GITHUB_REPOSITORY'
-CV='$PR_NUMBER $PR_TITLE $PR_BODY $PR_AUTHOR $PR_HEAD_SHA $CHANGED_FILES $CHANGED_FILES_JSON $PR_LABELS $PREVIOUS_COMPLIANCE_REPORT $TRIGGER_MESSAGE $THREAD_CONTEXT $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $DIFF_PATH $INCREMENTAL_DIFF_PATH $FILE_GROUPS $REPORT_TEMPLATE $GITHUB_REPOSITORY'
+export BOT_IDENTITY_LIST='mirrobot-agent,mirrobot-agent[bot]' BOT_IDENTITY_PRIMARY='mirrobot-agent'
+RV='$REVIEW_TYPE $PR_AUTHOR $PR_NUMBER $GITHUB_REPOSITORY $PR_HEAD_SHA $PULL_REQUEST_CONTEXT $DIFF_FILE_PATH $TRIGGER_MESSAGE $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $THREAD_CONTEXT $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY'
+BV='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY $DISCUSSION_NODE_ID $DISCUSSION_TITLE'
+IV='$ISSUE_CONTEXT $ISSUE_NUMBER $ISSUE_AUTHOR $TRIGGER_MESSAGE $GITHUB_REPOSITORY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY'
+CV='$PR_NUMBER $PR_TITLE $PR_BODY $PR_AUTHOR $PR_HEAD_SHA $CHANGED_FILES $CHANGED_FILES_JSON $PR_LABELS $PREVIOUS_COMPLIANCE_REPORT $TRIGGER_MESSAGE $THREAD_CONTEXT $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $DIFF_PATH $INCREMENTAL_DIFF_PATH $FILE_GROUPS $REPORT_TEMPLATE $GITHUB_REPOSITORY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY'
 bash .github/scripts/assemble-prompt.sh pr-review-first     | envsubst "$RV" > "$TMP/rf.txt"
 REVIEW_TYPE=FOLLOW-UP bash .github/scripts/assemble-prompt.sh pr-review-followup | REVIEW_TYPE=FOLLOW-UP envsubst "$RV" > "$TMP/ru.txt"
 bash .github/scripts/assemble-prompt.sh bot-reply          | envsubst "$BV" > "$TMP/br.txt"
@@ -46,6 +48,9 @@ for f in rf ru br ic cc cf; do
   need $f 'fresh shell'                        "$f: fresh-shell key point"
   need $f 'body-file'                          "$f: file-based posting"
   need $f 'FORBIDDEN COMMANDS'                 "$f: secrets rule"
+  need $f 'Never read, list, set, or modify repository or environment secrets' "$f: secrets-never rule"
+  need $f 'Never read, set, or modify repository Actions variables' "$f: variables-never rule (control plane)"
+  need $f 'A permission denial is a signal, not an obstacle' "$f: deny-is-a-signal doctrine"
   need $f 'webfetch'                           "$f: webfetch denied"
   need $f 'allowed prefix'                     "$f: shell prefix rule"
   need $f 'long-running processes'             "$f: no-daemons rule"
@@ -118,8 +123,22 @@ for w in .github/workflows/bot-reply.yml .github/workflows/pr-review.yml .github
   if grep -q '\["mirrobot",' "$w" 2>/dev/null && grep -q 'BOT_NAMES_JSON' "$w"; then
     echo "FAIL: $w: BOT_NAMES_JSON contains bare mirrobot (name != identity)"; FAILED=1
   fi
-  grep -q 'mirrobot-agent\[bot\]' "$w" || { echo "FAIL: $w: BOT_NAMES_JSON missing app identity"; FAILED=1; }
+  # Identity is no longer hardcoded in workflows: it resolves via bot-config.sh
+  # (variable ∪ /user detection, stock fallback). The wiring contract:
+  grep -q 'BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES' "$w" || { echo "FAIL: $w: identity input passthrough missing"; FAILED=1; }
+  grep -q 'BOT_TRIGGERS_INPUT: ${{ vars.BOT_TRIGGERS' "$w" || { echo "FAIL: $w: trigger input passthrough missing"; FAILED=1; }
+  grep -q 'bot-config.sh' "$w" || { echo "FAIL: $w: bot-config resolution unwired"; FAILED=1; }
 done
+# The stock identity fallback lives in ONE place (bot-config.sh), with the
+# app variant; bare mirrobot is a TRIGGER stem, never an identity.
+grep -q "FALLBACK_IDENTITIES='\[\"mirrobot-agent\",\"mirrobot-agent\[bot\]\"\]'" .github/scripts/bot-config.sh || { echo "FAIL: bot-config.sh: identity fallback missing"; FAILED=1; }
+grep -q 'FALLBACK_TRIGGERS="mirrobot,mirrobot-agent"' .github/scripts/bot-config.sh || { echo "FAIL: bot-config.sh: trigger fallback missing"; FAILED=1; }
+for w in .github/workflows/bot-reply.yml .github/workflows/pr-review.yml .github/workflows/compliance-check.yml .github/workflows/issue-comment.yml; do
+  grep -q 'AGENT_PAUSED_PARTS_JSON' "$w" || { echo "FAIL: $w: part-pause guard missing"; FAILED=1; }
+done
+grep -q 'CONTEXT_LIMITS_JSON: ${{ vars.CONTEXT_LIMITS_JSON' .github/workflows/pr-review.yml || { echo "FAIL: pr-review context budget unwired"; FAILED=1; }
+grep -q 'CONTEXT_LIMITS_JSON: ${{ vars.CONTEXT_LIMITS_JSON' .github/workflows/bot-reply.yml || { echo "FAIL: bot-reply context budget unwired"; FAILED=1; }
+grep -q 'CONTEXT_LIMITS_JSON: ${{ vars.CONTEXT_LIMITS_JSON' .github/workflows/compliance-check.yml || { echo "FAIL: compliance context budget unwired"; FAILED=1; }
 for w in .github/workflows/bot-reply.yml .github/workflows/pr-review.yml .github/workflows/compliance-check.yml .github/workflows/issue-comment.yml; do
   grep -q 'CONTEXT_IGNORE_AUTHORS' "$w" || { echo "FAIL: $w: CONTEXT_IGNORE_AUTHORS unwired"; FAILED=1; }
   grep -q 'CONTEXT_FILTER_PATTERNS_JSON' "$w" || { echo "FAIL: $w: CONTEXT_FILTER_PATTERNS_JSON unwired"; FAILED=1; }
@@ -134,7 +153,7 @@ grep -q 'cut -c1-600' .github/workflows/*.yml && { echo 'FAIL: flatten-cut taint
 need cc 'compliance'                           "cc: compliance mission"
 need cc 'file group'                           "cc: file groups wiring"
 need cc 'template'                             "cc: report template wiring"
-need ic 'Initial Analysis Report'              "ic: analysis output shape"
+need ic 'Step 3: Report'                    "ic: report step exists (shape is open)"
 need ic 'thanks'                               "ic: acknowledgment duty"
 
 # ---- context noise filtering + identity (2026-08 rework) ----
@@ -145,6 +164,30 @@ for f in rf ru cc cf; do
 done
 need ru 'your NAME, not an identity'           "ru: name-vs-identity rule"
 need br 'your name, not an identity'           "br: name-vs-identity rule"
+# ---- voice (universal agent trait, every mode) ----
+for f in rf ru br ic cc cf; do
+  need $f 'You are your own person'            "$f: voice: own person"
+  need $f 'never grade the person'             "$f: voice: no praise-grading"
+  need $f 'Pushback is a gift'                 "$f: voice: pushback doctrine"
+  need $f 'Humor is seasoning'                 "$f: voice: humor bounds"
+done
+
+# ---- analyst rework (2026-09-09: open-ended triage, label manager) ----
+need ic 'NEVER apply .Agent Monitored'              "ic: Agent Monitored is collaborator-only"
+need ic 'never redo done work'                      "ic: duplicate stop rule"
+need ic 'Labels: apply them, don.t just suggest'    "ic: labels applied, not suggested"
+need ic 'the repository.s own labels always win'    "ic: repo label customs take precedence"
+need ic 'earn evaluation, not applause'             "ic: feature-worth gate"
+need ic 'quick pass, not an exhaustive audit'       "ic: fast duplicate search"
+need ic 'Confidence belongs in the verdict'         "ic: calibrated confidence"
+neednt ic 'Issue Validation'                        "ic: old verdict form is dead"
+neednt ic 'Reproducibility Assessment'              "ic: old report skeleton is dead"
+neednt ic 'great catch'                             "ic: fawning ack example is dead"
+
+# ---- optional questions cure (2026-09-09: never filler) ----
+need rf 'never as filler'  "rf: questions optional (protocol-first)"
+need ru 'never as filler'  "ru: questions optional (review-submission)"
+
 # ---- severity universal + inline format (agent trait, every mode) ----
 for f in rf ru br ic cc cf; do
   need $f 'Severity System'                      "$f: severity part present"

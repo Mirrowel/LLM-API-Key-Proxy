@@ -13,8 +13,8 @@
 #          (merge blocked) either way; this is redundancy + visibility.
 #
 # EXECUTES FROM: THE PR's BASE BRANCH (pull_request semantics). On PRs
-#   targeting dev, dev's copy runs - keep dev merge-synced when this file
-#   changes (`git merge main` into dev; see docs/workflows/overview.md).
+#   targeting your integration branch, that branch's copy runs - keep it
+#   merge-synced when this file changes (see docs/workflows/overview.md).
 #   Zero secrets either way: this is a marker poster, nothing else.
 #
 # SECURITY: pull_request trigger, ZERO secrets, permissions statuses:write
