@@ -857,6 +857,9 @@ fi
 # ONLY when the operator declared it (variable) or it is the verifiable
 # stock pair. These pins keep the no-synthesis doctrine from regressing.
 WORKER="$SCRIPT_DIR/../../tools/mention-worker/worker.js"
+# The worker is agent-repo-only (per the port doctrine): consuming repos carry
+# no tools/ tree, so the worker identity pins run only when the file exists.
+if [ -f "$WORKER" ]; then
 check "identity: worker never synthesizes a [bot] twin (template form)" no \
   "$(grep -qF 'botLogin.toLowerCase()}[bot]' "$WORKER" && echo yes || echo no)"
 check "identity: worker never builds a [bot] twin (concat form)" no \
@@ -865,6 +868,9 @@ check "identity: worker self set includes declared variable" yes \
   "$(grep -q 'actions/variables/BOT_IDENTITIES' "$WORKER" && echo yes || echo no)"
 check "identity: worker reads the FLAT variable (no JSON endpoint)" no \
   "$(grep -q 'actions/variables/BOT_IDENTITIES_JSON' "$WORKER" && echo yes || echo no)"
+else
+  echo "note: tools/mention-worker absent - worker identity pins skipped (consuming repo, per port doctrine)"
+fi
 BC_OUT=$(BOT_IDENTITIES_INPUT='' BOT_DETECTED_LOGIN='zeta-acct' BOT_TRIGGERS_INPUT='' bash "$SCRIPT_DIR/bot-config.sh" --export 2>/dev/null; echo "rc=$?")
 check "identity: bot-config detected-only set has NO twin" \
   'export BOT_NAMES_JSON=\[\"zeta-acct\"\]' \
