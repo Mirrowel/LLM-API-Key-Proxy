@@ -3,11 +3,13 @@
 
 from typing import TYPE_CHECKING, Type
 
-from .client import RotatingClient
-
-# For type checkers (Pylint, mypy), import PROVIDER_PLUGINS statically
-# At runtime, it's lazy-loaded via __getattr__
+# For type checkers (Pylance, mypy), import statically. At runtime every
+# public name resolves lazily via __getattr__: `import rotator_library`
+# stays milliseconds-fast (the client package pulls litellm, ~8s) so the
+# proxy's launcher/load-screen phasing keeps heavy imports behind the
+# loading screens (see utils.paths / startup invariants).
 if TYPE_CHECKING:
+    from .client import RotatingClient
     from .providers import PROVIDER_PLUGINS
     from .providers.provider_interface import ProviderInterface
     from .model_info_service import ModelInfoService, ModelInfo, ModelMetadata
@@ -22,7 +24,15 @@ __all__ = [
 
 
 def __getattr__(name):
-    """Lazy-load PROVIDER_PLUGINS and ModelInfoService to speed up module import."""
+    """Lazy-load public names to keep `import rotator_library` fast."""
+    if name == "RotatingClient":
+        from .client import RotatingClient
+
+        return RotatingClient
+    if name == "ProviderInterface":
+        from .providers.provider_interface import ProviderInterface
+
+        return ProviderInterface
     if name == "PROVIDER_PLUGINS":
         from .providers import PROVIDER_PLUGINS
 

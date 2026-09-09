@@ -11,7 +11,9 @@ import os
 import sys
 from pathlib import Path
 
-from proxy_app.key_policy import DEFAULT_PROXY_API_KEY
+# NOTE: keep this module stdlib-light — it loads before the TUI renders and
+# must not drag the rotator_library import chain (litellm, ~8s) with it.
+# proxy_app.key_policy and friends import lazily inside their call sites.
 from rich.console import Console
 from rich.prompt import IntPrompt, Prompt
 from rich.panel import Panel
@@ -731,6 +733,8 @@ class LauncherTUI:
                 default_port = 8000
                 default_logging = False
                 default_raw_logging = False
+                from proxy_app.key_policy import DEFAULT_PROXY_API_KEY
+
                 default_api_key = DEFAULT_PROXY_API_KEY
 
                 # Get current values

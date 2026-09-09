@@ -8,18 +8,31 @@ import logging
 from typing import Optional, Dict, Any, Tuple
 import httpx
 
-from litellm.exceptions import (
-    APIConnectionError,
-    RateLimitError,
-    ServiceUnavailableError,
-    AuthenticationError,
-    InvalidRequestError,
-    BadRequestError,
-    OpenAIError,
-    InternalServerError,
-    Timeout,
-    ContextWindowExceededError,
+# litellm's import cost (~8s) must stay off the module-import path: the
+# launcher, startup screens, and lightweight core imports (constants,
+# config) pull this module transitively and need to stay fast. The
+# exception classes are bound into module globals on first classification.
+_LITELLM_EXCEPTION_NAMES = (
+    "APIConnectionError",
+    "RateLimitError",
+    "ServiceUnavailableError",
+    "AuthenticationError",
+    "InvalidRequestError",
+    "BadRequestError",
+    "OpenAIError",
+    "InternalServerError",
+    "Timeout",
+    "ContextWindowExceededError",
 )
+
+
+def _ensure_litellm_exceptions() -> None:
+    if "RateLimitError" in globals():
+        return
+    from litellm import exceptions as _litellm_exceptions
+
+    for _name in _LITELLM_EXCEPTION_NAMES:
+        globals()[_name] = getattr(_litellm_exceptions, _name)
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -766,6 +779,7 @@ def get_retry_after(error: Exception) -> Optional[int]:
 
 
 def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedError:
+    _ensure_litellm_exceptions()
     """
     Classifies an exception into a structured ClassifiedError object.
     Now handles both litellm and httpx exceptions.
@@ -1132,6 +1146,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
 def is_rate_limit_error(e: Exception) -> bool:
     """Checks if the exception is a rate limit error."""
+    _ensure_litellm_exceptions()
     return isinstance(e, RateLimitError)
 
 
@@ -1165,6 +1180,7 @@ def _classify_structured_error_text(payload: dict, details: dict) -> Optional[st
 
 def is_server_error(e: Exception) -> bool:
     """Checks if the exception is a temporary server-side error."""
+    _ensure_litellm_exceptions()
     return isinstance(
         e,
         (ServiceUnavailableError, APIConnectionError, InternalServerError, OpenAIError),
@@ -1176,6 +1192,7 @@ def is_unrecoverable_error(e: Exception) -> bool:
     Checks if the exception is a non-retriable client-side error.
     These are errors that will not resolve on their own.
     """
+    _ensure_litellm_exceptions()
     return isinstance(e, (InvalidRequestError, AuthenticationError, BadRequestError))
 
 
