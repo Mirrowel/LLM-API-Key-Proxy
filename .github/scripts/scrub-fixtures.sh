@@ -1047,6 +1047,17 @@ check "files: paginated REST files API used" yes \
   "$(grep -q 'pulls/\$PR_NUMBER/files?per_page=100' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q -- '--paginate' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "files: compact status-letter rendering" yes \
   "$(grep -q 'toupper(substr(\$1,1,1))' "$SCRIPT_DIR/../workflows/pr-review.yml" && ! grep -q '(MODIFIED)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+# Behavioral probe (live-caught: printf -- is a shell-ism mawk rejects with a
+# syntax error - the grep pin alone shipped a broken awk). Mirror of the
+# workflow body; the grep pins above guard the drift.
+FILES_PROBE=$(printf 'modified\t10\t2\tsrc/a.py\ndeleted\t0\t40\told.py\nadded\t0\t0\timg.png\n' | awk -F'\t' 'NF==4 {
+            st = toupper(substr($1,1,1))
+            if (st == "C") st = "M"
+            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
+            printf "%s %s %s %s\n", "-", st, $4, counts
+          }' 2>&1)
+check "files: awk renders compact lines on mawk-compatible syntax" "3" \
+  "$(printf '%s\n' "$FILES_PROBE" | grep -c -- '- [MDAR] ')"
 
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ]

@@ -469,7 +469,7 @@ jobs:
             st = toupper(substr($1,1,1))
             if (st == "C") st = "M"
             counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
-            printf -- "- %s %s %s\n", st, $4, counts
+            printf "%s %s %s %s\n", "-", st, $4, counts
           }')
 
           # Prepare linked issues robustly by fetching each one individually
