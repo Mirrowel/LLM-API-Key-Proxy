@@ -34,6 +34,16 @@ parser.add_argument(
 )
 args, _ = parser.parse_known_args()
 
+# Keep startup output deliverable on any console: Windows pipes default to
+# a legacy codepage that cannot encode the banner's unicode, which crashed
+# headless launches before the key policy could speak.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 # Add the 'src' directory to the Python path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
@@ -84,8 +94,24 @@ if _env_files_found:
     print(f"📁 Loaded {len(_env_files_found)} .env file(s): {', '.join(_env_names)}")
 
 
+# Default-key policy: the well-known default is only acceptable on a
+# localhost bind — otherwise prompt (enter/generate/skip) or block when
+# no terminal can answer. Enforcement matches the launch mode: script
+# runs (TUI, direct, flags, Docker CMD) use the parsed host; an ASGI
+# server launching this module is detected via its argv; plain library
+# imports (tests, tooling) never enforce.
+from proxy_app import key_policy as _key_policy
+
+if __name__ == "__main__":
+    _bind_host: str | None = args.host
+else:
+    _bind_host = _key_policy.uvicorn_bind_host()
+_adopted_key = (
+    _key_policy.enforce_proxy_key_policy(_bind_host) if _bind_host is not None else None
+)
+
 # Get proxy API key for display
-proxy_api_key = os.getenv("PROXY_API_KEY")
+proxy_api_key = _adopted_key or os.getenv("PROXY_API_KEY")
 if proxy_api_key:
     key_display = f"✓ {_mask_secret_for_display(proxy_api_key)}"
 else:
@@ -581,14 +607,14 @@ async def verify_gemini_api_key(
 
 
 # Stream wrapping, request overrides, and embedding fan-out live in route_helpers.
-from .route_helpers import (  # noqa: E402
+from proxy_app.route_helpers import (  # noqa: E402
     SSE_HEADERS,
     apply_temperature_override,
     execute_embeddings,
     streaming_response_wrapper,
 )
 # OAuth credential bootstrap lives in startup.
-from .startup import bootstrap_oauth_credentials  # noqa: E402
+from proxy_app.startup import bootstrap_oauth_credentials  # noqa: E402
 
 
 @app.post("/v1/chat/completions")

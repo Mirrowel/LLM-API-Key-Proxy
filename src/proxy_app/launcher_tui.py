@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-from .startup_display import mask_secret_for_display
+from proxy_app.key_policy import DEFAULT_PROXY_API_KEY
 from rich.console import Console
 from rich.prompt import IntPrompt, Prompt
 from rich.panel import Panel
@@ -104,8 +104,9 @@ class LauncherConfig:
     @staticmethod
     def update_proxy_api_key(new_key: str):
         """Update PROXY_API_KEY in .env only"""
-        env_file = _get_env_file()
-        set_key(str(env_file), "PROXY_API_KEY", new_key)
+        from proxy_app.key_policy import save_proxy_api_key
+
+        env_file = save_proxy_api_key(new_key)
         load_dotenv(dotenv_path=env_file, override=True)
 
 
@@ -454,7 +455,7 @@ class LauncherTUI:
         # Show actual API key value
         proxy_key = os.getenv("PROXY_API_KEY")
         if proxy_key:
-            self.console.print(f"   Proxy API Key:       {mask_secret_for_display(proxy_key)}")
+            self.console.print(f"   Proxy API Key:       {proxy_key}")
         else:
             self.console.print("   Proxy API Key:       [red]Not Set (INSECURE!)[/red]")
 
@@ -730,7 +731,7 @@ class LauncherTUI:
                 default_port = 8000
                 default_logging = False
                 default_raw_logging = False
-                default_api_key = "VerysecretKey"
+                default_api_key = DEFAULT_PROXY_API_KEY
 
                 # Get current values
                 current_host = self.config.config["host"]

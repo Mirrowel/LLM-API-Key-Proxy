@@ -1077,7 +1077,9 @@ def ensure_env_defaults():
 
     # Check for PROXY_API_KEY, similar to setup_env.bat
     if get_key(str(_get_env_file()), "PROXY_API_KEY") is None:
-        default_key = "VerysecretKey"
+        from rotator_library.core.constants import DEFAULT_PROXY_API_KEY
+
+        default_key = DEFAULT_PROXY_API_KEY
         console.print(
             f"Adding default [bold cyan]PROXY_API_KEY[/bold cyan] to [bold yellow]{_get_env_file().name}[/bold yellow]..."
         )

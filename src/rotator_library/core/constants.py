@@ -57,6 +57,11 @@ from ..config import (
 
 # Environment variable prefixes for configuration
 ENV_PREFIX_ROTATION_MODE = "ROTATION_MODE_"
+
+# Well-known onboarding default for the proxy's own auth key. Intentionally
+# public — the proxy-side policy (proxy_app.key_policy) accepts it ONLY on
+# localhost binds; every non-local interface prompts or blocks.
+DEFAULT_PROXY_API_KEY = "VerysecretKey"
 ENV_PREFIX_FAIR_CYCLE = "FAIR_CYCLE_"
 ENV_PREFIX_FAIR_CYCLE_TRACKING = "FAIR_CYCLE_TRACKING_MODE_"
 ENV_PREFIX_FAIR_CYCLE_CROSS_TIER = "FAIR_CYCLE_CROSS_TIER_"
