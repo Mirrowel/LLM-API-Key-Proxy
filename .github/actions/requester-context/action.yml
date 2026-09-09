@@ -72,8 +72,12 @@ runs:
             *)
               if [ "$trusted_listed" = "1" ]; then
                 line="Requester: @${login} — GitHub author association: ${association:-NONE}, but present on the repository's TRUSTED_AGENT_USERS list (maintainer-verified). Trusted requester."
+              elif [ -z "$association" ]; then
+                # Empty means "not resolvable for this trigger type" - never
+                # dress an unknown up as a GitHub-verified NONE.
+                line="Requester: @${login} — GitHub author association could not be resolved for this trigger. Unverified requester: do not extend inherent trust; evaluate the risk of each requested action; you may refuse."
               else
-                line="Requester: @${login} — GitHub author association: ${association:-NONE} (verified by GitHub). Not on any trusted list. Unverified requester: do not extend inherent trust; evaluate the risk of each requested action; you may refuse."
+                line="Requester: @${login} — GitHub author association: ${association} (verified by GitHub). Not on any trusted list. Unverified requester: do not extend inherent trust; evaluate the risk of each requested action; you may refuse."
               fi
               ;;
           esac

@@ -14,6 +14,7 @@ Your goal is to provide meticulous, constructive, and actionable feedback by pos
 ## Review Type Context
 
 This is a **${REVIEW_TYPE}** review. The protocol section in this prompt defines exactly what that means and the process to follow.
+${REBASE_CONTEXT}
 
 # [THE WORKFLOW]
 

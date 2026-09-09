@@ -175,9 +175,14 @@ jobs:
           BOT_IDENTITIES_INPUT: ${{ vars.BOT_IDENTITIES || '' }}
         run: |
           raw="${BOT_IDENTITIES_INPUT:-mirrobot-agent, mirrobot-agent[bot]}"
+          # Lowercased by design: consumers lowercase the author side and
+          # compare against this array (ascii_downcase as $a | $bots |
+          # index($a)); a display-case array matches nothing (live-caught:
+          # FIRST misclassification, empty review-memory blocks, own
+          # reviews polluting thread context as "other reviewers").
           case "$raw" in
-            '['*) printf 'BOT_NAMES_JSON=%s\n' "$raw" >> "$GITHUB_ENV" ;;
-            *) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc .)" >> "$GITHUB_ENV" ;;
+            '['*) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | jq -sc 'map(ascii_downcase)')" >> "$GITHUB_ENV" ;;
+            *) printf 'BOT_NAMES_JSON=%s\n' "$(printf '%s' "$raw" | tr ',;' '\n\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)')" >> "$GITHUB_ENV" ;;
           esac
       # ========================================================================
       # FAST EYES (account mode, routed comments only)
@@ -252,6 +257,13 @@ jobs:
             echo "RESOLVED_COMMENT_AUTHOR=${author}"
             echo "RESOLVED_ASSOCIATION=${association}"
           } >> "$GITHUB_ENV"
+          # Step outputs mirror the env writes: GITHUB_ENV vars are
+          # invisible to later steps' with:/if: expressions, so the
+          # requester-context fallback chain reads these instead.
+          {
+            echo "resolved_author=${author}"
+            echo "resolved_assoc=${association}"
+          } >> "$GITHUB_OUTPUT"
           # Trigger-message block: the routed comment IS the request.
           body=$(printf '%s' "$comment_json" | jq -r '.body')
           TM_DELIMITER="GH_TRIGGER_MSG_$(openssl rand -hex 8)"
@@ -310,13 +322,35 @@ jobs:
 # auto-triggered runs, dispatch actor
       # otherwise) consumed by the security brief. Any user may trigger the
       # review; this only informs the agent's judgment.
+      # Manual-dispatch requester identity: workflow_dispatch events carry
+      # no author_association, and with neither a routed comment nor the
+      # stub's PR-author context, the requester line rendered the repo
+      # OWNER as "NONE (verified by GitHub)" (live-caught). Resolve the
+      # dispatch actor's real standing from the API - one call. Invited
+      # collaborators of any level map to COLLABORATOR (an invite is the
+      # trust decision, same doctrine as the roster); admins map to OWNER;
+      # unresolvable stays empty and the action words it honestly.
+      - name: Resolve dispatch actor association
+        id: dispatch_assoc
+        if: github.event_name == 'workflow_dispatch' && steps.validate.outputs.resolved_assoc == '' && steps.auto_ctx.outputs.pr_association == ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR_LOGIN: ${{ github.actor }}
+        run: |
+          perm=$(gh api "/repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR_LOGIN}/permission" --jq '.permission' 2>/dev/null || echo "")
+          case "$perm" in
+            admin) echo "association=OWNER" >> "$GITHUB_OUTPUT" ;;
+            maintain|write|triage|read) echo "association=COLLABORATOR" >> "$GITHUB_OUTPUT" ;;
+            *) echo "association=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Build requester context
         id: requester
         if: github.event_name == 'workflow_dispatch'
         uses: ./.github/actions/requester-context
         with:
-          login: ${{ env.RESOLVED_COMMENT_AUTHOR || steps.auto_ctx.outputs.pr_author || github.actor }}
-          association: ${{ env.RESOLVED_ASSOCIATION || steps.auto_ctx.outputs.pr_association }}
+          login: ${{ steps.validate.outputs.resolved_author || steps.auto_ctx.outputs.pr_author || github.actor }}
+          association: ${{ steps.validate.outputs.resolved_assoc || steps.auto_ctx.outputs.pr_association || steps.dispatch_assoc.outputs.association }}
           trusted-users: ${{ vars.TRUSTED_AGENT_USERS }}
           trigger-note: '${{ github.event_name }} ${{ github.event.action }}'
 
@@ -408,7 +442,7 @@ jobs:
           # requester.login — it demands user-profile scopes the PAT lacks
           # (see compliance-check.yml pr_info for the REST pattern if a
           # field ever needs migrating). Do NOT add reviewRequests here.
-          pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files,closingIssuesReferences,headRepository)
+          pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository)
           timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/timeline")
 
           author=$(echo "$pr_json" | jq -r .author.login)
@@ -419,10 +453,24 @@ jobs:
           additions=$(echo "$pr_json" | jq -r .additions)
           deletions=$(echo "$pr_json" | jq -r .deletions)
           total_commits=$(echo "$pr_json" | jq -r '.commits | length')
-          changed_files_count=$(echo "$pr_json" | jq -r '.files | length')
           title=$(echo "$pr_json" | jq -r .title)
           body=$(echo "$pr_json" | jq -r '.body // "(No description provided)"')
-          changed_files_list=$(echo "$pr_json" | jq -r '.files[] | "- \(.path) (MODIFIED) +\((.additions))/-\((.deletions))"')
+
+          # Changed files via the paginated REST files API: gh pr view's
+          # --json files caps at ONE page (100) and silently lied about
+          # 300+-file PRs (live-caught: "Changed Files: 100" on a
+          # 324-file PR, src/ invisible to the list). Compact one line
+          # per file - status letter (A/D/M/R) + path + counts - keeps
+          # the prompt small; binary files are marked instead of
+          # numberless.
+          files_tsv=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files?per_page=100" --paginate --jq '.[] | [.status, (.additions // 0), (.deletions // 0), .filename] | @tsv' 2>/dev/null || true)
+          changed_files_count=$(printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
+          changed_files_list=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==4 {
+            st = toupper(substr($1,1,1))
+            if (st == "C") st = "M"
+            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
+            printf -- "- %s %s %s\n", st, $4, counts
+          }')
 
           # Prepare linked issues robustly by fetching each one individually
           linked_issues_content=""
@@ -529,14 +577,12 @@ jobs:
             def latest(testexpr):
               (items | map(select(.body | test(testexpr))) | sort_by(.ts) | last) // {};
             { latest_phrase: latest("This review was generated by an AI assistant\\.?"),
-              latest_marker: latest("<!-- last_reviewed_sha:[a-f0-9]{7,40} -->") }
+              latest_marker: latest("<!-- last_reviewed_sha:[a-f0-9]{7,40} -->"),
+              all_markers: [ items | map(select(.body | test("<!-- last_reviewed_sha:[a-f0-9]{7,40} -->"))) | sort_by(.ts) | reverse | .[] | {ts: .ts, sha: (.body | capture("(?<s><!-- last_reviewed_sha:(?<h>[a-f0-9]{7,40}) -->)").h // "")} ] }
           ')
 
           latest_phrase_ts=$(echo "$detect_json" | jq -r '.latest_phrase.ts // ""')
-          latest_phrase_type=$(echo "$detect_json" | jq -r '.latest_phrase.type // ""')
-          latest_phrase_body=$(echo "$detect_json" | jq -r '.latest_phrase.body // ""')
           latest_marker_ts=$(echo "$detect_json" | jq -r '.latest_marker.ts // ""')
-          latest_marker_body=$(echo "$detect_json" | jq -r '.latest_marker.body // ""')
 
           # Default outputs
           echo "is_first_review=false" >> $GITHUB_OUTPUT
@@ -547,27 +593,53 @@ jobs:
             echo "is_first_review=true" >> $GITHUB_OUTPUT
           fi
 
-          # Prefer the marker if it is the most recent
-          if [ -n "$latest_marker_ts" ] && { [ -z "$latest_phrase_ts" ] || [ "$latest_marker_ts" \> "$latest_phrase_ts" ] || [ "$latest_marker_ts" = "$latest_phrase_ts" ]; }; then
-            resolved_sha=$(printf '%s' "$latest_marker_body" | sed -n 's/.*<!-- last_reviewed_sha:\([a-f0-9]\{7,40\}\) -->.*/\1/p')
-            if [ -n "$resolved_sha" ]; then
-              echo "Using latest marker SHA: $resolved_sha"
-            fi
-          fi
-
-          # If marker not chosen or empty, attempt to resolve from the latest review commit_id
-          if [ -z "$resolved_sha" ] && [ -n "$latest_phrase_ts" ]; then
-            echo "Latest summary lacks marker; attempting commit_id from latest bot review..."
+          # ---- reviewed-state candidates, newest first -----------------------
+          # Every bot marker SHA newest-first; the latest review's commit_id
+          # joins as the last resort (marker-less summaries).
+          candidates=$(echo "$detect_json" | jq -r '.all_markers[] | select(.sha != "") | [.sha, .ts] | @tsv')
+          if [ -n "$latest_phrase_ts" ]; then
+            echo "Phrase-bearing review present; adding its commit_id as the last-resort candidate..."
             reviews_rest=$(gh api "/repos/${{ github.repository }}/pulls/$PR_NUMBER/reviews" || echo '[]')
-            resolved_sha=$(echo "$reviews_rest" | jq -r --argjson bots "$BOT_NAMES_JSON" '
+            commit_id_cand=$(echo "$reviews_rest" | jq -r --argjson bots "$BOT_NAMES_JSON" '
               map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
               | sort_by(.submitted_at)
               | last
-              | .commit_id // ""
+              | [(.commit_id // ""), (.submitted_at // "")]
+              | @tsv
             ')
-            if [ -n "$resolved_sha" ]; then
-              echo "Resolved from latest bot review commit_id: $resolved_sha"
+            [ -n "$commit_id_cand" ] && candidates="${candidates}${commit_id_cand}"$'\n'
+          fi
+
+          # ---- rebase ladder --------------------------------------------------
+          # After a force-push/rebase, the old reviewed SHAs are unreachable
+          # (not ancestors of HEAD). Walk the candidates newest-first and
+          # diff from the NEWEST REACHABLE reviewed state; if none are
+          # reachable, fall through to the full diff with an explicit
+          # rebase context so the agent reconstructs follow-up awareness
+          # in-session instead of being silently downgraded to FIRST.
+          resolved_ts=""
+          while IFS="$(printf '\t')" read -r csha cts; do
+            [ -n "$csha" ] || continue
+            if git cat-file -e "$csha" 2>/dev/null && git merge-base --is-ancestor "$csha" HEAD 2>/dev/null; then
+              resolved_sha="$csha"
+              resolved_ts="$cts"
+              echo "Using newest REACHABLE reviewed state: $resolved_sha (reviewed at ${cts:-unknown})"
+              break
             fi
+          done <<< "$candidates"
+
+          if [ -z "$resolved_sha" ] && [ -n "$candidates" ]; then
+            newest_sha=$(printf '%s\n' "$candidates" | head -1 | cut -f1)
+            newest_ts=$(printf '%s\n' "$candidates" | head -1 | cut -f2)
+            recent_commits=$(git log --oneline -12 2>/dev/null | head -c 2000)
+            {
+              echo "REBASE_CONTEXT<<RB_CTX_EOF"
+              echo "NOTE - branch history was rewritten (force-push/rebase) after your last review (${newest_sha:0:10}, reviewed at ${newest_ts:-unknown time}); every previously reviewed state is unreachable from the current head, so no incremental diff exists. The FULL diff is provided below. Your prior reviews are in the review-memory blocks: reconstruct what still applies yourself - verify your earlier findings against the new state and review the full delta knowingly."
+              echo "Recent commits (newest first, subjects truncated):"
+              printf '%s\n' "$recent_commits"
+              echo "RB_CTX_EOF"
+            } >> "$GITHUB_ENV"
+            echo "Rebase detected: all reviewed states unreachable. Full diff + in-session reconstruction instructed."
           fi
 
           if [ -n "$resolved_sha" ]; then
@@ -768,14 +840,17 @@ jobs:
               exit 0
             fi
           fi
-          # When the fallback fired, say so INSIDE the diff file — the agent's
-          # prompt otherwise assumes a follow-up diff is strictly incremental.
+          # When the fallback fired, the diff generated below is the FULL
+          # PR diff (from the merge base) - say so INSIDE the file (prepended
+          # after generation; the redirect below would clobber a note written
+          # earlier), because the prompt otherwise assumes a follow-up diff
+          # is strictly incremental.
           if [ "${FULL_DIFF_FALLBACK:-0}" = "1" ]; then
-            printf '%s\n' "[NOTE: the last reviewed SHA could not be resolved; this is the FULL PR diff against the base branch, not an incremental one. Review it with first-review thoroughness.]" > "$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
+            INC_NOTE="[NOTE: the last reviewed SHA could not be resolved; this is the FULL PR diff against the base branch, not an incremental one. Review it with first-review thoroughness.]"
           fi
 
           echo "Attempting to generate incremental diff from $LAST_SHA to $CURRENT_SHA"
-          
+
           # Fetch the last reviewed commit, handle potential errors (e.g., rebased/force-pushed commit)
           # First try fetching from origin
           if git fetch origin $LAST_SHA 2>/dev/null || git cat-file -e $LAST_SHA^{commit} 2>/dev/null; then
@@ -784,6 +859,9 @@ jobs:
             # Same split-not-truncate contract as the full diff above.
             INC_OUT="$GITHUB_WORKSPACE/.mirrobot_files/incremental_diff.txt"
             if git diff --patch $LAST_SHA..$CURRENT_SHA > "$INC_OUT" 2>/dev/null; then
+              if [ -n "${INC_NOTE:-}" ]; then
+                { printf '%s\n' "$INC_NOTE"; cat "$INC_OUT"; } > "$INC_OUT.note" && mv "$INC_OUT.note" "$INC_OUT"
+              fi
               echo "Generated incremental diff: $(wc -l < "$INC_OUT") lines, $(wc -c < "$INC_OUT") bytes"
               bash /tmp/split-diff.sh "$INC_OUT" "${DIFF_SPLIT_BYTES:-1000000}"
             else
@@ -830,7 +908,7 @@ jobs:
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}'
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}'
           # Prepend the security brief (with the verified requester + trust context lines)
           { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh "$MANIFEST" | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use
