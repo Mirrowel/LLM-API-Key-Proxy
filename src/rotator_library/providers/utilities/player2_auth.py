@@ -137,10 +137,11 @@ async def device_code_login(
         while waiting for approval isn't spelled out in the public API
         reference. This implementation assumes the standard RFC 8628 error
         body (`{"error": "authorization_pending"}`, `"slow_down"`,
-        `"expired_token"`, `"access_denied"`, etc.) on non-200/500 responses:
-        only "authorization_pending" and "slow_down" are treated as
-        "keep waiting"; anything else fails immediately with Player2's own
-        error message instead of silently polling until timeout.
+        `"expired_token"`, `"access_denied"`, etc.) can arrive on either a
+        200 or a non-200/500 response: only "authorization_pending" and
+        "slow_down" are treated as "keep waiting"; anything else fails
+        immediately with Player2's own error message instead of silently
+        polling until timeout.
     """
     # RFC 8628 §3.5 - errors that mean "keep polling", not "give up".
     PENDING_ERRORS = {"authorization_pending"}
@@ -191,28 +192,21 @@ async def device_code_login(
                 },
             )
 
-            if token_resp.status_code == 200:
-                p2_key = token_resp.json().get("p2Key")
-                if p2_key:
-                    lib_logger.info("Obtained Player2 key via device authorization flow.")
-                    return p2_key
-                # A 200 with no key is not a valid "success" response - fail
-                # rather than silently keep polling on something unexpected.
-                raise Player2AuthError(
-                    "Player2 returned a successful response with no p2Key."
-                )
-
-            if token_resp.status_code == 500:
-                raise Player2AuthError(
-                    f"Player2 device login failed with a server error: {token_resp.text}"
-                )
-
-            # Try to read a standard RFC 8628 error body to tell "still
-            # waiting" apart from a real, terminal failure.
+            # Parse the body once, regardless of status code, since Player2
+            # only documents 200/500 for this endpoint - a "still pending"
+            # signal could plausibly arrive as a 200 with an RFC 8628-style
+            # error body instead of a 4xx.
             try:
-                error_code = token_resp.json().get("error")
+                body = token_resp.json()
             except (json.JSONDecodeError, ValueError):
-                error_code = None
+                body = {}
+
+            p2_key = body.get("p2Key")
+            if token_resp.status_code == 200 and p2_key:
+                lib_logger.info("Obtained Player2 key via device authorization flow.")
+                return p2_key
+
+            error_code = body.get("error")
 
             if error_code in PENDING_ERRORS:
                 lib_logger.debug("Player2 device login still pending.")
@@ -225,6 +219,19 @@ async def device_code_login(
                 )
                 continue
 
+            if token_resp.status_code == 200:
+                # A 200 with neither a key nor a recognized pending/slow_down
+                # error is not a valid outcome - fail rather than silently
+                # looping on something unexpected.
+                raise Player2AuthError(
+                    "Player2 returned a successful response with no p2Key."
+                )
+
+            if token_resp.status_code == 500:
+                raise Player2AuthError(
+                    f"Player2 device login failed with a server error: {token_resp.text}"
+                )
+
             # Anything else (access_denied, expired_token, invalid client_id,
             # or an unrecognized/undocumented error) is a real, terminal
             # failure - fail fast instead of polling until timeout.
@@ -236,6 +243,7 @@ async def device_code_login(
         raise Player2AuthError(
             "Timed out waiting for Player2 login approval. Please try again."
         )
+
 
 async def get_p2_key(
     client_id: str,
