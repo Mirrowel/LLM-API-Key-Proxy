@@ -1037,6 +1037,68 @@ check "rebase: share-context words the no-SHA case honestly" yes \
 check "cc-rule: manual dispatch and auto runs get no cc" yes \
   "$(grep -q 'manual dispatches' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && grep -q 'EXACTLY one case' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && echo yes || echo no)"
 
+# ---- HIDDEN = GONE: minimized reviews/comments never count as coverage ------
+# Live-caught: hiding a review left its marker anchoring the next review -
+# hide means wanted-deleted. One shared GraphQL source (minimized-nodes.sh)
+# feeds every consumer; node ids join REST node_id / gh pr view id fields.
+check "hidden: shared minimized-nodes.sh exists with contract header" yes \
+  "$(grep -q 'minimized-nodes.sh <pr_number>' "$SCRIPT_DIR/minimized-nodes.sh" && grep -q 'FAIL CLOSED' "$SCRIPT_DIR/minimized-nodes.sh" && echo yes || echo no)"
+check "hidden: consumed by all four coverage surfaces" "4" \
+  "$(grep -l 'minimized-nodes.sh' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" "$SCRIPT_DIR/../workflows/compliance-check.yml" "$SCRIPT_DIR/generate-review-kit.sh" | wc -l | tr -d ' ')"
+check "hidden: kit captured as trusted artifact in both kit callers" "2" \
+  "$(grep -c 'minimized-nodes.sh /tmp/minimized-nodes.sh' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" | awk -F: '{s+=$2} END{print s}')"
+check "hidden: no consumer trusts a bare index(.field) inside the hidden join" yes \
+  "$(if grep -E 'index\(\.(id|node_id)\)' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" "$SCRIPT_DIR/../workflows/compliance-check.yml" >/dev/null 2>&1; then echo no; else echo yes; fi)"
+# Behavioral: the script parses a mock GraphQL payload into node-id arrays.
+MNSIM_DIR=$(mktemp -d)
+cat > "$MNSIM_DIR/gh" <<'MOCKGH'
+#!/usr/bin/env bash
+case "$*" in
+  *graphql*) printf '{"data":{"repository":{"pullRequest":{"reviews":{"nodes":[{"id":"PRR_a","isMinimized":true},{"id":"PRR_b","isMinimized":false},{"id":"PRR_c","isMinimized":true}]},"comments":{"nodes":[{"id":"IC_x","isMinimized":false},{"id":"IC_y","isMinimized":true}]}}}}}' ;;
+esac
+exit 0
+MOCKGH
+chmod +x "$MNSIM_DIR/gh"
+MNS_OUT=$(PATH="$MNSIM_DIR:$PATH" GH_TOKEN=mock GITHUB_REPOSITORY=Own/repo bash "$SCRIPT_DIR/minimized-nodes.sh" 42 2>/dev/null)
+rm -rf "$MNSIM_DIR"
+check "hidden: node-id extraction from GraphQL payload" '["PRR_a","PRR_c"]|["IC_y"]' \
+  "$(printf '%s' "$MNS_OUT" | jq -r '(.reviews|tostring) + "|" + (.comments|tostring)')"
+# Behavioral: the detection join drops hidden markers (synthetic payload
+# through the exact join shape the workflows use).
+DET_OUT=$(printf '{"comments":[{"id":"IC_y","isMinimized":true,"author":{"login":"zeta-agent"},"body":"<!-- last_reviewed_sha:aaaaaaa -->"},{"id":"IC_x","isMinimized":false,"author":{"login":"zeta-agent"},"body":"<!-- last_reviewed_sha:bbbbbbb -->"}],"reviews":[]}' \
+  | jq -c --argjson bots '["zeta-agent"]' --argjson hidden '{"reviews":[],"comments":["IC_y"]}' '
+        [ (.comments[]? | .id as $cid | select((.isMinimized != true) and (($hidden.comments | index($cid)) == null)) | {type:"comment", body:(.body//""), ts:(.updatedAt // .createdAt // ""), author:(.author.login // "unknown")} ),
+          (.reviews[]?  | .id as $rid | select(($hidden.reviews | index($rid)) == null) | {type:"review",  body:(.body//""), ts:(.submittedAt // .updatedAt // .createdAt // ""), author:(.author.login // "unknown")} )
+        ] | map(select((.author // "" | ascii_downcase as $a | $bots | index($a))))')
+check "hidden: detection join drops the hidden marker, keeps the visible one" "bbbbbbb" \
+  "$(printf '%s' "$DET_OUT" | jq -r '.[0].body' | grep -o 'sha:[a-f]*' | cut -d: -f2)"
+# Requester parity: the dispatch-association + step-output chain shipped to
+# all three dispatch workflows (live-caught in pr-review first).
+check "requester-parity: dispatch_assoc step in all three" "3" \
+  "$(grep -l 'dispatch actor association' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" "$SCRIPT_DIR/../workflows/compliance-check.yml" | wc -l | tr -d ' ')"
+check "requester-parity: no env.RESOLVED_* feeds an action with: input" "0" \
+  "$(grep -cE '(login|association): .*env\.RESOLVED_' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" "$SCRIPT_DIR/../workflows/compliance-check.yml" | awk -F: '{s+=$2} END{print s}')"
+
+# ---- rebase ladder parity: kit + bot-reply + compliance ---------------------
+# Audit-driven: the ladder and honest fallback notes shipped to pr-review
+# first; the shared machinery needed them everywhere.
+check "rebase-parity: kit walks all markers by ancestry" yes \
+  "$(grep -q 'merge-base --is-ancestor' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'tac' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+check "rebase-parity: kit exports REBASE_CONTEXT (RVARS placeholder was dead)" yes \
+  "$(grep -q 'REBASE_CONTEXT=' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+check "rebase-parity: kit full-diff fallback note INSIDE the file" yes \
+  "$(grep -q 'INCREMENTAL_DIFF.note' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'not an incremental one' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+check "rebase-parity: bot-reply ladder is home-guarded + head-pinned" yes \
+  "$(grep -q 'PR_HEAD_OBJ=""' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q -- '--is-ancestor "$csha" "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'QUERY_REPO" = "$GITHUB_REPOSITORY' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "rebase-parity: compliance incremental fallback guards reachability + notes in-file" yes \
+  "$(grep -q 'cat-file -e "$LAST_COMPLIANCE_SHA' "$SCRIPT_DIR/../workflows/compliance-check.yml" && grep -q 'first-run thoroughness' "$SCRIPT_DIR/../workflows/compliance-check.yml" && echo yes || echo no)"
+check "files-parity: no single-page --json files fetch anywhere" "0" \
+  "$(grep -c 'json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,files' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" | awk -F: '{s+=$2} END{print s}')"
+check "files-parity: (MODIFIED) hardcode extinct platform-wide" "0" \
+  "$(grep -c '(MODIFIED)' "$SCRIPT_DIR/../workflows/pr-review.yml" "$SCRIPT_DIR/../workflows/bot-reply.yml" | awk -F: '{s+=$2} END{print s}')"
+check "stub: no phantom BOT_IDENTITIES_INPUT reference" "0" \
+  "$(grep -c 'BOT_IDENTITIES_INPUT' "$SCRIPT_DIR/../workflows/pr-review-trigger.yml")"
+
 # ---- noise-filter defaults: bootstrap seed must MATCH the script ----------
 # Live-caught: bootstrap seeded [] which REPLACES the baked defaults -
 # every bootstrapped repo ran with noise filtering silently disabled.
