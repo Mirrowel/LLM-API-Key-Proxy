@@ -9,6 +9,7 @@ import os
 import re
 import time
 from pathlib import Path
+from typing import Optional
 from dotenv import set_key, get_key
 
 # NOTE: Heavy imports (provider_factory, PROVIDER_PLUGINS) are deferred
@@ -1150,6 +1151,120 @@ def _get_providers_by_category(providers: dict) -> dict:
         by_category[category].append((name, config))
     return by_category
 
+async def _setup_player2_credential(api_key_var: str):
+    """
+    Assisted login wizard for Player2 (https://player2.game).
+
+    Unlike a normal API key, a Player2 "p2Key" is meant to be obtained
+    through a login step rather than copy-pasted from a dashboard. This
+    wizard tries, in order:
+
+    1. Detecting a Player2 desktop app already running locally (instant,
+       no browser needed) - useful for the game-mod use case where players
+       already have the app open.
+    2. The OAuth 2.0 Device Authorization Flow (a URL + short code the user
+       opens on any device) - works headless, over SSH, in Docker, etc.
+
+    A manual "paste an existing p2Key" option is also offered, for people
+    who already have one.
+
+    Both flows need a Player2 "Game Client ID" (`PLAYER2_CLIENT_ID`),
+    registered once by the proxy operator via the Player2 Developer
+    Dashboard at https://player2.game. It's stored in .env like any other
+    setting and reused for all subsequent logins.
+    """
+    from .providers.utilities.player2_auth import (
+        DEFAULT_CLIENT_ID,
+        Player2AuthError,
+        get_p2_key,
+    )
+
+    env_file = _get_env_file()
+
+    # The Game Client ID ships with the code (see player2_auth.DEFAULT_CLIENT_ID
+    # for details on why it's currently provisional) - end users never create
+    # or enter their own. An env var override is supported for forks/self-hosters
+    # who register their own Player2 game for separate usage attribution.
+    client_id = (
+        os.environ.get("PLAYER2_CLIENT_ID")
+        or (get_key(str(env_file), "PLAYER2_CLIENT_ID") if env_file.is_file() else None)
+        or DEFAULT_CLIENT_ID
+    )
+
+    console.print()
+    console.print("[bold]How would you like to sign in?[/bold]")
+    console.print("  1. Auto (detect the Player2 app, or open a browser to approve)")
+    console.print("  2. Paste an existing p2Key manually")
+    choice = Prompt.ask("Choice", choices=["1", "2"], default="1")
+
+    p2_key: Optional[str] = None
+
+    if choice == "2":
+        p2_key = Prompt.ask("[bold]Enter your p2Key[/bold]", password=True).strip() or None
+    else:
+        def on_verification(uri: str, user_code: str) -> None:
+            console.print()
+            console.print(
+                Panel(
+                    Text.from_markup(
+                        f"Open this URL to approve access:\n[bold cyan]{uri}[/bold cyan]\n\n"
+                        f"Code: [bold]{user_code}[/bold]\n\n"
+                        "[dim]Waiting for approval...[/dim]"
+                    ),
+                    style="blue",
+                    title="Player2 Login",
+                    expand=False,
+                )
+            )
+            try:
+                import webbrowser
+
+                webbrowser.open(uri)
+            except Exception:
+                pass
+
+        console.print("\n[dim]Checking for a locally running Player2 app...[/dim]")
+        try:
+            p2_key = await get_p2_key(client_id, on_verification=on_verification)
+        except Player2AuthError as e:
+            console.print(Panel(str(e), style="bold red", title="Login Failed"))
+            return
+        except Exception as e:
+            console.print(
+                Panel(f"Unexpected error during Player2 login: {e}", style="bold red", title="Error")
+            )
+            return
+
+    if not p2_key:
+        console.print("[dim]No key obtained, cancelling.[/dim]")
+        return
+
+    # Reuse the same numbered-key convention as every other provider
+    # (PLAYER2_API_KEY_1, PLAYER2_API_KEY_2, ...).
+    key_index = 1
+    while True:
+        key_name = f"{api_key_var}_{key_index}"
+        if env_file.is_file():
+            with open(env_file, "r") as f:
+                if not any(line.startswith(f"{key_name}=") for line in f):
+                    break
+        else:
+            break
+        key_index += 1
+
+    key_name = f"{api_key_var}_{key_index}"
+    set_key(str(env_file), key_name, p2_key)
+
+    masked = f"{p2_key[:4]}...{p2_key[-4:]}" if len(p2_key) > 8 else "****"
+    console.print(
+        Panel(
+            Text.from_markup(f"Saved [yellow]{key_name}[/yellow] = {masked}"),
+            style="bold green",
+            title="Success",
+            expand=False,
+        )
+    )
+
 
 async def setup_api_key():
     """
@@ -1428,6 +1543,15 @@ async def setup_api_key():
             console.print()
 
         saved_vars = []
+
+        # Player2 gets an assisted login wizard instead of a plain paste
+        # prompt: a p2Key is normally obtained from the local desktop app or
+        # an approval step, not copy-pasted from a dashboard.
+        if provider_key == "player2":
+            await _setup_player2_credential(api_key_var)
+            console.print("\n[dim]Press Enter to continue...[/dim]")
+            input()
+            return
 
         # Prompt for API key (if provider has one)
         if api_key_var:
