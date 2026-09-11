@@ -944,7 +944,7 @@ rm -rf "$SD_TMP"
 
 # ---- per-body budget (body-chars) ------------------------------------------
 check "body-chars: default parsed in fetch-pr-discussion" yes \
-  "$(grep -q '"body-chars" // 3000' "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+  "$(grep -q '"body-chars" // 4000' "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
 check "body-chars: clip applied to all four body sites" "4" \
   "$(grep -c 'clip((' "$SCRIPT_DIR/fetch-pr-discussion.sh" | tr -d ' ')"
 check "body-chars: issue-mode comments clip + patterns + budget" yes \
@@ -1057,6 +1057,27 @@ check "discussion: posting.md mandates reply-where-asked as default" yes \
   "$(grep -q 'reply where you were summoned' "$SCRIPT_DIR/../prompts/parts/posting.md" && grep -q 'DISCUSSION_REPLY_TO_NODE' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 check "discussion: bootstrap seeds the thread-model keys" yes \
   "$(grep -q '"discussion-threads":40,"discussion-replies":30' "$SCRIPT_DIR/../workflows/agent-bootstrap.yml" && echo yes || echo no)"
+
+# ---- chronological presentation (operator ruling 2026-09-11) ---------------
+# Fetch stays newest-first (windows keep the newest N); RENDER is
+# chronological everywhere a conversation/thread is presented - inverted order
+# forced the model to unscramble narrative causality (live-caught: the
+# discussion render read answer-before-question). Also pins the
+# newest-N-SELECTION fix (ascending GraphQL pages sliced directly yielded the
+# OLDEST N of the window).
+check "order: fetch-pr-discussion renders blocks ascending" yes \
+  "$(grep -q '($agent_reviews_new\[0:\$count\] | sort_by(.submittedAt))' "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "order: fetch-pr-discussion threads+comments ascending inside reviews" yes \
+  "$(grep -c 'map(sort_by(.createdAt))' "$SCRIPT_DIR/fetch-pr-discussion.sh" | awk '{print ($1 >= 2) ? "yes" : "no"}')"
+check "order: discussion render = newest-selection THEN ascending" yes \
+  "$(grep -qF 'sort_by(.at) | reverse | .[0:$dt] | sort_by(.at)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'oldest-first below' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "order: memory-block labels say chronological" yes \
+  "$(grep -q 'chronological order' "$SCRIPT_DIR/../prompts/parts/previous-reviews.md" && grep -q 'chronological order' "$SCRIPT_DIR/../prompts/parts/agent-review-history.md" && echo yes || echo no)"
+# Behavioral: an ascending page through the exact select-then-render shape
+# keeps the NEWEST dt and renders them OLDEST-first (newest 2 of
+# old/mid/new = mid+new; rendered ascending = mid,new).
+ORDER_PROBE=$(printf '[{"at":"2026-01-01","t":"old"},{"at":"2026-02-02","t":"mid"},{"at":"2026-03-03","t":"new"}]' | jq -r --argjson dt 2 '[.[] | {at, txt: .t}] | sort_by(.at) | reverse | .[0:$dt] | sort_by(.at) | map(.txt) | join(",")')
+check "order: behavioral probe (newest 2 selected, rendered oldest-first)" "mid,new" "$ORDER_PROBE"
 
 # ---- HIDDEN = GONE: minimized reviews/comments never count as coverage ------
 # Live-caught: hiding a review left its marker anchoring the next review -

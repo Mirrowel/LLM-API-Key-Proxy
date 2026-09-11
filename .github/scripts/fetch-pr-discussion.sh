@@ -27,7 +27,7 @@
 #     "orphan-threads": 20,         // review-less threads ("Add single
 #                                    //   comment"), newest first
 #     "orphan-thread-comments": 10, // replies per orphaned thread
-#     "body-chars": 3000            // per-post body cap (comments AND review
+#     "body-chars": 4000            // per-post body cap (comments AND review
 #                                    //   summaries); longer bodies are cut
 #                                    //   with a visible [body truncated]
 #                                    //   marker - count caps alone cannot
@@ -100,7 +100,7 @@ if [ -n "${CONTEXT_LIMITS_JSON:-}" ]; then
     LIM_THREAD_COMMENTS=$(printf '%s' "$CONTEXT_LIMITS_JSON" | jq -r '."thread-comments" // 10')
     LIM_ORPHAN_THREADS=$(printf '%s' "$CONTEXT_LIMITS_JSON" | jq -r '."orphan-threads" // 20')
     LIM_ORPHAN_THREAD_COMMENTS=$(printf '%s' "$CONTEXT_LIMITS_JSON" | jq -r '."orphan-thread-comments" // 10')
-    LIM_BODY_CHARS=$(printf '%s' "$CONTEXT_LIMITS_JSON" | jq -r '."body-chars" // 3000')
+    LIM_BODY_CHARS=$(printf '%s' "$CONTEXT_LIMITS_JSON" | jq -r '."body-chars" // 4000')
   else
     echo "::warning::CONTEXT_LIMITS_JSON is not a JSON object; using per-key defaults."
   fi
@@ -342,11 +342,16 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     + (if .isMinimized then " [hidden]" else "" end);
   def fmt_c: ("- " + (.path // "Unknown file") + ":" + (((.line // .originalLine // "N/A")) | tostring) + " (" + (.createdAt // "N/A") + ") by " + (.author.login? // "unknown") + " - " + clip((.body // "") | tostring) + markers + " <" + (.url // "") + ">");
   # ---- review selection: newest limReviews + own-newest limOwn (safeguard) -
+  # SELECTION is newest-first (the windows keep the newest N); RENDER below
+  # re-sorts the selected set chronologically - a thread reads top-to-bottom
+  # the way a human would (operator ruling 2026-09-11: fetch newest-first,
+  # present oldest-first, everywhere).
   (($pr.reviews.nodes // []) | sort_by(.submittedAt) | reverse) as $reviews_new |
   ([ $reviews_new[] | select(is_own and (.isMinimized != true)) ] | .[0:$limOwn]) as $own_sel |
   ([ $reviews_new[] | select((is_own | not) and (.isMinimized != true) and (noisy | not) and (((.author.login? // "unknown" | ascii_downcase) as $login | $ignored | index($login)) | not)) ] | .[0:$limReviews]) as $other_sel |
-  (($own_sel + $other_sel) | unique_by(.databaseId) | sort_by(.submittedAt) | reverse) as $selected |
-  ([ $selected[] | select(is_own) ]) as $agent_reviews |
+  (($own_sel + $other_sel) | unique_by(.databaseId) | sort_by(.submittedAt) | reverse) as $selected_new |
+  ($selected_new | sort_by(.submittedAt)) as $selected |
+  ($selected_new | map(select(is_own))) as $agent_reviews_new |
   # ---- per-review thread allocation (newest threads, capped) ---------------
   # FILTER BEFORE CAP, strictly: inside each thread, filter comments FIRST
   # (hidden never counts; resolved/outdated/stale-anchors never count outside
@@ -354,7 +359,8 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   # with markers, but never the hidden drop), drop threads left with zero
   # survivors so they consume no slot, THEN take the newest
   # threads-per-review threads, and only then the newest thread-comments
-  # replies per surviving thread.
+  # replies per surviving thread. Render order is chronological at both
+  # levels (selection newest-first, presentation oldest-first).
   def rv_alloc($rid; $skipfilter):
     [ $allc[] | select((.pullRequestReview.databaseId? // null) == $rid) ]
     | group_by(.thId)
@@ -364,6 +370,8 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     | sort_by((.[0].createdAt // "0")) | reverse
     | .[0:$limThreadsPerReview]
     | map(.[0:$limThreadComments])
+    | map(sort_by(.createdAt))
+    | sort_by((.[0].createdAt // "0"))
     | flatten;
   def review_block($skipfilter):
     . as $r |
@@ -375,7 +383,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   # ---- orphan threads: review-less, filtered, newest, capped ----------------
   # Same filter-before-cap discipline: filter the comments of each thread
   # first, drop emptied threads (no slot consumed), then cap the newest
-  # orphan threads and their replies.
+  # orphan threads and their replies. Render chronological (same ruling).
   ([ $allc | group_by(.thId)[]
       | select([.[] | select(.pullRequestReview != null)] | length == 0) ]
     | map(sort_by(.createdAt) | reverse
@@ -384,6 +392,8 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     | sort_by((.[0].createdAt // "0")) | reverse
     | .[0:$limOrphanThreads]
     | map(.[0:$limOrphanThreadComments])
+    | map(sort_by(.createdAt))
+    | sort_by((.[0].createdAt // "0"))
     | flatten) as $orphan_cmts |
   [ $orphan_cmts[] | select(agent_cmt | not) | fmt_c ] as $unlinked |
   # ---- other reviews render (selected only, filtered comments) -------------
@@ -397,12 +407,12 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   ] | join("") as $othertext |
   ([ $allc[] | select((cmt_ok and (thread_ok and cmt_fresh)) | not) ] | length) as $n_filtered |
   {
-    elevated: ((([$agent_reviews[0:$count][] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end) + ($agent_reviews[0:$count] | dismissed_note)),
-    history: ((([$agent_reviews[$count:][] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end) + ($agent_reviews[$count:] | dismissed_note)),
+    elevated: ((([($agent_reviews_new[0:$count] | sort_by(.submittedAt))[] | review_block(true)] | join("\n")) | if length > 0 then . else "(No previous reviews by this agent yet.)" end) + ($agent_reviews_new[0:$count] | dismissed_note)),
+    history: ((([($agent_reviews_new[$count:] | sort_by(.submittedAt))[] | review_block(false)] | join("\n")) | if length > 0 then . else "(No older reviews by this agent.)" end) + ($agent_reviews_new[$count:] | dismissed_note)),
     threadreviews: ((if ($othertext | length) > 0 then $othertext else "No formal reviews." end)
    + (if ($unlinked | length) > 0 then "\nStandalone inline comments (no review):\n" + ($unlinked | join("\n")) + "\n" else "" end)
    + (($selected | map(select(is_own | not))) | dismissed_note)),
-    filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, stale anchors, or minimized comments in active threads); hidden (minimized) content excluded everywhere, own reviews included; AI-reviewer noise posts (rate-limit/skip notices) and ignored authors dropped. The elevated block bypasses only the resolved/outdated filter, on purpose. Context budget (newest-first, filter-before-cap): " + ($limReviews | tostring) + " reviews + " + ($limOwn | tostring) + " own safeguard, " + ($limThreadsPerReview | tostring) + " threads/review, " + ($limThreadComments | tostring) + " replies/thread, " + ($limOrphanThreads | tostring) + " orphan threads.</filtering_summary>")
+    filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, stale anchors, or minimized comments in active threads); hidden (minimized) content excluded everywhere, own reviews included; AI-reviewer noise posts (rate-limit/skip notices) and ignored authors dropped. The elevated block bypasses only the resolved/outdated filter, on purpose. Context budget (newest-N selected after filtering, rendered chronologically): " + ($limReviews | tostring) + " reviews + " + ($limOwn | tostring) + " own safeguard, " + ($limThreadsPerReview | tostring) + " threads/review, " + ($limThreadComments | tostring) + " replies/thread, " + ($limOrphanThreads | tostring) + " orphan threads.</filtering_summary>")
   }
 '); then
   echo "::warning::Discussion block formatting failed for PR #$PR_NUMBER"

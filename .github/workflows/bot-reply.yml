@@ -282,7 +282,7 @@ jobs:
             [ -z "$CLJ" ] && CLJ='{}'
             LIM_DT=$(printf '%s' "$CLJ" | jq -r '."discussion-threads" // 40')
             LIM_DR=$(printf '%s' "$CLJ" | jq -r '."discussion-replies" // 30')
-            LIM_BC=$(printf '%s' "$CLJ" | jq -r '."body-chars" // 3000')
+            LIM_BC=$(printf '%s' "$CLJ" | jq -r '."body-chars" // 4000')
             # Overfill 3x for filter-before-cap, clamped to GraphQL's 100 max.
             TCOUNT=$LIM_DT; [ $((TCOUNT * 3)) -le 100 ] && TCOUNT=$((LIM_DT * 3)) || TCOUNT=100
             RCOUNT=$LIM_DR; [ $((RCOUNT * 3)) -le 100 ] && RCOUNT=$((LIM_DR * 3)) || RCOUNT=100
@@ -419,15 +419,22 @@ jobs:
                   | ([(($c.replies.nodes // [])[])
                       | select(.isMinimized != true)
                       | select(kept(.author.login // ""))
-                      | select((.body // "") | noise(.) | not)]) as $rk
-                  | ($rk[0:$dr]) as $show
-                  | (($c.replies.totalCount // ($rk | length)) - ($show | length)) as $rdrop
-                  | "- \($c.author.login // "?") (\($c.authorAssociation // "NONE")) at \($c.createdAt):\n\(clip($c.body // ""))"
-                    + (if ($show | length) > 0 then "\n" + ([$show[] | "    ↳ \(.author.login // "?"): \(clip(.body // ""))"] | join("\n")) else "" end)
-                    + (if $rdrop > 0 then "\n    [\($rdrop) replies not shown here (older than the window or filtered) - retrieve via GraphQL replies() if they matter]" else "" end) ]
-                | .[0:$dt]
-                | reverse
-                | join("\n\n")')
+                      | select((.body // "") | noise(.) | not)]
+                      | sort_by(.createdAt) | reverse | .[0:$dr] | sort_by(.createdAt)) as $show
+                  | (($c.replies.totalCount // (($show | length) + 0)) - ($show | length)) as $rdrop
+                  | { at: ($c.createdAt // "0"),
+                      txt: ("- \($c.author.login // "?") (\($c.authorAssociation // "NONE")) at \($c.createdAt):\n\(clip($c.body // ""))"
+                        + (if ($show | length) > 0 then "\n" + ([$show[] | "    ↳ \(.author.login // "?"): \(clip(.body // ""))"] | join("\n")) else "" end)
+                        + (if $rdrop > 0 then "\n    [\($rdrop) replies not shown here (older than the window or filtered) - retrieve via GraphQL replies() if they matter]" else "" end)) } ]
+                # SELECTION keeps the newest dt threads (sort descending,
+                # slice) - the raw page arrives ascending, so slicing it
+                # directly took the OLDEST dt of the window. Render then
+                # the OLDEST dt of the window (live-caught class). Render then
+                # re-sorts chronologically: conversations read top-to-bottom
+                # the way a human would (fetch newest-first, present
+                # oldest-first).
+                | sort_by(.at) | reverse | .[0:$dt] | sort_by(.at)
+                | map(.txt) | join("\n\n")')
             total_threads=$(printf '%s' "$disc_json" | jq -r '.comments.totalCount // (.comments.nodes | length)')
             # Count rendered THREAD HEADS only (shape-pinned: "- Login (ASSOC)
             # at <ts>:") - comment bodies contain their own "- " bullets that
@@ -464,7 +471,7 @@ jobs:
             TC_DELIM="DISC_CTX_EOF_$(openssl rand -hex 8)"
             DISC_BODY=$(printf '%s' "$disc_json" | jq -r '(.body // "") | if length > 8000 then .[0:8000] + "\n[discussion body truncated]" else . end')
             { printf 'THREAD_CONTEXT<<%s\n' "$TC_DELIM"
-              printf '%s\n\nDiscussion body:\n%s\n\nComment threads (newest %s top-level, up to %s replies each, filtered):\n%s%s\n' "$cat_hdr" "$DISC_BODY" "$LIM_DT" "$LIM_DR" "$comments_rendered" "$threads_note"
+              printf '%s\n\nDiscussion body:\n%s\n\nComment threads (the %s most recent top-level, up to %s replies each, oldest-first below, filtered):\n%s%s\n' "$cat_hdr" "$DISC_BODY" "$LIM_DT" "$LIM_DR" "$comments_rendered" "$threads_note"
               printf '%s\n' "$TC_DELIM"; } >> "$GITHUB_ENV"
             # Reply anchoring: a comment-trigger answers INSIDE that comment's
             # thread (replyTo); only new-discussion bodies (or a guest relay
@@ -948,7 +955,7 @@ jobs:
             created_at=$(echo "$issue_data" | jq -r .createdAt)
             state=$(echo "$issue_data" | jq -r .state)
             title=$(echo "$issue_data" | jq -r .title)
-            body=$(echo "$issue_data" | jq -r --argjson bc "$(printf '%s' "${CONTEXT_LIMITS_JSON:-}" | jq -r '."body-chars" // 3000')" '(.body // "(No description provided)") | if length > $bc then .[0:$bc] + "\n[body truncated]" else . end')
+            body=$(echo "$issue_data" | jq -r --argjson bc "$(printf '%s' "${CONTEXT_LIMITS_JSON:-}" | jq -r '."body-chars" // 4000')" '(.body // "(No description provided)") | if length > $bc then .[0:$bc] + "\n[body truncated]" else . end')
             # Prepare comments - SAME discipline as fetch-pr-discussion.sh:
             # filter-before-cap (ignored authors + AI-reviewer noise patterns
             # never consume a slot), then newest-N survivors, then per-body
@@ -963,7 +970,7 @@ jobs:
               --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
               --argjson patterns "$FILTER_PATTERNS_JSON" \
               --argjson limComments "$(printf '%s' "${CONTEXT_LIMITS_JSON:-}" | jq -r '.comments // 30')" \
-              --argjson bodyChars "$(printf '%s' "${CONTEXT_LIMITS_JSON:-}" | jq -r '."body-chars" // 3000')" '
+              --argjson bodyChars "$(printf '%s' "${CONTEXT_LIMITS_JSON:-}" | jq -r '."body-chars" // 4000')" '
               ($ignore_authors | split(",") | map(select(length > 0))) as $ignored |
               def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
               def clip($s): if ($s | length) > $bodyChars then ($s[0:$bodyChars] + "\n[body truncated]") else $s end;
