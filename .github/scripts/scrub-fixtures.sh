@@ -378,6 +378,47 @@ check "permission: legit jq flows unaffected" 0 "$pt"
 pt=0; for t in "${denied_tests[@]}"; do hit=0; for r in "${deny_rules[@]}"; do [[ $t == $r ]] && hit=1; done; [ $hit -eq 0 ] && pt=1; done
 check "permission: all env-dump forms denied" 0 "$pt"
 
+# ---- gh api permission matrix (REAL rules, ORDERED, last-match-wins) -------
+# Replicates opencode semantics: rules evaluated in file order, last match
+# wins. Anchored REST-path denies + graphql allow LAST. Live-caught seed:
+# the bare *actions* deny blocked any query carrying the reactions FIELD.
+gh_rules=$(jq -r '.permission.bash | to_entries[] | "\(.value)\t\(.key)"' "$SCRIPT_DIR/../actions/bot-setup/permissions.example.json" | tr -d '\r')
+gh_verdict() { # command -> final verdict via ordered evaluation
+  local t="$1" v="allow" line pat
+  while IFS=$'\t' read -r verdict pat; do
+    [ -n "$pat" ] || continue
+    # shellcheck disable=SC2254
+    case "$t" in $pat) v="$verdict" ;; esac
+  done <<RULES
+$gh_rules
+RULES
+  printf '%s' "$v"
+}
+check "perm-gh: graphql reactions field allowed (live-caught collision)" allow \
+  "$(gh_verdict "gh api graphql -f query='query { repository { discussion(number:5) { comments { nodes { author { login } reactions { content } } } } } } }'")"
+check "perm-gh: graphql addDiscussionComment reply mutation allowed" allow \
+  "$(gh_verdict "gh api graphql -f query='mutation(\$b: String!, \$d: ID!, \$r: ID) { addDiscussionComment(input: {discussionId: \$d, body: \$b, replyTo: \$r}) { comment { id } } }' -f body=@/tmp/b.md")"
+check "perm-gh: reading a file named dispatcher.py allowed" allow \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/contents/src/dispatcher.py")"
+check "perm-gh: code search for 'variables' allowed" allow \
+  "$(gh_verdict "gh api search/code?q=variables%20repo:Mirrowel/LLM-API-Key-Proxy")"
+check "perm-gh: REST actions runs denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/actions/runs")"
+check "perm-gh: repository_dispatch POST denied" deny \
+  "$(gh_verdict "gh api -X POST /repos/Mirrowel/LLM-API-Key-Proxy/dispatches -f event_type=x")"
+check "perm-gh: actions variables write denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/actions/variables/PROD")"
+check "perm-gh: repo secrets read denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/secrets")"
+check "perm-gh: environment secrets denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/environment-secrets/DEPLOY_KEY")"
+check "perm-precision: os.environ import-alias exfil denied" deny \
+  "$(gh_verdict "python -c \"from os import environ as e; print(e['GH_TOKEN'])\"")"
+check "perm-precision: ps eww env-dump denied" deny \
+  "$(gh_verdict "ps eww")"
+check "perm-precision: plus-refspec force push denied" deny \
+  "$(gh_verdict "git push origin +main")"
+
 # ---- agent-router decision matrix (exercises the REAL route-comment.sh) ----
 route() { # body is_pr -> flags or "none" — delegates to the shared script
   # SCRIPT_DIR is the absolute path computed at script start (line 9); do NOT
@@ -1078,6 +1119,28 @@ check "order: memory-block labels say chronological" yes \
 # old/mid/new = mid+new; rendered ascending = mid,new).
 ORDER_PROBE=$(printf '[{"at":"2026-01-01","t":"old"},{"at":"2026-02-02","t":"mid"},{"at":"2026-03-03","t":"new"}]' | jq -r --argjson dt 2 '[.[] | {at, txt: .t}] | sort_by(.at) | reverse | .[0:$dt] | sort_by(.at) | map(.txt) | join(",")')
 check "order: behavioral probe (newest 2 selected, rendered oldest-first)" "mid,new" "$ORDER_PROBE"
+
+# ---- addressable context: every conversation line carries its id ----------
+# Live-caught via the agent's own workaround: reactions.md teaches
+# POST .../comments/<comment_id>/reactions but NO renderer carried ids, so
+# everything beyond the trigger was taught-yet-unaddressable. Every surface
+# now renders the id: numeric [id N] on issues/PRs (exactly what the REST
+# endpoints want), node ids [DC_...] on discussions (what replyTo/addReaction
+# want).
+check "ids: PR conversation comments carry [id N]" yes \
+  "$(grep -q 'map("- \[id "' "$SCRIPT_DIR/fetch-pr-discussion.sh" && echo yes || echo no)"
+check "ids: bot-reply issue-mode comments carry [id N]" yes \
+  "$(grep -q 'map("- \[id "' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "ids: issue-comment renders ids in both paths" "2" \
+  "$(grep -c '"- \[id "' "$SCRIPT_DIR/../workflows/issue-comment.yml" | tr -d ' ')"
+check "ids: discussion thread heads carry node ids" yes \
+  "$(grep -qF '"- [\($c.id)]' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "ids: discussion reply lines carry node ids" yes \
+  "$(grep -qF '"    ↳ [\(.id)]' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "ids: reactions.md points at the context-line ids" yes \
+  "$(grep -q 'numeric comment id rides every conversation line' "$SCRIPT_DIR/../prompts/parts/reactions.md" && grep -q 'addReaction' "$SCRIPT_DIR/../prompts/parts/reactions.md" && echo yes || echo no)"
+check "ids: posting.md arbitrary-reply lane uses context node ids" yes \
+  "$(grep -q 'f r=\"<that comment' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 
 # ---- HIDDEN = GONE: minimized reviews/comments never count as coverage ------
 # Live-caught: hiding a review left its marker anchoring the next review -

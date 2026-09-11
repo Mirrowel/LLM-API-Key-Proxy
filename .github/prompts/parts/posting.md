@@ -43,5 +43,5 @@ The mutation returns your comment's node `id` — remember it for edits. Edit yo
 ```bash
 gh api graphql -f query='mutation($b: String!, $c: ID!) { updateDiscussionComment(input: {commentId: $c, body: $b}) { comment { id } } }' -f body=@/tmp/comment-body.md -f c="<your comment node id>"
 ```
-Reply to a specific comment: add `replyToId: "<comment node id>"` inside the `addDiscussionComment` input. Rules that follow from the API: a FORBIDDEN error means the thread is locked (say so in the run summary, post nothing); never mark answers yourself — suggest the author accept one when the thread clearly resolved, and only in answerable (Q&A) categories.
+Reply to a specific comment other than the trigger: every comment in your context carries its node id as `[DC_...]` — same mutation, anchor it with `-f r="<that comment's node id>"`. Rules that follow from the API: a FORBIDDEN error means the thread is locked (say so in the run summary, post nothing); never mark answers yourself — suggest the author accept one when the thread clearly resolved, and only in answerable (Q&A) categories.
 

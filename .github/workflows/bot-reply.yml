@@ -423,8 +423,8 @@ jobs:
                       | sort_by(.createdAt) | reverse | .[0:$dr] | sort_by(.createdAt)) as $show
                   | (($c.replies.totalCount // (($show | length) + 0)) - ($show | length)) as $rdrop
                   | { at: ($c.createdAt // "0"),
-                      txt: ("- \($c.author.login // "?") (\($c.authorAssociation // "NONE")) at \($c.createdAt):\n\(clip($c.body // ""))"
-                        + (if ($show | length) > 0 then "\n" + ([$show[] | "    ↳ \(.author.login // "?"): \(clip(.body // ""))"] | join("\n")) else "" end)
+                      txt: ("- [\($c.id)] \($c.author.login // "?") (\($c.authorAssociation // "NONE")) at \($c.createdAt):\n\(clip($c.body // ""))"
+                        + (if ($show | length) > 0 then "\n" + ([$show[] | "    ↳ [\(.id)] \(.author.login // "?"): \(clip(.body // ""))"] | join("\n")) else "" end)
                         + (if $rdrop > 0 then "\n    [\($rdrop) replies not shown here (older than the window or filtered) - retrieve via GraphQL replies() if they matter]" else "" end)) } ]
                 # SELECTION keeps the newest dt threads (sort descending,
                 # slice) - the raw page arrives ascending, so slicing it
@@ -978,7 +978,7 @@ jobs:
               | map(select(((.author.login // "" | ascii_downcase) as $login | ($ignored | index($login)) | not) and (noisy | not)))
               | if length > $limComments then .[($limComments * -1):] else . end
               | if length > 0 then
-                  map("- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + clip((.body // "") | tostring) + "\n") | join("")
+                  map("- [id " + ((.id // "?") | tostring) + "] " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + clip((.body // "") | tostring) + "\n") | join("")
                 else "No comments have been posted yet."
                 end')
 

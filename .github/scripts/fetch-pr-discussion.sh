@@ -295,7 +295,7 @@ thread_context=$(printf '%s' "$discussion_data" | jq -r \
     ))
   | if length > $limComments then .[($limComments * -1):] else . end
   | if length > 0 then
-      map("- " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + clip((.body // "") | tostring) + "\n")
+      map("- [id " + ((.databaseId // "?") | tostring) + "] " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + clip((.body // "") | tostring) + "\n")
       | join("")
     else "No general comments."
     end
