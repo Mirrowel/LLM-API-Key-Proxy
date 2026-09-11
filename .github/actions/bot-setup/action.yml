@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ''
   plugins-json:
-    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under ~/.mirrobot-plugins/ for referencing from the config secret plugin array (absolute path /home/runner/.mirrobot-plugins/<path>).'
+    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under $HOME/.mirrobot-plugins/ (on GitHub-hosted runners /home/runner/.mirrobot-plugins/) for referencing from the config secret plugin array.'
     required: false
     default: ''
   plugins-json-1:

@@ -236,7 +236,7 @@ jobs:
           | `OPENCODE_API_KEY` | optional | API key applied to the main model's provider (redundant when keys live inside `OPENCODE_CONFIG_JSON`). |
           | `SHARE_LINK_PUBKEY` | optional | RSA public key enabling encrypted session share links (see `decrypt_share_link.py`). |
 
-          Quick fill (run from a machine with `gh` authenticated as an admin):
+          Quick fill (run from a machine with `gh` authenticated as an admin; Windows PowerShell: `Get-Content config.min.json | gh secret set OPENCODE_CONFIG_JSON -R <owner>/<repo>`):
           ```bash
           gh secret set OPENCODE_MODEL        -R <owner>/<repo> --body "provider/model"
           gh secret set OPENCODE_CONFIG_JSON  -R <owner>/<repo> < config.min.json
