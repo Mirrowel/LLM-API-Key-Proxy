@@ -24,12 +24,23 @@ def _classified(error_type: str, **kwargs) -> ClassifiedError:
 
 
 def test_classifier_output_maps_to_fallback_policy_categories() -> None:
-    retryable = ["rate_limit", "quota_exceeded", "server_error", "api_connection", "unsupported_operation"]
-    stopped = [
+    retryable = [
+        "rate_limit",
+        "quota_exceeded",
+        "server_error",
+        "api_connection",
+        "unsupported_operation",
+        # Credential-scoped failures advance the chain (operator-approved
+        # matrix, error-reference 5.9).
         "authentication",
         "forbidden",
+        "not_found",
+        "conflict",
+    ]
+    stopped = [
         "invalid_request",
         "context_window_exceeded",
+        "request_too_large",
         "credential_reauth_needed",
         "pre_request_callback_error",
         "cancelled",

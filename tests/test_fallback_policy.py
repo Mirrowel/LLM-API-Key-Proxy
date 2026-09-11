@@ -17,13 +17,26 @@ def test_policy_falls_back_on_retryable_categories() -> None:
 def test_policy_stops_on_permanent_categories() -> None:
     policy = FallbackPolicy()
 
-    assert policy.should_fallback("authentication") is False
-    assert policy.should_fallback("forbidden") is False
+    # Deterministic client-side failures stop the chain: no provider or
+    # credential can fix them.
     assert policy.should_fallback("invalid_request") is False
     assert policy.should_fallback("context_window_exceeded") is False
+    assert policy.should_fallback("request_too_large") is False
     assert policy.should_fallback("credential_reauth_needed") is False
     assert policy.should_fallback("pre_request_callback_error") is False
     assert policy.should_fallback("cancelled") is False
+
+
+def test_policy_fails_over_on_credential_scoped_failures() -> None:
+    # Operator-approved matrix (error-reference 5.9): a dead key on one
+    # provider must not stop the next provider from being tried.
+    policy = FallbackPolicy()
+
+    assert policy.should_fallback("authentication") is True
+    assert policy.should_fallback("forbidden") is True
+    # Provider-level facts another target may resolve.
+    assert policy.should_fallback("not_found") is True
+    assert policy.should_fallback("conflict") is True
 
 
 def test_policy_blocks_stream_fallback_after_visible_output() -> None:
@@ -50,11 +63,11 @@ def test_policy_hard_stops_cannot_be_overridden_by_group_failover() -> None:
     group = FallbackGroup(
         name="unsafe",
         targets=(parse_route_target("a/model"), parse_route_target("b/model")),
-        failover_on=frozenset({"auth", "configuration"}),
+        failover_on=frozenset({"validation", "configuration"}),
         stop_on=frozenset(),
     )
 
-    assert FallbackPolicy().should_fallback("authentication", group=group) is False
+    assert FallbackPolicy().should_fallback("invalid_request", group=group) is False
     assert FallbackPolicy().should_fallback("configuration_error", group=group) is False
 
 
@@ -76,4 +89,12 @@ def test_policy_normalizes_common_structured_provider_aliases() -> None:
     assert normalize_route_error_type("too_many_requests") == "rate_limit"
     assert normalize_route_error_type("resource_exhausted") == "quota_exceeded"
     assert normalize_route_error_type("unavailable") == "server_error"
-    assert normalize_route_error_type("deadline_exceeded") == "api_connection"
+    assert normalize_route_error_type("deadline_exceeded") == "server_error"
+    assert normalize_route_error_type("timeout_error") == "server_error"
+    assert normalize_route_error_type("overloaded_error") == "server_error"
+    assert normalize_route_error_type("rate_limit_error") == "rate_limit"
+    assert normalize_route_error_type("insufficient_quota") == "quota_exceeded"
+    assert normalize_route_error_type("billing_error") == "quota_exceeded"
+    assert normalize_route_error_type("not_found_error") == "not_found"
+    assert normalize_route_error_type("conflict_error") == "conflict"
+    assert normalize_route_error_type("request_too_large") == "request_too_large"

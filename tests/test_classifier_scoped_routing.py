@@ -494,7 +494,10 @@ def test_usage_manager_resyncs_active_credentials_while_preserving_history(tmp_p
         stats = await manager.get_stats_for_endpoint()
         assert stats["credential_count"] == 1
         active = next(iter(stats["credentials"].values()))
-        assert active["full_path"] == "key-two"
+        from rotator_library.usage.identity.registry import derive_accessor_id
+
+        assert active["full_path"] == derive_accessor_id("key-two")
+        assert "key-two" not in json.dumps(active)
         await manager.shutdown()
 
     run_async(run_test())

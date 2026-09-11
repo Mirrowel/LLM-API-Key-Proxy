@@ -88,6 +88,9 @@ class StructuredAPIResponseError(Exception):
         return {
             "authentication": 401,
             "forbidden": 403,
+            "not_found": 404,
+            "conflict": 409,
+            "request_too_large": 413,
             "rate_limit": 429,
             "quota_exceeded": 429,
             "invalid_request": 400,
@@ -95,11 +98,16 @@ class StructuredAPIResponseError(Exception):
             "server_error": 502,
             "proxy_timeout": 504,
             "proxy_all_credentials_exhausted": 503,
-            "not_found": 404,
         }.get(self.error_type, 502)
 
     def to_protocol_payload(self, protocol: str) -> dict:
-        """Format one terminal provider error in the selected client protocol."""
+        """Format one terminal provider error in the selected client protocol.
+
+        Vocabulary per docs/experimental/error-reference.md 5.10 — official
+        enums only. The anthropic branch is status-aware so 504 renders as
+        timeout_error and 529 as overloaded_error even though both classify
+        as the internal server_error family.
+        """
 
         message = str(self)
         if protocol == "anthropic_messages":
@@ -111,7 +119,16 @@ class StructuredAPIResponseError(Exception):
                 "invalid_request": "invalid_request_error",
                 "context_window_exceeded": "invalid_request_error",
                 "not_found": "not_found_error",
+                "conflict": "conflict_error",
+                "request_too_large": "request_too_large",
             }.get(self.error_type, "api_error")
+            if self.error_type in ("server_error", "proxy_timeout", "api_connection"):
+                if self.http_status == 504:
+                    error_type = "timeout_error"
+                elif self.http_status == 529:
+                    error_type = "overloaded_error"
+                else:
+                    error_type = "api_error"
             return {"type": "error", "error": {"type": error_type, "message": message}}
         if protocol == "gemini":
             status = {
@@ -122,14 +139,39 @@ class StructuredAPIResponseError(Exception):
                 "invalid_request": "INVALID_ARGUMENT",
                 "context_window_exceeded": "INVALID_ARGUMENT",
                 "not_found": "NOT_FOUND",
+                "conflict": "ALREADY_EXISTS",
+                "request_too_large": "INVALID_ARGUMENT",
                 "proxy_timeout": "DEADLINE_EXCEEDED",
                 "proxy_all_credentials_exhausted": "UNAVAILABLE",
             }.get(self.error_type, "INTERNAL")
+            if self.error_type in ("server_error", "api_connection"):
+                if self.http_status == 529 or self.http_status == 503:
+                    status = "UNAVAILABLE"
+                elif self.http_status == 504:
+                    status = "DEADLINE_EXCEEDED"
             return {"error": {"code": self.http_status, "message": message, "status": status}}
+        # openai_chat / responses default branch: official error-object
+        # vocabulary (invalid_request_error, rate_limit_error, ...) with a
+        # separate machine `code` and the spec's `param` key.
+        type_map = {
+            "invalid_request": "invalid_request_error",
+            "context_window_exceeded": "invalid_request_error",
+            "request_too_large": "invalid_request_error",
+            "authentication": "authentication_error",
+            "forbidden": "permission_error",
+            "not_found": "not_found_error",
+            "rate_limit": "rate_limit_error",
+            "quota_exceeded": "insufficient_quota",
+            "server_error": "server_error",
+            "proxy_timeout": "server_error",
+            "api_connection": "server_error",
+            "proxy_all_credentials_exhausted": "server_error",
+        }
         return {
             "error": {
                 "message": message,
-                "type": self.error_type,
+                "type": type_map.get(self.error_type, "server_error"),
+                "param": None,
                 "code": self.error_type,
             }
         }
@@ -140,7 +182,20 @@ def structured_api_response_error(
     *,
     headers: dict | None = None,
 ) -> StructuredAPIResponseError | None:
-    """Normalize top-level provider error envelopes across execution modes."""
+    """Normalize top-level provider error envelopes across execution modes.
+
+    Classification shares the grounded evidence order with
+    ``classify_error`` (docs/experimental/error-reference.md 5.9): quota
+    markers at any status first, then structured wire vocabulary, then the
+    status ladder. Free-text participates only in the two sanctioned narrow
+    checks (context spellings; quota tokens at 400/429) — never bare
+    substring tokens like "rate".
+    """
+
+    from ..error_handler import (
+        _classify_structured_error_text,
+        _structured_quota_signal,
+    )
 
     if not isinstance(response, dict) or "error" not in response or response.get("error") in (None, "", False):
         return None
@@ -164,22 +219,34 @@ def structured_api_response_error(
         status_code = int(raw_status)
     except (TypeError, ValueError):
         status_code = None
-    descriptor = " ".join(
-        str(details.get(key) or "")
-        for key in ("type", "status", "code", "message")
-    ).lower()
-    if is_context_window_error_text(descriptor):
-        error_type = "context_window_exceeded"
-    elif status_code == 429 or any(token in descriptor for token in ("rate", "quota", "resource_exhausted")):
-        error_type = "quota_exceeded" if "quota" in descriptor or "resource_exhausted" in descriptor else "rate_limit"
-    elif status_code == 401 or "auth" in descriptor or "unauthorized" in descriptor or "unauthenticated" in descriptor:
-        error_type = "authentication"
-    elif status_code == 403 or "forbidden" in descriptor or "permission_denied" in descriptor:
-        error_type = "forbidden"
-    elif (status_code is not None and status_code >= 500) or any(token in descriptor for token in ("server", "unavailable", "internal")):
-        error_type = "server_error"
+    message = str(details.get("message") or "")
+
+    if _structured_quota_signal(details, {}, message, status_code):
+        error_type = "quota_exceeded"
     else:
-        error_type = "invalid_request"
+        structured_type = _classify_structured_error_text(details, {})
+        if structured_type:
+            error_type = structured_type
+        elif status_code == 401:
+            error_type = "authentication"
+        elif status_code == 403:
+            error_type = "forbidden"
+        elif status_code == 404:
+            error_type = "not_found"
+        elif status_code == 409:
+            error_type = "conflict"
+        elif status_code == 413:
+            error_type = "request_too_large"
+        elif status_code == 429:
+            error_type = "rate_limit"
+        elif is_context_window_error_text(message):
+            error_type = "context_window_exceeded"
+        elif (status_code is not None and status_code >= 500) or str(
+            details.get("status") or ""
+        ).upper() in {"INTERNAL", "UNAVAILABLE", "DEADLINE_EXCEEDED"}:
+            error_type = "server_error"
+        else:
+            error_type = "invalid_request"
     message = str(details.get("message") or details.get("status") or value or "Provider returned a structured error response")
     return StructuredAPIResponseError(
         message,

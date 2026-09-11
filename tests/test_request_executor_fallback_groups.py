@@ -152,7 +152,7 @@ async def test_non_streaming_fallback_group_hard_stops_group_override() -> None:
     async def fake_execute(self, context):
         attempts.append(context.provider)
         if len(attempts) == 1:
-            raise ClassifiedFailure("authentication")
+            raise ClassifiedFailure("invalid_request")
         return {"id": "ok", "model": context.model}
 
     executor._execute_non_streaming = MethodType(fake_execute, executor)
@@ -165,7 +165,7 @@ async def test_non_streaming_fallback_group_hard_stops_group_override() -> None:
                 routing_group=FallbackGroup(
                     name="code_chain",
                     targets=targets,
-                    failover_on=frozenset({"authentication"}),
+                    failover_on=frozenset({"invalid_request"}),
                     stop_on=frozenset({"validation"}),
                 ),
             )

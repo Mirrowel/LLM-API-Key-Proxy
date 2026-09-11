@@ -9,6 +9,7 @@ import json
 import pytest
 
 from rotator_library.client.executor import RequestExecutor, RoutingExecutionError, _can_start_stream_provider_cooldown
+from rotator_library.core.errors import StructuredAPIResponseError
 from rotator_library.cooldown_manager import CooldownManager
 from rotator_library.core.types import RequestContext
 from rotator_library.error_handler import ClassifiedError
@@ -197,10 +198,13 @@ async def test_wait_for_cooldown_uses_model_scope_when_available() -> None:
 async def test_wait_for_cooldown_exceeding_budget_fails_fast() -> None:
     cooldown = BudgetCooldown(remaining=60)
 
-    with pytest.raises(RoutingExecutionError) as exc:
+    # A cooldown longer than the whole request budget surfaces as a clean
+    # structured 429 (client-renderable), not a raw internal exception.
+    with pytest.raises(StructuredAPIResponseError) as exc:
         await _executor(cooldown)._wait_for_cooldown("openai", 1.0, model="gpt-5")
 
     assert exc.value.error_type == "rate_limit"
+    assert exc.value.http_status == 429
     assert cooldown.waits == [("openai", "gpt-5")]
 
 

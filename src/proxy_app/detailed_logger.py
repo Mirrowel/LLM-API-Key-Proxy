@@ -112,10 +112,23 @@ class RawIOLogger:
             "proxy-authorization",
             "set-cookie",
             "x-api-key",
+            "x-goog-api-key",
+            "api-key",
             "x-proxy-session-domain",
         }
+
+        def _is_sensitive(key: Any) -> bool:
+            normalised = str(key).lower().strip()
+            if normalised in sensitive:
+                return True
+            # Azure/Gemini/AI-gateway conventions use arbitrary `*-api-key`
+            # (or `*_api_key` / `*apikey`) header names.
+            return normalised.endswith(
+                ("-api-key", "_api_key", "api-key", "apikey")
+            )
+
         return {
-            key: "<redacted>" if str(key).lower() in sensitive else value
+            key: "<redacted>" if _is_sensitive(key) else value
             for key, value in headers.items()
         }
 

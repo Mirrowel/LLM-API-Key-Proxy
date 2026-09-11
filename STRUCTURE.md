@@ -20,6 +20,7 @@
 ├── Dockerfile                  # Container build definition
 ├── docker-compose.yml          # Docker Compose configuration
 ├── requirements.txt            # Python dependencies
+├── pytest.ini                  # Pytest configuration (asyncio_mode = auto)
 ├── decrypt_share_link.py       # Mirrobot share-link decryptor (CI tooling)
 ├── DOCUMENTATION.md            # Detailed technical documentation
 └── README.md                   # Project overview
@@ -30,7 +31,7 @@
 **`src/proxy_app/`:**
 - Purpose: FastAPI application serving as the user-facing proxy gateway
 - Contains: Route handlers, Pydantic models, TUI tools, startup/lifespan logic
-- Key files: `main.py` (thin route surface), `route_helpers.py` (stream framing with in-band terminal error frames, request overrides, embedding fan-out), `startup.py` (OAuth credential bootstrap), `launcher_tui.py`, `quota_viewer.py`, `batch_manager.py`, `request_logger.py`, `detailed_logger.py`, `build.py`, `provider_urls.py`, `settings_tool.py`, `model_filter_gui.py`
+- Key files: `main.py` (thin route surface), `route_helpers.py` (stream framing with in-band terminal error frames, request overrides, embedding fan-out), `startup.py` (OAuth credential bootstrap), `key_policy.py` (default-key policy: the well-known default `PROXY_API_KEY` is accepted only on localhost binds; interactive enter/generate/skip prompt, hard block without a terminal — the launcher and credential tool reuse its primitives), `launcher_tui.py`, `quota_viewer.py`, `batch_manager.py`, `request_logger.py`, `detailed_logger.py`, `build.py`, `provider_urls.py`, `settings_tool.py`, `model_filter_gui.py`
 
 **`src/rotator_library/`:**
 - Purpose: Portable resilience library for multi-provider API key rotation
@@ -161,7 +162,7 @@
 **`tests/`:**
 - Purpose: Test suite organized by feature area
 - Contains: Unit and integration tests for the rotator library
-- Key files: `test_selection_engine.py`, `test_fair_cycle_and_custom_caps.py`, `test_fallback_groups.py`, `test_error_handler.py`, `test_executor_session_forwarding.py`, `test_session_tracking.py`, `test_protocol_streaming_matrix.py`, `test_w2_neutral_completeness.py`, `test_w3_same_protocol_fidelity.py`, `test_w4_cross_protocol_conversion.py`, `test_w5_stream_parity.py`, `test_w7_adapter_staging.py`, `test_w11_native_default.py`, `test_w12_transaction_tiers.py`, `test_w13_cache_replay.py`, `test_w_prof_profiles.py`, `test_anthropic_transform_tracing.py`, `test_transaction_logger_json_safety.py`
+- Key files: `test_selection_engine.py`, `test_fair_cycle_and_custom_caps.py`, `test_fallback_groups.py`, `test_error_handler.py`, `test_executor_session_forwarding.py`, `test_session_tracking.py`, `test_protocol_streaming_matrix.py`, `test_w2_neutral_completeness.py`, `test_w3_same_protocol_fidelity.py`, `test_w4_cross_protocol_conversion.py`, `test_w5_stream_parity.py`, `test_w7_adapter_staging.py`, `test_w11_native_default.py`, `test_w12_transaction_tiers.py`, `test_w13_cache_replay.py`, `test_w_prof_profiles.py`, `test_proxy_key_policy.py`, `test_anthropic_transform_tracing.py`, `test_transaction_logger_json_safety.py`
 
 **`tests/refactor/`:**
 - Purpose: Tests verifying parity after refactoring from monolithic client.py

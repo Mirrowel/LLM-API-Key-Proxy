@@ -37,7 +37,7 @@ from .config import (
     get_default_windows,
     CapMode,
 )
-from .identity.registry import CredentialRegistry
+from .identity.registry import CredentialRegistry, derive_accessor_id
 from .tracking.engine import TrackingEngine
 from .tracking.windows import WindowManager
 from .limits.engine import LimitEngine
@@ -990,7 +990,7 @@ class UsageManager:
             cred_stats = {
                 "stable_id": stable_id,
                 "accessor_masked": mask_credential(state.accessor, style="full"),
-                "full_path": None if is_private else state.accessor,
+                "full_path": None if is_private else derive_accessor_id(state.accessor),
                 "identifier": mask_credential(state.accessor, style="full"),
                 "private": is_private,
                 "email": state.display_name,

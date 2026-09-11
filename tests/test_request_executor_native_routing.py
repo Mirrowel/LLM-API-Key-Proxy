@@ -551,7 +551,7 @@ def test_route_error_type_from_response_uses_structured_aliases() -> None:
     assert executor_module._route_error_type_from_response({"error": {"code": "invalid_argument"}}) == "invalid_request"
     assert executor_module._route_error_type_from_response({"error": {"code": "resource_exhausted"}}) == "quota_exceeded"
     assert executor_module._route_error_type_from_response({"error": {"code": "unavailable"}}) == "server_error"
-    assert executor_module._route_error_type_from_response({"error": {"code": "deadline_exceeded"}}) == "api_connection"
+    assert executor_module._route_error_type_from_response({"error": {"code": "deadline_exceeded"}}) == "server_error"
     assert executor_module._route_error_type_from_response({"error": {"details": {"status_code": 503}}}) == "server_error"
 
 

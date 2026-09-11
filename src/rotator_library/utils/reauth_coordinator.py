@@ -222,14 +222,19 @@ class ReauthCoordinator:
     def get_status(self) -> Dict[str, Any]:
         """Get current coordinator status for debugging/monitoring."""
         return {
-            "current_reauth": self._current_reauth,
+            "current_reauth": self._get_display_name(self._current_reauth)
+            if self._current_reauth
+            else None,
             "current_provider": self._current_provider,
             "reauth_in_progress": self._current_reauth is not None,
             "reauth_duration": (time.time() - self._reauth_start_time)
             if self._reauth_start_time
             else None,
             "pending_count": len(self._pending_reauths),
-            "pending_credentials": list(self._pending_reauths.keys()),
+            "pending_credentials": [
+                self._get_display_name(credential)
+                for credential in self._pending_reauths.keys()
+            ],
             "stats": {
                 "total": self._total_reauths,
                 "successful": self._successful_reauths,

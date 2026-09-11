@@ -18,6 +18,14 @@ DEFAULT_FAILOVER_ON = frozenset(
         "server_error",
         "api_connection",
         "unsupported_operation",
+        # Credential-scoped failures advance the chain too (operator-approved
+        # matrix, error-reference 5.9): a dead key on provider A must not
+        # stop provider B from being tried, and a missing model is a
+        # provider-level fact another target may resolve.
+        "authentication",
+        "forbidden",
+        "not_found",
+        "conflict",
         # Human-friendly aliases for config files; classifier output uses the
         # names above, but config authors should not need to know every internal
         # error string.
@@ -28,15 +36,13 @@ DEFAULT_FAILOVER_ON = frozenset(
 )
 DEFAULT_STOP_ON = frozenset(
     {
-        "authentication",
-        "forbidden",
         "invalid_request",
         "context_window_exceeded",
+        "request_too_large",
         "credential_reauth_needed",
         "pre_request_callback_error",
         "cancelled",
         # Config aliases retained for readability.
-        "auth",
         "validation",
         "permanent",
         "pre_request_callback",
@@ -44,10 +50,9 @@ DEFAULT_STOP_ON = frozenset(
 )
 HARD_STOP_ON = frozenset(
     {
-        "authentication",
-        "forbidden",
         "invalid_request",
         "context_window_exceeded",
+        "request_too_large",
         "credential_reauth_needed",
         "pre_request_callback_error",
         "cancelled",

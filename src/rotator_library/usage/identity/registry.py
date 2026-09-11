@@ -19,6 +19,21 @@ from ...core.types import CredentialInfo
 lib_logger = logging.getLogger("rotator_library")
 
 
+def derive_accessor_id(accessor: str) -> str:
+    """Return a non-reversible identifier for a credential accessor.
+
+    Raw upstream secrets must never be persisted (usage.json) or served over
+    the proxy API (quota-stats). Private accessors are already derived hashes
+    and pass through unchanged; every other accessor is replaced with a
+    truncated SHA-256 digest.
+    """
+
+    value = str(accessor)
+    if value.startswith("private:"):
+        return value
+    return "sha256:" + hashlib.sha256(value.encode()).hexdigest()[:16]
+
+
 class CredentialRegistry:
     """
     Manages stable identifiers for credentials.

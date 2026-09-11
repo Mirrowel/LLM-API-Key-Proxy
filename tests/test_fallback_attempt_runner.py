@@ -83,7 +83,7 @@ async def test_attempt_runner_hard_stops_group_policy_overrides() -> None:
     group = FallbackGroup(
         name="custom",
         targets=_decision().targets,
-        failover_on=frozenset({"authentication"}),
+        failover_on=frozenset({"invalid_request"}),
         stop_on=frozenset({"validation"}),
     )
     calls = []
@@ -91,7 +91,7 @@ async def test_attempt_runner_hard_stops_group_policy_overrides() -> None:
     async def attempt(target, index):
         calls.append(index)
         if index == 0:
-            raise ClassifiedFailure("authentication")
+            raise ClassifiedFailure("invalid_request")
         return {"target": target.prefixed_model}
 
     with pytest.raises(FallbackExhaustedError):

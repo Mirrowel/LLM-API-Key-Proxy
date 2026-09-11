@@ -1059,6 +1059,30 @@ class RequestExecutor:
             )
             try:
                 result = await self._execute_non_streaming(target_context)
+            except _FailDecision as failure:
+                exc = failure.original
+                last_failure = exc
+                error_type = _route_error_type(exc, target.provider)
+                self._log_routing_trace(
+                    context,
+                    "routing_target_attempt_failed",
+                    _target_trace(target),
+                    metadata={"target_index": index, "error_type": error_type, "exception": exc.__class__.__name__},
+                )
+                target_failures.append(_target_failure_summary(target, error_type))
+                fallback_allowed = index < len(targets) - 1 and policy.should_fallback(error_type, group=context.routing_group)
+                _append_routing_attempt_history(context, target, index, success=False, error_type=error_type, fallback_allowed=fallback_allowed, duration_ms=_elapsed_ms(attempt_started_at))
+                if not fallback_allowed:
+                    self._log_routing_trace(context, "routing_fallback_exhausted", _target_trace(target), metadata={"error_type": error_type, "fallback_targets": target_failures})
+                    if isinstance(exc, StructuredAPIResponseError):
+                        exc.response = _with_fallback_summary(
+                            deepcopy(exc.response),
+                            target_failures,
+                            context.routing_attempt_history,
+                        )
+                    raise exc from None
+                self._log_routing_trace(context, "routing_fallback_selected", _target_trace(targets[index + 1]), metadata={"from_target_index": index, "to_target_index": index + 1, "reason": error_type})
+                continue
             except Exception as exc:
                 last_failure = exc
                 error_type = _route_error_type(exc, target.provider)
@@ -1202,6 +1226,8 @@ class RequestExecutor:
                 _append_routing_attempt_history(context, target, index, success=True, emitted_output=emitted_output, duration_ms=_elapsed_ms(attempt_started_at))
                 return
             except Exception as exc:
+                if isinstance(exc, _FailDecision):
+                    exc = exc.original
                 error_type = _route_error_type(exc, target.provider)
                 self._log_routing_trace(
                     context,
@@ -1494,32 +1520,42 @@ class RequestExecutor:
                                     metadata={"provider": provider, "model": model},
                                 )
 
-                                # Success! Extract token usage if available
-                                usage_record, cost_breakdown = self._account_for_response_usage(
-                                    provider, model, response, context
-                                )
-                                prompt_tokens = usage_record.prompt_tokens_for_mark_success
-                                completion_tokens = usage_record.completion_tokens
-                                prompt_tokens_cached = usage_record.cache_read_tokens
-                                prompt_tokens_cache_write = usage_record.cache_write_tokens
-                                thinking_tokens = usage_record.reasoning_tokens
-                                approx_cost = cost_breakdown.total_cost
-                                response_headers = self._extract_response_headers(
-                                    response
-                                )
+                                # Success! Extract token usage if available.
+                                # Bookkeeping must never destroy a completed
+                                # response (fix-pass G1): a hook or accounting
+                                # failure logs loudly and the answer still
+                                # returns to the client.
+                                try:
+                                    usage_record, cost_breakdown = self._account_for_response_usage(
+                                        provider, model, response, context
+                                    )
+                                    prompt_tokens = usage_record.prompt_tokens_for_mark_success
+                                    completion_tokens = usage_record.completion_tokens
+                                    prompt_tokens_cached = usage_record.cache_read_tokens
+                                    prompt_tokens_cache_write = usage_record.cache_write_tokens
+                                    thinking_tokens = usage_record.reasoning_tokens
+                                    approx_cost = cost_breakdown.total_cost
+                                    response_headers = self._extract_response_headers(
+                                        response
+                                    )
 
-                                cred_context.mark_success(
-                                    response=response,
-                                    prompt_tokens=prompt_tokens,
-                                    completion_tokens=completion_tokens,
-                                    thinking_tokens=thinking_tokens,
-                                    prompt_tokens_cache_read=prompt_tokens_cached,
-                                    prompt_tokens_cache_write=prompt_tokens_cache_write,
-                                    approx_cost=approx_cost,
-                                    response_headers=response_headers,
-                                )
-                                self._clear_failure_history_on_success(provider, model)
-                                self._record_session_response(context, response)
+                                    cred_context.mark_success(
+                                        response=response,
+                                        prompt_tokens=prompt_tokens,
+                                        completion_tokens=completion_tokens,
+                                        thinking_tokens=thinking_tokens,
+                                        prompt_tokens_cache_read=prompt_tokens_cached,
+                                        prompt_tokens_cache_write=prompt_tokens_cache_write,
+                                        approx_cost=approx_cost,
+                                        response_headers=response_headers,
+                                    )
+                                    self._clear_failure_history_on_success(provider, model)
+                                    self._record_session_response(context, response)
+                                except Exception as bookkeeping_error:
+                                    lib_logger.error(
+                                        f"Post-completion bookkeeping failed for {provider}/{model} "
+                                        f"(response preserved): {bookkeeping_error}"
+                                    )
 
                                 lib_logger.info(
                                     f"Recorded usage from response object for key {mask_credential(cred)}"
@@ -1594,7 +1630,7 @@ class RequestExecutor:
                                 elif action == ErrorAction.ROTATE:
                                     break  # Try next credential
                                 else:  # FAIL
-                                    raise
+                                    raise _FailDecision(e) from e
 
                     except PreRequestCallbackError:
                         raise
@@ -1606,6 +1642,8 @@ class RequestExecutor:
                         # (invalid_request) never rotate: the next credential
                         # would fail identically.
                         raise
+                    except _FailDecision as failure:
+                        raise failure.original from None
                     except Exception:
                         # Let context manager handle cleanup
                         pass
@@ -1749,6 +1787,12 @@ class RequestExecutor:
                                 )
 
                             # Add stream usage metadata for active providers.
+                            # Explicit `stream_options: null` is legal client
+                            # JSON meaning "absent" — normalize before the
+                            # include_usage injection (None[...] would raise
+                            # TypeError and silently rotate credentials).
+                            if kwargs.get("stream_options") is None:
+                                kwargs["stream_options"] = {}
                             if not native_execution and "stream_options" not in kwargs:
                                 kwargs["stream_options"] = {}
                             if not native_execution and "include_usage" not in kwargs["stream_options"]:
@@ -1985,12 +2029,16 @@ class RequestExecutor:
                                             for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                                 yield line
                                             return
-                                    else:
+                                    elif classified.error_type in _QUOTA_STRIKE_RESET_CLASSES:
+                                        # Deterministic client faults reset the
+                                        # consecutive-quota strike counter;
+                                        # interleaved transient errors must
+                                        # not erase an ongoing quota storm.
                                         retry_state.reset_quota_failures()
 
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
-                                        raise
+                                        raise _FailDecision(e) from e
 
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
@@ -2067,12 +2115,16 @@ class RequestExecutor:
                                             for line in self._terminal_stream_error_lines(context, error_data, protocol_context=client_protocol_context):
                                                 yield line
                                             return
-                                    else:
+                                    elif classified.error_type in _QUOTA_STRIKE_RESET_CLASSES:
+                                        # Deterministic client faults reset the
+                                        # consecutive-quota strike counter;
+                                        # interleaved transient errors must
+                                        # not erase an ongoing quota storm.
                                         retry_state.reset_quota_failures()
 
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
-                                        raise
+                                        raise _FailDecision(e) from e
 
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
@@ -2176,7 +2228,7 @@ class RequestExecutor:
                                     error_accumulator.record_error(cred, classified, str(e)[:150])
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
-                                        raise
+                                        raise _FailDecision(e) from e
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
                                         error_data = {"error": {"message": "Upstream stream failed after output began", "type": classified.error_type}}
@@ -2207,7 +2259,7 @@ class RequestExecutor:
 
                                     if not should_rotate_on_error(classified):
                                         cred_context.mark_failure(classified)
-                                        raise
+                                        raise _FailDecision(e) from e
 
                                     if not _can_retry_stream_after_error(last_streamed_chunk, self._stream_retry_on_reasoning_only_enabled(), emitted_output=stream_visible_output_emitted):
                                         cred_context.mark_failure(classified)
@@ -2255,6 +2307,8 @@ class RequestExecutor:
                         except StructuredAPIResponseError:
                             # Client-visible failures never rotate streams.
                             raise
+                        except _FailDecision as failure:
+                            raise failure.original from None
                         except Exception:
                             # Let context manager handle cleanup
                             pass
@@ -2348,9 +2402,20 @@ class RequestExecutor:
                     "cooldown_exceeds_budget",
                     model=model,
                 )
-                raise RoutingExecutionError(
-                    f"Provider {provider} cooldown exceeds request budget",
+                # A cooldown longer than the whole request budget is a
+                # clean, client-visible 429 (rendered in the caller's
+                # protocol) — never a raw exception that surfaces as 500.
+                raise StructuredAPIResponseError(
+                    f"Provider {provider} is rate-limited for another {int(remaining)}s, which exceeds the request budget",
                     error_type="rate_limit",
+                    status_code=429,
+                    response={
+                        "error": {
+                            "message": f"Provider {provider} is rate-limited for another {int(remaining)}s, which exceeds the request budget",
+                            "type": "rate_limit",
+                            "retry_after": int(remaining),
+                        }
+                    },
                 )
             lib_logger.info(f"Waiting {remaining:.1f}s for {provider} cooldown")
             self._log_cooldown_wait_trace(context, provider, model, remaining)
@@ -2406,7 +2471,11 @@ class RequestExecutor:
                 error_accumulator.record_error(credential, classified, error_message)
                 cred_context.mark_failure(classified)
                 return ErrorAction.FAIL
-        else:
+        elif classified.error_type in _QUOTA_STRIKE_RESET_CLASSES:
+            # Only deterministic client-fault classes reset the consecutive-
+            # quota counter: interleaved transient errors (rate_limit /
+            # server_error / connection) must not erase an ongoing quota
+            # storm — the 3-strike abort depends on it.
             retry_state.reset_quota_failures()
 
         # Check if should rotate
@@ -2445,7 +2514,15 @@ class RequestExecutor:
             lib_logger.info(
                 f"Retrying {mask_credential(credential)} in {wait_time:.1f}s{retry_reason}"
             )
-            await asyncio.sleep(wait_time)
+            # Same discipline as the streaming loop: every wait asks the
+            # request deadline first instead of sleeping past the budget.
+            sleep_deadline = float(getattr(context, "deadline", 0) or 0)
+            if sleep_deadline <= 0:
+                await asyncio.sleep(wait_time)
+            else:
+                await self._sleep_before_transient_action(
+                    wait_time, sleep_deadline, "non-stream retry"
+                )
             return ErrorAction.RETRY_SAME
 
         # Record error and rotate
@@ -2456,7 +2533,13 @@ class RequestExecutor:
             lib_logger.info(
                 f"Waiting {wait_time:.1f}s before rotating from {mask_credential(credential)}"
             )
-            await asyncio.sleep(wait_time)
+            sleep_deadline = float(getattr(context, "deadline", 0) or 0)
+            if sleep_deadline <= 0:
+                await asyncio.sleep(wait_time)
+            else:
+                await self._sleep_before_transient_action(
+                    wait_time, sleep_deadline, "credential rotation"
+                )
         lib_logger.info(
             f"Rotating from {mask_credential(credential)} after {classified.error_type}"
         )
@@ -3389,9 +3472,43 @@ def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:
     return default
 
 
+# Deterministic client-fault classes that reset the consecutive-quota
+# strike counter; transient classes deliberately keep it (see the reset
+# sites for the reasoning).
+_QUOTA_STRIKE_RESET_CLASSES = frozenset(
+    {
+        "invalid_request",
+        "context_window_exceeded",
+        "request_too_large",
+        "not_found",
+        "conflict",
+        "authentication",
+        "forbidden",
+        "pre_request_callback_error",
+    }
+)
+
+
+class _FailDecision(Exception):
+    """Wrap a deliberate stop verdict escaping a credential loop.
+
+    The credential-loop cleanup handlers swallow bare exceptions so the
+    context manager can unwind between credentials; a FAIL decision must
+    survive that unwind (docs/experimental/fix-pass-plan.md G1: stop means
+    stop — no retrying a deterministic client error against every key).
+    Consumers unwrap ``original`` via ``_route_error_type`` or directly.
+    """
+
+    def __init__(self, original: BaseException) -> None:
+        super().__init__(str(original))
+        self.original = original
+
+
 def _route_error_type(error: BaseException, provider: Optional[str] = None) -> str:
     """Map an exception to a fallback-policy error type."""
 
+    if isinstance(error, _FailDecision):
+        error = error.original
     if isinstance(error, asyncio.CancelledError):
         return "cancelled"
     if isinstance(error, StructuredAPIResponseError):
@@ -3406,26 +3523,38 @@ def _route_error_type(error: BaseException, provider: Optional[str] = None) -> s
 
 
 def _route_error_type_from_response(response: Any) -> Optional[str]:
-    """Infer retryability from the proxy's structured error response."""
+    """Infer retryability from the proxy's structured error response.
+
+    One judge: provider-shaped envelopes classify through the shared
+    classifier (grounded evidence order, docs/experimental/
+    error-reference.md) instead of local candidate sets. Proxy-aggregate
+    summaries (all-credentials-exhausted envelopes) carry internal error
+    counts rather than provider wire shapes and map through the summary
+    fallback.
+    """
 
     if not isinstance(response, dict) or not isinstance(response.get("error"), dict):
         return None
     error = response["error"]
     details = error.get("details") if isinstance(error.get("details"), dict) else {}
-    candidates = _structured_error_candidates(error, details)
-    hard_stop = _first_route_error_candidate(candidates, _HARD_STOP_ROUTE_ERRORS)
-    if hard_stop:
-        return hard_stop
-    retryable = _first_route_error_candidate(candidates, _RETRYABLE_ROUTE_ERRORS)
-    if retryable:
-        return retryable
+    # Provider-shaped wire evidence first (shared classifier); specific
+    # evidence always beats the aggregate summary.
+    classified = classify_error(response)
+    if classified.error_type != "unknown":
+        return normalize_route_error_type(classified.error_type)
+    # Proxy aggregates: abnormal (credential-scoped) failures are the
+    # specific evidence inside an all-credentials-exhausted envelope.
+    for abnormal in details.get("abnormal_errors") or []:
+        if isinstance(abnormal, dict) and abnormal.get("error_type"):
+            return normalize_route_error_type(str(abnormal["error_type"]))
     normal_summary = str(details.get("normal_error_summary", "")).lower()
-    if any(token in normal_summary for token in ("authentication", "forbidden", "invalid_request", "context_window", "credential_reauth", "configuration_error")):
-        return _summary_hard_stop_type(normal_summary)
-    if any(token in normal_summary for token in ("rate_limit", "quota", "capacity")):
-        return "quota_exceeded" if "quota" in normal_summary else "rate_limit"
-    if any(token in normal_summary for token in ("server_error", "api_connection", "transient")):
-        return "api_connection" if "api_connection" in normal_summary else "server_error"
+    if normal_summary:
+        if any(token in normal_summary for token in ("authentication", "forbidden", "invalid_request", "context_window", "credential_reauth", "configuration_error")):
+            return _summary_hard_stop_type(normal_summary)
+        if any(token in normal_summary for token in ("rate_limit", "quota", "capacity")):
+            return "quota_exceeded" if "quota" in normal_summary else "rate_limit"
+        if any(token in normal_summary for token in ("server_error", "api_connection", "transient")):
+            return "api_connection" if "api_connection" in normal_summary else "server_error"
     error_type = normalize_route_error_type(str(error.get("type", "")))
     if error_type in {"proxy_timeout", "proxy_all_credentials_exhausted"}:
         return "rate_limit"
@@ -3545,57 +3674,6 @@ def _streaming_policy_allows_fallback(group: Any) -> bool:
     """Return whether a group permits pre-output streaming fallback."""
 
     return _group_streaming_policy(group) != "never"
-
-
-_HARD_STOP_ROUTE_ERRORS = {
-    "authentication",
-    "forbidden",
-    "invalid_request",
-    "context_window_exceeded",
-    "credential_reauth_needed",
-    "pre_request_callback_error",
-    "cancelled",
-    "configuration_error",
-}
-_RETRYABLE_ROUTE_ERRORS = {"rate_limit", "quota_exceeded", "server_error", "api_connection", "unsupported_operation"}
-
-
-def _structured_error_candidates(error: Dict[str, Any], details: Dict[str, Any]) -> List[str]:
-    """Return normalized structured error hints before reading free-form text."""
-
-    values: List[Any] = [
-        error.get("type"),
-        error.get("code"),
-        error.get("status"),
-        details.get("classification"),
-        details.get("error_type"),
-        details.get("status"),
-    ]
-    for abnormal in details.get("abnormal_errors") or []:
-        if isinstance(abnormal, dict):
-            values.append(abnormal.get("error_type"))
-            values.append(abnormal.get("status_code"))
-    status_code = _route_status_code_from_response({"error": error})
-    if status_code == 400:
-        values.append("invalid_request")
-    elif status_code == 401:
-        values.append("authentication")
-    elif status_code == 403:
-        values.append("forbidden")
-    elif status_code == 429:
-        values.append("rate_limit")
-    elif status_code is not None and status_code >= 500:
-        values.append("server_error")
-    return [normalize_route_error_type(str(value)) for value in values if value not in (None, "")]
-
-
-def _first_route_error_candidate(candidates: List[str], allowed: set[str]) -> Optional[str]:
-    """Return the first structured candidate in an allowed policy set."""
-
-    for candidate in candidates:
-        if candidate in allowed:
-            return candidate
-    return None
 
 
 def _summary_hard_stop_type(summary: str) -> str:

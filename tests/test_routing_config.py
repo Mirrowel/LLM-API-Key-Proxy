@@ -66,12 +66,14 @@ def test_load_routing_config_parses_group_policy_overrides() -> None:
 
 
 def test_load_routing_config_rejects_hard_stop_failover() -> None:
+    # authentication now FAILS OVER (operator-approved matrix) — the
+    # hard-stop guard is pinned on categories that still hard-stop.
     with pytest.raises(RoutingConfigError):
         load_routing_config_from_env(
             {
                 "FALLBACK_GROUPS": "chain",
                 "FALLBACK_GROUP_CHAIN": "openai/gpt,copilot/gpt",
-                "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "auth",
+                "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "invalid_request",
             }
         )
 
@@ -83,6 +85,19 @@ def test_load_routing_config_rejects_hard_stop_failover() -> None:
                 "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "pre_request_callback",
             }
         )
+
+
+def test_load_routing_config_allows_credential_scoped_failover() -> None:
+    # Auth/forbidden/not_found are legal failover categories now.
+    config = load_routing_config_from_env(
+        {
+            "FALLBACK_GROUPS": "chain",
+            "FALLBACK_GROUP_CHAIN": "openai/gpt,copilot/gpt",
+            "FALLBACK_GROUP_CHAIN_FAILOVER_ON": "auth,not_found",
+        }
+    )
+    assert config is not None
+    assert "chain" in config.fallback_groups
 
 
 def test_load_routing_config_rejects_unknown_streaming_policy() -> None:

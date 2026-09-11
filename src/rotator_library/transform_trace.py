@@ -71,7 +71,7 @@ _SENSITIVE_KEYS = frozenset(
 )
 
 _SENSITIVE_TEXT_RE = re.compile(
-    r"(?im)\b(authorization|proxy-authorization|x-api-key|x-goog-api-key|openai-api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|client[_-]?secret|cookie|set-cookie)\b(['\"]?\s*[:=]\s*['\"]?)([^'\"\r\n,}]+)"
+    r"(?im)\b(authorization|proxy-authorization|x-api-key|x-goog-api-key|openai-api-key|api[_-]?key|apikey|key|access[_-]?token|refresh[_-]?token|id[_-]?token|token|client[_-]?secret|cookie|set-cookie)\b(['\"]?\s*[:=]\s*['\"]?)([^'\"\r\n,}&]+)"
 )
 
 

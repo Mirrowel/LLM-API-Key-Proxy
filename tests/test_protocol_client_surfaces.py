@@ -177,7 +177,7 @@ class FailingSurfaceClient(SurfaceClient):
         (
             "/v1/chat/completions",
             {"model": "openai/gpt-test", "messages": [{"role": "user", "content": "hello"}]},
-            lambda payload: payload["error"]["type"] == "invalid_request",
+            lambda payload: payload["error"]["type"] == "invalid_request_error",
         ),
         (
             "/v1/messages",
@@ -213,7 +213,7 @@ def test_responses_malformed_json_uses_responses_error_shape() -> None:
     )
 
     assert response.status_code == 400
-    assert response.json()["error"]["type"] == "invalid_request"
+    assert response.json()["error"]["type"] == "invalid_request_error"
     assert "detail" not in response.json()
 
 

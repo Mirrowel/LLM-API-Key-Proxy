@@ -28,6 +28,7 @@ from ..types import (
 )
 from ...utils.resilient_io import ResilientStateWriter, safe_read_json
 from ...error_handler import mask_credential
+from ..identity.registry import derive_accessor_id
 from ...core.constants import (
     DEFAULT_MAX_CONCURRENT_PER_KEY,
     DEFAULT_OPTIMAL_CONCURRENT_PER_KEY,
@@ -59,7 +60,7 @@ class UsageStorage:
     - Debounced saves to reduce I/O
     """
 
-    CURRENT_SCHEMA_VERSION = 2
+    CURRENT_SCHEMA_VERSION = 3
 
     def __init__(
         self,
@@ -103,11 +104,13 @@ class UsageStorage:
 
             # Check schema version
             version = data.get("schema_version", 1)
+            migrated = False
             if version < self.CURRENT_SCHEMA_VERSION:
                 lib_logger.info(
                     f"Migrating usage data from v{version} to v{self.CURRENT_SCHEMA_VERSION}"
                 )
                 data = self._migrate(data, version)
+                migrated = True
 
             # Parse credentials
             states = {}
@@ -115,6 +118,11 @@ class UsageStorage:
                 state = self._parse_credential_state(stable_id, cred_data)
                 if state:
                     states[stable_id] = state
+
+            if migrated:
+                # Rewrite immediately so old raw accessors do not survive on
+                # disk after the first load (defense in depth).
+                self._writer.write(data)
 
             lib_logger.info(f"Loaded {len(states)} credentials from {self.file_path}")
             return states, data.get("fair_cycle_global", {}), True
@@ -166,7 +174,9 @@ class UsageStorage:
                         state
                     )
                     if not str(state.accessor).startswith("private:"):
-                        data["accessor_index"][state.accessor] = stable_id
+                        data["accessor_index"][
+                            derive_accessor_id(state.accessor)
+                        ] = stable_id
 
                 saved = self._writer.write(data)
 
@@ -241,8 +251,36 @@ class UsageStorage:
                 new_credentials[stable_id]["accessor"] = key
 
             data["credentials"] = new_credentials
+            from_version = 2
+
+        if from_version == 2:
+            # v2 -> v3: raw accessors are replaced with derived identifiers so
+            # usage.json never contains upstream API keys.
+            data["credentials"] = self._derive_accessors(
+                data.get("credentials", {})
+            )
+            data["accessor_index"] = {
+                derive_accessor_id(accessor): stable_id
+                for accessor, stable_id in data.get("accessor_index", {}).items()
+                if not str(accessor).startswith("private:")
+            }
+            data["schema_version"] = self.CURRENT_SCHEMA_VERSION
 
         return data
+
+    @staticmethod
+    def _derive_accessors(
+        credentials: Dict[str, Dict[str, Any]]
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return credential rows with raw accessors replaced by derived ids."""
+        derived: Dict[str, Dict[str, Any]] = {}
+        for stable_id, cred_data in credentials.items():
+            if isinstance(cred_data, dict):
+                accessor = cred_data.get("accessor")
+                if isinstance(accessor, str):
+                    cred_data = {**cred_data, "accessor": derive_accessor_id(accessor)}
+            derived[stable_id] = cred_data
+        return derived
 
     def _parse_window_stats(self, name: str, data: Dict[str, Any]) -> WindowStats:
         """Parse window stats from storage data."""
@@ -499,7 +537,7 @@ class UsageStorage:
 
         return {
             "provider": state.provider,
-            "accessor": state.accessor,
+            "accessor": derive_accessor_id(state.accessor),
             "private": str(state.accessor).startswith("private:"),
             "display_name": state.display_name,
             "tier": state.tier,

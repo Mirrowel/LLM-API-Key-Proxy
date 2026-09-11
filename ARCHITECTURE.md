@@ -18,7 +18,7 @@
 **Proxy Application Layer:**
 - Purpose: Expose OpenAI Chat Completions, OpenAI Responses, and Anthropic-compatible HTTP endpoints, handle auth, logging, TUI
 - Location: `src/proxy_app/`
-- Contains: FastAPI app, route handlers, Pydantic request/response models, launcher TUI, quota viewer; `main.py` stays a thin route surface — OAuth credential bootstrap lives in `startup.py` and route-support behaviors (stream framing with in-band terminal error frames, request overrides, embedding fan-out) in `route_helpers.py`
+- Contains: FastAPI app, route handlers, Pydantic request/response models, launcher TUI, quota viewer; `main.py` stays a thin route surface — OAuth credential bootstrap lives in `startup.py`, route-support behaviors (stream framing with in-band terminal error frames, request overrides, embedding fan-out) in `route_helpers.py`, and the default-key policy in `key_policy.py`
 - Depends on: `rotator_library`, `litellm`, `fastapi`, `uvicorn`
 - Used by: External API clients (Claude Code, Gemini CLI, OpenAI SDK, curl)
 
@@ -175,6 +175,7 @@
 - Location: `src/proxy_app/main.py`
 - Triggers: `python src/proxy_app/main.py` (no args = TUI mode), `--host`, `--port`, `--enable-request-logging`, `--add-credential`
 - Responsibilities: Parse args, load `.env` files, configure logging, initialize `RotatingClient` (OAuth credential bootstrap via `startup.py`), mount FastAPI routes, start `BackgroundRefresher` and `ModelInfoService`
+- Default-key policy: enforced at import/module-flow time via `key_policy.py` — the well-known default `PROXY_API_KEY` is accepted only on localhost binds; a non-local bind with the default key prompts enter/generate/skip (saved to `.env`), and a terminal-less context hard-blocks startup with fix instructions
 
 **TUI Launcher:**
 - Location: `src/proxy_app/launcher_tui.py`

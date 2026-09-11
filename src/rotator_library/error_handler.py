@@ -22,7 +22,10 @@ _LITELLM_EXCEPTION_NAMES = (
     "OpenAIError",
     "InternalServerError",
     "Timeout",
+    "NotFoundError",
+    "PermissionDeniedError",
     "ContextWindowExceededError",
+    "ContentPolicyViolationError",
 )
 
 
@@ -39,12 +42,19 @@ lib_logger = logging.getLogger("rotator_library")
 _CONTEXT_WINDOW_ERROR_PATTERNS = (
     "context_length",
     "context length",
-    "max_tokens",
-    "token limit",
     "context window",
+    "token limit",
     "too many tokens",
-    "too long",
+    "prompt is too long",
+    "exceed context limit",
+    "exceeds the maximum number of tokens",
+    "maximum context length",
 )
+
+# Deliberately NOT matched as context errors (request-shape problems, not
+# context overflow): "max_tokens" alone (any parameter-validation message
+# matches), "too long" alone (string-length validation), per the grounded
+# error reference (docs/experimental/error-reference.md 5.4).
 
 
 def is_context_window_error_text(value: Any) -> bool:
@@ -92,6 +102,12 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
         # Round up to at least 1 second to avoid immediate retry floods
         return max(1, int(seconds)) if seconds > 0 else 0
 
+    # Parse days component (Google-style quota resets: "2d5h")
+    day_match = re.match(r"(\d+)d", remaining)
+    if day_match:
+        total_seconds += int(day_match.group(1)) * 86400
+        remaining = remaining[day_match.end() :]
+
     # Parse hours component
     hour_match = re.match(r"(\d+)h", remaining)
     if hour_match:
@@ -113,6 +129,39 @@ def _parse_duration_string(duration_str: str) -> Optional[int]:
     if total_seconds > 0:
         return max(1, int(total_seconds))
     return None
+
+
+def _parse_http_date(value: str) -> Optional[int]:
+    """Parse an HTTP-date or RFC 3339 timestamp into seconds-from-now."""
+
+    if not value:
+        return None
+    try:
+        from datetime import datetime, timezone
+
+        text = str(value).strip()
+        parsed = None
+        try:
+            from email.utils import parsedate_to_datetime
+
+            parsed = parsedate_to_datetime(text)
+        except (TypeError, ValueError):
+            parsed = None
+        if parsed is None:
+            for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%f%z"):
+                try:
+                    parsed = datetime.strptime(text, fmt)
+                    break
+                except ValueError:
+                    continue
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        wait = (parsed - datetime.now(timezone.utc)).total_seconds()
+        return max(1, int(wait)) if wait > 0 else None
+    except Exception:
+        return None
 
 
 def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
@@ -139,6 +188,8 @@ def extract_retry_after_from_body(error_body: Optional[str]) -> Optional[int]:
         r"reset after\s*([\dhmso.]+)",
         r"retry after\s*([\dhmso.]+)",
         r"try again in\s*(\d+)\s*seconds?",
+        r"retry in\s*([\d.]+)\s*s\b",  # Gemini prose: "Please retry in 34.07s."
+        r"try again in\s*~?\s*([\dhmso.]+)",  # Codex-style: "Try again in ~5m"
     ]
 
     for pattern in patterns:
@@ -686,29 +737,46 @@ def get_retry_after(error: Exception) -> Optional[int]:
 
         # Fallback to HTTP headers
         headers = error.response.headers
-        # Check standard Retry-After header (case-insensitive)
+        # Check standard Retry-After header (case-insensitive): seconds or
+        # HTTP-date per the spec.
         retry_header = headers.get("retry-after") or headers.get("Retry-After")
         if retry_header:
             try:
-                return int(retry_header)  # Assumes seconds format
+                return int(retry_header)  # Seconds format
             except ValueError:
-                pass  # Might be HTTP date format, skip for now
+                parsed_date = _parse_http_date(retry_header)
+                if parsed_date is not None:
+                    return parsed_date
 
-        # Check X-RateLimit-Reset header (Unix timestamp)
-        reset_header = headers.get("x-ratelimit-reset") or headers.get(
-            "X-RateLimit-Reset"
-        )
-        if reset_header:
+        # OpenAI-style reset headers carry Go duration strings ("6m0s");
+        # some gateways carry Unix timestamps. Try duration first, then
+        # timestamp arithmetic. Anthropic reset headers are RFC 3339
+        # timestamps (handled by the same date fallback).
+        for reset_key in (
+            "x-ratelimit-reset",
+            "x-ratelimit-reset-requests",
+            "x-ratelimit-reset-tokens",
+            "anthropic-ratelimit-requests-reset",
+            "anthropic-ratelimit-tokens-reset",
+        ):
+            reset_header = headers.get(reset_key)
+            if not reset_header:
+                continue
+            duration = _parse_duration_string(reset_header)
+            if duration is not None:
+                return duration
+            parsed_date = _parse_http_date(reset_header)
+            if parsed_date is not None:
+                return parsed_date
             try:
                 import time
 
                 reset_timestamp = int(reset_header)
-                current_time = int(time.time())
-                wait_seconds = reset_timestamp - current_time
+                wait_seconds = reset_timestamp - int(time.time())
                 if wait_seconds > 0:
                     return wait_seconds
             except (ValueError, TypeError):
-                pass
+                continue
 
     # Structured native errors retain decoded bodies and headers without needing
     # to expose transport objects to protocol formatters.
@@ -817,30 +885,86 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 status_code = int(status_value) if status_value is not None else None
             except (TypeError, ValueError):
                 status_code = None
+            message = str(payload.get("message") or "")
+            retry_after = get_retry_after(e)
+            quota_value, quota_id = (None, None)
+            if retry_after is not None:
+                quota_value, quota_id = _extract_quota_details(json.dumps(payload))
+
+            # Evidence order (error-reference 5.9): quota markers at ANY
+            # status first — quota must never masquerade as invalid_request
+            # or a generic 5xx. Then structured vocabulary, then the status
+            # ladder. Message text participates only inside the sanctioned
+            # narrow checks.
+            if _structured_quota_signal(payload, details, message, status_code):
+                return ClassifiedError(
+                    error_type="quota_exceeded",
+                    original_exception=e,
+                    status_code=status_code or 429,
+                    retry_after=retry_after,
+                    quota_value=quota_value,
+                    quota_id=quota_id,
+                )
             structured_type = _classify_structured_error_text(payload, details)
+            if structured_type == "quota_exceeded":
+                return ClassifiedError(
+                    error_type="quota_exceeded",
+                    original_exception=e,
+                    status_code=status_code or 429,
+                    retry_after=retry_after,
+                    quota_value=quota_value,
+                    quota_id=quota_id,
+                )
+            if structured_type:
+                return ClassifiedError(
+                    error_type=structured_type,
+                    original_exception=e,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                )
             if status_code == 400:
-                return ClassifiedError(error_type=structured_type or "invalid_request", original_exception=e, status_code=status_code)
+                if is_context_window_error_text(message) or is_context_window_error_text(
+                    payload.get("type")
+                ):
+                    return ClassifiedError(
+                        error_type="context_window_exceeded",
+                        original_exception=e,
+                        status_code=status_code,
+                    )
+                return ClassifiedError(
+                    error_type="invalid_request", original_exception=e, status_code=status_code
+                )
             if status_code == 401:
                 return ClassifiedError(error_type="authentication", original_exception=e, status_code=status_code)
             if status_code == 403:
                 return ClassifiedError(error_type="forbidden", original_exception=e, status_code=status_code)
+            if status_code == 404:
+                return ClassifiedError(error_type="not_found", original_exception=e, status_code=status_code)
+            if status_code == 409:
+                return ClassifiedError(error_type="conflict", original_exception=e, status_code=status_code)
+            if status_code == 413:
+                return ClassifiedError(error_type="request_too_large", original_exception=e, status_code=status_code)
             if status_code == 429:
-                body = str(payload).lower()
-                return ClassifiedError(error_type="quota_exceeded" if "quota" in body or "resource_exhausted" in body else "rate_limit", original_exception=e, status_code=status_code)
-            if structured_type:
-                return ClassifiedError(error_type=structured_type, original_exception=e, status_code=status_code)
+                return ClassifiedError(
+                    error_type="rate_limit",
+                    original_exception=e,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                )
             if (status_code is not None and status_code >= 500) or status in {
                 "INTERNAL",
                 "UNAVAILABLE",
+                "DEADLINE_EXCEEDED",
             }:
                 return ClassifiedError(
                     error_type="server_error",
                     original_exception=e,
                     status_code=status_code or 503,
+                    retry_after=retry_after,
                 )
 
     explicit_error_type = getattr(e, "error_type", None)
-    if explicit_error_type:
+    if explicit_error_type and not isinstance(e, ContextWindowExceededError):
         return ClassifiedError(
             error_type=str(explicit_error_type).strip().lower().replace("-", "_").replace(" ", "_"),
             original_exception=e,
@@ -924,14 +1048,56 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
     # Generic classification logic
     status_code = getattr(e, "status_code", None)
 
-    if isinstance(e, httpx.HTTPStatusError):  # [NEW] Handle httpx errors first
+    if isinstance(e, httpx.HTTPStatusError):
         status_code = e.response.status_code
 
-        # Try to get error body for better classification
+        # Structured body first: quota markers and wire vocabulary beat the
+        # numeric status whenever the body carries them (error-reference
+        # 5.9 — quota can ride 400/5xx, 5xx can wrap a body 429).
+        payload = None
         try:
-            error_body = e.response.text.lower() if hasattr(e.response, "text") else ""
+            body_text = e.response.text if hasattr(e.response, "text") else ""
         except Exception:
-            error_body = ""
+            body_text = ""
+        if body_text:
+            try:
+                parsed = json.loads(body_text)
+                if isinstance(parsed, dict):
+                    payload = parsed.get("error") if isinstance(parsed.get("error"), dict) else parsed
+            except (json.JSONDecodeError, ValueError):
+                payload = None
+        retry_after = get_retry_after(e)
+        if isinstance(payload, dict):
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            message = str(payload.get("message") or "")
+            if _structured_quota_signal(payload, details, message, status_code):
+                quota_value, quota_id = _extract_quota_details(body_text)
+                return ClassifiedError(
+                    error_type="quota_exceeded",
+                    original_exception=e,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                    quota_value=quota_value,
+                    quota_id=quota_id,
+                )
+            structured_type = _classify_structured_error_text(payload, details)
+            if structured_type == "quota_exceeded":
+                quota_value, quota_id = _extract_quota_details(body_text)
+                return ClassifiedError(
+                    error_type="quota_exceeded",
+                    original_exception=e,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                    quota_value=quota_value,
+                    quota_id=quota_id,
+                )
+            if structured_type and structured_type != "cancelled":
+                return ClassifiedError(
+                    error_type=structured_type,
+                    original_exception=e,
+                    status_code=status_code,
+                    retry_after=retry_after,
+                )
 
         if status_code == 401:
             return ClassifiedError(
@@ -947,20 +1113,31 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 original_exception=e,
                 status_code=status_code,
             )
+        if status_code == 404:
+            return ClassifiedError(
+                error_type="not_found",
+                original_exception=e,
+                status_code=status_code,
+            )
+        if status_code == 409:
+            return ClassifiedError(
+                error_type="conflict",
+                original_exception=e,
+                status_code=status_code,
+            )
+        if status_code == 413:
+            return ClassifiedError(
+                error_type="request_too_large",
+                original_exception=e,
+                status_code=status_code,
+            )
         if status_code == 429:
-            retry_after = get_retry_after(e)
-            # Check if this is a quota error vs rate limit
-            if "quota" in error_body or "resource_exhausted" in error_body:
-                # Extract quota details from the original (non-lowercased) response
-                quota_value, quota_id = None, None
-                try:
-                    original_body = (
-                        e.response.text if hasattr(e.response, "text") else ""
-                    )
-                    quota_value, quota_id = _extract_quota_details(original_body)
-                except Exception:
-                    pass
-
+            # Quota-vs-rate was already resolved by structured evidence
+            # above; a bare-text quota body (no JSON) still resolves here
+            # via the sanctioned narrow sniff.
+            lowered_body = (body_text or "").lower()
+            if any(token in lowered_body for token in _QUOTA_MESSAGE_TOKENS):
+                quota_value, quota_id = _extract_quota_details(body_text)
                 return ClassifiedError(
                     error_type="quota_exceeded",
                     original_exception=e,
@@ -976,8 +1153,8 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 retry_after=retry_after,
             )
         if status_code == 400:
-            # Check for context window / token limit errors with more specific patterns
-            if is_context_window_error_text(error_body):
+            # Check for context window / token limit errors
+            if is_context_window_error_text(body_text):
                 return ClassifiedError(
                     error_type="context_window_exceeded",
                     original_exception=e,
@@ -996,22 +1173,13 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 status_code=status_code,
             )
         if 500 <= status_code:
-            # Log 503 MODEL_CAPACITY_EXHAUSTED for visibility
-            # (Provider-level handling may intercept this before it reaches here)
+            # 408/504/529 and all 5xx are the retryable server family; the
+            # specific status is preserved on the ClassifiedError for
+            # protocol rendering (529 → overloaded_error, 504 →
+            # timeout_error at the anthropic envelope, per the reference).
             if status_code == 503:
                 try:
-                    capacity_exhausted = False
-                    if error_body and "MODEL_CAPACITY_EXHAUSTED" in error_body:
-                        capacity_exhausted = True
-                    else:
-                        # Try to get from response if not in lowercased body
-                        original_body = (
-                            e.response.text if hasattr(e.response, "text") else ""
-                        )
-                        if "MODEL_CAPACITY_EXHAUSTED" in original_body:
-                            capacity_exhausted = True
-
-                    if capacity_exhausted:
+                    if body_text and "MODEL_CAPACITY_EXHAUSTED" in body_text.upper():
                         lib_logger.info(
                             "503 MODEL_CAPACITY_EXHAUSTED detected - "
                             "will be handled with provider/model cooldown"
@@ -1024,6 +1192,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 error_type="server_error",
                 original_exception=e,
                 status_code=status_code,
+                retry_after=retry_after,
             )
 
     if isinstance(
@@ -1068,17 +1237,24 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
 
     if isinstance(e, RateLimitError):
         retry_after = get_retry_after(e)
-        # Check if this is a quota error vs rate limit
-        error_msg = str(e).lower()
-        if "quota" in error_msg or "resource_exhausted" in error_msg:
-            # Try to extract quota details from exception body
-            quota_value, quota_id = None, None
+        # Quota-vs-rate via structured evidence, never substrings of the
+        # free-form message ("generate" must never match "rate").
+        error_body = getattr(e, "body", None)
+        payload = error_body if isinstance(error_body, dict) else None
+        if payload is not None and isinstance(payload.get("error"), dict):
+            payload = payload["error"]
+        quota_signal = False
+        if isinstance(payload, dict):
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            quota_signal = _structured_quota_signal(
+                payload, details, str(payload.get("message") or ""), 429
+            )
+        if quota_signal:
+            quota_value, quota_id = (None, None)
             try:
-                error_body = getattr(e, "body", None) or str(e)
-                quota_value, quota_id = _extract_quota_details(str(error_body))
+                quota_value, quota_id = _extract_quota_details(str(error_body or e))
             except Exception:
                 pass
-
             return ClassifiedError(
                 error_type="quota_exceeded",
                 original_exception=e,
@@ -1101,7 +1277,23 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
             status_code=status_code or 401,
         )
 
-    if isinstance(e, (InvalidRequestError, BadRequestError)):
+    if isinstance(e, NotFoundError):
+        return ClassifiedError(
+            error_type="not_found",
+            original_exception=e,
+            status_code=status_code or 404,
+        )
+
+    if isinstance(e, PermissionDeniedError):
+        return ClassifiedError(
+            error_type="forbidden",
+            original_exception=e,
+            status_code=status_code or 403,
+        )
+
+    if isinstance(e, ContentPolicyViolationError):
+        # Request-level content policy rejection — an error (distinct from
+        # in-band refusals which are successful 200s and never reach here).
         return ClassifiedError(
             error_type="invalid_request",
             original_exception=e,
@@ -1111,6 +1303,13 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
     if isinstance(e, ContextWindowExceededError):
         return ClassifiedError(
             error_type="context_window_exceeded",
+            original_exception=e,
+            status_code=status_code or 400,
+        )
+
+    if isinstance(e, (InvalidRequestError, BadRequestError)):
+        return ClassifiedError(
+            error_type="invalid_request",
             original_exception=e,
             status_code=status_code or 400,
         )
@@ -1151,31 +1350,174 @@ def is_rate_limit_error(e: Exception) -> bool:
 
 
 def _classify_structured_error_text(payload: dict, details: dict) -> Optional[str]:
-    """Classify structured error type/code/status text without raw messages."""
+    """Classify structured error type/code/status text without raw messages.
 
-    values = [payload.get("type"), payload.get("code"), payload.get("status"), details.get("error_type"), details.get("classification"), details.get("status")]
-    normalized = {str(value).strip().lower().replace("-", "_").replace(" ", "_") for value in values if value not in (None, "")}
-    if normalized & {"authentication", "auth", "unauthorized", "invalid_api_key"}:
-        return "authentication"
-    if normalized & {"forbidden", "permission_denied", "access_denied"}:
-        return "forbidden"
-    if normalized & {"context_window_exceeded", "context_length", "context_length_exceeded", "too_many_tokens"}:
-        return "context_window_exceeded"
-    if normalized & {"invalid_request", "bad_request", "validation", "invalid_argument"}:
-        return "invalid_request"
-    if normalized & {"credential_reauth_needed"}:
-        return "credential_reauth_needed"
-    if normalized & {"configuration_error", "config", "configuration"}:
-        return "configuration_error"
-    if normalized & {"rate_limit", "rate_limited", "too_many_requests"}:
-        return "rate_limit"
-    if normalized & {"quota_exceeded", "resource_exhausted", "quota"}:
-        return "quota_exceeded"
-    if normalized & {"server_error", "internal", "unavailable"}:
-        return "server_error"
-    if normalized & {"api_connection", "network", "connection"}:
-        return "api_connection"
+    Evidence order per docs/experimental/error-reference.md: structured
+    fields only (type/code/status/classification). Free-text message
+    sniffing is deliberately absent here — the two sanctioned message
+    checks (context spellings, quota tokens at 400) run at the call site
+    where the status context is known.
+    """
+
+    # Wire vocabulary from all four protocols (official enums + documented
+    # codes) mapped onto the internal taxonomy. Token equality only — never
+    # substring matching ("rate" must never match "generate").
+    wire_vocabulary = {
+        # --- openai_chat family ---
+        "invalid_request_error": "invalid_request",
+        "authentication_error": "authentication",
+        "invalid_api_key": "authentication",
+        "permission_error": "forbidden",
+        "not_found_error": "not_found",
+        "model_not_found": "not_found",
+        "rate_limit_error": "rate_limit",
+        "rate_limit_exceeded": "rate_limit",
+        "insufficient_quota": "quota_exceeded",
+        "credit_balance_exhausted": "quota_exceeded",
+        "organization_spend_limit_exceeded": "quota_exceeded",
+        "project_spend_limit_exceeded": "quota_exceeded",
+        "organization_usage_limit_exceeded": "quota_exceeded",
+        "enforced_spend_limit_reached": "quota_exceeded",
+        "server_error": "server_error",
+        "api_error": "server_error",
+        "bad_request": "invalid_request",
+        "validation": "invalid_request",
+        "invalid_argument": "invalid_request",
+        "invalid_prompt": "invalid_request",
+        "context_length_exceeded": "context_window_exceeded",
+        "context_length": "context_window_exceeded",
+        "too_many_tokens": "context_window_exceeded",
+        "string_above_max_length": "invalid_request",
+        # --- anthropic_messages family ---
+        "billing_error": "quota_exceeded",
+        "conflict_error": "conflict",
+        "request_too_large": "request_too_large",
+        "timeout_error": "server_error",
+        "overloaded_error": "server_error",
+        # --- gemini google.rpc family ---
+        "unauthenticated": "authentication",
+        "permission_denied": "forbidden",
+        "access_denied": "forbidden",
+        "not_found": "not_found",
+        "resource_exhausted": "quota_exceeded",
+        "quota_exceeded": "quota_exceeded",
+        "deadline_exceeded": "server_error",
+        "internal": "server_error",
+        "unavailable": "server_error",
+        "cancelled": "cancelled",
+        "failed_precondition": "invalid_request",
+        "already_exists": "conflict",
+        "out_of_range": "invalid_request",
+        "unimplemented": "invalid_request",
+        # --- internal vocabulary (round-trips) ---
+        "authentication": "authentication",
+        "forbidden": "forbidden",
+        "not_found": "not_found",
+        "conflict": "conflict",
+        "request_too_large": "request_too_large",
+        "invalid_request": "invalid_request",
+        "context_window_exceeded": "context_window_exceeded",
+        "rate_limit": "rate_limit",
+        "quota_exceeded": "quota_exceeded",
+        "server_error": "server_error",
+        "api_connection": "api_connection",
+        "cancelled": "cancelled",
+        "configuration_error": "configuration_error",
+        "credential_reauth_needed": "credential_reauth_needed",
+        "pre_request_callback_error": "pre_request_callback_error",
+        "proxy_timeout": "server_error",
+        "auth": "authentication",
+        "unauthorized": "authentication",
+        "quota": "quota_exceeded",
+        "rate_limited": "rate_limit",
+        "too_many_requests": "rate_limit",
+        "capacity": "rate_limit",
+        "transient": "server_error",
+        "network": "api_connection",
+        "connection": "api_connection",
+    }
+
+    values = [
+        payload.get("type"),
+        payload.get("code"),
+        payload.get("status"),
+        details.get("error_type"),
+        details.get("classification"),
+        details.get("status"),
+        details.get("error_code"),
+    ]
+    for value in values:
+        if value in (None, ""):
+            continue
+        normalized = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+        mapped = wire_vocabulary.get(normalized)
+        if mapped is not None:
+            return mapped
     return None
+
+
+# Quota markers that reclassify an error as quota at ANY HTTP status
+# (gemini-compat wraps 429 in 400/5xx; anthropic self-set spend limits ride
+# 400; openrouter embeds errors in 200s). Structured detection only —
+# presence of these fields/tokens in code/status/details, or the sanctioned
+# quota words in the message when the status is 400 (operator-approved
+# narrow sniff).
+_QUOTA_MESSAGE_TOKENS = (
+    "quota",
+    "resource_exhausted",
+    "insufficient_quota",
+    "spend limit",
+    "billing",
+)
+
+
+def _structured_quota_signal(
+    payload: dict, details: dict, message: str, status_code: Optional[int]
+) -> bool:
+    """Return whether structured evidence marks this error as quota at any status."""
+
+    for source in (payload, details):
+        for key in ("code", "status", "type", "error_code"):
+            value = source.get(key)
+            if value in (None, ""):
+                continue
+            token = str(value).strip().lower()
+            if token in {
+                "resource_exhausted",
+                "insufficient_quota",
+                "credit_balance_exhausted",
+                "organization_spend_limit_exceeded",
+                "project_spend_limit_exceeded",
+                "organization_usage_limit_exceeded",
+                "enforced_spend_limit_reached",
+                "billing_error",
+                "quota_exceeded",
+                "8",
+            }:
+                return True
+        # google.rpc details[] members are authoritative quota evidence
+        raw_details = source.get("details")
+        if isinstance(raw_details, list):
+            for detail in raw_details:
+                if not isinstance(detail, dict):
+                    continue
+                detail_type = str(detail.get("@type", ""))
+                if "QuotaFailure" in detail_type or "RetryInfo" in detail_type:
+                    return True
+    # Body-carried numeric 429 inside a DIFFERENT effective status (5xx-
+    # wrapped or compat-400 quota bodies). When the body code is itself
+    # the status source, a bare 429 is just a rate limit.
+    body_code = payload.get("code")
+    if isinstance(body_code, int) and body_code == 429 and status_code != 429:
+        return True
+    # Sanctioned narrow message sniff: quota words only, and only where
+    # quota-vs-rate ambiguity exists (400 rescue + bare-text 429 bodies
+    # without structured fields).
+    if status_code in (400, 429):
+        lowered = (message or "").lower()
+        if any(token in lowered for token in _QUOTA_MESSAGE_TOKENS):
+            return True
+    return False
 
 
 def is_server_error(e: Exception) -> bool:
@@ -1209,19 +1551,25 @@ def should_rotate_on_error(classified_error: ClassifiedError) -> bool:
     - server_error: Provider having issues (might work with different endpoint/key)
     - api_connection: Network issues (might be transient)
     - unknown: Safer to try another key
-
     Errors that should NOT rotate (fail immediately):
     - invalid_request: Client error in request payload (won't help to retry)
     - context_window_exceeded: Request too large (won't help to retry)
     - pre_request_callback_error: Internal proxy error
+    - request_too_large: Deterministic payload-size rejection
+    - not_found: Model/resource absence is provider-level — rotating
+      credentials cannot fix it; the FAIL escape lets the fallback policy
+      advance to the next TARGET (which may serve that model).
 
     Returns:
         True if should rotate to next key, False if should fail immediately
     """
+
     non_rotatable_errors = {
         "invalid_request",
         "context_window_exceeded",
         "pre_request_callback_error",
+        "request_too_large",
+        "not_found",
     }
     return classified_error.error_type not in non_rotatable_errors
 

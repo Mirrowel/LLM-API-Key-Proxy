@@ -35,7 +35,12 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
-from .transform_trace import TransformTraceWriter, provider_snapshot_namespace, sanitize_for_trace
+from .transform_trace import (
+    TransformTraceWriter,
+    provider_snapshot_namespace,
+    sanitize_for_trace,
+    scrub_sensitive_text,
+)
 from .utils import zstd_io
 from .utils.paths import get_logs_dir
 
@@ -246,6 +251,31 @@ def _sanitize_name(name: str) -> str:
     for char in '/\\:*?"<>|':
         name = name.replace(char, "_")
     return name
+
+
+_SAFE_LOG_FILENAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+)
+
+
+def _safe_log_path(base: Path, filename: str) -> Optional[Path]:
+    """Resolve a log filename inside ``base`` or return None when unsafe.
+
+    Provider-supplied filenames must not escape the transaction log directory:
+    reject empty names, absolute paths, path separators, ``..`` and any
+    character outside a conservative filename allowlist.
+    """
+
+    name = str(filename).strip()
+    if not name or name in {".", ".."}:
+        return None
+    if "/" in name or "\\" in name or ".." in name:
+        return None
+    if Path(name).is_absolute() or name.startswith("~"):
+        return None
+    if any(char not in _SAFE_LOG_FILENAME_CHARS for char in name):
+        return None
+    return base / name
 
 
 @dataclass
@@ -534,7 +564,7 @@ class TransactionLogger:
             {
                 "failed_pass_name": failed_pass_name,
                 "error_type": type(error).__name__,
-                "message": str(error)[:2000],
+                "message": scrub_sensitive_text(str(error))[:2000],
                 "stage": stage,
             }
         )
@@ -600,7 +630,7 @@ class TransactionLogger:
             record = {
                 "failed_pass_name": "finalize",
                 "error_type": type(error).__name__,
-                "message": str(error)[:2000],
+                "message": scrub_sensitive_text(str(error))[:2000],
                 "stage": "final",
             }
             if not any(entry.get("error_type") == type(error).__name__ and entry.get("message") == record["message"] for entry in self._error_records):
@@ -755,7 +785,9 @@ class TransactionLogger:
             "timestamp_utc": _utc_timestamp(),
             "status_code": status_code,
             "duration_ms": round(duration_ms),
-            "headers": _make_json_safe(dict(headers)) if headers else None,
+            "headers": sanitize_for_trace(_make_json_safe(dict(headers)))
+            if headers
+            else None,
             "data": sanitize_for_trace(safe_response),
         }
         self.log_transform_pass(
@@ -1175,6 +1207,7 @@ class ProviderLogger:
             error_message: The error message to log
         """
         timestamp = _utc_timestamp()
+        scrubbed_message = scrub_sensitive_text(str(error_message))
         self._log_transform_pass(
             "provider_error",
             {"timestamp_utc": timestamp, "message": error_message},
@@ -1182,7 +1215,7 @@ class ProviderLogger:
             scrub_strings=True,
             snapshot=False,
         )
-        self._append_text("error.log", f"[{timestamp}] {error_message}\n")
+        self._append_text("error.log", f"[{timestamp}] {scrubbed_message}\n")
         self.finalize()
 
     def log_extra(self, filename: str, data: Union[Dict[str, Any], str]) -> None:
@@ -1204,8 +1237,14 @@ class ProviderLogger:
         """Write JSON data to a file in the log directory."""
         if not self.enabled or not self.log_dir:
             return
+        target = _safe_log_path(self.log_dir, filename)
+        if target is None:
+            lib_logger.warning(
+                f"ProviderLogger: refusing unsafe log filename {filename!r}"
+            )
+            return
         try:
-            with open(self.log_dir / filename, "w", encoding="utf-8") as f:
+            with open(target, "w", encoding="utf-8") as f:
                 json.dump(_make_json_safe(data), f, indent=2, ensure_ascii=False)
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to write {filename}: {e}")
@@ -1214,8 +1253,14 @@ class ProviderLogger:
         """Append text to a file in the log directory."""
         if not self.enabled or not self.log_dir:
             return
+        target = _safe_log_path(self.log_dir, filename)
+        if target is None:
+            lib_logger.warning(
+                f"ProviderLogger: refusing unsafe log filename {filename!r}"
+            )
+            return
         try:
-            with open(self.log_dir / filename, "a", encoding="utf-8") as f:
+            with open(target, "a", encoding="utf-8") as f:
                 f.write(text)
         except Exception as e:
             lib_logger.error(f"ProviderLogger: Failed to append to {filename}: {e}")

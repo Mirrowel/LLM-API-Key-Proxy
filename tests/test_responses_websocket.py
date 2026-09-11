@@ -624,13 +624,47 @@ def test_websocket_route_streams_a_full_turn() -> None:
 
 
 def test_websocket_route_denies_unauthenticated_upgrade() -> None:
+    from starlette.websockets import WebSocketDisconnect
+
     proxy_main.PROXY_API_KEY = "secret-key"
     proxy_main.app.state.rotating_client = RouteFakeClient()
     proxy_main.app.state.responses_service = ResponsesService(store=InMemoryResponsesStore())
     client = TestClient(proxy_main.app)
-    with pytest.raises(Exception):
-        with client.websocket_connect("/v1/responses"):
-            pass
+    with client.websocket_connect("/v1/responses") as ws:
+        with pytest.raises(WebSocketDisconnect) as excinfo:
+            ws.receive_json()
+        assert excinfo.value.code == 1008
+    proxy_main.PROXY_API_KEY = None
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"x-api-key": "secret-key"},
+        {"x-goog-api-key": "secret-key"},
+    ],
+)
+def test_websocket_route_accepts_non_bearer_carriers(headers) -> None:
+    proxy_main.PROXY_API_KEY = "secret-key"
+    proxy_main.app.state.rotating_client = RouteFakeClient()
+    proxy_main.app.state.responses_service = ResponsesService(store=InMemoryResponsesStore())
+    client = TestClient(proxy_main.app)
+    with client.websocket_connect("/v1/responses", headers=headers) as ws:
+        ws.send_json({"type": "response.create", "model": "gpt-test", "input": "hi", "generate": False})
+        frame = ws.receive_json()
+        assert frame["type"] == "response.completed"
+    proxy_main.PROXY_API_KEY = None
+
+
+def test_websocket_route_accepts_query_key_carrier() -> None:
+    proxy_main.PROXY_API_KEY = "secret-key"
+    proxy_main.app.state.rotating_client = RouteFakeClient()
+    proxy_main.app.state.responses_service = ResponsesService(store=InMemoryResponsesStore())
+    client = TestClient(proxy_main.app)
+    with client.websocket_connect("/v1/responses?key=secret-key") as ws:
+        ws.send_json({"type": "response.create", "model": "gpt-test", "input": "hi", "generate": False})
+        frame = ws.receive_json()
+        assert frame["type"] == "response.completed"
     proxy_main.PROXY_API_KEY = None
 
 

@@ -47,8 +47,11 @@ for _stream in (sys.stdout, sys.stderr):
 # Add the 'src' directory to the Python path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-# Check if we should launch TUI (no arguments = TUI mode)
-if len(sys.argv) == 1:
+# Check if we should launch TUI (no arguments = TUI mode).
+# Real script launches ONLY — a plain `import proxy_app.main` (uvicorn/
+# gunicorn workers, tests, tooling) must never block on the interactive
+# TUI.
+if __name__ == "__main__" and len(sys.argv) == 1:
     # TUI MODE - Load ONLY what's needed for the launcher (fast path!)
     from proxy_app.launcher_tui import run_launcher_tui
 
@@ -98,14 +101,16 @@ if _env_files_found:
 # localhost bind — otherwise prompt (enter/generate/skip) or block when
 # no terminal can answer. Enforcement matches the launch mode: script
 # runs (TUI, direct, flags, Docker CMD) use the parsed host; an ASGI
-# server launching this module is detected via its argv; plain library
-# imports (tests, tooling) never enforce.
+# server launching this module (uvicorn CLI incl. `python -m uvicorn`
+# with UVICORN_HOST, programmatic uvicorn.run, gunicorn/hypercorn) is
+# detected via argv or the launch stack, and unprovable binds fail
+# closed as public; plain library imports (tests, tooling) never enforce.
 from proxy_app import key_policy as _key_policy
 
 if __name__ == "__main__":
     _bind_host: str | None = args.host
 else:
-    _bind_host = _key_policy.uvicorn_bind_host()
+    _bind_host = _key_policy.serving_bind_host()
 _adopted_key = (
     _key_policy.enforce_proxy_key_policy(_bind_host) if _bind_host is not None else None
 )
@@ -159,14 +164,12 @@ litellm.suppress_debug_info = True
 print("  → Initializing proxy core...")
 with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library import RotatingClient
-    from rotator_library.client.protocol_selection import format_client_protocol_error
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
     from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from rotator_library.responses import ResponsesService, ResponsesServiceError
-    from rotator_library.core.errors import StructuredAPIResponseError
     from rotator_library.transaction_logger import TransactionLogger
 
 print("  → Discovering provider plugins...")
@@ -519,13 +522,17 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App Setup ---
 app = FastAPI(lifespan=lifespan)
 
-# Add CORS middleware to allow all origins, methods, and headers
+# Add CORS middleware. Wildcard origins cannot be combined with credentials
+# per the Fetch spec (browsers reject `*` when credentials mode is include),
+# so credentials are disabled — proxy auth travels in headers, not cookies.
+# X-Proxy-Session-Domain is exposed so browser clients can chain responses.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allows all origins
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
+    expose_headers=["X-Proxy-Session-Domain"],
 )
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 
@@ -553,13 +560,30 @@ def get_responses_service(request: Request) -> ResponsesService:
     return service
 
 
+class ProxyAuthError(Exception):
+    """Signal a failed proxy-key check; the app renders it per route dialect."""
+
+    error_type = "authentication"
+    status_code = 401
+
+
+@app.exception_handler(ProxyAuthError)
+async def _render_proxy_auth_error(request: Request, exc: ProxyAuthError):
+    """One shared 401 renderer: the route path decides the client protocol."""
+
+    status, content = route_error_response(
+        exc, protocol=protocol_for_route_path(request.url.path)
+    )
+    return JSONResponse(status_code=status, content=content)
+
+
 async def verify_api_key(auth: str = Depends(api_key_header)):
     """Dependency to verify the proxy API key."""
     # If PROXY_API_KEY is not set or empty, skip verification (open access)
     if not PROXY_API_KEY:
         return auth
     if not auth or auth != f"Bearer {PROXY_API_KEY}":
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+        raise ProxyAuthError("Invalid or missing API Key")
     return auth
 
 
@@ -584,7 +608,7 @@ async def verify_anthropic_api_key(
     # Fall back to Bearer token (OpenAI style)
     if auth and auth == f"Bearer {PROXY_API_KEY}":
         return auth
-    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    raise ProxyAuthError("Invalid or missing API Key")
 
 
 async def verify_gemini_api_key(
@@ -603,7 +627,27 @@ async def verify_gemini_api_key(
         or auth == f"Bearer {PROXY_API_KEY}"
     ):
         return x_api_key or query_key or auth
-    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
+    raise ProxyAuthError("Invalid or missing API Key")
+
+
+def _websocket_authorized(websocket) -> bool:
+    """Accept the same proxy-key carriers as the HTTP route families.
+
+    Supports ``Authorization: Bearer``, ``x-api-key``, ``x-goog-api-key`` and
+    the Gemini ``?key=`` query form. Returns True when auth is disabled (no
+    PROXY_API_KEY configured) or the presented key matches.
+    """
+
+    if not PROXY_API_KEY:
+        return True
+    if websocket.headers.get("authorization") == f"Bearer {PROXY_API_KEY}":
+        return True
+    for header in ("x-api-key", "x-goog-api-key"):
+        if websocket.headers.get(header) == PROXY_API_KEY:
+            return True
+    if websocket.query_params.get("key") == PROXY_API_KEY:
+        return True
+    return False
 
 
 # Stream wrapping, request overrides, and embedding fan-out live in route_helpers.
@@ -611,6 +655,9 @@ from proxy_app.route_helpers import (  # noqa: E402
     SSE_HEADERS,
     apply_temperature_override,
     execute_embeddings,
+    protocol_for_route_path,
+    route_error_response,
+    stable_error_response,
     streaming_response_wrapper,
 )
 # OAuth credential bootstrap lives in startup.
@@ -635,11 +682,15 @@ async def chat_completions(
         try:
             request_data = await request.json()
         except json.JSONDecodeError:
-            status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-                error="Invalid JSON in request body.",
-                error_type="invalid_request",
-                status_code=400,
+            status, content = route_error_response(
+                "Invalid JSON in request body.", protocol="openai_chat"
+            )
+            return JSONResponse(status_code=status, content=content)
+
+        if not isinstance(request_data, dict):
+            status, content = route_error_response(
+                ValueError("request body must be a JSON object"),
+                protocol="openai_chat",
             )
             return JSONResponse(status_code=status, content=content)
 
@@ -672,7 +723,15 @@ async def chat_completions(
             client_info=(request.client.host, request.client.port),
             request_data=request_data,
         )
-        is_streaming = request_data.get("stream", False)
+        # JSON typing: only boolean True (or absent) selects streaming. Any
+        # other non-null value is a malformed request, never a truthy string.
+        stream_value = request_data.get("stream")
+        if stream_value is not None and not isinstance(stream_value, bool):
+            status, content = route_error_response(
+                ValueError("stream must be a boolean"), protocol="openai_chat"
+            )
+            return JSONResponse(status_code=status, content=content)
+        is_streaming = bool(stream_value)
 
         if is_streaming:
             response_generator = await client.agenerate(
@@ -707,54 +766,8 @@ async def chat_completions(
                 )
             return response
 
-    except StructuredAPIResponseError as e:
-        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("openai_chat"))
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e,
-            error_type=(
-                "context_window_exceeded"
-                if isinstance(e, litellm.ContextWindowExceededError)
-                else "invalid_request"
-            ),
-            status_code=400,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.AuthenticationError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e, error_type="authentication", status_code=401,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.RateLimitError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e, error_type="rate_limit", status_code=429,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e, error_type="server_error", status_code=503,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.Timeout as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e, error_type="proxy_timeout", status_code=504,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e, error_type="server_error", status_code=502,
-        )
-        return JSONResponse(status_code=status, content=content)
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Request failed after all retries: {e}")
         # Optionally log the failed request
@@ -767,12 +780,7 @@ async def chat_completions(
                 raw_logger.log_final_response(
                     status_code=500, headers=None, body={"error": str(e)}
                 )
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat",
-            error=e,
-            error_type="server_error",
-            status_code=500,
-        )
+        status, content = route_error_response(e, protocol="openai_chat")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -798,11 +806,13 @@ async def responses_create(
     try:
         request_data = await request.json()
     except json.JSONDecodeError:
-        status, content = format_client_protocol_error(
-            input_protocol="responses",
-            error="Invalid JSON in request body.",
-            error_type="invalid_request",
-            status_code=400,
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="responses"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(request_data, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="responses"
         )
         return JSONResponse(status_code=status, content=content)
     if logger:
@@ -942,18 +952,17 @@ async def responses_websocket(websocket: WebSocket):
 
     Thin shell: the session driver lives in rotator_library
     (ResponsesWebSocketSession) per the shell-plus-library pattern.
-    Unauthenticated upgrades are denied at the handshake (Starlette sends
-    HTTP 403 on close-before-accept — the deliberate security shape: no
-    socket for unauthenticated peers; there is no official auth close code).
+    Authentication matches the HTTP carriers (Authorization Bearer,
+    x-api-key, x-goog-api-key, ?key=); unauthenticated upgrades are accepted
+    then closed with application close code 1008 and a reason.
     """
 
     from rotator_library.responses.websocket import DEFAULT_MAX_CONNECTION_SECONDS, ResponsesWebSocketSession
 
-    if PROXY_API_KEY:
-        auth_header = websocket.headers.get("Authorization") or websocket.headers.get("authorization")
-        if auth_header != f"Bearer {PROXY_API_KEY}":
-            await websocket.close()
-            return
+    if not _websocket_authorized(websocket):
+        await websocket.accept()
+        await websocket.close(code=1008, reason="Invalid or missing API Key")
+        return
     service = getattr(websocket.app.state, "responses_service", None)
     rotating_client = getattr(websocket.app.state, "rotating_client", None)
     if service is None or rotating_client is None:
@@ -1000,19 +1009,14 @@ async def anthropic_messages(
     try:
         body = await request.json()
     except Exception as exc:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages",
-            error=exc,
-            error_type="invalid_request",
-            status_code=400,
+        status, content = route_error_response(
+            exc, protocol="anthropic_messages"
         )
         return JSONResponse(status_code=status, content=content)
     if not isinstance(body, dict):
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages",
-            error=ValueError("request body must be a JSON object"),
-            error_type="invalid_request",
-            status_code=400,
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"),
+            protocol="anthropic_messages",
         )
         return JSONResponse(status_code=status, content=content)
 
@@ -1059,55 +1063,17 @@ async def anthropic_messages(
                 )
             return JSONResponse(content=result)
 
-    except StructuredAPIResponseError as e:
-        return JSONResponse(status_code=e.http_status, content=e.to_protocol_payload("anthropic_messages"))
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type=("context_window_exceeded" if isinstance(e, litellm.ContextWindowExceededError) else "invalid_request"),
-            status_code=400,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.AuthenticationError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="authentication", status_code=401,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.RateLimitError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="rate_limit", status_code=429,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="server_error", status_code=503,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.Timeout as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="proxy_timeout", status_code=504,
-        )
-        return JSONResponse(status_code=status, content=content)
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Anthropic messages endpoint error: {e}")
-        if logger:
+        if logger is not None:
             logger.log_final_response(
                 status_code=500,
                 headers=None,
                 body={"error": str(e)},
             )
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="server_error", status_code=500,
-        )
+        status, content = route_error_response(e, protocol="anthropic_messages")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -1128,12 +1094,15 @@ async def anthropic_count_tokens(
     """
     try:
         body = await request.json()
-        if not isinstance(body, dict):
-            raise ValueError("request body must be a JSON object")
-    except Exception as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="invalid_request", status_code=400,
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="anthropic_messages"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(body, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"),
+            protocol="anthropic_messages",
         )
         return JSONResponse(status_code=status, content=content)
     try:
@@ -1141,24 +1110,11 @@ async def anthropic_count_tokens(
         result = await client.anthropic_count_tokens(body)
         return JSONResponse(content=result)
 
-    except (ValueError, litellm.InvalidRequestError) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="invalid_request", status_code=400,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.AuthenticationError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="authentication", status_code=401,
-        )
-        return JSONResponse(status_code=status, content=content)
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Anthropic count_tokens endpoint error: {e}")
-        status, content = format_client_protocol_error(
-            input_protocol="anthropic_messages", error=e,
-            error_type="api_error", status_code=500,
-        )
+        status, content = route_error_response(e, protocol="anthropic_messages")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -1176,10 +1132,13 @@ async def gemini_generate_content(
     try:
         payload = await request.json()
     except json.JSONDecodeError:
-        status, content = format_client_protocol_error(
-            input_protocol="gemini",
-            error="Invalid JSON in request body.", error_type="invalid_request",
-            status_code=400,
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="gemini"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="gemini"
         )
         return JSONResponse(status_code=status, content=content)
     try:
@@ -1189,19 +1148,11 @@ async def gemini_generate_content(
             )
         result = await client.gemini_generate(payload, model=model, raw_request=request)
         return JSONResponse(content=result)
-    except StructuredAPIResponseError as error:
-        return JSONResponse(status_code=error.http_status, content=error.to_protocol_payload("gemini"))
-    except (ValueError, litellm.InvalidRequestError) as error:
-        status, content = format_client_protocol_error(
-            input_protocol="gemini", error=error, error_type="invalid_request",
-            status_code=400,
-        )
-        return JSONResponse(status_code=status, content=content)
+    except HTTPException:
+        raise
     except Exception as error:
-        status, content = format_client_protocol_error(
-            input_protocol="gemini", error=error, error_type="server_error",
-            status_code=500,
-        )
+        logging.error(f"Gemini generateContent endpoint error: {error}")
+        status, content = route_error_response(error, protocol="gemini")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -1218,6 +1169,17 @@ async def gemini_stream_generate_content(
     payload: dict[str, Any] = {}
     try:
         payload = await request.json()
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="gemini"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="gemini"
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
         response_stream = await client.gemini_stream_generate(
             payload,
             model=model,
@@ -1228,22 +1190,11 @@ async def gemini_stream_generate_content(
             media_type="text/event-stream",
             headers=SSE_HEADERS,
         )
-    except (json.JSONDecodeError, ValueError, litellm.InvalidRequestError) as error:
-        status, content = format_client_protocol_error(
-            input_protocol="gemini", error=error, error_type="invalid_request",
-            status_code=400,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except StructuredAPIResponseError as error:
-        return JSONResponse(
-            status_code=error.http_status,
-            content=error.to_protocol_payload("gemini"),
-        )
+    except HTTPException:
+        raise
     except Exception as error:
-        status, content = format_client_protocol_error(
-            input_protocol="gemini", error=error, error_type="server_error",
-            status_code=500,
-        )
+        logging.error(f"Gemini streamGenerateContent endpoint error: {error}")
+        status, content = route_error_response(error, protocol="gemini")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -1259,12 +1210,25 @@ async def gemini_count_tokens(
 
     try:
         payload = await request.json()
-        return JSONResponse(content=client.gemini_count_tokens(payload, model=model))
-    except (json.JSONDecodeError, ValueError) as error:
-        return JSONResponse(
-            status_code=400,
-            content={"error": {"code": 400, "message": str(error), "status": "INVALID_ARGUMENT"}},
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="gemini"
         )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="gemini"
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
+        result = client.gemini_count_tokens(payload, model=model)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Gemini countTokens endpoint error: {error}")
+        status, content = route_error_response(error, protocol="gemini")
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1/embeddings")
@@ -1282,16 +1246,24 @@ async def embeddings(
     """
     try:
         request_data = await request.json()
-        if not isinstance(request_data, dict):
-            raise ValueError("request body must be a JSON object")
-        if not request_data.get("model"):
-            raise ValueError("Field required: 'model'")
-        if "input" not in request_data:
-            raise ValueError("Field required: 'input'")
-    except Exception as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="invalid_request", status_code=400,
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(request_data, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(request_data.get("model"), str) or not request_data.get("model"):
+        status, content = route_error_response(
+            ValueError("Field required: 'model'"), protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if "input" not in request_data:
+        status, content = route_error_response(
+            ValueError("Field required: 'input'"), protocol="openai_chat"
         )
         return JSONResponse(status_code=status, content=content)
     try:
@@ -1313,52 +1285,9 @@ async def embeddings(
     except HTTPException as e:
         # Re-raise HTTPException to ensure it's not caught by the generic Exception handler
         raise e
-    except (
-        litellm.InvalidRequestError,
-        ValueError,
-        litellm.ContextWindowExceededError,
-    ) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="invalid_request", status_code=400,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.AuthenticationError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="authentication", status_code=401,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.RateLimitError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="rate_limit", status_code=429,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except (litellm.ServiceUnavailableError, litellm.APIConnectionError) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="server_error", status_code=503,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except litellm.Timeout as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="proxy_timeout", status_code=504,
-        )
-        return JSONResponse(status_code=status, content=content)
-    except (litellm.InternalServerError, litellm.OpenAIError) as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="server_error", status_code=502,
-        )
-        return JSONResponse(status_code=status, content=content)
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="server_error", status_code=500,
-        )
+        status, content = route_error_response(e, protocol="openai_chat")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -1381,26 +1310,33 @@ async def list_models(
         enriched: If True (default), returns detailed model info with pricing and capabilities.
                   If False, returns minimal OpenAI-compatible response.
     """
-    model_ids = await client.get_all_available_models(grouped=False)
+    try:
+        model_ids = await client.get_all_available_models(grouped=False)
 
-    if enriched and hasattr(request.app.state, "model_info_service"):
-        model_info_service = request.app.state.model_info_service
-        if model_info_service.is_ready:
-            # Return enriched model data
-            enriched_data = model_info_service.enrich_model_list(model_ids)
-            return {"object": "list", "data": enriched_data}
+        if enriched and hasattr(request.app.state, "model_info_service"):
+            model_info_service = request.app.state.model_info_service
+            if model_info_service.is_ready:
+                # Return enriched model data
+                enriched_data = model_info_service.enrich_model_list(model_ids)
+                return {"object": "list", "data": enriched_data}
 
-    # Fallback to basic model cards
-    model_cards = [
-        {
-            "id": model_id,
-            "object": "model",
-            "created": int(time.time()),
-            "owned_by": "Mirro-Proxy",
-        }
-        for model_id in model_ids
-    ]
-    return {"object": "list", "data": model_cards}
+        # Fallback to basic model cards
+        model_cards = [
+            {
+                "id": model_id,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "Mirro-Proxy",
+            }
+            for model_id in model_ids
+        ]
+        return {"object": "list", "data": model_cards}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Model listing failed: {e}")
+        status, content = route_error_response(e, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.get("/v1/models/{model_id:path}")
@@ -1415,20 +1351,27 @@ async def get_model(
     Path Parameters:
         model_id: The model ID (e.g., "anthropic/claude-3-opus", "openrouter/openai/gpt-4")
     """
-    if hasattr(request.app.state, "model_info_service"):
-        model_info_service = request.app.state.model_info_service
-        if model_info_service.is_ready:
-            info = model_info_service.get_model_info(model_id)
-            if info:
-                return info.to_dict()
+    try:
+        if hasattr(request.app.state, "model_info_service"):
+            model_info_service = request.app.state.model_info_service
+            if model_info_service.is_ready:
+                info = model_info_service.get_model_info(model_id)
+                if info:
+                    return info.to_dict()
 
-    # Return basic info if service not ready or model not found
-    return {
-        "id": model_id,
-        "object": "model",
-        "created": int(time.time()),
-        "owned_by": model_id.split("/")[0] if "/" in model_id else "unknown",
-    }
+        # Return basic info if service not ready or model not found
+        return {
+            "id": model_id,
+            "object": "model",
+            "created": int(time.time()),
+            "owned_by": model_id.split("/")[0] if "/" in model_id else "unknown",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Model lookup failed for {model_id!r}: {e}")
+        status, content = route_error_response(e, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.get("/v1/model-info/stats")
@@ -1439,9 +1382,16 @@ async def model_info_stats(
     """
     Returns statistics about the model info service (for monitoring/debugging).
     """
-    if hasattr(request.app.state, "model_info_service"):
-        return request.app.state.model_info_service.get_stats()
-    return {"error": "Model info service not initialized"}
+    try:
+        if hasattr(request.app.state, "model_info_service"):
+            return request.app.state.model_info_service.get_stats()
+        return {"error": "Model info service not initialized"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Model info stats failed: {e}")
+        status, content = route_error_response(e, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.get("/v1/providers")
@@ -1449,7 +1399,14 @@ async def list_providers(_=Depends(verify_api_key)):
     """
     Returns a list of all available providers.
     """
-    return list(PROVIDER_PLUGINS.keys())
+    try:
+        return list(PROVIDER_PLUGINS.keys())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.error(f"Provider listing failed: {e}")
+        status, content = route_error_response(e, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.get("/v1/quota-stats")
@@ -1491,9 +1448,17 @@ async def get_quota_stats(
     try:
         stats = await client.get_quota_stats(provider_filter=provider)
         return stats
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Failed to get quota stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = stable_error_response(
+            "Failed to retrieve quota statistics.",
+            protocol="openai_chat",
+            error_type="server_error",
+            status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1/quota-stats")
@@ -1523,36 +1488,48 @@ async def refresh_quota_stats(
     """
     try:
         data = await request.json()
-        action = data.get("action", "reload")
-        scope = data.get("scope", "all")
-        provider = data.get("provider")
-        credential = data.get("credential")
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(data, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
 
-        # Validate parameters
-        if action not in ("reload", "force_refresh"):
-            raise HTTPException(
-                status_code=400,
-                detail="action must be 'reload' or 'force_refresh'",
+    action = data.get("action", "reload")
+    scope = data.get("scope", "all")
+    provider = data.get("provider")
+    credential = data.get("credential")
+
+    # Validate parameters
+    for message, invalid in (
+        (
+            "action must be 'reload' or 'force_refresh'",
+            action not in ("reload", "force_refresh"),
+        ),
+        (
+            "scope must be 'all', 'provider', or 'credential'",
+            scope not in ("all", "provider", "credential"),
+        ),
+        (
+            "'provider' is required when scope is 'provider' or 'credential'",
+            scope in ("provider", "credential") and not provider,
+        ),
+        (
+            "'credential' is required when scope is 'credential'",
+            scope == "credential" and not credential,
+        ),
+    ):
+        if invalid:
+            status, content = route_error_response(
+                ValueError(message), protocol="openai_chat"
             )
+            return JSONResponse(status_code=status, content=content)
 
-        if scope not in ("all", "provider", "credential"):
-            raise HTTPException(
-                status_code=400,
-                detail="scope must be 'all', 'provider', or 'credential'",
-            )
-
-        if scope in ("provider", "credential") and not provider:
-            raise HTTPException(
-                status_code=400,
-                detail="'provider' is required when scope is 'provider' or 'credential'",
-            )
-
-        if scope == "credential" and not credential:
-            raise HTTPException(
-                status_code=400,
-                detail="'credential' is required when scope is 'credential'",
-            )
-
+    try:
         refresh_result = {
             "action": action,
             "scope": scope,
@@ -1588,7 +1565,13 @@ async def refresh_quota_stats(
         raise
     except Exception as e:
         logging.error(f"Failed to refresh quota stats: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = stable_error_response(
+            "Failed to refresh quota statistics.",
+            protocol="openai_chat",
+            error_type="server_error",
+            status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 @app.post("/v1/token-count")
@@ -1602,27 +1585,32 @@ async def token_count(
     """
     try:
         data = await request.json()
-        model = data.get("model")
-        messages = data.get("messages")
-
-        if not model or not messages:
-            raise ValueError("'model' and 'messages' are required.")
-
-        count = client.token_count(**data)
-        return {"token_count": count}
-
-    except ValueError as e:
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="invalid_request", status_code=400,
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="openai_chat"
         )
         return JSONResponse(status_code=status, content=content)
+    if not isinstance(data, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+
+    model = data.get("model")
+    messages = data.get("messages")
+    if not isinstance(model, str) or not model or not messages:
+        status, content = route_error_response(
+            ValueError("'model' and 'messages' are required."), protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
+        count = client.token_count(**data)
+        return {"token_count": count}
+    except HTTPException:
+        raise
     except Exception as e:
         logging.error(f"Token count failed: {e}")
-        status, content = format_client_protocol_error(
-            input_protocol="openai_chat", error=e,
-            error_type="server_error", status_code=500,
-        )
+        status, content = route_error_response(e, protocol="openai_chat")
         return JSONResponse(status_code=status, content=content)
 
 
@@ -1654,18 +1642,21 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
     """
     try:
         data = await request.json()
+        if not isinstance(data, dict):
+            status, content = route_error_response(
+                ValueError("request body must be a JSON object"),
+                protocol="openai_chat",
+            )
+            return JSONResponse(status_code=status, content=content)
         model = data.get("model")
         prompt_tokens = data.get("prompt_tokens", 0)
         completion_tokens = data.get("completion_tokens", 0)
         cache_read_tokens = data.get("cache_read_tokens", 0)
         cache_creation_tokens = data.get("cache_creation_tokens", 0)
 
-        if not model:
-            status, content = format_client_protocol_error(
-                input_protocol="openai_chat",
-                error=ValueError("'model' is required."),
-                error_type="invalid_request",
-                status_code=400,
+        if not isinstance(model, str) or not model:
+            status, content = route_error_response(
+                ValueError("'model' is required."), protocol="openai_chat"
             )
             return JSONResponse(status_code=status, content=content)
 
@@ -1708,23 +1699,22 @@ async def cost_estimate(request: Request, _=Depends(verify_api_key)):
         raise
     except Exception as e:
         logging.error(f"Cost estimate failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        status, content = stable_error_response(
+            "Failed to estimate request cost.",
+            protocol="openai_chat",
+            error_type="server_error",
+            status_code=502,
+        )
+        return JSONResponse(status_code=status, content=content)
 
 
 if __name__ == "__main__":
     # Define ENV_FILE for onboarding checks using centralized path
     ENV_FILE = get_data_file(".env")
 
-    # Check if launcher TUI should be shown (no arguments provided)
-    if len(sys.argv) == 1:
-        # No arguments - show launcher TUI (lazy import)
-        from proxy_app.launcher_tui import run_launcher_tui
-
-        run_launcher_tui()
-        # Launcher modifies sys.argv and returns, or exits if user chose Exit
-        # If we get here, user chose "Run Proxy" and sys.argv is modified
-        # Re-parse arguments with modified sys.argv
-        args = parser.parse_args()
+    # (The TUI-vs-flags decision happens at the top of the module, under
+    # this same __main__ guard — the duplicate trigger that lived here
+    # was merged into it.)
 
     def needs_onboarding() -> bool:
         """

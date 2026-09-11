@@ -74,6 +74,24 @@ def test_log_response_and_stream_chunk_write_trace_entries(tmp_path) -> None:
     assert not any(entry.name.startswith("0002_parsed_stream_chunk.json") for entry in (logger.log_dir / "transforms").iterdir())
 
 
+def test_log_response_redacts_headers_channel(tmp_path) -> None:
+    logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
+
+    logger.log_response(
+        {"model": "gpt-test", "choices": []},
+        headers={
+            "Authorization": "Bearer response-secret",
+            "X-Goog-Api-Key": "AIzaRESPONSESECRET",
+            "Content-Type": "application/json",
+        },
+    )
+
+    data = zstd_io.read_json_any(_artifact(logger.log_dir, "response.json"))
+    assert data["headers"]["Authorization"] == REDACTED
+    assert data["headers"]["X-Goog-Api-Key"] == REDACTED
+    assert data["headers"]["Content-Type"] == "application/json"
+
+
 def test_provider_logger_writes_provider_trace_entries(tmp_path) -> None:
     logger = TransactionLogger("gemini_cli", "gemini_cli/gemini-test", parent_dir=tmp_path)
     provider_logger = ProviderLogger(logger.get_context())

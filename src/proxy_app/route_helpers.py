@@ -10,12 +10,23 @@ in-band error handling, request overrides, and embedding fan-out.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
-from rotator_library.client.protocol_selection import format_client_protocol_error
+import httpx
+
+from rotator_library.client.protocol_selection import (
+    canonical_protocol_name,
+    format_client_protocol_error,
+)
+from rotator_library.core.errors import (
+    StructuredAPIResponseError,
+    protocol_error_payload,
+)
+from rotator_library.error_handler import classify_error
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -28,6 +39,119 @@ SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+
+# Grounded route status ladder (docs/experimental/error-reference.md 5.9): the
+# internal classifier type decides the client-visible status. Server-family
+# statuses that carry a stronger wire signal (503 unavailable / 504 deadline /
+# 529 overloaded) are preserved so the anthropic envelope can render
+# timeout_error/overloaded_error.
+_GROUNDED_ROUTE_STATUS = {
+    "invalid_request": 400,
+    "context_window_exceeded": 400,
+    "authentication": 401,
+    "forbidden": 403,
+    "not_found": 404,
+    "conflict": 409,
+    "request_too_large": 413,
+    "rate_limit": 429,
+    "quota_exceeded": 429,
+    "server_error": 502,
+    "api_connection": 502,
+    "proxy_timeout": 504,
+    "proxy_all_credentials_exhausted": 503,
+}
+_SERVER_FAMILY_TYPES = {
+    "server_error",
+    "api_connection",
+    "proxy_all_credentials_exhausted",
+}
+_PRESERVED_SERVER_STATUSES = {503, 504, 529}
+
+
+def _is_timeout_exception(error: BaseException) -> bool:
+    """True for litellm/httpx/asyncio timeout classes (any MRO name match)."""
+
+    if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+        return True
+    return any("timeout" in cls.__name__.lower() for cls in type(error).__mro__)
+
+
+def classify_route_error(error: BaseException) -> tuple[str, int]:
+    """Classify a route-side failure into the grounded (type, status) pair."""
+
+    if _is_timeout_exception(error):
+        return "proxy_timeout", 504
+
+    classified = classify_error(error)
+    error_type = classified.error_type
+    raw_status = classified.status_code
+
+    if error_type == "unknown":
+        # The bare-ValueError family is the request-path validation contract
+        # (bad addressing, bad model reference, malformed bodies) → 400.
+        if isinstance(error, ValueError):
+            error_type = "invalid_request"
+        elif isinstance(error, asyncio.CancelledError):
+            error_type = "cancelled"
+        else:
+            error_type = "server_error"
+
+    if error_type in _SERVER_FAMILY_TYPES and raw_status in _PRESERVED_SERVER_STATUSES:
+        return error_type, raw_status
+
+    return error_type, _GROUNDED_ROUTE_STATUS.get(error_type, 502)
+
+
+def route_error_response(
+    error: BaseException | str, *, protocol: str
+) -> tuple[int, dict[str, Any]]:
+    """Render one shell-side failure in the route's own client protocol.
+
+    The shell stays thin: classification lives in the library
+    (``classify_error``) and rendering lives in the library
+    (``protocol_error_payload``). This helper only bridges the two and picks
+    the grounded status ladder.
+    """
+
+    canonical = canonical_protocol_name(protocol)
+    if isinstance(error, BaseException):
+        error_type, status_code = classify_route_error(error)
+    else:
+        error_type, status_code = "invalid_request", 400
+    return protocol_error_payload(
+        error, canonical, error_type=error_type, status_code=status_code
+    )
+
+
+def protocol_for_route_path(path: str | None) -> str:
+    """Map an HTTP route path onto its client protocol dialect."""
+
+    path = path or ""
+    if path.endswith((":generateContent", ":streamGenerateContent", ":countTokens")):
+        return "gemini"
+    if path.startswith("/v1/messages"):
+        return "anthropic_messages"
+    if path.startswith("/v1/responses"):
+        return "responses"
+    return "openai_chat"
+
+
+def stable_error_response(
+    message: str,
+    *,
+    protocol: str,
+    error_type: str = "server_error",
+    status_code: int = 502,
+) -> tuple[int, dict[str, Any]]:
+    """Render a fixed, non-leaking message for management-route failures."""
+
+    return route_error_response(
+        StructuredAPIResponseError(
+            message, error_type=error_type, status_code=status_code
+        ),
+        protocol=protocol,
+    )
 
 
 def _stream_error_frames(error: BaseException, *, input_protocol: str) -> list[str]:

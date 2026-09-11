@@ -50,7 +50,7 @@ def _context(*, logger=None) -> RequestContext:
         transaction_logger=logger,
         routing_targets=targets,
         routing_group_name="code_chain",
-        routing_group=FallbackGroup(name="code_chain", targets=targets, failover_on=frozenset({"authentication", "rate_limit"}), stop_on=frozenset({"validation"})),
+        routing_group=FallbackGroup(name="code_chain", targets=targets, failover_on=frozenset({"invalid_request", "rate_limit"}), stop_on=frozenset({"validation"})),
     )
 
 
@@ -61,14 +61,14 @@ def _context_never_streaming_fallback(*, logger=None) -> RequestContext:
 
 
 @pytest.mark.asyncio
-async def test_streaming_fallback_hard_stops_auth_even_with_group_override() -> None:
+async def test_streaming_fallback_hard_stops_deterministic_failures_even_with_group_override() -> None:
     executor = RequestExecutor.__new__(RequestExecutor)
     attempts = []
 
     async def fake_stream(self, context):
         attempts.append(context.provider)
         if len(attempts) == 1:
-            raise StreamFailure("authentication")
+            raise StreamFailure("invalid_request")
         yield "data: [DONE]\n\n"
 
     executor._execute_streaming = MethodType(fake_stream, executor)
