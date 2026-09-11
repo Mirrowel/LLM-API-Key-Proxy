@@ -273,14 +273,23 @@ jobs:
             # NOTE: never write "${CONTEXT_LIMITS_JSON:-{}}" — the first }
             # TERMINATES the expansion, appending a literal } to a set value
             # (live-caught: jq Unmatched '}' on the seeded variable).
+            # Discussion budget mirrors the PR-review thread model: X newest
+            # top-level comment-threads, N newest replies within each, both
+            # windows filtered BEFORE capping (dropped content never
+            # consumes budget), with not-shown counts surfaced so the agent
+            # can retrieve more when it matters.
             CLJ="${CONTEXT_LIMITS_JSON:-}"
             [ -z "$CLJ" ] && CLJ='{}'
-            LIM_DC=$(printf '%s' "$CLJ" | jq -r '."discussion-comments" // 70')
+            LIM_DT=$(printf '%s' "$CLJ" | jq -r '."discussion-threads" // 40')
+            LIM_DR=$(printf '%s' "$CLJ" | jq -r '."discussion-replies" // 30')
             LIM_BC=$(printf '%s' "$CLJ" | jq -r '."body-chars" // 3000')
+            # Overfill 3x for filter-before-cap, clamped to GraphQL's 100 max.
+            TCOUNT=$LIM_DT; [ $((TCOUNT * 3)) -le 100 ] && TCOUNT=$((LIM_DT * 3)) || TCOUNT=100
+            RCOUNT=$LIM_DR; [ $((RCOUNT * 3)) -le 100 ] && RCOUNT=$((LIM_DR * 3)) || RCOUNT=100
 
             if ! disc_json=$(gh api graphql \
-                -f owner="$D_OWNER" -f name="$D_NAME" -F n="$THREAD_NUM_INPUT" -F ccount="$((LIM_DC + 20))" \
-                -f query='query($owner:String!,$name:String!,$n:Int!,$ccount:Int!) { repository(owner:$owner,name:$name) { discussion(number:$n) { id number title body createdAt author { login } authorAssociation category { name isAnswerable } isAnswered answer { id } comments(last:$ccount) { nodes { id databaseId author { login } authorAssociation isMinimized createdAt body replies(last:5) { nodes { id databaseId author { login } authorAssociation isMinimized createdAt body } } } } } } }' \
+                -f owner="$D_OWNER" -f name="$D_NAME" -F n="$THREAD_NUM_INPUT" -F tcount="$TCOUNT" -F rcount="$RCOUNT" \
+                -f query='query($owner:String!,$name:String!,$n:Int!,$tcount:Int!,$rcount:Int!) { repository(owner:$owner,name:$name) { discussion(number:$n) { id number title body createdAt author { login } authorAssociation category { name isAnswerable } isAnswered answer { id } comments(last:$tcount) { totalCount nodes { id databaseId author { login } authorAssociation isMinimized createdAt body replies(last:$rcount) { totalCount nodes { id databaseId author { login } authorAssociation isMinimized createdAt body } } } } } } }' \
                 --jq '.data.repository.discussion' 2>/dev/null) || [ "$disc_json" = "null" ]; then
               echo "::notice::Discussion ${REPO_SLUG}#${THREAD_NUM_INPUT} not readable; nothing to do."
               echo "should_proceed=false" >> "$GITHUB_OUTPUT"; exit 0
@@ -291,7 +300,7 @@ jobs:
             # authoritative array later).
 
             # --- resolve the trigger --------------------------------------
-            trig_body=""; trig_author=""; trig_assoc="NONE"; trig_node=""
+            trig_body=""; trig_author=""; trig_assoc="NONE"; trig_node=""; trig_is_comment=0
             if [ "$THREAD_TYPE" = "discussion" ] && [ -n "${COMMENT_ID_INPUT:-}" ]; then
               trig=$(printf '%s' "$disc_json" | jq -r --arg id "$COMMENT_ID_INPUT" '
                 [((.comments.nodes // [])[] | ({db: (.databaseId|tostring), node: .id, author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), body: (.body // ""), ok: true}))
@@ -305,6 +314,7 @@ jobs:
               trig_author=$(printf '%s' "$trig" | jq -r '.author')
               trig_assoc=$(printf '%s' "$trig" | jq -r '.assoc')
               trig_node=$(printf '%s' "$trig" | jq -r '.node')
+              trig_is_comment=1
             else
               # discussion-new (home: the body carried the mention) OR a
               # guest comment-mention relay (worker cannot know the comment
@@ -346,6 +356,7 @@ jobs:
                     [((.comments.nodes // [])[]) | ((.replies.nodes // [])[]) | {assoc: (.authorAssociation // "NONE"), node: .id}), (((.comments.nodes // [])[]) | {assoc: (.authorAssociation // "NONE"), node: .id})]
                     | .[] | select(.node == $n) | .assoc')
                   trig_node="$winner_node"
+                  trig_is_comment=1
                 fi
               fi
             fi
@@ -382,23 +393,50 @@ jobs:
             fi
 
             # --- budgeted, filtered, hidden-aware context -------------------
-            # Comments only (the root body is exported separately below);
-            # replies inherit the same hidden/ignore filter and the
-            # body-chars cap. Null-guarded connections: payloads missing a
-            # comments/replies node must not break the render.
+            # Thread model (mirrors PR review): keep X newest top-level
+            # comment-threads, each with its N newest replies rendered
+            # directly beneath it (ownership is explicit). Filtering (hidden
+            # /noise/ignored) happens BEFORE the window caps. The noise
+            # pattern MUST bind the pattern first: ". as $p | $lb | test(
+            # \"(?i)\" + $p)" — an unbound "." in the argument resolves to
+            # the BODY, turning the filter into a self-match test that
+            # silently dropped any comment whose body happens to be a valid
+            # regex (live-caught: a plain user follow-up question vanished).
             comments_rendered=$(printf '%s' "$disc_json" | jq -r \
                 --arg ig "${CONTEXT_IGNORE_AUTHORS:-}" \
                 --argjson pats "${CONTEXT_FILTER_PATTERNS_JSON:-[]}" \
-                --argjson bc "$LIM_BC" '
-                def noise($b): ($b | ascii_downcase) as $lb | [$pats[] | ascii_downcase] | map($lb | test("(?i)" + .)) | any;
+                --argjson bc "$LIM_BC" \
+                --argjson dt "$LIM_DT" \
+                --argjson dr "$LIM_DR" '
+                def noise($b): ($b | ascii_downcase) as $lb | [($pats[] | ascii_downcase) as $p | select($lb | test("(?i)" + $p))] | length > 0;
                 def clip($s): if ($s | length) > $bc then ($s[0:$bc] + "\n[truncated]") else $s end;
-                [ ((.comments.nodes // [])[])
+                def kept($u): ($u | ascii_downcase) as $l | ($ig | ascii_downcase | split(",") | map(select(length > 0))) | index($l) | not;
+                [ (.comments.nodes // [])[]
                   | select(.isMinimized != true)
-                  | select((.author.login // "" | ascii_downcase) as $u | ($ig | ascii_downcase | split(",")) | index($u) | not)
+                  | select(kept(.author.login // ""))
                   | select((.body // "") | noise(.) | not)
-                  | "- \(.author.login // "?") (\(.authorAssociation // "NONE")) at \(.createdAt):\n\(clip(.body // ""))"
-                  + (([((.replies.nodes // [])[]) | select(.isMinimized != true) | select((.author.login // "" | ascii_downcase) as $u | ($ig | ascii_downcase | split(",")) | index($u) | not) | "    ↳ \(.author.login // "?"): \(clip(.body // ""))"] | if length > 0 then "\n" + join("\n") else "" end)) ]
-                | reverse | join("\n\n")')
+                  | . as $c
+                  | ([(($c.replies.nodes // [])[])
+                      | select(.isMinimized != true)
+                      | select(kept(.author.login // ""))
+                      | select((.body // "") | noise(.) | not)]) as $rk
+                  | ($rk[0:$dr]) as $show
+                  | (($c.replies.totalCount // ($rk | length)) - ($show | length)) as $rdrop
+                  | "- \($c.author.login // "?") (\($c.authorAssociation // "NONE")) at \($c.createdAt):\n\(clip($c.body // ""))"
+                    + (if ($show | length) > 0 then "\n" + ([$show[] | "    ↳ \(.author.login // "?"): \(clip(.body // ""))"] | join("\n")) else "" end)
+                    + (if $rdrop > 0 then "\n    [\($rdrop) replies not shown here (older than the window or filtered) - retrieve via GraphQL replies() if they matter]" else "" end) ]
+                | .[0:$dt]
+                | reverse
+                | join("\n\n")')
+            total_threads=$(printf '%s' "$disc_json" | jq -r '.comments.totalCount // (.comments.nodes | length)')
+            # Count rendered THREAD HEADS only (shape-pinned: "- Login (ASSOC)
+            # at <ts>:") - comment bodies contain their own "- " bullets that
+            # must not inflate the count and mask a real drop.
+            shown_threads=$(printf '%s\n' "$comments_rendered" | grep -cE '^- .+ \((OWNER|MEMBER|COLLABORATOR|CONTRIBUTOR|FIRST_TIME_CONTRIBUTOR|NONE)\) at [0-9]{4}-' || true)
+            threads_note=""
+            if [ "$total_threads" -gt "$shown_threads" ]; then
+              threads_note="$(printf '\n[%s threads not shown here (older than the window or filtered) - retrieve via GraphQL if they matter]' "$((total_threads - shown_threads))")"
+            fi
 
             cat_hdr=$(printf '%s\n' "$disc_json" | jq -r '"Discussion #\(.number): \(.title)\nCategory: \(.category.name)\(if .category.isAnswerable then " (answerable)" else "" end)\(if .isAnswered == true then " | ANSWERED" elif .isAnswered == false then "" else "" end)\nOpened by \(.author.login // "?") at \(.createdAt)"')
 
@@ -426,8 +464,19 @@ jobs:
             TC_DELIM="DISC_CTX_EOF_$(openssl rand -hex 8)"
             DISC_BODY=$(printf '%s' "$disc_json" | jq -r '(.body // "") | if length > 8000 then .[0:8000] + "\n[discussion body truncated]" else . end')
             { printf 'THREAD_CONTEXT<<%s\n' "$TC_DELIM"
-              printf '%s\n\nDiscussion body:\n%s\n\nComments (newest %s, filtered):\n%s\n' "$cat_hdr" "$DISC_BODY" "$LIM_DC" "$comments_rendered"
+              printf '%s\n\nDiscussion body:\n%s\n\nComment threads (newest %s top-level, up to %s replies each, filtered):\n%s%s\n' "$cat_hdr" "$DISC_BODY" "$LIM_DT" "$LIM_DR" "$comments_rendered" "$threads_note"
               printf '%s\n' "$TC_DELIM"; } >> "$GITHUB_ENV"
+            # Reply anchoring: a comment-trigger answers INSIDE that comment's
+            # thread (replyTo); only new-discussion bodies (or a guest relay
+            # that could not reconstruct a mentioning comment) post
+            # top-level. DISCUSSION_REPLY_TO_NODE is exported ONLY when the
+            # trigger is a genuine comment node - replyTo with a discussion
+            # node id is an invalid mutation input.
+            if [ "$trig_is_comment" = "1" ]; then
+              echo "DISCUSSION_REPLY_TO_NODE=${trig_node}" >> "$GITHUB_ENV"
+            else
+              echo "DISCUSSION_REPLY_TO_NODE=" >> "$GITHUB_ENV"
+            fi
             echo "::notice::Discussion session validated: @${trig_author} in ${REPO_SLUG}#${THREAD_NUM_INPUT} (${THREAD_TYPE})."
             echo "should_proceed=true" >> "$GITHUB_OUTPUT"
             exit 0
@@ -1363,6 +1412,7 @@ jobs:
           LAST_REVIEWED_SHA: ${{ steps.review_type.outputs.last_reviewed_sha }}
           # Discussion mode: the GraphQL node id for posting + the title.
           DISCUSSION_NODE_ID: ${{ env.DISCUSSION_NODE_ID }}
+          DISCUSSION_REPLY_TO_NODE: ${{ env.DISCUSSION_REPLY_TO_NODE }}
           DISCUSSION_TITLE: ${{ env.DISCUSSION_TITLE }}
           THREAD_TYPE: ${{ env.THREAD_TYPE }}
           # Agent permissions are owned by the OPENCODE_CONFIG_JSON secret
@@ -1387,7 +1437,7 @@ jobs:
               INCREMENTAL_DIFF_PATH=""
               LAST_REVIEWED_SHA=""
             fi
-            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY $DISCUSSION_NODE_ID $DISCUSSION_TITLE'
+            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY $DISCUSSION_NODE_ID $DISCUSSION_REPLY_TO_NODE $DISCUSSION_TITLE'
             # Prepend the security brief (with the verified requester and trust context lines);
             # guest sessions additionally carry the guest rules block right after the brief.
             # Config lifecycle: opencode reads config + plugins once at boot.

@@ -436,7 +436,7 @@ asm() { bash "$ASM" "$1" | REVIEW_TYPE=FIRST envsubst "$RVARS"; }
 vars_for() {
   case "$1" in
     pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
-    bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${DISCUSSION_NODE_ID} ${DISCUSSION_TITLE}' ;;
+    bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${DISCUSSION_NODE_ID} ${DISCUSSION_REPLY_TO_NODE} ${DISCUSSION_TITLE}' ;;
     issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
     compliance-first|compliance-followup) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
     # bot-reply's on-demand instruction sets: union of the IVARS list and the
@@ -1036,6 +1036,27 @@ check "rebase: share-context words the no-SHA case honestly" yes \
   "$(grep -q 'rebased - full re-review' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "cc-rule: manual dispatch and auto runs get no cc" yes \
   "$(grep -q 'manual dispatches' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && grep -q 'EXACTLY one case' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && echo yes || echo no)"
+
+# ---- discussion thread-model context + reply anchoring ---------------------
+# Live-caught twice: (1) the noise filter's unbound "." made it a self-match
+# test that silently dropped any comment whose body is a valid regex; (2) the
+# agent posted a top-level comment instead of replying where it was asked.
+check "discussion: noise pattern binding in bot-reply render (pattern-first)" yes \
+  "$(grep -q ') as $p | select' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+NOISE_PROBE=$(jq -rn --arg b "@Mirrobot-Agent follow-up: does the quarantine survive across runs, or is it per-session only?" --argjson pats '["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","<!-- greptile-status -->","Too many files changed for review"]' '($b | ascii_downcase) as $lb | [($pats[] | ascii_downcase) as $p | select($lb | test("(?i)" + $p))] | length > 0')
+check "discussion: behavioral noise probe (plain follow-up question must survive)" "false" "$NOISE_PROBE"
+check "discussion: thread/reply budget keys read (40/30 model)" yes \
+  "$(grep -q '."discussion-threads" // 40' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q '."discussion-replies" // 30' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "discussion: totalCount on both levels (dropped markers)" yes \
+  "$(grep -c 'totalCount' "$SCRIPT_DIR/../workflows/bot-reply.yml" | awk '{print ($1 >= 3) ? "yes" : "no"}')"
+check "discussion: not-shown markers rendered for agent retrieval" yes \
+  "$(grep -q 'replies not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'threads not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "discussion: reply anchor exported only for genuine comment triggers" yes \
+  "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_node}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'trig_is_comment=1' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "discussion: posting.md mandates reply-where-asked as default" yes \
+  "$(grep -q 'reply where you were summoned' "$SCRIPT_DIR/../prompts/parts/posting.md" && grep -q 'DISCUSSION_REPLY_TO_NODE' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
+check "discussion: bootstrap seeds the thread-model keys" yes \
+  "$(grep -q '"discussion-threads":40,"discussion-replies":30' "$SCRIPT_DIR/../workflows/agent-bootstrap.yml" && echo yes || echo no)"
 
 # ---- HIDDEN = GONE: minimized reviews/comments never count as coverage ------
 # Live-caught: hiding a review left its marker anchoring the next review -

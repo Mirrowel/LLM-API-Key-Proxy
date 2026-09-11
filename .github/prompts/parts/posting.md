@@ -34,10 +34,11 @@ Failing to use the file-based form will get the command denied or cause the shel
 
 Discussions have NO REST endpoints — every read and write goes through `gh api graphql`. The file-based body mandate applies identically: the body variable is fed with `-f body=@/tmp/comment-body.md` (gh reads the file's contents into the variable), never inlined.
 
-Post a top-level discussion comment (the node id arrives in `$DISCUSSION_NODE_ID`):
+**Default: reply where you were summoned.** When you were triggered by a comment, `$DISCUSSION_REPLY_TO_NODE` holds that comment's node id — answer as a REPLY inside its thread (this is the conversation's natural shape; a separate top-level post for a direct question reads as shouting past the person). This holds at both levels: asked in a top-level comment → your reply lands in its replies; asked inside a reply → your reply joins that same thread (discussions are flat two-level — there is no deeper nesting, and `replyTo` on a nested reply stays in its owning thread):
 ```bash
-gh api graphql -f query='mutation($b: String!, $d: ID!) { addDiscussionComment(input: {discussionId: $d, body: $b}) { comment { id databaseId } } }' -f body=@/tmp/comment-body.md -f id="$DISCUSSION_NODE_ID"
+gh api graphql -f query='mutation($b: String!, $d: ID!, $r: ID) { addDiscussionComment(input: {discussionId: $d, body: $b, replyTo: $r}) { comment { id databaseId } } }' -f body=@/tmp/comment-body.md -f d="$DISCUSSION_NODE_ID" -f r="$DISCUSSION_REPLY_TO_NODE"
 ```
+When `$DISCUSSION_REPLY_TO_NODE` is empty (you were summoned by a new discussion's body, or the trigger comment could not be pinned), post top-level with the same mutation but `-F r=null` instead of the `-f r=` flag (the variable stays declared and used; null means no reply anchor). A top-level post is also legitimate when your answer genuinely serves the whole thread rather than the asker — use your judgment, and when you deviate from the reply default, say why in one line.
 The mutation returns your comment's node `id` — remember it for edits. Edit your own comment (living ack):
 ```bash
 gh api graphql -f query='mutation($b: String!, $c: ID!) { updateDiscussionComment(input: {commentId: $c, body: $b}) { comment { id } } }' -f body=@/tmp/comment-body.md -f c="<your comment node id>"
