@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -93,7 +94,12 @@ class StoredResponse:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "StoredResponse":
-        """Rehydrate a stored response from a JSON-compatible dict."""
+        """Rehydrate a stored response from a JSON-compatible dict.
+
+        Malformed expiry values degrade to ``None`` (never expires) instead of
+        poisoning every read of the row: a corrupt persisted ``expires_at``
+        must not raise on comparison.
+        """
 
         return cls(
             id=str(data["id"]),
@@ -109,5 +115,19 @@ class StoredResponse:
             session_id=data.get("session_id"),
             scope_key=data.get("scope_key"),
             classifier=data.get("classifier"),
-            expires_at=data.get("expires_at"),
+            expires_at=_coerce_expires_at(data.get("expires_at")),
         )
+
+
+def _coerce_expires_at(value: Any) -> Optional[float]:
+    """Return a finite float expiry or ``None`` for unusable persisted values."""
+
+    if value is None:
+        return None
+    try:
+        expires_at = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(expires_at):
+        return None
+    return expires_at

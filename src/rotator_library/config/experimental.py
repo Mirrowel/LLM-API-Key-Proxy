@@ -119,7 +119,7 @@ class RetryRuntimeSettings:
 class ResponsesStoreRuntimeSettings:
     """Runtime backend selection for Responses storage."""
 
-    backend: str = "memory"
+    backend: str = "provider_cache"
     cache_name: str = "responses"
     cache_prefix: str = "responses"
     cache_dir: Optional[str] = None
@@ -315,6 +315,10 @@ def get_responses_store_settings(
     store = responses.get("store", {}) if isinstance(responses.get("store"), dict) else responses
     ttl_seconds = _optional_positive_int(_env_or_json(source, "RESPONSES_STORE_TTL_SECONDS", store, "ttl_seconds"), "RESPONSES_STORE_TTL_SECONDS")
     max_items = _optional_positive_int(_env_or_json(source, "RESPONSES_STORE_MAX_ITEMS", store, "max_items"), "RESPONSES_STORE_MAX_ITEMS")
+    if max_items is None:
+        # Bounded by default even when unset: an unbounded durable store is a
+        # disk-growth bug waiting for the first long-running deployment.
+        max_items = 10000
     return ResponsesStoreSettings(
         ttl_seconds=ttl_seconds,
         max_items=max_items,
@@ -334,7 +338,7 @@ def get_responses_store_runtime_settings(
     active = config if config is not None else load_experimental_config(env=source)
     responses = active.responses if isinstance(active.responses, dict) else {}
     store = responses.get("store", {}) if isinstance(responses.get("store"), dict) else responses
-    backend = str(_env_or_json(source, "RESPONSES_STORE_BACKEND", store, "backend", default="memory")).strip().lower()
+    backend = str(_env_or_json(source, "RESPONSES_STORE_BACKEND", store, "backend", default="provider_cache")).strip().lower()
     if backend not in {"memory", "provider_cache"}:
         raise ExperimentalConfigError("RESPONSES_STORE_BACKEND must be 'memory' or 'provider_cache'")
     return ResponsesStoreRuntimeSettings(

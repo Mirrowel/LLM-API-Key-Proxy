@@ -231,6 +231,7 @@ class ResponsesService:
             transaction_logger,
             expected_scope_key=isolation_key,
             access_token=previous_response_access_token,
+            provider_passthrough=_provider_continuation_eligible(raw_request),
         )
         try:
             parent_lineage = await self._load_response_lineage(
@@ -287,12 +288,8 @@ class ResponsesService:
         )
         if should_store:
             stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-            try:
-                await self.store.save(stored)
-            except Exception as exc:
-                self._log_transform_error(transaction_logger, "responses_store_response", exc, stored.to_dict())
-                raise
-            self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
+            if await self._safe_store(stored, transaction_logger, "responses_store_response"):
+                self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
 
         self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")
         # W12: the responses route never calls log_response (no chat-shaped
@@ -441,6 +438,7 @@ class ResponsesService:
                 expected_scope_key=resolved_scope.key,
                 access_token=previous_response_access_token,
                 local_cache=local_cache,
+                provider_passthrough=_provider_continuation_eligible(raw_request),
             )
             parent_lineage = await self._load_response_lineage(
                 parent,
@@ -682,6 +680,7 @@ class ResponsesService:
                 None,
                 expected_scope_key=resolved_scope.key,
                 access_token=previous_response_access_token,
+                provider_passthrough=_provider_continuation_eligible(raw_request),
             )
 
     async def stream_events(
@@ -1359,6 +1358,7 @@ class ResponsesService:
         expected_scope_key: str,
         access_token: Optional[str] = None,
         local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
+        provider_passthrough: bool = False,
     ) -> Optional[StoredResponse]:
         if not response_id:
             return None
@@ -1368,10 +1368,25 @@ class ResponsesService:
             # path that keeps store=false / ZDR chains working.
             return local_cache[response_id]
         if expected_scope_key == "public":
-            parent = await self._stored_or_not_found(response_id, "public")
+            stored = await self.store.get(response_id, "public")
+            if stored is not None and stored.scope_key == "public":
+                parent = stored
+            elif provider_passthrough:
+                # G11 hybrid: public-scope miss on a provider that speaks
+                # the Responses family — the id may be the provider's own
+                # (minted upstream, retained server-side). Return no local
+                # parent; the id rides through verbatim and the provider
+                # resolves it (preserving its encrypted-reasoning chains
+                # and cache keys) or answers its own honest 404.
+                return None
+            else:
+                self._raise_response_not_found(response_id)
+                return None  # pragma: no cover - raises
         else:
             parent = await self._stored_for_access(response_id, access_token or "")
             if parent.scope_key != expected_scope_key:
+                # Scoped misses never fall through to the provider — the
+                # capability gate stays local and ahead of any fallback.
                 self._raise_response_not_found(response_id)
         if transaction_logger:
             self._trace(
@@ -1402,9 +1417,13 @@ class ResponsesService:
         if isinstance(response_payload.get("response"), dict):
             response_payload = response_payload["response"]
         session_info = session_info or {}
+        provider_created_at = response_payload.get("created_at")
         return StoredResponse(
             id=str(response_payload["id"]),
-            created_at=float(response_payload.get("created_at") or time.time()),
+            # The proxy's receive time is authoritative for eviction/LRU; a
+            # provider-stamped old date could otherwise evict a fresh answer
+            # early. The provider value stays for diagnostics only.
+            created_at=time.time(),
             model=str(response_payload.get("model") or raw_request.get("model") or ""),
             status=str(response_payload.get("status") or "completed"),
             request=_safe_stored_request(raw_request),
@@ -1416,6 +1435,10 @@ class ResponsesService:
                 "previous_response_id": parent.id if parent else raw_request.get("previous_response_id"),
                 "response_id": response_payload.get("id"),
                 "scope_access_hash": session_info.get("scope_access_hash"),
+                # G11 hybrid provenance: which provider served this response —
+                # retrieval fallback and continuation routing key on it.
+                "provider": session_info.get("provider"),
+                "provider_created_at": provider_created_at,
             },
             session_id=session_info.get("session_id") or (parent.session_id if parent else None),
             scope_key=(
@@ -1493,6 +1516,33 @@ class ResponsesService:
             metadata={"source": source, "pricing_source": cost_breakdown.pricing_source},
         )
 
+    async def _safe_store(
+        self,
+        stored: StoredResponse,
+        transaction_logger: Optional[Any],
+        stage: str,
+    ) -> bool:
+        """Persist one response without ever failing the delivered answer.
+
+        A storage failure is recorded as a transform error plus a store-specific
+        trace record; it never propagates. Returns ``True`` only when the write
+        actually landed, so callers can still report the observed outcome.
+        """
+
+        try:
+            await self.store.save(stored)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, stage, exc, stored.to_dict())
+            self._trace(
+                transaction_logger,
+                f"{stage}_error",
+                {"response_id": stored.id, "error": str(exc)},
+                direction="metadata",
+                stage="final",
+            )
+            return False
+        return True
+
     async def _store_stream_response(
         self,
         raw_request: dict[str, Any],
@@ -1521,14 +1571,10 @@ class ResponsesService:
                 local_cache[stored.id] = stored
             return False
         stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-        try:
-            await self.store.save(stored)
-        except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_store_stream_response", exc, stored.to_dict())
-            raise
+        saved = await self._safe_store(stored, transaction_logger, "responses_store_stream_response")
         if build_and_cache:
             local_cache[stored.id] = stored
-        return True
+        return saved
 
     async def _store_stream_current_state(
         self,
@@ -1544,11 +1590,8 @@ class ResponsesService:
         if not self.store_settings.store_in_progress or not raw_request.get("store", True):
             return False
         stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-        try:
-            await self.store.save(stored)
-        except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_store_stream_current_state", exc, stored.to_dict())
-            raise
+        if not await self._safe_store(stored, transaction_logger, "responses_store_stream_current_state"):
+            return False
         self._trace(
             transaction_logger,
             "responses_stored_stream_current_state",
@@ -1583,6 +1626,45 @@ def _reject_unsupported_lifecycles(raw_request: dict[str, Any]) -> None:
             "background mode is not supported by this proxy (no queued/polling lifecycle); omit 'background'",
             status_code=400,
         )
+
+
+def _provider_continuation_eligible(raw_request: dict[str, Any]) -> bool:
+    """Whether public provider-side continuation is viable (G11 hybrid).
+
+    True when the request's routing target resolves to a provider whose
+    protocol family is Responses — the provider retains its own chains
+    (previous_response_id passthrough, encrypted reasoning, cache keys).
+    Conservative by construction: unresolvable routing, unknown aliases,
+    or non-Responses families return False (local replay / honest 404).
+    """
+
+    model = str(raw_request.get("model") or "")
+    if not model:
+        return False
+    try:
+        from ..providers import PROVIDER_PLUGINS
+        from ..routing.config import load_routing_config_from_env
+        from ..routing.profiles import parse_model_reference
+
+        target = model
+        config = load_routing_config_from_env()
+        routes = getattr(config, "model_routes", None) or {}
+        target = str(routes.get(model.lower(), target))
+
+        reference = parse_model_reference(target)
+        plugin = PROVIDER_PLUGINS.get(reference.provider)
+        if plugin is None:
+            return False
+        protocol_name = plugin.get_protocol_name(reference.model or "", profile=reference.profile or None)
+        if not protocol_name:
+            return False
+        from ..protocols.registry import get_protocol_class
+
+        cls = get_protocol_class(protocol_name)
+        family = getattr(cls, "base_family", "") or protocol_name
+        return family == "responses"
+    except Exception:
+        return False
 
 
 def _expanded_responses_request(

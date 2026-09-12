@@ -573,15 +573,17 @@ async def test_stream_response_store_failures_emit_store_specific_trace(tmp_path
     logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
     service = ResponsesService(store=FailingStore())
 
-    with pytest.raises(RuntimeError):
-        _ = [
-            chunk
-            async for chunk in service.stream_response(
-                {"model": "gpt-test", "input": "Hello", "stream": True},
-                FakeStreamingClient(),
-                transaction_logger=logger,
-            )
-        ]
+    events = [
+        chunk
+        async for chunk in service.stream_response(
+            {"model": "gpt-test", "input": "Hello", "stream": True},
+            FakeStreamingClient(),
+            transaction_logger=logger,
+        )
+    ]
+
+    # A failing store must never cost the client its terminal frames.
+    assert any("response.completed" in event for event in events)
 
     entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
     errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
@@ -594,15 +596,17 @@ async def test_stream_current_state_store_failures_emit_store_specific_trace(tmp
     logger = TransactionLogger("responses", "gpt-test", parent_dir=tmp_path)
     service = ResponsesService(store=FailingStore(), store_settings=ResponsesStoreSettings(store_in_progress=True))
 
-    with pytest.raises(RuntimeError):
-        _ = [
-            event
-            async for event in service.stream_events(
-                {"model": "gpt-test", "input": "Hello", "stream": True},
-                FakeStreamingClient(),
-                transaction_logger=logger,
-            )
-        ]
+    events = [
+        event
+        async for event in service.stream_events(
+            {"model": "gpt-test", "input": "Hello", "stream": True},
+            FakeStreamingClient(),
+            transaction_logger=logger,
+        )
+    ]
+
+    # In-progress snapshots are best-effort: the stream still completes.
+    assert any(event.event_name == "response.completed" for event in events)
 
     entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
     errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
