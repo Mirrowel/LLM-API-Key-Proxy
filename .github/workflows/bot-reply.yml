@@ -300,11 +300,11 @@ jobs:
             # authoritative array later).
 
             # --- resolve the trigger --------------------------------------
-            trig_body=""; trig_author=""; trig_assoc="NONE"; trig_node=""; trig_is_comment=0
+            trig_body=""; trig_author=""; trig_assoc="NONE"; trig_node=""; trig_anchor=""; trig_is_comment=0
             if [ "$THREAD_TYPE" = "discussion" ] && [ -n "${COMMENT_ID_INPUT:-}" ]; then
               trig=$(printf '%s' "$disc_json" | jq -r --arg id "$COMMENT_ID_INPUT" '
-                [((.comments.nodes // [])[] | ({db: (.databaseId|tostring), node: .id, author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), body: (.body // ""), ok: true}))
-                 , ((.comments.nodes // [])[] | ((.replies.nodes // [])[]) | {db: (.databaseId|tostring), node: .id, author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), body: (.body // ""), ok: true})]
+                [((.comments.nodes // [])[] | ({db: (.databaseId|tostring), node: .id, anchor: .id, author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), body: (.body // ""), ok: true}))
+                 , ((.comments.nodes // [])[] | . as $c | ((.replies.nodes // [])[]) | {db: (.databaseId|tostring), node: .id, anchor: $c.id, author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), body: (.body // ""), ok: true})]
                 | .[] | select(.db == $id)')
               if [ -z "$trig" ] || [ "$trig" = "null" ]; then
                 echo "::notice::Trigger comment ${COMMENT_ID_INPUT} not found in the discussion window (older than the last ${LIM_DC} comments?); declining rather than acting on partial context."
@@ -314,6 +314,11 @@ jobs:
               trig_author=$(printf '%s' "$trig" | jq -r '.author')
               trig_assoc=$(printf '%s' "$trig" | jq -r '.assoc')
               trig_node=$(printf '%s' "$trig" | jq -r '.node')
+              # Anchor = OWNING TOP-LEVEL comment node: the API refuses a
+              # reply anchored to a comment that is itself inside a thread
+              # ("Parent comment is already in a thread"). Top-level
+              # triggers anchor to themselves (anchor == node).
+              trig_anchor=$(printf '%s' "$trig" | jq -r '.anchor // .node')
               trig_is_comment=1
             else
               # discussion-new (home: the body carried the mention) OR a
@@ -334,18 +339,21 @@ jobs:
                 # never spans lines); full text is re-extracted by node id.
                 tok_file=$(mktemp)
                 printf '%s' "$BOT_NAMES_JSON" | jq -r '.[] | "@" + ltrimstr("@") | (., sub("\\[bot\\]$"; ""))' | awk 'NF' | tr 'A-Z' 'a-z' > "$tok_file"
-                winner_node=$(printf '%s' "$disc_json" | jq -r '
-                  [((.comments.nodes // [])[]
-                    | ((.replies.nodes // [])[]) | {node: .id, flat: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: .createdAt}),
-                    (((.comments.nodes // [])[]) | {node: .id, flat: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: .createdAt})]
-                  | sort_by(.at) | reverse | .[] | [.node, .flat] | @tsv' \
-                  | while IFS=$'\t' read -r n f; do
+                winner_line=$(printf '%s' "$disc_json" | jq -r '
+                  [((.comments.nodes // [])[] | . as $c | ((.replies.nodes // [])[]) | {node: .id, anchor: $c.id, flat: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: .createdAt}),
+                   (((.comments.nodes // [])[]) | {node: .id, anchor: .id, flat: ((.body // "") | gsub("[\\r\\n]+"; " ")), at: .createdAt})]
+                  | sort_by(.at) | reverse | .[] | [.node, .anchor, .flat] | @tsv' \
+                  | while IFS=$'\t' read -r n a f; do
                       if [ -n "$n" ] && printf '%s' "$f" | grep -qiFf "$tok_file"; then
-                        printf '%s\n' "$n"; break
+                        printf '%s\n' "$n"$'\t'"$a"; break
                       fi
                     done | head -1)
                 rm -f "$tok_file"
-                if [ -n "$winner_node" ]; then
+                winner_node=""; winner_anchor=""
+                if [ -n "$winner_line" ]; then
+                  winner_node=${winner_line%%$'\t'*}
+                  winner_anchor=${winner_line#*$'\t'}
+                  [ -z "$winner_anchor" ] && winner_anchor="$winner_node"
                   trig_body=$(printf '%s' "$disc_json" | jq -r --arg n "$winner_node" '
                     [((.comments.nodes // [])[]) | ((.replies.nodes // [])[]) | {author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), node: .id, body: (.body // "")}), (((.comments.nodes // [])[]) | {author: (.author.login // "?"), assoc: (.authorAssociation // "NONE"), node: .id, body: (.body // "")})]
                     | .[] | select(.node == $n) | .body')
@@ -356,6 +364,7 @@ jobs:
                     [((.comments.nodes // [])[]) | ((.replies.nodes // [])[]) | {assoc: (.authorAssociation // "NONE"), node: .id}), (((.comments.nodes // [])[]) | {assoc: (.authorAssociation // "NONE"), node: .id})]
                     | .[] | select(.node == $n) | .assoc')
                   trig_node="$winner_node"
+                  trig_anchor="$winner_anchor"
                   trig_is_comment=1
                 fi
               fi
@@ -474,13 +483,16 @@ jobs:
               printf '%s\n\nDiscussion body:\n%s\n\nComment threads (the %s most recent top-level, up to %s replies each, oldest-first below, filtered):\n%s%s\n' "$cat_hdr" "$DISC_BODY" "$LIM_DT" "$LIM_DR" "$comments_rendered" "$threads_note"
               printf '%s\n' "$TC_DELIM"; } >> "$GITHUB_ENV"
             # Reply anchoring: a comment-trigger answers INSIDE that comment's
-            # thread (replyTo); only new-discussion bodies (or a guest relay
-            # that could not reconstruct a mentioning comment) post
-            # top-level. DISCUSSION_REPLY_TO_NODE is exported ONLY when the
-            # trigger is a genuine comment node - replyTo with a discussion
-            # node id is an invalid mutation input.
+            # thread; only new-discussion bodies (or a guest relay that could
+            # not reconstruct a mentioning comment) post top-level.
+            # DISCUSSION_REPLY_TO_NODE is the OWNING TOP-LEVEL comment node
+            # (trig_anchor): the API refuses a reply anchored to a comment
+            # already inside a thread, and REACTION_SUBJECT_NODE stays the
+            # trigger itself. Exported ONLY when the trigger is a genuine
+            # comment node - replyToId with a discussion node id is an
+            # invalid mutation input.
             if [ "$trig_is_comment" = "1" ]; then
-              echo "DISCUSSION_REPLY_TO_NODE=${trig_node}" >> "$GITHUB_ENV"
+              echo "DISCUSSION_REPLY_TO_NODE=${trig_anchor}" >> "$GITHUB_ENV"
             else
               echo "DISCUSSION_REPLY_TO_NODE=" >> "$GITHUB_ENV"
             fi

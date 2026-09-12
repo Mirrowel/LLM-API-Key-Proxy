@@ -1093,7 +1093,7 @@ check "discussion: totalCount on both levels (dropped markers)" yes \
 check "discussion: not-shown markers rendered for agent retrieval" yes \
   "$(grep -q 'replies not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'threads not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "discussion: reply anchor exported only for genuine comment triggers" yes \
-  "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_node}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'trig_is_comment=1' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+  "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'trig_is_comment=1' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "discussion: posting.md mandates reply-where-asked as default" yes \
   "$(grep -q 'reply where you were summoned' "$SCRIPT_DIR/../prompts/parts/posting.md" && grep -q 'DISCUSSION_REPLY_TO_NODE' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 check "discussion: bootstrap seeds the thread-model keys" yes \
@@ -1140,7 +1140,7 @@ check "ids: discussion reply lines carry node ids" yes \
 check "ids: reactions.md points at the context-line ids" yes \
   "$(grep -q 'numeric comment id rides every conversation line' "$SCRIPT_DIR/../prompts/parts/reactions.md" && grep -q 'addReaction' "$SCRIPT_DIR/../prompts/parts/reactions.md" && echo yes || echo no)"
 check "ids: posting.md arbitrary-reply lane uses context node ids" yes \
-  "$(grep -q 'f r=\"<that comment' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
+  "$(grep -q 'F r=\"<that comment' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 
 # ---- HIDDEN = GONE: minimized reviews/comments never count as coverage ------
 # Live-caught: hiding a review left its marker anchoring the next review -
@@ -1238,5 +1238,35 @@ FILES_PROBE=$(printf 'modified\t10\t2\tsrc/a.py\ndeleted\t0\t40\told.py\nadded\t
 check "files: awk renders compact lines on mawk-compatible syntax" "3" \
   "$(printf '%s\n' "$FILES_PROBE" | grep -c -- '- [MDAR] ')"
 
+# ---- share-filter model-header removal (behavioral, real script) -----------
+# Live-caught: opencode prints "> build <middot> <model>" on stderr in every
+# session; the model identifier is config-derived and must not reach public
+# logs. Runs the REAL filter against the byte-exact captured shape.
+SFIX="$(mktemp -d)"
+printf '\033[0m\r\n> build \302\267 glm-5.3\r\n\033[0m\r\nsome agent output line\r\n> quoted prose \302\267 with a middot\r\n> plan \302\267 a-very-long-model-name\r\n' > "$SFIX/stream"
+SHARE_LINK_PUBKEY="" URL_OUT="$SFIX/url" CTX_OUT="$SFIX/ctx" BOOT_OUT="$SFIX/boot" \
+  bash "$SCRIPT_DIR/share-filter.sh" < "$SFIX/stream" > "$SFIX/out" 2>&1
+check "share: model header line removed"            no  "$(grep -q 'glm-5.3' "$SFIX/out" && echo yes || echo no)"
+check "share: plan-mode header removed"             no  "$(grep 'a-very-long-model-name' "$SFIX/out" | grep -qv add-mask && echo yes || echo no)"
+check "share: long model masked"                    yes "$(grep -q '::add-mask::a-very-long-model-name' "$SFIX/out" && echo yes || echo no)"
+check "share: blockquote prose survives"            yes "$(grep -q 'quoted prose' "$SFIX/out" && echo yes || echo no)"
+check "share: plain output passes through"          yes "$(grep -q 'some agent output line' "$SFIX/out" && echo yes || echo no)"
+rm -rf "$SFIX"
+
+# ---- discussion reply recipe + anchor resolution (live-caught trio) --------
+# The documented discussion-reply recipe carried three defects that CI could
+# not see: wrong schema field (replyTo vs replyToId), wrong gh variable
+# binding (-f body=@ sets a variable named "body", leaving $b null - only
+# -F reads @files), and the workflow exporting the trigger's OWN node as the
+# reply anchor (invalid when the trigger is itself a reply - the API needs
+# the owning top-level comment node).
+check "disc: recipe uses replyToId (schema field)"  yes "$(grep -q 'replyToId: \$r' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
+check "disc: recipe binds -F b=@file (key=var)"     yes "$(grep -q -- '-F b=@/tmp/comment-body.md' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
+check "disc: no dead replyTo field"                 no  "$(grep -E 'replyTo[^I]' "$SCRIPT_DIR/../prompts/parts/posting.md" | grep -qv 'replyToId' && echo yes || echo no)"
+check "disc: no -f body=@ (raw-field has no @file magic)" no "$(grep -q -- '-f body=@' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
+check "disc: bot-reply resolves owning anchor (replies carry parent)" yes "$(grep -q 'anchor: \$c.id' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "disc: anchor export uses trig_anchor"        yes "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+
 echo "----"; echo "PASS=$PASS FAIL=$FAIL"
+
 [ "$FAIL" -eq 0 ]
