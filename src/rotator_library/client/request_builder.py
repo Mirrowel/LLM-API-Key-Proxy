@@ -240,6 +240,31 @@ class RequestContextBuilder:
         disable_provider_continuation = bool(kwargs.pop("_disable_provider_continuation", False))
         requested_input_protocol = str(kwargs.pop("_input_protocol", "openai_chat") or "openai_chat")
         input_protocol = get_protocol(requested_input_protocol)
+        # R1 client entry: the payload passes through the request_received
+        # slot BEFORE any snapshot, normalization, or routing — hook edits are
+        # authoritative (in-place), so the pristine protocol snapshot, the
+        # cross-protocol projection, model resolution, routing, and session
+        # inference all see the edited payload. A model rewrite here
+        # legitimately changes routing. The run is minted bare (global and
+        # config hooks only): the provider is not known at entry, so
+        # provider-bound hooks cannot intercept this stage — they bind at the
+        # enrichment below.
+        pipeline_run = make_pipeline_run(None, operation="chat", config=self._experimental_config)
+        entry_outcome = await run_slot(pipeline_run, "request_received", kwargs, direction="request", copy_payload=False)
+        if entry_outcome.modified and isinstance(entry_outcome.payload, dict):
+            edited = entry_outcome.payload
+            changed_keys = sorted(
+                key for key in set(edited) | set(kwargs)
+                if key not in kwargs or key not in edited or edited.get(key) != kwargs.get(key)
+            )[:20]
+            kwargs.clear()
+            kwargs.update(edited)
+            pipeline_run.record_overlay(
+                "request_received_edit",
+                stage="request_received",
+                direction="request",
+                keys=changed_keys,
+            )
         # D13 grammar FIRST: provider:profile/model normalizes to the bare
         # form before ANY snapshot or identity use, so protocol_request,
         # unified_request, raw fast-path payloads, and every identity sink
@@ -340,18 +365,26 @@ class RequestContextBuilder:
                 classifier=scope["classifier"],
             )
 
-        pipeline_run = self._mint_pipeline_run(
-            provider,
-            resolved_model,
-            session,
-            session_isolation_key,
-            scope,
+        # Provider enrichment: routing has resolved the provider — fill the
+        # run's identity and extend its bindings with the provider's class
+        # and config hooks. One request, one run: the same object the entry
+        # stage fired on and the native executor will use.
+        from ..hooks.binding import resolve_hook_declarations as _resolve_decls
+
+        plugin = self._get_provider_instance(provider) if self._get_provider_instance else None
+        provider_class_hooks, provider_config_hooks, _ = _resolve_decls(
+            plugin, resolved_model, config=self._experimental_config, provider=provider
         )
-        # R1 client entry: the raw client payload passes through the declared
-        # request_received slot once per request. The legacy per-attempt
-        # pre_request_callback remains the native mutation path (see executor);
-        # this slot is for hook-bound consumers.
-        await run_slot(pipeline_run, "request_received", deepcopy(kwargs), direction="request")
+        pipeline_run.enrich(
+            provider=provider,
+            model=resolved_model,
+            session_id=getattr(session, "session_id", "") or "",
+            scope_key=session_isolation_key or "",
+            classifier=scope.get("classifier") or "",
+            operation="chat",
+            class_hooks=provider_class_hooks,
+            config_hooks=provider_config_hooks,
+        )
         # R2 routing decision is stamped; hooks observe the resolved targets.
         await run_slot(
             pipeline_run,

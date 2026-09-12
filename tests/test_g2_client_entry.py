@@ -299,14 +299,65 @@ async def test_entry_stages_fire_once_on_one_run(monkeypatch) -> None:
         None, None, {"model": "hooked", "messages": []}
     )
 
+    # Provider-bound hooks bind at enrichment — AFTER request_received
+    # fired (provider unknown at entry). They see the post-routing stages.
     stages = [stage for stage, _ in recorder.seen]
-    assert stages == ["request_received", "routing_resolved", "session_resolved"]
+    assert stages == ["routing_resolved", "session_resolved"]
     assert context.pipeline_run is not None
     payloads = dict(recorder.seen)
-    assert payloads["request_received"]["messages"] == []
     assert payloads["routing_resolved"]["targets"][0]["provider"] == "hooked"
     assert payloads["routing_resolved"]["targets"][0]["model"] == "hooked/hooked-model"
     assert payloads["session_resolved"]["session_id"] == "session"
+
+
+@pytest.mark.asyncio
+async def test_request_received_hook_edits_are_authoritative(monkeypatch) -> None:
+    """Global hooks intercept request_received and their edits reach the wire."""
+    from rotator_library.hooks.registry import register_hook
+    from rotator_library.hooks.types import PipelineHook
+
+    class EntryMutator(PipelineHook):
+        name = "entry_mutator_g2"
+        stages = ("request_received",)
+        stateful = False
+
+        async def __call__(self, invocation, context):
+            payload = dict(invocation.payload)
+            payload["messages"] = [{"role": "user", "content": "rewritten by entry hook"}]
+            payload["temperature"] = 0.123
+            return payload
+
+    register_hook(EntryMutator, replace=True)
+
+    class _StubConfig:
+        hooks = {"global": ["entry_mutator_g2"]}
+
+    monkeypatch.setenv("FALLBACK_GROUPS", "entry_chain")
+    monkeypatch.setenv("FALLBACK_GROUP_ENTRY_CHAIN", "hooked/hooked-model")
+    monkeypatch.setenv("MODEL_ROUTE_HOOKED", "group:entry_chain")
+
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=FakeModelResolver(),
+        session_tracker=FakeSessionTracker(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+        get_provider_instance=lambda provider: None,
+        experimental_config=_StubConfig(),
+    )
+
+    context = await builder.build_completion_context(
+        None, None, {"model": "hooked", "messages": []}
+    )
+    # The edit is authoritative: the request kwargs carry the rewritten
+    # payload downstream (model resolution, routing, and the native raw
+    # basis all see it).
+    assert context.kwargs["messages"] == [{"role": "user", "content": "rewritten by entry hook"}]
+    assert context.kwargs["temperature"] == 0.123
+    # And the protocol snapshot (taken AFTER the entry slot) sees it too.
+    assert context.protocol_request["messages"] == [{"role": "user", "content": "rewritten by entry hook"}]
+    # The rewrite is recorded — nothing invisible.
+    assert any(o.get("kind") == "request_received_edit" for o in context.pipeline_run.overlays)
 
 
 @pytest.mark.asyncio

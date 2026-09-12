@@ -125,6 +125,48 @@ class PipelineRun:
                                    kind="overlay", name=kind, changed=True,
                                    detail=str(fields)[:200]))
 
+    def enrich(
+        self,
+        *,
+        provider: str = "",
+        model: str = "",
+        session_id: str = "",
+        scope_key: str = "",
+        classifier: str = "",
+        credential_id: str = "",
+        operation: str = "",
+        class_hooks: Sequence[Any] = (),
+        config_hooks: Sequence[Any] = (),
+    ) -> None:
+        """Fill in identity and extend bindings once routing resolves them.
+
+        A run may be minted bare at client entry (provider unknown, only
+        global/config hooks bound) and enriched after provider resolution —
+        stages fired before enrichment see only the early bindings, which is
+        the honest semantic: ``request_received`` precedes provider
+        selection, so provider-bound hooks cannot intercept it.
+        """
+
+        ctx = self.context
+        if provider:
+            ctx.provider = provider
+        if model:
+            ctx.model = model
+        if session_id:
+            ctx.session_id = session_id
+        if scope_key:
+            ctx.scope_key = scope_key
+        if classifier:
+            ctx.classifier = classifier
+        if credential_id:
+            ctx.credential_id = credential_id
+        if operation:
+            ctx.operation = operation
+        if class_hooks:
+            self._class_hooks = tuple(self._class_hooks) + tuple(class_hooks)
+        if config_hooks:
+            self._config_hooks = tuple(self._config_hooks) + tuple(config_hooks)
+
     # -- binding resolution -------------------------------------------------
 
     def _instance_for(self, binding: HookBinding) -> Any:
