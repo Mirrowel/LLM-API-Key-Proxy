@@ -367,6 +367,7 @@ class RotatingClient:
             get_global_timeout=lambda: self.global_timeout,
             get_enable_request_logging=lambda: self.enable_request_logging,
             get_provider_instance=self._get_provider_instance,
+            experimental_config=self._experimental_config,
         )
         self._quota_service = QuotaService(
             usage_managers=self._usage_managers,

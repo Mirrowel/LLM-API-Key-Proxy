@@ -24,7 +24,7 @@ from ..field_cache import FieldCacheInjection, FieldCacheRule
 from ..usage.costs import ModelPricing
 
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
-_KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses"}
+_KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses", "hooks"}
 _SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "credential", "credentials", "password")
 _PROVIDER_CONFIG_KEYS = {
     "protocol_name",
@@ -38,6 +38,7 @@ _PROVIDER_CONFIG_KEYS = {
     "native_streaming_supported",
     "field_cache",
     "model_quota_groups",
+    "hooks",
 }
 _HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
@@ -64,13 +65,14 @@ class ExperimentalConfig:
     providers: dict[str, Any] = field(default_factory=dict)
     retry: dict[str, Any] = field(default_factory=dict)
     responses: dict[str, Any] = field(default_factory=dict)
+    hooks: dict[str, Any] = field(default_factory=dict)
     unknown_sections: dict[str, Any] = field(default_factory=dict)
     warnings: tuple[str, ...] = ()
     path: Optional[str] = None
 
     @property
     def is_empty(self) -> bool:
-        return not (self.routing or self.pricing or self.streaming or self.field_cache or self.providers or self.retry or self.responses or self.unknown_sections)
+        return not (self.routing or self.pricing or self.streaming or self.field_cache or self.providers or self.retry or self.responses or self.hooks or self.unknown_sections)
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,9 @@ class ProviderRuntimeConfig:
     native_streaming_supported: Optional[bool] = None
     field_cache_rules: tuple[FieldCacheRule, ...] = ()
     model_quota_groups: Optional[dict[str, list[str]]] = None
+    # G2 hooks: JSON provider ``hooks`` entries (names/objects) that add to
+    # the provider class declaration. None means "not configured".
+    hooks: Optional[tuple[Any, ...]] = None
 
 
 def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Mapping[str, str] | None = None) -> ExperimentalConfig:
@@ -147,6 +152,7 @@ def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Ma
         raise ExperimentalConfigError("JSON config root must be an object")
     _reject_secret_keys(data)
     _validate_provider_sections(data.get("providers", {}))
+    _validate_global_hooks(data.get("hooks"))
     warnings = tuple(f"Unknown config section '{key}' ignored by current runtime" for key in data if key not in _KNOWN_SECTIONS)
     unknown = {key: value for key, value in data.items() if key not in _KNOWN_SECTIONS}
     return ExperimentalConfig(
@@ -157,6 +163,7 @@ def load_experimental_config(path: str | os.PathLike[str] | None = None, env: Ma
         providers=_dict_section(data, "providers"),
         retry=_dict_section(data, "retry"),
         responses=_dict_section(data, "responses"),
+        hooks=_dict_section(data, "hooks"),
         unknown_sections=unknown,
         warnings=warnings,
         path=str(resolved),
@@ -168,6 +175,7 @@ def load_config_from_mapping(data: Mapping[str, Any]) -> ExperimentalConfig:
 
     _reject_secret_keys(data)
     _validate_provider_sections(data.get("providers", {}))
+    _validate_global_hooks(data.get("hooks"))
     warnings = tuple(f"Unknown config section '{key}' ignored by current runtime" for key in data if key not in _KNOWN_SECTIONS)
     return ExperimentalConfig(
         routing=_dict_section(data, "routing"),
@@ -177,6 +185,7 @@ def load_config_from_mapping(data: Mapping[str, Any]) -> ExperimentalConfig:
         providers=_dict_section(data, "providers"),
         retry=_dict_section(data, "retry"),
         responses=_dict_section(data, "responses"),
+        hooks=_dict_section(data, "hooks"),
         unknown_sections={key: value for key, value in data.items() if key not in _KNOWN_SECTIONS},
         warnings=warnings,
     )
@@ -326,6 +335,7 @@ def get_provider_runtime_config(
         native_streaming_supported = as_bool(raw.get("native_streaming_supported"), name="providers.native_streaming_supported")
     field_cache_rules = _configured_provider_field_cache(provider, model, raw.get("field_cache"))
     model_quota_groups = _configured_quota_groups(raw.get("model_quota_groups")) if "model_quota_groups" in raw else None
+    hooks = _configured_hooks(raw.get("hooks")) if "hooks" in raw else None
     return ProviderRuntimeConfig(
         protocol_name=protocol_name,
         api_base=_configured_api_base(raw.get("api_base")),
@@ -338,6 +348,7 @@ def get_provider_runtime_config(
         native_streaming_supported=native_streaming_supported,
         field_cache_rules=field_cache_rules,
         model_quota_groups=model_quota_groups,
+        hooks=hooks,
     )
 
 
@@ -473,6 +484,8 @@ def _validate_provider_sections(value: Any) -> None:
             as_bool(raw.get("native_streaming_supported"), name="providers.native_streaming_supported")
         if "model_quota_groups" in raw:
             _configured_quota_groups(raw.get("model_quota_groups"))
+        if "hooks" in raw:
+            _configured_hooks(raw.get("hooks"))
 
 
 def _configured_protocol(value: Any) -> Optional[str]:
@@ -642,6 +655,92 @@ def _validate_adapter_name(name: str) -> None:
         raise ExperimentalConfigError(f"Unknown provider adapter {name!r}") from exc
 
 
+def get_global_hook_names(
+    *,
+    config: ExperimentalConfig | None = None,
+    env: Mapping[str, str] | None = None,
+) -> tuple[str, ...]:
+    """Return the process-wide hook names declared under ``hooks.global``.
+
+    Global hooks are names resolved against the hook registry (hooks/registry.py)
+    and applied to every request after provider class/config declarations.
+    Unknown names fail at startup via ``validate_declared_names``.
+    """
+
+    source = env if env is not None else os.environ
+    active = config if config is not None else load_experimental_config(env=source)
+    section = active.hooks if isinstance(active.hooks, dict) else {}
+    raw = section.get("global")
+    if raw in (None, ""):
+        return ()
+    if isinstance(raw, str):
+        return tuple(part.strip() for part in raw.split(",") if part.strip())
+    if isinstance(raw, (list, tuple)):
+        names: list[str] = []
+        for entry in raw:
+            name = entry.get("name") if isinstance(entry, Mapping) else entry
+            if name is not None and str(name).strip():
+                names.append(str(name).strip())
+        return tuple(names)
+    raise ExperimentalConfigError("hooks.global must be a list of hook names")
+
+
+def _validate_global_hooks(value: Any) -> None:
+    if value in (None, {}):
+        return
+    if not isinstance(value, Mapping):
+        raise ExperimentalConfigError("hooks config section must be an object")
+    unsupported = set(str(key) for key in value) - {"global"}
+    if unsupported:
+        raise ExperimentalConfigError(f"hooks contains unsupported keys: {', '.join(sorted(unsupported))}")
+    raw = value.get("global")
+    if raw in (None, ""):
+        return
+    if isinstance(raw, str):
+        return
+    if not isinstance(raw, (list, tuple)):
+        raise ExperimentalConfigError("hooks.global must be a list of hook names")
+    for entry in raw:
+        name = entry.get("name") if isinstance(entry, Mapping) else entry
+        if not isinstance(name, str) or not name.strip():
+            raise ExperimentalConfigError("hooks.global entries must be non-empty hook names")
+
+
+def _configured_hooks(value: Any) -> Optional[tuple[Any, ...]]:
+    """Normalize a provider JSON ``hooks`` declaration into registry entries.
+
+    Entries are hook names or objects (``name`` + optional ``stages`` /
+    ``priority`` / ``critical``). Names are validated against the registry at
+    startup by ``providers.validate_provider_hooks`` — never per request.
+    """
+
+    if value in (None, ""):
+        return None
+    if isinstance(value, str):
+        entries: list[Any] = [part.strip() for part in value.split(",") if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        entries = list(value)
+    else:
+        raise ExperimentalConfigError("providers.hooks must be a string or list")
+    normalized: list[Any] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            name = entry.strip()
+            if name:
+                normalized.append({"name": name})
+            continue
+        if isinstance(entry, Mapping):
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise ExperimentalConfigError("providers.hooks entries require a non-empty name")
+            item = {str(key): value for key, value in entry.items()}
+            item["name"] = name.strip()
+            normalized.append(item)
+            continue
+        raise ExperimentalConfigError("providers.hooks entries must be hook names or objects")
+    return tuple(normalized)
+
+
 def _configured_provider_field_cache(provider: str, model: str, value: Any) -> tuple[FieldCacheRule, ...]:
     if value in (None, {}, []):
         return ()
@@ -786,6 +885,7 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
             scope=scope_values,
             inject=inject,
             enabled=as_bool(data.get("enabled", True), name="field_cache.enabled"),
+            critical=as_bool(data.get("critical", False), name="field_cache.critical"),
             ttl_seconds=int(data["ttl_seconds"]) if data.get("ttl_seconds") is not None else None,
             metadata=_metadata_dict(data.get("metadata", {})),
             allow_missing_session=as_bool(data.get("allow_missing_session", False), name="field_cache.allow_missing_session"),

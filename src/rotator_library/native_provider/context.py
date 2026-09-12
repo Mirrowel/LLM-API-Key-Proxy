@@ -53,6 +53,15 @@ class NativeProviderContext:
     metadata: dict[str, Any] = field(default_factory=dict)
     request_preparer: Optional[Callable[..., dict[str, Any]]] = None
     request_validator: Optional[Callable[..., Any]] = None
+    # G2 hookable pipeline: per-request run (isolation unit). Minted lazily by
+    # the executor when absent; the client layer may pre-create it with the
+    # full tri-source hook declarations.
+    pipeline_run: Any = None
+    # Hook declarations resolved into the run: provider class attrs, provider
+    # JSON config entries, and global registry names.
+    hook_class_declarations: tuple[Any, ...] = ()
+    hook_config_declarations: tuple[Any, ...] = ()
+    hook_global_names: tuple[str, ...] = ()
 
     def protocol_context(
         self,

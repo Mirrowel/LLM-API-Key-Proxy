@@ -4,7 +4,7 @@
 import importlib
 import pkgutil
 import os
-from typing import Any, Dict, Optional, Type
+from typing import Any, Dict, Mapping, Optional, Type
 from .provider_interface import ProviderInterface
 
 # --- Provider Plugin System ---
@@ -199,6 +199,58 @@ class DynamicOpenAICompatibleProvider:
         return headers
 
 
+def validate_provider_hooks(config_snapshot: Any = None) -> None:
+    """Fail startup when any declared hook name/stage cannot resolve.
+
+    Mirrors adapter-name validation: provider class ``hooks``, JSON provider
+    ``hooks``, and configured global hook names all resolve through
+    ``hooks.registry.validate_declared_names``. Called after every provider
+    module is imported so declarations and the global registry are complete.
+    """
+
+    from ..config.experimental import (
+        _configured_hooks,
+        get_global_hook_names,
+        load_experimental_config,
+    )
+    from ..hooks.registry import validate_declared_names
+
+    active = config_snapshot if config_snapshot is not None else load_experimental_config()
+    class_hooks: list[Any] = []
+    for plugin in PROVIDER_PLUGINS.values():
+        class_hooks.extend(getattr(plugin, "hooks", ()) or ())
+    config_hooks: list[Any] = []
+    providers = active.providers if isinstance(getattr(active, "providers", None), Mapping) else {}
+    for raw in providers.values():
+        if isinstance(raw, Mapping) and "hooks" in raw:
+            config_hooks.extend(_configured_hooks(raw.get("hooks")) or ())
+    validate_declared_names(
+        class_hooks=class_hooks,
+        config_hooks=config_hooks,
+        global_hooks=get_global_hook_names(config=active),
+    )
+
+
+def _validate_provider_hooks_at_startup(config_snapshot: Any = None) -> None:
+    """Startup wrapper kept tolerant of import-time registry gaps.
+
+    Provider modules register their hook classes as they import; a genuinely
+    unknown name must fail. A missing dependency (partial import) must not
+    crash the launcher — it will surface again when the request runs.
+    """
+
+    try:
+        validate_provider_hooks(config_snapshot)
+    except (KeyError, ValueError):
+        raise
+    except Exception as exc:  # pragma: no cover - defensive import guard
+        import logging
+
+        logging.getLogger("rotator_library").warning(
+            "hook declaration startup validation skipped: %s", exc
+        )
+
+
 def _register_providers():
     """
     Dynamically discovers and imports provider plugins from this directory.
@@ -321,6 +373,11 @@ def _register_providers():
         logging.getLogger("rotator_library").debug(
             f"Registered config-defined provider: {provider_name}"
         )
+
+    # G2 startup validation: every declared hook name/stage must resolve now,
+    # never on a request. Runs after all provider modules (and their hook
+    # classes) are registered.
+    _validate_provider_hooks_at_startup(config_snapshot)
 
 
 # Discover and register providers when the package is imported

@@ -76,6 +76,8 @@ from ..protocols import ProtocolContext, UnifiedStreamEvent, get_protocol
 from ..protocols.streaming import format_canonical_stream_event
 from ..native_provider.streaming import provider_supports_native_streaming as native_provider_supports_streaming
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
+from ..hooks.binding import make_pipeline_run, resolve_hook_declarations
+from ..hooks.runner import run_slot
 from ..transform_trace import REDACTED
 from ..usage.accounting import UsageRecord, extract_usage_record
 from ..usage.costs import CostBreakdown, CostCalculator
@@ -726,6 +728,54 @@ class RequestExecutor:
             self._native_executor = native_executor
         return native_executor
 
+    def _ensure_client_pipeline_run(self, context: RequestContext, plugin: Any = None):
+        """Return this request's PipelineRun, minting the lazy fallback.
+
+        RequestContextBuilder normally pre-mints the run so client entry stages
+        and the native executor share one object. Direct executor callers (and
+        lower-level tests) may not have gone through the builder; minting here
+        keeps the client stages working without changing the native path.
+        """
+
+        run = getattr(context, "pipeline_run", None)
+        if run is not None:
+            return run
+        if plugin is None:
+            plugin = self._get_plugin_instance(context.provider)
+        run = make_pipeline_run(
+            plugin,
+            provider=context.provider,
+            model=context.model,
+            credential_id=getattr(context, "credential_id", "") or "",
+            session_id=context.session_id or "",
+            scope_key=context.usage_manager_key or "",
+            classifier=context.classifier or "",
+            operation="chat",
+            config=getattr(self, "_experimental_config", None),
+        )
+        context.pipeline_run = run
+        return run
+
+    async def _fire_client_stage(
+        self,
+        context: RequestContext,
+        stage: str,
+        payload: Any,
+        *,
+        plugin: Any = None,
+    ):
+        """Fire one client-layer request stage on the shared per-request run.
+
+        Rewrites are observed but identity is not swapped in v1: the
+        credential_selected payload documents the resolved credential yet the
+        executor keeps the acquired credential (hooks must not silently reroute
+        accounting). Routing/session payload rewrites are applied only where
+        the request builder does so explicitly.
+        """
+
+        run = self._ensure_client_pipeline_run(context, plugin)
+        return await run_slot(run, stage, payload, direction="request")
+
     async def _execute_litellm_request(
         self,
         kwargs: Dict[str, Any],
@@ -854,6 +904,31 @@ class RequestExecutor:
             headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
         except NotImplementedError as exc:
             raise RoutingExecutionError(str(exc)) from exc
+        # G2: thread tri-source hook declarations and the shared per-request
+        # run so the native executor's lazy mint reuses the client's run.
+        class_hooks, config_hooks, global_hooks = resolve_hook_declarations(
+            plugin,
+            native_model,
+            config=getattr(self, "_experimental_config", None),
+            provider=provider,
+        )
+        pipeline_run = getattr(context, "pipeline_run", None)
+        if pipeline_run is None:
+            pipeline_run = make_pipeline_run(
+                plugin,
+                provider=provider,
+                model=native_model,
+                credential_id=credential_id or "",
+                session_id=context.session_id or "",
+                scope_key=context.usage_manager_key or "",
+                classifier=context.classifier or "",
+                operation=operation,
+                config=getattr(self, "_experimental_config", None),
+                class_hooks=class_hooks,
+                config_hooks=config_hooks,
+                global_hooks=global_hooks,
+            )
+            context.pipeline_run = pipeline_run
         native_context = NativeProviderContext(
             provider=provider,
             model=native_model,
@@ -892,6 +967,10 @@ class RequestExecutor:
             },
             request_preparer=plugin.prepare_native_request if hasattr(plugin, "prepare_native_request") else None,
             request_validator=plugin.validate_request if hasattr(plugin, "validate_request") else None,
+            pipeline_run=pipeline_run,
+            hook_class_declarations=class_hooks,
+            hook_config_declarations=config_hooks,
+            hook_global_names=global_hooks,
         )
         # W12 metadata producers: protocol pair + execution identity + the
         # raw fast-path/overlay record (reconstruction inputs).
@@ -1459,6 +1538,19 @@ class RequestExecutor:
                     )
                     plugin = self._get_plugin_instance(provider)
                     native_execution = _attempt_uses_native_protocol(plugin, model, context)
+                    # G2 R3 credential_selected: observe the acquired identity.
+                    # v1 records the fact and does NOT swap credentials (the
+                    # payload rewrite is deliberately inert for identity).
+                    await self._fire_client_stage(
+                        context,
+                        "credential_selected",
+                        {
+                            "credential_id": cred_context.stable_id,
+                            "provider": provider,
+                            "model": model,
+                        },
+                        plugin=plugin,
+                    )
 
                     try:
                         # Prepare request kwargs
@@ -1761,6 +1853,17 @@ class RequestExecutor:
                         )
                         plugin = self._get_plugin_instance(provider)
                         native_execution = _attempt_uses_native_protocol(plugin, model, context)
+                        # G2 R3 credential_selected: observe the acquired identity.
+                        await self._fire_client_stage(
+                            context,
+                            "credential_selected",
+                            {
+                                "credential_id": cred_context.stable_id,
+                                "provider": provider,
+                                "model": model,
+                            },
+                            plugin=plugin,
+                        )
 
                         try:
                             # Prepare request kwargs
@@ -3228,11 +3331,16 @@ def _redact_context_field_cache_paths(
         return payload
     redacted = deepcopy(payload)
     for rule in rules:
-        if direction == "response" and getattr(rule, "source", None) not in {"response", "unified_response"}:
+        inject = getattr(rule, "inject", None)
+        response_target = inject is not None and getattr(inject, "target", None) in {"response", "unified_response"}
+        if direction == "response" and getattr(rule, "source", None) not in {"response", "unified_response"} and not response_target:
             continue
         if direction == "stream" and getattr(rule, "source", None) not in {"stream_event", "unified_stream_event", "response", "unified_response"}:
             continue
-        for path in _trace_redaction_paths((rule.path,), direction=direction):
+        paths: list[str] = [str(rule.path)]
+        if direction == "response" and response_target:
+            paths.append(str(inject.path))
+        for path in _trace_redaction_paths(paths, direction=direction):
             try:
                 tokens = parse_path(path)
                 _redact_trace_path(redacted, tokens)
@@ -3435,6 +3543,7 @@ def _safe_field_cache_override(declared: Any, configured: Any) -> bool:
     )
     if not (
         getattr(configured, "cache_key", None) == getattr(declared, "cache_key", None)
+        and getattr(configured, "source", None) == getattr(declared, "source", None)
         and getattr(configured, "mode", None) == getattr(declared, "mode", None)
         and getattr(configured, "scope", None) == getattr(declared, "scope", None)
         and getattr(configured, "ttl_seconds", None) == getattr(declared, "ttl_seconds", None)

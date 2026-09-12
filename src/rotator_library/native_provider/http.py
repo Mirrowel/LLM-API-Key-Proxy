@@ -17,20 +17,31 @@ class NativeHTTPTransport:
     def __init__(self, client: Any) -> None:
         self.client = client
 
-    async def post_json(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any]) -> Any:
+    async def post_json(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float | None = None) -> Any:
         """POST JSON and return a decoded response body.
 
         The wrapper keeps HTTP behavior easy to mock. It does not own retries or
         credential rotation; those remain in the existing executor/usage layer.
+        ``timeout_seconds`` carries hook-mandated per-request timeouts
+        (G2 transport slot) through to capable clients.
         """
 
-        response = await self.client.post(endpoint, headers=headers, json=payload)
+        request_kwargs: dict[str, Any] = {}
+        if timeout_seconds is not None:
+            if hasattr(self.client, "post"):
+                try:
+                    import httpx
+
+                    request_kwargs["timeout"] = httpx.Timeout(timeout_seconds)
+                except ImportError:
+                    request_kwargs["timeout"] = timeout_seconds
+        response = await self.client.post(endpoint, headers=headers, json=payload, **request_kwargs)
         await _raise_for_http_error(response)
         if hasattr(response, "json"):
             return response.json()
         return response
 
-    async def stream_json_lines(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any]) -> AsyncIterator[Any]:
+    async def stream_json_lines(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float | None = None) -> AsyncIterator[Any]:
         """Yield provider stream chunks from an injected streaming-capable client.
 
         Provider-specific test clients can still expose `stream_json_lines()`.

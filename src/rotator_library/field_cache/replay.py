@@ -17,17 +17,21 @@ injects — the fallback identity is recorded in transaction metadata
 Declaration schema (list of entries):
 
 ``name``           unique rule name
-``source``         request | response | stream_event | unified_*
+``source``         request | response | stream_event | unified_*  (default
+                   response — a "watch the response and cache this" rule)
 ``path``           extraction path
 ``keep``           last | all | turn | turns:N | per_tool_call  (mode mapping)
 ``inject.path``    restore path
 ``inject.if``      auto (default — add only when absent) | always (overwrite;
                    an operator choice, honored for every field class)
-``inject.target``  request | unified_request | metadata (default request)
+``inject.target``  request | unified_request | metadata | response |
+                   unified_response (default request)
 ``compatibility``  bound | portable (default bound)
 ``transform``      registered transform name (portable only)
 ``scope``          scope dimensions (default provider+model, credential and
                    session optional refinements per D11)
+``critical``       rule-level fail-closed escape hatch (default false:
+                   contained, logged, skipped)
 ``ttl_seconds``    retention window
 
 The operator is the trust boundary: explicit per-field choices (including
@@ -54,6 +58,15 @@ _MODE_MAP: dict[str, FieldCacheMode] = {
     "all": "all",
     "turn": "last_user_turn",
     "per_tool_call": "per_tool_call",
+}
+
+_VALID_REPLAY_SOURCES = {
+    "request",
+    "response",
+    "stream_event",
+    "unified_request",
+    "unified_response",
+    "unified_stream_event",
 }
 
 
@@ -92,7 +105,13 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
         name = str(entry.get("name") or "").strip()
         if not name:
             raise ValueError(f"cache_replay entry {index} for {provider} needs a name")
-        source = entry.get("source") or "response"
+        source = str(entry.get("source") or "response").strip().lower()
+        if source not in _VALID_REPLAY_SOURCES:
+            raise ValueError(
+                f"cache_replay rule {name!r} source must be one of "
+                "request | response | stream_event | unified_request | unified_response | unified_stream_event, "
+                f"got {entry.get('source')!r}"
+            )
         path = entry.get("path")
         if not path:
             raise ValueError(f"cache_replay rule {name!r} needs a path")
@@ -149,6 +168,7 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
                 scope=scope,
                 inject=injection,
                 enabled=bool(entry.get("enabled", True)),
+                critical=bool(entry.get("critical", False)),
                 ttl_seconds=int(entry["ttl_seconds"]) if entry.get("ttl_seconds") is not None else None,
                 metadata=metadata,
                 # Matches the raw/JSON-configured rule default so the

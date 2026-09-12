@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -18,6 +19,9 @@ from .store import (
     _bounded_set_value,
 )
 from .types import FieldCacheContext, FieldCacheRule
+
+
+_LOGGER = logging.getLogger("rotator_library.field_cache")
 
 
 @dataclass
@@ -182,7 +186,12 @@ class FieldCacheEngine:
                     operation.changed = await self._store_values(rule, operation.cache_key, values, payload, operation)
             except Exception as exc:
                 self._log_error(transaction_logger, "field_cache_extract", exc, payload, rule)
-                raise
+                if rule.critical:
+                    raise
+                self._contain_rule_error(rule, operation, exc)
+                operations.append(operation)
+                self._trace(transaction_logger, "after_field_cache_extraction", payload, rule, operation, source=source)
+                continue
             operations.append(operation)
             self._trace(transaction_logger, "after_field_cache_extraction", payload, rule, operation, source=source)
         self._trace_summary(transaction_logger, "field_cache_extraction_complete", payload, source=source, target=None, rules=rules, operations=operations)
@@ -285,7 +294,12 @@ class FieldCacheEngine:
                 operation.sample_values = _sample_values(value if isinstance(value, list) else [value])
             except Exception as exc:
                 self._log_error(transaction_logger, "field_cache_inject", exc, updated, rule)
-                raise
+                if rule.critical:
+                    raise
+                self._contain_rule_error(rule, operation, exc)
+                operations.append(operation)
+                self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
+                continue
             operations.append(operation)
             self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
         self._trace_summary(transaction_logger, "field_cache_injection_complete", updated, source=None, target=target, rules=rules, operations=operations)
@@ -549,7 +563,7 @@ class FieldCacheEngine:
         transaction_logger.log_transform_pass(
             pass_name,
             _payload_shape(payload),
-            direction="request" if target or source == "request" else "response" if source == "response" else "stream" if source == "stream_event" else "metadata",
+            direction=_summary_direction(source, target),
             stage="adapter",
             metadata={
                 "source": source,
@@ -573,6 +587,22 @@ class FieldCacheEngine:
             payload=_payload_shape(payload),
             stage="adapter",
             metadata={"rule_name": rule.name, "path": rule.path, "mode": rule.mode},
+        )
+
+    def _contain_rule_error(self, rule: FieldCacheRule, operation: FieldCacheOperation, error: BaseException) -> None:
+        """Absorb one rule failure: loud warning + skip-this-rule semantics.
+
+        A field-cache rule error must never fail the request. ``critical=True``
+        rules opt back into fail-closed behavior (handled by the caller, which
+        re-raises before invoking this helper).
+        """
+
+        operation.skipped = True
+        operation.reason = f"rule_error:{type(error).__name__}"
+        _LOGGER.warning(
+            "Field-cache rule %r failed (%s); skipping rule and continuing request",
+            rule.name,
+            error,
         )
 
 
@@ -675,6 +705,22 @@ def _trace_direction(pass_name: str, source: str, metadata: dict[str, Any]) -> s
     if source in {"request", "unified_request"}:
         return "request"
     return "response"
+
+
+def _summary_direction(source: Optional[str], target: Optional[str]) -> str:
+    if target is not None:
+        if target in {"stream_event", "unified_stream_event"}:
+            return "stream"
+        if target in {"request", "unified_request", "metadata"}:
+            return "request"
+        return "response"
+    if source in {"stream_event", "unified_stream_event"}:
+        return "stream"
+    if source in {"request", "unified_request"}:
+        return "request"
+    if source in {"response", "unified_response"}:
+        return "response"
+    return "metadata"
 
 
 def _sample_values(values: list[Any], *, max_items: int = 3, max_text: int = 500) -> list[Any]:

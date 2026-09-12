@@ -355,14 +355,17 @@ async def test_field_cache_error_trace_omits_raw_payload_values(tmp_path) -> Non
     logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
     engine = FieldCacheEngine([_reasoning_rule()], store=FailingStore())
 
-    with pytest.raises(RuntimeError):
-        await engine.extract(
-            "response",
-            {"choices": [{"message": {"reasoning_content": "provider-signature-secret"}}]},
-            _context(),
-            transaction_logger=logger,
-        )
+    operations = await engine.extract(
+        "response",
+        {"choices": [{"message": {"reasoning_content": "provider-signature-secret"}}]},
+        _context(),
+        transaction_logger=logger,
+    )
 
+    # G2 containment: a store failure is logged + traced and the rule is
+    # skipped; the request proceeds.
+    assert operations[0].skipped is True
+    assert operations[0].reason == "rule_error:RuntimeError"
     trace_text = _trace_text(logger.log_dir)
     assert "provider-signature-secret" not in trace_text
     assert "payload_type" in trace_text
@@ -507,12 +510,17 @@ async def test_all_mode_enforces_value_count_and_byte_bounds() -> None:
     updated, _ = await engine.inject("request", {"metadata": {}}, _context())
 
     assert updated["metadata"]["values"] == ["two", "three"]
-    with pytest.raises(ValueError, match="exceeds max_bytes"):
-        await engine.extract("response", {"value": "x" * 64}, _context())
+    operations = await engine.extract("response", {"value": "x" * 64}, _context())
+    # G2 containment: the byte-bound violation skips the rule (loud warning +
+    # trace) instead of failing the request; the prior values survive.
+    assert operations[0].skipped is True
+    assert operations[0].reason == "rule_error:ValueError"
+    unchanged, _ = await engine.inject("request", {"metadata": {}}, _context())
+    assert unchanged["metadata"]["values"] == ["two", "three"]
 
 
 @pytest.mark.asyncio
-async def test_last_mode_rejects_oversized_opaque_state() -> None:
+async def test_last_mode_contains_oversized_opaque_state() -> None:
     rule = FieldCacheRule(
         name="provider_response_id",
         source="response",
@@ -526,12 +534,14 @@ async def test_last_mode_rejects_oversized_opaque_state() -> None:
         metadata={"provider_continuation": True},
     )
 
-    with pytest.raises(ValueError, match="exceeds max_bytes"):
-        await FieldCacheEngine([rule]).extract(
-            "response",
-            {"id": "resp_" + "x" * 64},
-            _context(),
-        )
+    operations = await FieldCacheEngine([rule]).extract(
+        "response",
+        {"id": "resp_" + "x" * 64},
+        _context(),
+    )
+
+    assert operations[0].skipped is True
+    assert operations[0].reason == "rule_error:ValueError"
 
 
 @pytest.mark.asyncio
@@ -635,23 +645,33 @@ async def test_legacy_append_fallback_remains_bounded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_store_internal_type_error_is_not_treated_as_legacy_signature() -> None:
+async def test_store_internal_type_error_is_contained_not_treated_as_legacy_signature() -> None:
     class BrokenStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
         async def get(self, key):
             return None
 
         async def set(self, key, value, *, ttl_seconds=None):
+            self.calls += 1
             raise TypeError("internal serialization failure")
 
         async def append(self, key, values, **kwargs):
             raise TypeError("internal serialization failure")
 
-    with pytest.raises(TypeError, match="internal serialization"):
-        await FieldCacheEngine([_reasoning_rule()], store=BrokenStore()).extract(
-            "response",
-            {"choices": [{"message": {"reasoning_content": "x"}}]},
-            _context(),
-        )
+    store = BrokenStore()
+    operations = await FieldCacheEngine([_reasoning_rule()], store=store).extract(
+        "response",
+        {"choices": [{"message": {"reasoning_content": "x"}}]},
+        _context(),
+    )
+
+    # Internal TypeError is never mistaken for a legacy store signature (which
+    # would trigger a second, keyword-less set call); containment skips the rule.
+    assert store.calls == 1
+    assert operations[0].skipped is True
+    assert operations[0].reason == "rule_error:TypeError"
 
 
 @pytest.mark.asyncio

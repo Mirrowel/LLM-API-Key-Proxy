@@ -99,6 +99,10 @@ class RequestContext:
     unified_request: Optional[Any] = None
     input_provider: Optional[str] = None
     disable_provider_continuation: bool = False
+    # G2 hookable pipeline: the single per-request PipelineRun. Minted by
+    # RequestContextBuilder and shared (same object) by the client executor,
+    # the native executor, and every cloned fallback-target context.
+    pipeline_run: Optional[Any] = None
 
 
 @dataclass

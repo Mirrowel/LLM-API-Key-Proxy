@@ -16,7 +16,13 @@ FieldCacheSource = Literal[
     "unified_response",
     "unified_stream_event",
 ]
-FieldCacheTarget = Literal["request", "unified_request", "metadata"]
+FieldCacheTarget = Literal[
+    "request",
+    "unified_request",
+    "metadata",
+    "response",
+    "unified_response",
+]
 FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"]
 FieldCacheScope = Literal["provider", "model", "credential", "session", "classifier"]
 
@@ -28,7 +34,7 @@ DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential",
 OPTIONAL_SCOPE_DIMENSIONS = frozenset({"credential", "session"})
 _VALID_COMPATIBILITY = {"bound", "portable"}
 _VALID_SOURCES = {"request", "response", "stream_event", "unified_request", "unified_response", "unified_stream_event"}
-_VALID_TARGETS = {"request", "unified_request", "metadata"}
+_VALID_TARGETS = {"request", "unified_request", "metadata", "response", "unified_response"}
 _VALID_SCOPES = {"provider", "model", "credential", "session", "classifier"}
 
 
@@ -59,6 +65,11 @@ class FieldCacheRule:
     scope: tuple[FieldCacheScope, ...] = DEFAULT_SCOPE
     inject: Optional[FieldCacheInjection] = None
     enabled: bool = True
+    # Rule-level escape hatch (G2 containment): by default a rule error is
+    # contained (warning + trace + skip this rule, request proceeds). Setting
+    # ``critical=True`` restores the old fail-closed behavior for rules whose
+    # failure must never be silently absorbed.
+    critical: bool = False
     ttl_seconds: Optional[int] = None
     metadata: dict[str, Any] = field(default_factory=dict)
     allow_missing_session: bool = False

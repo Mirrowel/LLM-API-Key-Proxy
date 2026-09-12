@@ -11,6 +11,8 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 from ..routing.profiles import PROFILE_SEPARATOR
 
 from ..core.types import RequestContext
+from ..hooks.binding import make_pipeline_run
+from ..hooks.runner import run_slot
 from ..protocols import ProtocolContext, get_protocol
 from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
 from ..routing.types import RouteTarget, RoutingDecision
@@ -34,6 +36,7 @@ class RequestContextBuilder:
         get_global_timeout: Callable[[], int],
         get_enable_request_logging: Callable[[], bool],
         get_provider_instance: Optional[Callable[[str], Any]] = None,
+        experimental_config: Optional[Any] = None,
     ):
         self._resolve_scope_for_provider = resolve_scope_for_provider
         self._model_resolver = model_resolver
@@ -41,6 +44,7 @@ class RequestContextBuilder:
         self._get_global_timeout = get_global_timeout
         self._get_enable_request_logging = get_enable_request_logging
         self._get_provider_instance = get_provider_instance
+        self._experimental_config = experimental_config
 
     @staticmethod
     def _pop_scope_kwargs(kwargs: Dict[str, Any]) -> tuple[Optional[str], Any, Any, bool, Any]:
@@ -336,6 +340,52 @@ class RequestContextBuilder:
                 classifier=scope["classifier"],
             )
 
+        pipeline_run = self._mint_pipeline_run(
+            provider,
+            resolved_model,
+            session,
+            session_isolation_key,
+            scope,
+        )
+        # R1 client entry: the raw client payload passes through the declared
+        # request_received slot once per request. The legacy per-attempt
+        # pre_request_callback remains the native mutation path (see executor);
+        # this slot is for hook-bound consumers.
+        await run_slot(pipeline_run, "request_received", deepcopy(kwargs), direction="request")
+        # R2 routing decision is stamped; hooks observe the resolved targets.
+        await run_slot(
+            pipeline_run,
+            "routing_resolved",
+            {
+                "targets": [
+                    {
+                        "provider": target.provider,
+                        "model": target.prefixed_model,
+                        "protocol": target.protocol,
+                        "execution": target.execution,
+                    }
+                    for target in (routing_targets or ())
+                ]
+            },
+            direction="request",
+        )
+        # R4 session evidence is settled; a session_id rewrite is applied
+        # (cheap and safe — it feeds every identity sink downstream).
+        session_outcome = await run_slot(
+            pipeline_run,
+            "session_resolved",
+            {
+                "session_id": session.session_id,
+                "confidence": getattr(session, "confidence", None),
+            },
+            direction="request",
+        )
+        resolved_session_id = session.session_id
+        if session_outcome.modified and isinstance(session_outcome.payload, dict):
+            rewritten_session_id = session_outcome.payload.get("session_id")
+            if rewritten_session_id:
+                resolved_session_id = rewritten_session_id
+
         return RequestContext(
             model=resolved_model,
             provider=provider,
@@ -344,7 +394,7 @@ class RequestContextBuilder:
             streaming=kwargs.get("stream", False),
             credentials=scope["credentials"],
             deadline=time.time() + self._get_global_timeout(),
-            session_id=session.session_id,
+            session_id=resolved_session_id,
             session_affinity_key=session.affinity_key,
             session_tracker=self._session_tracker,
             session_tracking_namespace=session.tracking_namespace,
@@ -364,6 +414,29 @@ class RequestContextBuilder:
             input_provider=provider,
             disable_provider_continuation=disable_provider_continuation,
             routing_group=routing_decision.group if routing_decision else None,
+            pipeline_run=pipeline_run,
+        )
+
+    def _mint_pipeline_run(
+        self,
+        provider: str,
+        model: str,
+        session: Any,
+        session_isolation_key: Optional[str],
+        scope: Dict[str, Any],
+    ) -> Any:
+        """Mint the single per-request run from provider class/config hooks."""
+
+        plugin = self._get_provider_instance(provider) if self._get_provider_instance else None
+        return make_pipeline_run(
+            plugin,
+            provider=provider,
+            model=model,
+            session_id=getattr(session, "session_id", "") or "",
+            scope_key=session_isolation_key or "",
+            classifier=scope.get("classifier") or "",
+            operation="chat",
+            config=self._experimental_config,
         )
 
     async def build_embedding_context(

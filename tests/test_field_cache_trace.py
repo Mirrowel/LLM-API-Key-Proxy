@@ -115,10 +115,14 @@ async def test_field_cache_errors_emit_transform_log_error(tmp_path) -> None:
     context = FieldCacheContext(provider="openai", model="gpt-test", credential_id="credential_1", session_id="session_1", classifier="global")
 
     await engine.extract("response", {"choices": [{"message": {"reasoning_content": "hidden"}}]}, context, transaction_logger=logger)
-    with pytest.raises(Exception):
-        await engine.inject("request", {"messages": [{"role": "user"}]}, context, transaction_logger=logger)
+    # G2 containment: the wildcard injection error is traced and the rule is
+    # skipped; the request is not failed.
+    updated, operations = await engine.inject("request", {"messages": [{"role": "user"}]}, context, transaction_logger=logger)
+    assert operations[0].skipped is True
+    assert operations[0].reason == "rule_error:FieldCachePathError"
 
     entries = _trace_entries(logger.log_dir)
     error_entry = next(entry for entry in entries if entry["pass_name"] == "transform_log_error")
     assert error_entry["data"]["failed_pass_name"] == "field_cache_inject"
     assert error_entry["metadata"]["rule_name"] == "bad_injection"
+    assert updated == {"messages": [{"role": "user"}]}

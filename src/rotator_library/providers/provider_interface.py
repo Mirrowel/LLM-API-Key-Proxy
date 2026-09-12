@@ -276,6 +276,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # the LiteLLM-backed path.
     protocol_name: Optional[str] = None
     adapter_names: Tuple[str, ...] = ()
+    # G2 hookable pipeline: class-level hook declarations (PipelineHook
+    # classes, instances, or factories). JSON config ``hooks`` and globally
+    # registered hook names add to this declaration (hooks/registry.py).
+    hooks: Tuple[Any, ...] = ()
     field_cache_rules: Tuple[Any, ...] = ()
     native_streaming_supported: bool = False
     # Default transport base for native execution; env ``{PROVIDER}_API_BASE``
@@ -290,6 +294,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     default_profile: Optional[str] = None
     # Declarative cache-and-replay (W13/D14): list of rule entries compiled
     # to FieldCacheRules at native-context build (see field_cache/replay.py).
+    # Each entry declares its own ``source`` (request | response | stream_event
+    # | unified_request | unified_response | unified_stream_event), so a
+    # provider can force-cache response state by declaring a response-watching
+    # rule with an ``inject.target`` of request/response/unified_*.
     cache_replay: Optional[List[Dict[str, Any]]] = None
 
     @abstractmethod
@@ -390,6 +398,18 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
 
         return dict(self._get_runtime_config(model).adapter_config)
+
+    def get_hooks(self, model: str = "") -> Tuple[Any, ...]:
+        """Return ordered hook declarations for this provider/model.
+
+        Class-declared ``hooks`` are the base; JSON runtime config ``hooks``
+        (validated at startup) are appended. Global registry names are resolved
+        separately when the per-request run is minted. Order is significant —
+        declaration order breaks priority ties (hooks/registry.py).
+        """
+
+        configured = self._get_runtime_config(model).hooks
+        return tuple(self.hooks) + tuple(configured or ())
 
     def get_field_cache_rules(self, model: str = "") -> Tuple[Any, ...]:
         """Return field-cache rules for provider-specific protocol state.

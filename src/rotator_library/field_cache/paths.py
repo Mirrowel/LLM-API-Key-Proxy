@@ -111,6 +111,10 @@ def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_on
     mutation predictable for message-tail use cases like `messages[-1].field`.
     `insert=True` is intentionally limited to final list-index tokens so rules
     cannot accidentally create provider-specific list structures.
+
+    ``when_missing_only`` combined with ``insert=True`` means "insert only when
+    an equal entry is not already present" (the auto/if-absent declaration).
+    Without this, auto insertion was a permanent no-op.
     """
 
     tokens = parse_path(path)
@@ -146,7 +150,7 @@ def inject_path(payload: Any, path: str, injected_value: Any, *, when_missing_on
                     list_index = max(0, len(current) + list_index)
                 if not (0 <= list_index <= len(current)):
                     raise FieldCachePathError(f"List index out of range for field-cache insertion: {list_index}")
-                if when_missing_only:
+                if when_missing_only and injected_value in current:
                     return False
                 current.insert(list_index, injected_value)
                 return True

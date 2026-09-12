@@ -22,6 +22,22 @@ _ADAPTER_INSTANCES: dict[str, PayloadAdapter] = {}
 _INFRASTRUCTURE_MODULES = {"base", "registry"}
 
 
+def _register_adapter_hook(name: str, *, replace: bool) -> None:
+    """Mirror a registered adapter into the G2 hooks registry.
+
+    The wrapped adapter becomes declarable as ``adapter:<name>`` (aliases as
+    ``adapter:<alias>``) from every hook declaration surface. Collision rules
+    mirror the adapter registry: an occupied name raises unless ``replace``.
+    Imports are deferred so auto-discovery (module import time) cannot hit an
+    import cycle with the hooks package.
+    """
+
+    from ..hooks.adapter_compat import adapters_compatible_hook
+    from ..hooks.registry import register_hook
+
+    register_hook(adapters_compatible_hook(name), replace=replace)
+
+
 def register_adapter(adapter_class: Type[PayloadAdapter], *, replace: bool = False) -> Type[PayloadAdapter]:
     """Register an adapter class and its aliases with collision checks."""
 
@@ -51,6 +67,7 @@ def register_adapter(adapter_class: Type[PayloadAdapter], *, replace: bool = Fal
         if alias in ADAPTER_PLUGINS and alias != name and not replace:
             raise ValueError(f"Adapter alias conflicts with registered name: {alias}")
         ADAPTER_ALIASES[alias] = name
+    _register_adapter_hook(name, replace=replace)
     lib_logger.debug("Registered adapter: %s", name)
     return adapter_class
 
