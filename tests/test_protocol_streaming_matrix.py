@@ -176,13 +176,17 @@ def test_responses_converter_harvests_encrypted_content_from_done_events() -> No
     assert "E9" in joined, "encrypted_content from the done snapshot must land in the terminal object"
 
 
-def test_gemini_rejects_incomplete_foreign_tool_arguments_at_terminal() -> None:
+def test_gemini_degrades_incomplete_foreign_tool_arguments_at_terminal() -> None:
     context = ProtocolContext(model="model-a", source_protocol="openai_chat", target_protocol="gemini", transport="sse")
     converter = ProtocolStreamConverter(get_protocol("openai_chat"), get_protocol("gemini"), context)
     converter.convert({"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "weather", "arguments": '{"city":'}}]}}]})
 
-    with pytest.raises(ValueError, match="incomplete streamed tool-call"):
-        converter.convert("[DONE]")
+    # G13: the formatter never raises in-band — an incomplete fragment
+    # degrades to the accumulated prefix, disclosed via a stream warning.
+    output = "".join(converter.convert("[DONE]"))
+    assert "functionCall" in output
+    assert "weather" in output
+    assert any(w.code == "tool_arguments_incomplete" for w in converter.state.warnings)
 
 
 def test_gemini_emits_fragmented_tool_call_exactly_once() -> None:

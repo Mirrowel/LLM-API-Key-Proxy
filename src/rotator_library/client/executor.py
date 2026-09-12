@@ -2100,6 +2100,18 @@ class RequestExecutor:
                                         transport="sse",
                                     )
                                     client_protocol_context.metadata = prior_stream_metadata
+                                    # G13 rotation survival: the formatter state
+                                    # carried in metadata must NOT carry the
+                                    # previous attempt's terminal latch,
+                                    # finishes, or buffers — only lifecycle
+                                    # continuity (started/identity/usage/
+                                    # warnings) survives; everything else
+                                    # resets or attempt 2 would emit zero
+                                    # frames after attempt 1's error terminal.
+                                    if "_stream_format_states" in prior_stream_metadata:
+                                        for _fmt_state in prior_stream_metadata["_stream_format_states"].values():
+                                            if hasattr(_fmt_state, "reset_for_attempt"):
+                                                _fmt_state.reset_for_attempt()
                                     stream_repair_state = StreamRepairState()
                                     client_include_usage = _client_requested_include_usage(context.kwargs)
                                     pipeline = NeutralStreamPipeline(

@@ -656,13 +656,28 @@ class NeutralStreamPipeline:
                         and not error_in_frame
                         and not self.repair_state.edited_by_hook
                     ):
+                        # G13 shadow: keep the formatter warm by feeding the
+                        # same events through state accumulation with frame
+                        # production suppressed — a mid-stream disengage then
+                        # continues from live state instead of a virgin one.
+                        state.observe_only = True
+                        try:
+                            for item_event in frame_events:
+                                format_canonical_stream_event(
+                                    item_event,
+                                    self.client_protocol_name,
+                                    self.protocol_context,
+                                    state=state,
+                                )
+                        finally:
+                            state.observe_only = False
                         self._trace_frame(frame_raw)
                         _note_yield_suspension()
                         yield frame_raw + "\n\n"
                         if terminal_seen:
                             # The provider's own terminal bytes were relayed —
-                            # the tail must not synthesize a second one.
-                            state.terminal = True
+                            # the tail must not synthesize a second one. The
+                            # shadow pass already latched state.terminal.
                             stream_completed = True
                             break
                         continue

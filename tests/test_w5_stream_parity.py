@@ -233,7 +233,9 @@ async def test_native_stream_terminal_frames_usage_and_anchors_per_client_protoc
         assert "message_stop" in output
     elif client_protocol == "responses":
         assert "response.completed" in output
-        assert "data: [DONE]" in output
+        # G13: official Responses SSE grammar ends on the terminal
+        # event — the chat-grammar [DONE] sentinel must NOT appear.
+        assert "data: [DONE]" not in output
     else:
         assert '"candidates"' in output
     assert "hello world" in output.replace("hello ", "hello") or "hello" in output
