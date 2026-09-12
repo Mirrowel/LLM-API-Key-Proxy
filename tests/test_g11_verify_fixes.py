@@ -194,6 +194,63 @@ async def test_provider_owned_row_replays_when_target_switched() -> None:
     assert parent is not None and parent.id == "resp_prov_2"
 
 
+@pytest.mark.asyncio
+async def test_provider_owned_row_replays_when_same_family_other_provider() -> None:
+    """A provider-owned row is only safe to ride with the SAME provider.
+
+    Both targets speak the Responses family, but the row was minted on
+    provider A and the request now targets provider B (fallback): B can never
+    resolve A's hidden chain, so local replay is the honest outcome.
+    """
+
+    import time as _time
+
+    from rotator_library.providers import PROVIDER_PLUGINS
+    from rotator_library.responses.service import ResponsesService
+    from rotator_library.responses.store import InMemoryResponsesStore
+    from rotator_library.responses.types import StoredResponse
+
+    class _ResponsesPlugin:
+        protocol_name = "responses"
+        transport_profiles = None
+        default_profile = None
+
+        def get_protocol_name(self, model: str = "", profile=None) -> str:
+            return "responses"
+
+    PROVIDER_PLUGINS["respa"] = _ResponsesPlugin
+    PROVIDER_PLUGINS["respb"] = _ResponsesPlugin
+    try:
+        service = ResponsesService.__new__(ResponsesService)
+        service.store = InMemoryResponsesStore()
+
+        row = StoredResponse(
+            id="resp_a",
+            created_at=_time.time(),
+            model="respa/gpt-x",
+            status="completed",
+            request={"model": "respa/gpt-x"},
+            response={"id": "resp_a"},
+            input_items=[],
+            output_items=[],
+            metadata={"provider": "respa", "provider_owned": True},
+            scope_key="public",
+        )
+        await service.store.save(row)
+
+        parent = await service._load_previous_response(
+            "resp_a",
+            None,
+            expected_scope_key="public",
+            provider_passthrough=True,
+            raw_request_dict={"model": "respb/gpt-x", "previous_response_id": "resp_a"},
+        )
+        assert parent is not None and parent.id == "resp_a"
+    finally:
+        PROVIDER_PLUGINS.pop("respa", None)
+        PROVIDER_PLUGINS.pop("respb", None)
+
+
 # ------------------------------------------------- never-fail row build
 
 @pytest.mark.asyncio

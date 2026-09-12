@@ -958,7 +958,7 @@ async def responses_websocket(websocket: WebSocket):
     then closed with application close code 1008 and a reason.
     """
 
-    from rotator_library.responses.websocket import DEFAULT_MAX_CONNECTION_SECONDS, ResponsesWebSocketSession
+    from rotator_library.responses.websocket import DEFAULT_MAX_CONNECTION_SECONDS, DEFAULT_MAX_INBOUND_FRAME_BYTES, ResponsesWebSocketSession
 
     if not _websocket_authorized(websocket):
         await websocket.accept()
@@ -979,6 +979,12 @@ async def responses_websocket(websocket: WebSocket):
             max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
     except (TypeError, ValueError):
         max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
+    try:
+        max_inbound_frame_bytes = int(os.getenv("RESPONSES_WEBSOCKET_MAX_FRAME_BYTES") or DEFAULT_MAX_INBOUND_FRAME_BYTES)
+        if max_inbound_frame_bytes <= 0:
+            max_inbound_frame_bytes = DEFAULT_MAX_INBOUND_FRAME_BYTES
+    except (TypeError, ValueError):
+        max_inbound_frame_bytes = DEFAULT_MAX_INBOUND_FRAME_BYTES
     transaction_logger_factory = None
     if ENABLE_REQUEST_LOGGING:
         def transaction_logger_factory(model: str):  # noqa: F811
@@ -987,6 +993,7 @@ async def responses_websocket(websocket: WebSocket):
         service=service,
         client=rotating_client,
         max_connection_seconds=max_seconds,
+        max_inbound_frame_bytes=max_inbound_frame_bytes,
         transaction_logger_factory=transaction_logger_factory,
     )
     await websocket.accept()

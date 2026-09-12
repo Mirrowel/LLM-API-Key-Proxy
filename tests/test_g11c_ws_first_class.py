@@ -16,6 +16,7 @@ from rotator_library.responses import InMemoryResponsesStore, ResponsesService
 from rotator_library.responses.streaming import ResponsesStreamEvent
 from rotator_library.responses.types import StoredResponse
 from rotator_library.responses.websocket import (
+    DEFAULT_MAX_INBOUND_FRAME_BYTES,
     MAX_CONCURRENT_RESPONSES,
     MAX_FRAME_BYTES,
     MAX_NAMED_LANES,
@@ -234,6 +235,10 @@ async def test_thirty_second_named_lane_is_rejected() -> None:
     assert len(errors) == 1
     assert errors[0]["error"]["code"] == "websocket_stream_limit_reached"
     assert errors[0]["error"]["type"] == "invalid_request_error"
+    # The rejected stream_id is attributed at frame level AND named in the
+    # inner error, per the official example shape.
+    assert errors[0]["stream_id"] == f"lane-{MAX_NAMED_LANES}"
+    assert errors[0]["error"]["param"] == "stream_id"
 
 
 async def test_default_lane_omits_stream_id() -> None:
@@ -305,8 +310,9 @@ async def test_steer_accepted_and_input_prepended_to_next_create() -> None:
         await harness.ws.push(json.dumps({"type": "response.steer", "previous_response_id": "resp_script_1", "input": "steer text"}))
         await harness.wait(lambda sent: len(_events_for(sent, "response.steer.accepted")) == 1)
         accepted = _events_for(harness.ws.sent, "response.steer.accepted")[0]
-        # Grammar: the steer frame must NOT carry stream_id.
-        assert "stream_id" not in accepted
+        # The CLIENT steer frame carries no stream_id, but the SERVER answer
+        # is stamped with the TARGET lane so a multiplexed client can route it.
+        assert accepted["stream_id"] == "lane-a"
         assert accepted["steer"]["previous_response_id"] == "resp_script_1"
 
         service.gates[0].set()
@@ -360,6 +366,138 @@ async def test_invalid_steer_grammar_is_invalid_input() -> None:
     assert frames[0]["error"]["code"] == "invalid_input"
 
 
+async def test_steer_targets_are_partitioned_by_previous_response_id() -> None:
+    """A pending steer is consumed only by a create chaining from ITS target.
+
+    resp_script_1's steer must not ride a create that chains from resp_B;
+    it stays queued until a create chains from resp_script_1.
+    """
+
+    service = ScriptedService(gate_count=3)
+    session = ResponsesWebSocketSession(service=service, client=object())
+    session.local_cache["resp_B"] = StoredResponse(id="resp_B", model="m", status="completed", response={})
+    harness = Harness(session, [_create(stream_id="lane-a", input="base")])
+    try:
+        await harness.wait(lambda sent: len(_events_for(sent, "response.created")) == 1)
+        await harness.ws.push(json.dumps({"type": "response.steer", "previous_response_id": "resp_script_1", "input": "steer text"}))
+        await harness.wait(lambda sent: len(_events_for(sent, "response.steer.accepted")) == 1)
+        service.gates[0].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 1)
+
+        # A create chaining from resp_B must NOT drain resp_script_1's steer.
+        await harness.ws.push(
+            json.dumps({"type": "response.create", "model": "m", "stream_id": "lane-a", "previous_response_id": "resp_B", "input": "b"})
+        )
+        await harness.wait(lambda sent: len(service.requests) == 2)
+        assert service.requests[1]["input"] == "b"
+        assert [entry["target"] for entry in session.lanes["lane-a"].pending_steers] == ["resp_script_1"]
+        service.gates[1].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 2)
+
+        # Chaining from resp_script_1 now consumes the queued steer.
+        await harness.ws.push(
+            json.dumps({"type": "response.create", "model": "m", "stream_id": "lane-a", "previous_response_id": "resp_script_1", "input": "c"})
+        )
+        await harness.wait(lambda sent: len(service.requests) == 3)
+        service.gates[2].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 3)
+    finally:
+        await harness.aclose()
+
+    assert service.requests[2]["input"] == ["steer text", "c"]
+    assert session.lanes["lane-a"].pending_steers == []
+
+
+async def test_failed_turn_returns_consumed_steers_for_retry() -> None:
+    """A failed terminal must not swallow an accepted steer: the retry create
+    re-prepends it."""
+
+    service = ScriptedService(gate_count=2, fail_ids=("resp_script_1",))
+    session = ResponsesWebSocketSession(service=service, client=object())
+    harness = Harness(session, [_create(stream_id="lane-a", input="base")])
+    try:
+        await harness.wait(lambda sent: len(_events_for(sent, "response.created")) == 1)
+        await harness.ws.push(json.dumps({"type": "response.steer", "previous_response_id": "resp_script_1", "input": "steer text"}))
+        await harness.wait(lambda sent: len(_events_for(sent, "response.steer.accepted")) == 1)
+        service.gates[0].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.failed")) == 1)
+
+        # The failed turn restored the consumed steer to the lane queue.
+        assert [entry["input"] for entry in session.lanes["lane-a"].pending_steers] == ["steer text"]
+
+        await harness.ws.push(
+            json.dumps({"type": "response.create", "model": "m", "stream_id": "lane-a", "previous_response_id": "resp_script_1", "input": "retry"})
+        )
+        await harness.wait(lambda sent: len(service.requests) == 2)
+        service.gates[1].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 1)
+    finally:
+        await harness.aclose()
+
+    assert service.requests[1]["input"] == ["steer text", "retry"]
+
+
+async def test_steer_frames_omit_stream_id_on_default_lane() -> None:
+    service = ScriptedService(gate_count=1)
+    session = ResponsesWebSocketSession(service=service, client=object())
+    harness = Harness(session, [_create(input="base")])
+    try:
+        await harness.wait(lambda sent: len(_events_for(sent, "response.created")) == 1)
+        await harness.ws.push(json.dumps({"type": "response.steer", "previous_response_id": "resp_script_1", "input": "s"}))
+        await harness.wait(lambda sent: len(_events_for(sent, "response.steer.accepted")) == 1)
+    finally:
+        await harness.aclose()
+
+    accepted = _events_for(harness.ws.sent, "response.steer.accepted")[0]
+    assert "stream_id" not in accepted
+
+
+async def test_steer_to_failed_response_is_not_active() -> None:
+    service = ScriptedService(gate_count=1, fail_ids=("resp_script_1",))
+    session = ResponsesWebSocketSession(service=service, client=object())
+    harness = Harness(session, [_create(stream_id="lane-a")])
+    try:
+        await harness.wait(lambda sent: len(_events_for(sent, "response.created")) == 1)
+        service.gates[0].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.failed")) == 1)
+        await harness.ws.push(json.dumps({"type": "response.steer", "previous_response_id": "resp_script_1", "input": "late"}))
+        await harness.wait(lambda sent: len(_events_for(sent, "response.steer.failed")) == 1)
+    finally:
+        await harness.aclose()
+
+    failed = _events_for(harness.ws.sent, "response.steer.failed")[0]
+    assert failed["error"]["code"] == "response_not_active"
+    assert failed["stream_id"] == "lane-a"
+    assert not _events_for(harness.ws.sent, "response.steer.accepted")
+
+
+async def test_lane_sequence_is_monotonic_across_synthesized_and_provider_frames() -> None:
+    """Per-lane numbering: a synthesized steer frame between two provider
+    events must not reuse the provider's sequence domain."""
+
+    service = ScriptedService(gate_count=1)
+    session = ResponsesWebSocketSession(service=service, client=object())
+    harness = Harness(session, [_create(input="base")])
+    try:
+        await harness.wait(lambda sent: len(_events_for(sent, "response.created")) == 1)
+        await harness.ws.push(json.dumps({"type": "response.steer", "previous_response_id": "resp_script_1", "input": "s"}))
+        await harness.wait(lambda sent: len(_events_for(sent, "response.steer.accepted")) == 1)
+        service.gates[0].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 1)
+    finally:
+        await harness.aclose()
+
+    ordered = [
+        frame
+        for frame in harness.ws.sent
+        if frame.get("type") in {"response.created", "response.steer.accepted", "response.completed"}
+    ]
+    assert [frame["type"] for frame in ordered] == ["response.created", "response.steer.accepted", "response.completed"]
+    sequences = [frame["sequence_number"] for frame in ordered]
+    assert sequences == sorted(sequences)
+    assert len(set(sequences)) == 3
+
+
 # ---------------------------------------------------------------------------
 # Warmup
 # ---------------------------------------------------------------------------
@@ -374,6 +512,7 @@ async def test_warmup_preserves_tools_instructions_and_derives_scope_from_frame(
         "model": "m",
         "generate": False,
         "classifier": "scope-a",
+        "api_keys": ["secret"],
         "instructions": "Be terse.",
         "tools": tools,
         "input": "warm context",
@@ -384,6 +523,9 @@ async def test_warmup_preserves_tools_instructions_and_derives_scope_from_frame(
     assert cached.metadata.get("warmup") is True
     assert cached.request["tools"] == tools
     assert cached.request["instructions"] == "Be terse."
+    # Routing credentials never land in the cached request row.
+    assert "api_keys" not in cached.request
+    assert "classifier" not in cached.request
     # Scope is derived FROM THE FRAME, not pinned to public.
     expected_scope = service.request_scope_key({key: value for key, value in warmup_body.items() if key != "type"})
     assert cached.scope_key == expected_scope
@@ -407,6 +549,50 @@ async def test_warmup_preserves_tools_instructions_and_derives_scope_from_frame(
     assert client.payloads[0]["tools"] == tools
     assert client.payloads[0]["instructions"] == "Be terse."
     assert "warm context" in json.dumps(client.payloads[0].get("input"))
+
+
+async def test_warmup_seed_is_scope_gated() -> None:
+    """Warmup request state must not cross scopes: a warmed row in scope A
+    seeds only turns whose routing scope resolves to A."""
+
+    class ScopedService(ScriptedService):
+        def request_scope_key(self, body: dict[str, Any]) -> str:
+            return f"classifier:{body.get('classifier', 'public')}"
+
+    tools = [{"type": "function", "name": "lookup", "parameters": {"type": "object"}}]
+    service = ScopedService(gate_count=2)
+    session = ResponsesWebSocketSession(service=service, client=object())
+    session.local_cache["resp_warm"] = StoredResponse(
+        id="resp_warm",
+        model="m",
+        status="completed",
+        response={},
+        request={"tools": tools, "instructions": "Be terse."},
+        metadata={"warmup": True},
+        scope_key="classifier:a",
+    )
+    harness = Harness(session, [])
+    try:
+        await harness.ws.push(
+            json.dumps({"type": "response.create", "model": "m", "stream_id": "lane-b", "classifier": "b", "previous_response_id": "resp_warm", "input": "q1"})
+        )
+        await harness.wait(lambda sent: len(service.requests) == 1)
+        # Cross-scope: the warmed row must NOT seed the request.
+        assert "tools" not in service.requests[0]
+        assert "instructions" not in service.requests[0]
+        service.gates[0].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 1)
+
+        await harness.ws.push(
+            json.dumps({"type": "response.create", "model": "m", "stream_id": "lane-a", "classifier": "a", "previous_response_id": "resp_warm", "input": "q2"})
+        )
+        await harness.wait(lambda sent: len(service.requests) == 2)
+        assert service.requests[1]["tools"] == tools
+        assert service.requests[1]["instructions"] == "Be terse."
+        service.gates[1].set()
+        await harness.wait(lambda sent: len(_events_for(sent, "response.completed")) == 2)
+    finally:
+        await harness.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -436,9 +622,30 @@ def test_non_finite_numbers_are_rejected() -> None:
     assert infinity["error"]["code"] == "invalid_request_error"
 
 
-async def test_frame_over_four_mib_is_rejected_and_closes_1008() -> None:
+async def test_default_inbound_cap_admits_official_multimodal_sizes() -> None:
+    """The default inbound cap is 32 MiB (not the 4 MiB outbound cap): the
+    official input schema admits multimodal file_data payloads far larger
+    than 4 MiB, and HTTP has no comparable frame cap."""
+
+    assert DEFAULT_MAX_INBOUND_FRAME_BYTES == 32 * 1024 * 1024
+    assert DEFAULT_MAX_INBOUND_FRAME_BYTES > MAX_FRAME_BYTES
+    raw = '{"type":"response.create","model":"m","input":"' + ("x" * (MAX_FRAME_BYTES + 1024)) + '"}'
+    service = ScriptedService(gate_count=0)
+    session = ResponsesWebSocketSession(service=service, client=object())
+    harness = Harness(session, [raw])
+    try:
+        await harness.wait(lambda sent: len(_events_for(sent, "response.created")) == 1, timeout=10.0)
+    finally:
+        await harness.aclose()
+
+    assert not _events_for(harness.ws.sent, "error")
+
+
+async def test_inbound_frame_over_configured_cap_is_rejected_and_closes_1008() -> None:
+    # Pin the inbound-cap MECHANISM with a small configured cap; the default
+    # is 32 MiB (see the previous test). Outbound keeps its own 4 MiB cap.
     raw = '{"type":"response.create","model":"m","input":"' + ("x" * MAX_FRAME_BYTES) + '"}'
-    session = ResponsesWebSocketSession(service=ScriptedService(), client=object())
+    session = ResponsesWebSocketSession(service=ScriptedService(), client=object(), max_inbound_frame_bytes=MAX_FRAME_BYTES)
     harness = Harness(session, [raw])
     try:
         await harness.wait(lambda sent: bool(_events_for(sent, "error")))

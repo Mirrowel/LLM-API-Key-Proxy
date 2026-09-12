@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -80,6 +81,18 @@ def test_malformed_unknown_and_cancel_frames_rejected_with_spec_shapes() -> None
     assert long_lane["error"]["param"] == "stream_id"
     legal_lane = parse_client_frame({"type": "response.create", "stream_id": "a.-_9"})
     assert legal_lane.stream_id == "a.-_9"
+
+
+def test_steer_input_must_be_non_empty_string_or_list() -> None:
+    for bad in ("", [], 5, {"a": 1}, None, True):
+        frame = parse_client_frame({"type": "response.steer", "previous_response_id": "resp_1", "input": bad})
+        assert frame.error is not None, bad
+        assert frame.error[0] == "invalid_input"
+        assert frame.error[2] == "input"
+    ok_string = parse_client_frame({"type": "response.steer", "previous_response_id": "resp_1", "input": "go"})
+    assert ok_string.input == "go" and ok_string.error is None
+    ok_list = parse_client_frame({"type": "response.steer", "previous_response_id": "resp_1", "input": ["go"]})
+    assert ok_list.input == ["go"] and ok_list.error is None
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +212,9 @@ async def test_warmup_returns_chainable_id_and_caches_state_session_locally() ->
     cached = session.local_cache.get(response_id)
     assert cached is not None
     assert cached.request["instructions"] == "You are a coder."
-    # Warmup sequences never collide with 0 (per-connection counter).
-    # Shared sequence domain: any non-negative monotonic value is legal
-    # (the session counter is unified with the turn-event domain).
-    assert frame["sequence_number"] >= 0
+    # The lane's own monotonic counter starts at 1: provider/synthesized
+    # frames on the same lane never share a sequence number.
+    assert frame["sequence_number"] == 1
 
 
 @pytest.mark.asyncio
@@ -558,29 +570,89 @@ class FakeWebSocket:
 
 @pytest.mark.asyncio
 async def test_connection_limit_error_frame_and_explicit_close() -> None:
+    """The 60-minute lifetime is enforced between turns, at dequeue time.
+
+    A create that dequeues after the deadline gets the documented limit
+    error frame and the connection closes; an in-flight turn is never
+    killed mid-stream by the reader.
+    """
+
     now = {"t": 0.0}
 
     def clock():
         return now["t"]
 
-    calls = {"n": 0}
+    class LimitSocket:
+        def __init__(self):
+            self.sent: list[dict] = []
+            self.closed_with = None
+            self._received: asyncio.Queue[str] = asyncio.Queue()
+            self._received.put_nowait(json.dumps({"type": "response.create", "model": "m"}))
 
-    def on_receive():
-        calls["n"] += 1
-        if calls["n"] >= 1:
+        async def receive_text(self):
             now["t"] = 3601.0
+            return await self._received.get()
 
-    ws = FakeWebSocket(
-        incoming=[json.dumps({"type": "response.create", "model": "m", "generate": False})],
-        on_receive=on_receive,
-    )
+        async def send_json(self, payload):
+            self.sent.append(payload)
+
+        async def close(self, code=1000):
+            self.closed_with = code
+
+    ws = LimitSocket()
     session = ResponsesWebSocketSession(service=FakeService(), client=object(), max_connection_seconds=3600.0, clock=clock)
-    await session.run(ws)
+    await asyncio.wait_for(session.run(ws), timeout=5)
     limit_frames = [f for f in ws.sent if f.get("error", {}).get("code") == "websocket_connection_limit_reached"]
     assert limit_frames, ws.sent
     assert limit_frames[0]["error"]["type"] == "invalid_request_error"
     assert "(60 minutes)" in limit_frames[0]["error"]["message"]
     assert ws.closed_with == 1000
+
+
+@pytest.mark.asyncio
+async def test_in_flight_turn_that_dequeued_before_limit_runs_to_terminal() -> None:
+    """A turn that dequeued before the deadline completes; only the create
+    that dequeues after the deadline gets the limit frame."""
+
+    now = {"t": 0.0}
+
+    def clock():
+        return now["t"]
+
+    class TwoCreateSocket:
+        def __init__(self, frames: list[str]):
+            self.sent: list[dict] = []
+            self.closed_with = None
+            self._received: asyncio.Queue[str] = asyncio.Queue()
+            for frame in frames:
+                self._received.put_nowait(frame)
+
+        async def receive_text(self):
+            return await self._received.get()
+
+        async def send_json(self, payload):
+            self.sent.append(payload)
+            # The first terminal is emitted: subsequent dequeues are late.
+            now["t"] = 3601.0
+
+        async def close(self, code=1000):
+            self.closed_with = code
+
+    service = FakeService(events=[_event("response.completed", {"response": {"id": "resp_ok", "status": "completed"}})])
+    session = ResponsesWebSocketSession(service=service, client=object(), max_connection_seconds=3600.0, clock=clock)
+    ws = TwoCreateSocket(
+        [
+            json.dumps({"type": "response.create", "model": "m"}),
+            json.dumps({"type": "response.create", "model": "m"}),
+        ]
+    )
+    await asyncio.wait_for(session.run(ws), timeout=5)
+    types = [frame.get("type") for frame in ws.sent]
+    assert "response.completed" in types
+    assert any(frame.get("error", {}).get("code") == "websocket_connection_limit_reached" for frame in ws.sent)
+    assert types.index("response.completed") < next(
+        i for i, frame in enumerate(ws.sent) if frame.get("error", {}).get("code") == "websocket_connection_limit_reached"
+    )
 
 
 # ---------------------------------------------------------------------------

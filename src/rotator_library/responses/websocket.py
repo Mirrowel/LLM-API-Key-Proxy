@@ -40,11 +40,16 @@ pinned 2026-09-12 — the multiplexed revision):
   by :class:`ResponsesWebSocketFormatter`; terminal
   ``response.completed`` / ``response.failed`` / ``response.incomplete``
   close the turn — there is no ``[DONE]`` sentinel on this transport.
+  ``sequence_number`` is a per-lane monotonic authority: the session overlays
+  the lane's own counter on every frame it emits (provider events,
+  synthesized steer/warmup frames, terminal failures), replacing whatever
+  number the payload carried, so one lane's stream is strictly increasing.
 - Errors arrive as ``{"type":"error","status":...,"error":{...}}`` frames,
   including ``invalid_stream_id``, ``websocket_stream_limit_reached``,
   ``websocket_connection_limit_reached``, and ``previous_response_not_found``.
-  Frames larger than 4 MiB are rejected with ``invalid_request_error`` and
-  close code 1008. Non-finite numeric values in a frame are rejected as
+  Outbound frames larger than 4 MiB are rejected with ``invalid_request_error``
+  and close code 1008; inbound frames are capped by the configurable limit in
+  the divergences below. Non-finite numeric values in a frame are rejected as
   ``invalid_request_error`` (JSON ``NaN`` / ``Infinity`` are not valid).
 
 Concurrency model: ONE reader loop parses frames and routes each
@@ -67,6 +72,28 @@ Deliberate divergences from the pinned revision (never silent):
   honestly, but the client still owns issuing that next create. Consequently
   a steered in-flight turn is never interrupted and therefore never ends as
   ``response.incomplete`` with ``incomplete_details.reason: "steered"``.
+  ``response.steer.pending`` is not implemented — an accepted steer is only
+  observed through the create that consumes it.
+- **Inbound frame cap raised for official payloads.** The guide's 4 MiB
+  client-frame cap cannot carry the official input schema (``file_data``
+  payloads reach tens of MB), so this transport defaults inbound frames to
+  32 MiB (``RESPONSES_WEBSOCKET_MAX_FRAME_BYTES``). Outbound frames keep the
+  documented 4 MiB cap. The HTTP Responses transport has no comparable
+  frame-size cap.
+- **Per-lane backlog is unbounded.** The documented 16 in-flight and 32-lane
+  caps hold, but creates queued behind them accumulate in their lane FIFO
+  without a second bound; only the lane worker drains that queue.
+- **Warmup validation runs inline in the reader.** A ``generate: false``
+  frame validates (model, lifecycle, continuation resolution) on the reader
+  loop rather than in a lane worker; validation is I/O-light by construction,
+  which keeps the lane-state mutation race-free.
+- **Steer index may outlive the continuation cache.** The steer response
+  index holds 256 ids while the connection-local continuation cache holds 32;
+  under churn an accepted steer's target can be evicted from the cache before
+  the next create. A late ``response_not_found`` is the honest outcome.
+- **Oldest-insertion cache eviction.** The connection-local cache evicts the
+  oldest inserted entry (not an access-LRU); re-inserting a key refreshes its
+  insertion position.
 - **No eviction on failure.** The official same-lane-failure rule drops the
   referenced parent's memory. Operator ruling overrides it here: a failed
   turn NEVER deletes conversation memory (cross-lane parents obviously also
@@ -96,6 +123,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, MutableMapping, Optional
 
+from .service import _safe_stored_request
 from .streaming import ResponsesStreamEvent
 from .types import StoredResponse, generate_response_id
 
@@ -113,7 +141,13 @@ _LOCAL_CACHE_MAX_ENTRIES = 32
 MAX_NAMED_LANES = 32
 MAX_CONCURRENT_RESPONSES = 16
 MAX_PENDING_STEERS = 8
+
+# Outbound frames keep the documented 4 MiB cap. Inbound frames default to
+# 32 MiB because the official input schema admits multimodal `file_data`
+# payloads far larger than 4 MiB (the HTTP transport has no such cap);
+# deployments tune this via RESPONSES_WEBSOCKET_MAX_FRAME_BYTES.
 MAX_FRAME_BYTES = 4 * 1024 * 1024
+DEFAULT_MAX_INBOUND_FRAME_BYTES = 32 * 1024 * 1024
 
 # Steering lookups are bounded alongside the local cache so a long-lived
 # connection cannot accumulate response ids without limit.
@@ -218,8 +252,12 @@ class LaneState:
     ``latest_response_id`` is the fork/parent pointer: it tracks the newest
     response observed on the lane (active or completed) so steering and
     continuation can resolve the lane's turn without re-walking the cache.
-    ``pending_steers`` holds accepted steer inputs (``{"target", "input"}``)
-    that the next ``response.create`` on the lane prepends.
+    ``pending_steers`` holds accepted steer entries (``{"target", "input"}``)
+    that a future ``response.create`` chaining from their target prepends.
+    ``sequence`` is the lane's own monotonic frame counter: every frame
+    emitted on the lane is stamped with the next value, so one lane's
+    observable stream is strictly increasing regardless of provider-supplied
+    numbers.
     """
 
     stream_id: Optional[str] = None
@@ -227,6 +265,7 @@ class LaneState:
     queue: "asyncio.Queue[ClientFrame]" = field(default_factory=asyncio.Queue)
     in_flight: int = 0
     pending_steers: list[dict[str, Any]] = field(default_factory=list)
+    sequence: int = 0
     worker: Optional[asyncio.Task] = None
 
 
@@ -257,7 +296,24 @@ def _parse_steer_frame(payload: dict[str, Any]) -> SteerFrame:
             steer_id=steer_id,
             error=("invalid_input", "response.steer requires input", "input"),
         )
-    return SteerFrame(previous_response_id=previous_id, input=payload.get("input"), steer_id=steer_id)
+    steer_input = payload.get("input")
+    if isinstance(steer_input, str):
+        valid = bool(steer_input)
+    elif isinstance(steer_input, list):
+        valid = bool(steer_input)
+    else:
+        valid = False
+    if not valid:
+        return SteerFrame(
+            previous_response_id=previous_id,
+            steer_id=steer_id,
+            error=(
+                "invalid_input",
+                "response.steer input must be a non-empty string or a non-empty list",
+                "input",
+            ),
+        )
+    return SteerFrame(previous_response_id=previous_id, input=steer_input, steer_id=steer_id)
 
 
 def parse_client_frame(raw: str | bytes | dict[str, Any]) -> ClientFrame | SteerFrame | dict[str, Any]:
@@ -383,12 +439,13 @@ class ResponsesWebSocketFormatter:
 
 
 class _LocalResponsesCache(OrderedDict):
-    """Connection-local continuation cache (bounded, most-recent eviction).
+    """Connection-local continuation cache (bounded, oldest-insertion eviction).
 
     In-memory only — the guide's ZDR-compatible fast continuation path.
     The ResponsesService consults it before the global store for
     previous_response_id resolution and lineage walks, and stores each
-    completed turn in it (even when ``store=false``).
+    completed turn in it (even when ``store=false``). Re-inserting a key
+    refreshes its insertion position.
     """
 
     def __setitem__(self, key, value):
@@ -498,13 +555,16 @@ class ResponsesWebSocketSession:
         service: Any,
         client: Any,
         max_connection_seconds: float = DEFAULT_MAX_CONNECTION_SECONDS,
+        max_inbound_frame_bytes: int = DEFAULT_MAX_INBOUND_FRAME_BYTES,
         clock: Callable[[], float] = time.monotonic,
         transaction_logger_factory: Optional[Callable[[str], Any]] = None,
     ) -> None:
         self._service = service
         self._client = client
         self._max_connection_seconds = max_connection_seconds
+        self._max_inbound_frame_bytes = max_inbound_frame_bytes
         self._clock = clock
+        self._started = clock()
         self._transaction_logger_factory = transaction_logger_factory
         self._lanes: dict[str, LaneState] = {}
         self._response_lane: "OrderedDict[str, LaneState]" = OrderedDict()
@@ -522,19 +582,46 @@ class ResponsesWebSocketSession:
         return self._lanes
 
     def _next_sequence(self) -> int:
-        # Shared module domain (the same counter native-turn events use):
-        # per-connection counters would collide with turn event sequences —
-        # every frame on the connection must be monotonic together.
+        """Global fallback sequence for frames with no lane.
+
+        Lane-attached frames use the lane's own counter (``_stamp_lane``):
+        every provider-supplied number is replaced so each lane's observable
+        stream stays strictly monotonic on its own.
+        """
         from .streaming import next_sequence_value
 
         return next_sequence_value()
 
-    def _format_event(self, event_name: str, payload: dict[str, Any], stream_id: Optional[str]) -> dict[str, Any]:
-        """Build one server event frame through the WebSocket formatter."""
+    @staticmethod
+    def _stamp_lane(frame: dict[str, Any], lane: LaneState) -> dict[str, Any]:
+        """Overlay the lane's next monotonic sequence number onto ``frame``."""
+
+        lane.sequence += 1
+        frame["sequence_number"] = lane.sequence
+        return frame
+
+    def _format_event(
+        self,
+        event_name: str,
+        payload: dict[str, Any],
+        stream_id: Optional[str],
+        *,
+        lane: Optional[LaneState] = None,
+    ) -> dict[str, Any]:
+        """Build one server event frame through the WebSocket formatter.
+
+        With a ``lane`` the frame is stamped using that lane's monotonic
+        counter (replacing whatever sequence number the payload carried);
+        without one (grammar-level failures before lane resolution) the
+        process-global counter is used.
+        """
 
         frame = self._formatter.event_frame(ResponsesStreamEvent(event_name, payload), stream_id=stream_id)
         if frame is None:  # pragma: no cover - callers never pass heartbeat/done
-            return dict(payload)
+            frame = dict(payload)
+        if lane is not None:
+            return self._stamp_lane(frame, lane)
+        frame["sequence_number"] = self._next_sequence()
         return frame
 
     def _scope_key_for(self, body: dict[str, Any]) -> str:
@@ -580,6 +667,8 @@ class ResponsesWebSocketSession:
             return None, error_frame(
                 "websocket_stream_limit_reached",
                 f"Responses websocket stream limit reached ({MAX_NAMED_LANES} named streams). Reuse an existing stream_id or create a new connection to continue.",
+                param="stream_id",
+                stream_id=stream_id,
                 err_type="invalid_request_error",
             )
         return self._lane(stream_id), None
@@ -667,7 +756,7 @@ class ResponsesWebSocketSession:
                 "model": model,
                 "output": [],
             },
-            request=dict(body),
+            request=_safe_stored_request(body),
             input_items=_warmup_input_items(body.get("input")),
             metadata={"warmup": True},
             scope_key=self._scope_key_for(body),
@@ -679,45 +768,61 @@ class ResponsesWebSocketSession:
             "response.completed",
             {
                 "type": "response.completed",
-                "sequence_number": self._next_sequence(),
                 "response": dict(stored.response),
             },
             frame.stream_id,
+            lane=lane,
         )
 
     # -- turns ---------------------------------------------------------------
 
-    def _prepare_body(self, frame: ClientFrame, lane: LaneState) -> dict[str, Any]:
-        """Merge warmup request state and queued steer input into a turn body."""
+    def _prepare_body(self, frame: ClientFrame, lane: LaneState) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Merge warmup state and the target's queued steers into a turn body.
+
+        Returns the body plus the steer entries consumed into it; the caller
+        restores those entries on failure so a retry create can re-prepend
+        them. Warmup seeding is scope-gated: a warmed row only seeds a turn
+        whose routing scope matches. Steers are partitioned by target, so an
+        accepted steer for a different response stays queued.
+        """
 
         body = dict(frame.payload)
         previous_id = body.get("previous_response_id")
         if isinstance(previous_id, str):
             parent = self.local_cache.get(previous_id)
-            if parent is not None and parent.metadata.get("warmup") and isinstance(parent.request, dict):
+            if (
+                parent is not None
+                and parent.metadata.get("warmup")
+                and isinstance(parent.request, dict)
+                and parent.scope_key == self._scope_key_for(body)
+            ):
                 for key in ("tools", "tool_choice", "instructions"):
                     if key not in body and key in parent.request:
                         body[key] = deepcopy(parent.request[key])
-        pending = list(lane.pending_steers)
-        if pending:
-            lane.pending_steers.clear()
-            items: list[Any] = []
-            for entry in pending:
-                items.extend(_warmup_input_items(entry.get("input")))
-            items.extend(_warmup_input_items(body.get("input")))
-            body["input"] = items
-        return body
+        consumed: list[dict[str, Any]] = []
+        if isinstance(previous_id, str) and lane.pending_steers:
+            consumed = [entry for entry in lane.pending_steers if entry.get("target") == previous_id]
+            if consumed:
+                lane.pending_steers = [entry for entry in lane.pending_steers if entry.get("target") != previous_id]
+                items: list[Any] = []
+                for entry in consumed:
+                    items.extend(_warmup_input_items(entry.get("input")))
+                items.extend(_warmup_input_items(body.get("input")))
+                body["input"] = items
+        return body, consumed
 
     async def _turn(self, frame: ClientFrame, lane: LaneState) -> AsyncGenerator[dict[str, Any], None]:
         """Run one response.create turn to its terminal event.
 
         Provider events pass through the WebSocket formatter (never a
         hand-built frame); a continuation miss is surfaced as the documented
-        top-level ``previous_response_not_found`` frame. No failure path
-        evicts the referenced parent — the no-eviction ruling.
+        top-level ``previous_response_not_found`` frame. Every frame is
+        stamped with the lane's monotonic sequence. No failure path evicts
+        the referenced parent (the no-eviction ruling), and a failed turn
+        returns any steer input it consumed so a retry create re-prepends it.
         """
 
-        body = self._prepare_body(frame, lane)
+        body, consumed_steers = self._prepare_body(frame, lane)
         transaction_logger = (
             self._transaction_logger_factory(str(body.get("model") or "unknown"))
             if self._transaction_logger_factory is not None
@@ -725,6 +830,7 @@ class ResponsesWebSocketSession:
         )
         events: Optional[AsyncGenerator[ResponsesStreamEvent, None]] = None
         terminal_seen = False
+        turn_failed = False
         turn_error_status: Optional[int] = None
         try:
             events = self._service.stream_turn_events(
@@ -750,21 +856,33 @@ class ResponsesWebSocketSession:
                     # response.failed events; the guide documents continuation
                     # misses as top-level error frames. The parent is NOT
                     # evicted (the no-eviction ruling).
-                    yield error_frame(
-                        "previous_response_not_found",
-                        str((response_obj.get("error") or {}).get("message") or "previous response not found"),
-                        status=400,
-                        param="previous_response_id",
-                        stream_id=frame.stream_id,
+                    if isinstance(response_id, str):
+                        self._response_status[response_id] = "failed"
+                    yield self._stamp_lane(
+                        error_frame(
+                            "previous_response_not_found",
+                            str((response_obj.get("error") or {}).get("message") or "previous response not found"),
+                            status=400,
+                            param="previous_response_id",
+                            stream_id=frame.stream_id,
+                        ),
+                        lane,
                     )
                     terminal_seen = True
+                    turn_failed = True
                     turn_error_status = 400
                     break
                 if event_name in _TERMINAL_EVENT_TYPES:
                     terminal_seen = True
                     if isinstance(response_id, str):
-                        self._response_status[response_id] = "completed"
+                        # Terminal status is its own vocabulary: a failed
+                        # response can no longer be steered.
+                        self._response_status[response_id] = {
+                            "response.completed": "completed",
+                            "response.failed": "failed",
+                        }.get(event_name, "incomplete")
                     if event_name == "response.failed":
+                        turn_failed = True
                         # Failure status derives from the failure payload when
                         # the provider classified it (4xx request classes),
                         # else 500 — never a blanket 500.
@@ -778,14 +896,19 @@ class ResponsesWebSocketSession:
                             turn_error_status = int(failure_status) if failure_status else 500
                         except (TypeError, ValueError):
                             turn_error_status = 500
-                    yield self._format_event(event_name, payload, frame.stream_id)
+                    yield self._format_event(event_name, payload, frame.stream_id, lane=lane)
                     break
-                yield self._format_event(event_name, payload, frame.stream_id)
+                yield self._format_event(event_name, payload, frame.stream_id, lane=lane)
         except Exception as exc:
+            turn_failed = True
             frame_out = _service_error_frame(exc, frame.stream_id)
             turn_error_status = int(frame_out.get("status") or 500)
-            yield frame_out
+            yield self._stamp_lane(frame_out, lane)
         finally:
+            if turn_failed and consumed_steers:
+                # A failed turn must not swallow accepted steers: return them
+                # to the front of the queue so a retry create re-prepends them.
+                lane.pending_steers = consumed_steers + lane.pending_steers
             if events is not None:
                 try:
                     await events.aclose()
@@ -801,18 +924,25 @@ class ResponsesWebSocketSession:
 
     # -- steering ------------------------------------------------------------
 
-    def _steer_accepted_frame(self, frame: SteerFrame) -> dict[str, Any]:
+    def _steer_accepted_frame(self, frame: SteerFrame, lane: Optional[LaneState] = None) -> dict[str, Any]:
         return self._format_event(
             "response.steer.accepted",
             {
                 "type": "response.steer.accepted",
-                "sequence_number": self._next_sequence(),
                 "steer": {"id": frame.steer_id, "previous_response_id": frame.previous_response_id},
             },
-            None,
+            lane.stream_id if lane is not None else None,
+            lane=lane,
         )
 
-    def _steer_failed_frame(self, frame: SteerFrame, code: str, message: str, param: Optional[str]) -> dict[str, Any]:
+    def _steer_failed_frame(
+        self,
+        frame: SteerFrame,
+        code: str,
+        message: str,
+        param: Optional[str],
+        lane: Optional[LaneState] = None,
+    ) -> dict[str, Any]:
         error: dict[str, Any] = {"type": "invalid_request_error", "code": code, "message": message}
         if param is not None:
             error["param"] = param
@@ -820,7 +950,6 @@ class ResponsesWebSocketSession:
             "response.steer.failed",
             {
                 "type": "response.steer.failed",
-                "sequence_number": self._next_sequence(),
                 "steer": {
                     "id": frame.steer_id,
                     "input": frame.input,
@@ -828,7 +957,8 @@ class ResponsesWebSocketSession:
                 },
                 "error": error,
             },
-            None,
+            lane.stream_id if lane is not None else None,
+            lane=lane,
         )
 
     def _pending_steer_count(self, lane: LaneState, target: str) -> int:
@@ -854,22 +984,25 @@ class ResponsesWebSocketSession:
         status = self._response_status.get(target)
         if status == "active":
             if self._pending_steer_count(lane, target) >= MAX_PENDING_STEERS:
-                yield self._steer_failed_frame(frame, "too_many_pending_steers", f"Response {target!r} already has {MAX_PENDING_STEERS} pending steers", None)
+                yield self._steer_failed_frame(frame, "too_many_pending_steers", f"Response {target!r} already has {MAX_PENDING_STEERS} pending steers", None, lane)
                 return
             lane.pending_steers.append({"target": target, "input": frame.input})
-            yield self._steer_accepted_frame(frame)
+            yield self._steer_accepted_frame(frame, lane)
             return
         if status == "completed":
             if lane.latest_response_id != target:
-                yield self._steer_failed_frame(frame, "response_already_completed", f"Response {target!r} already completed and is no longer the lane's active response", None)
+                yield self._steer_failed_frame(frame, "response_already_completed", f"Response {target!r} already completed and is no longer the lane's active response", None, lane)
                 return
             if self._pending_steer_count(lane, target) >= MAX_PENDING_STEERS:
-                yield self._steer_failed_frame(frame, "too_many_pending_steers", f"Response {target!r} already has {MAX_PENDING_STEERS} pending steers", None)
+                yield self._steer_failed_frame(frame, "too_many_pending_steers", f"Response {target!r} already has {MAX_PENDING_STEERS} pending steers", None, lane)
                 return
             lane.pending_steers.append({"target": target, "input": frame.input})
-            yield self._steer_accepted_frame(frame)
+            yield self._steer_accepted_frame(frame, lane)
             return
-        yield self._steer_failed_frame(frame, "response_not_active", f"Response {target!r} is not active and cannot be steered", None)
+        if status == "failed":
+            yield self._steer_failed_frame(frame, "response_not_active", f"Response {target!r} failed and can no longer be steered", None, lane)
+            return
+        yield self._steer_failed_frame(frame, "response_not_active", f"Response {target!r} is not active and cannot be steered", None, lane)
 
     # -- connection driver ---------------------------------------------------
 
@@ -911,13 +1044,35 @@ class ResponsesWebSocketSession:
             task.add_done_callback(self._worker_tasks.discard)
 
     async def _lane_worker(self, lane: LaneState, websocket: Any) -> None:
-        """Drain one lane's FIFO queue, one in-flight turn at a time."""
+        """Drain one lane's FIFO queue, one in-flight turn at a time.
+
+        The connection lifetime is enforced here, between turns: a turn that
+        dequeued before the deadline runs to its terminal, and the next queued
+        create after the deadline gets the documented limit error frame and
+        closes the connection. An in-flight stream is never truncated.
+        """
 
         while not self._closed:
             try:
                 frame = await lane.queue.get()
             except asyncio.CancelledError:
                 raise
+            if self._clock() - self._started >= self._max_connection_seconds:
+                await self._send(
+                    websocket,
+                    self._stamp_lane(
+                        error_frame(
+                            "websocket_connection_limit_reached",
+                            f"Responses websocket connection limit reached ({_human_duration(self._max_connection_seconds)}). Create a new websocket connection to continue.",
+                            err_type="invalid_request_error",
+                            stream_id=lane.stream_id,
+                        ),
+                        lane,
+                    ),
+                )
+                lane.queue.task_done()
+                self._closed = True
+                break
             async with self._in_flight_semaphore:
                 lane.in_flight += 1
                 turn_gen = self._turn(frame, lane)
@@ -991,24 +1146,17 @@ class ResponsesWebSocketSession:
         """
 
         started = self._clock()
+        self._started = started
         close_code = 1000
         cancelled = False
         try:
             while not self._closed:
-                elapsed = self._clock() - started
-                remaining = self._max_connection_seconds - elapsed
-                if remaining <= 0:
-                    await self._send(
-                        websocket,
-                        error_frame(
-                            "websocket_connection_limit_reached",
-                            f"Responses websocket connection limit reached ({_human_duration(self._max_connection_seconds)}). Create a new websocket connection to continue.",
-                            err_type="invalid_request_error",
-                        ),
-                    )
-                    break
+                # The reader never enforces the lifetime itself: a turn may be
+                # in flight. `_lane_worker` sees the deadline between turns.
+                remaining = self._max_connection_seconds - (self._clock() - started)
+                timeout = min(remaining, _RECEIVE_POLL_SECONDS) if remaining > 0 else _RECEIVE_POLL_SECONDS
                 try:
-                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=min(remaining, _RECEIVE_POLL_SECONDS))
+                    raw = await asyncio.wait_for(websocket.receive_text(), timeout=timeout)
                 except asyncio.TimeoutError:
                     continue
                 except Exception:
@@ -1017,12 +1165,12 @@ class ResponsesWebSocketSession:
                 if self._closed:
                     close_code = self._close_code if self._close_code is not None else close_code
                     break
-                if _frame_bytes(raw) > MAX_FRAME_BYTES:
+                if _frame_bytes(raw) > self._max_inbound_frame_bytes:
                     await self._send(
                         websocket,
                         error_frame(
                             "invalid_request_error",
-                            f"client frame exceeds the {MAX_FRAME_BYTES} byte WebSocket frame limit",
+                            f"client frame exceeds the {self._max_inbound_frame_bytes} byte WebSocket frame limit",
                             err_type="invalid_request_error",
                         ),
                     )

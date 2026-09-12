@@ -1389,12 +1389,14 @@ class ResponsesService:
                 # Riding the id keeps the provider chain; the provider
                 # switched (fallback/redirect) → local replay instead
                 # (cross-provider continuation can never succeed).
-                if (
-                    provider_passthrough
-                    and stored.metadata.get("provider_owned")
-                    and _provider_continuation_eligible(raw_request_dict or {})
-                ):
-                    return None
+                if provider_passthrough and stored.metadata.get("provider_owned"):
+                    # The row is only safe to ride when the SAME provider is
+                    # targeted: a provider-owned row minted elsewhere cannot
+                    # resolve on the current provider's chain. Provider
+                    # switched (fallback) → fall through to local replay.
+                    target_provider = _provider_continuation_target(raw_request_dict or {})
+                    if target_provider is not None and stored.metadata.get("provider") == target_provider:
+                        return None
                 parent = stored
             elif provider_passthrough:
                 # G11 hybrid: public-scope miss on a provider that speaks
@@ -1683,19 +1685,21 @@ def _reject_unsupported_lifecycles(raw_request: dict[str, Any]) -> None:
         )
 
 
-def _provider_continuation_eligible(raw_request: dict[str, Any]) -> bool:
-    """Whether public provider-side continuation is viable (G11 hybrid).
+def _provider_continuation_target(raw_request: dict[str, Any]) -> Optional[str]:
+    """Resolve the routing target's provider when it speaks Responses, else None.
 
-    True when the request's routing target resolves to a provider whose
-    protocol family is Responses — the provider retains its own chains
+    True/eligible when the request's routing target resolves to a provider
+    whose protocol family is Responses — the provider retains its own chains
     (previous_response_id passthrough, encrypted reasoning, cache keys).
-    Conservative by construction: unresolvable routing, unknown aliases,
-    or non-Responses families return False (local replay / honest 404).
+    Conservative by construction: unresolvable routing, unknown aliases, or
+    non-Responses families return ``None`` (local replay / honest 404). The
+    provider name is returned so continuation can verify a provider-owned row
+    was minted by the same provider now targeted.
     """
 
     model = str(raw_request.get("model") or "")
     if not model:
-        return False
+        return None
     try:
         from ..providers import PROVIDER_PLUGINS
         from ..routing.config import load_routing_config_from_env
@@ -1713,7 +1717,7 @@ def _provider_continuation_eligible(raw_request: dict[str, Any]) -> bool:
         reference = parse_model_reference(target)
         plugin_class = PROVIDER_PLUGINS.get(reference.provider)
         if plugin_class is None:
-            return False
+            return None
         # PROVIDER_PLUGINS stores CLASSES (SingletonABCMeta) — unbound
         # method calls bind the model string as self and explode; use the
         # executor convention and talk to the singleton instance.
@@ -1741,14 +1745,20 @@ def _provider_continuation_eligible(raw_request: dict[str, Any]) -> bool:
         if not protocol_name:
             protocol_name = plugin.get_protocol_name(reference.model or "", profile=None)
         if not protocol_name:
-            return False
+            return None
         from ..protocols.registry import get_protocol_class
 
         cls = get_protocol_class(protocol_name)
         family = getattr(cls, "base_family", "") or protocol_name
-        return family == "responses"
+        return reference.provider if family == "responses" else None
     except Exception:
-        return False
+        return None
+
+
+def _provider_continuation_eligible(raw_request: dict[str, Any]) -> bool:
+    """Whether public provider-side continuation is viable (G11 hybrid)."""
+
+    return _provider_continuation_target(raw_request) is not None
 
 
 def _expanded_responses_request(
