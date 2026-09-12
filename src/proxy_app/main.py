@@ -463,9 +463,9 @@ async def lifespan(app: FastAPI):
     # print(f"🔑 Credentials loaded: {_total_summary} (API: {_api_summary} | OAuth: {_oauth_summary})")
     client.background_refresher.start()  # Start the background task
     app.state.rotating_client = client
-    # Phase 4 Responses API compatibility service. It currently bridges through
-    # the existing chat-completions client path; later native providers can reuse
-    # the same route/storage surface without changing clients.
+    # Responses API compatibility service. Execution is native
+    # (``agenerate(input_protocol="responses")``); the route/storage surface is
+    # independent of the client transport.
     from rotator_library.config.experimental import get_responses_store_settings
     from rotator_library.responses import create_configured_responses_store
 
@@ -930,14 +930,51 @@ async def responses_delete(
 async def responses_input_items(
     response_id: str,
     request: Request,
+    limit: int = 20,
+    after: Optional[str] = None,
     service: ResponsesService = Depends(get_responses_service),
     _=Depends(verify_api_key),
 ):
-    """Return stored input items for a Responses object."""
+    """Return a paginated input-items list for a Responses object.
+
+    ``limit`` defaults to 20 and caps at 100 server-side; ``after`` is an item
+    id cursor. The envelope is the official list shape
+    (``object``/``data``/``first_id``/``last_id``/``has_more``).
+    """
 
     try:
         return JSONResponse(
             content=await service.list_input_items_with_access_token(
+                response_id,
+                request.headers.get("X-Proxy-Session-Domain", "public"),
+                limit=limit,
+                after=after,
+            )
+        )
+    except ResponsesServiceError as e:
+        return JSONResponse(status_code=e.status_code, content=_responses_error_response(e))
+
+
+@app.post("/v1/responses/{response_id}/cancel")
+async def responses_cancel(
+    response_id: str,
+    request: Request,
+    service: ResponsesService = Depends(get_responses_service),
+    _=Depends(verify_api_key),
+):
+    """Cancel a stored Responses object.
+
+    Best-effort by contract: the stored row is marked ``cancelled`` and the
+    response object is returned. In-flight provider cancellation is NOT wired
+    (no in-tree provider exposes a cancel hook) — the provenance eligibility
+    seam exists in the service, but a turn already streaming through our own
+    runtime is only reflected in the stored row. Scoped rows stay local; an
+    unknown id is a 404 in the Responses error vocabulary.
+    """
+
+    try:
+        return JSONResponse(
+            content=await service.cancel_response_with_access_token(
                 response_id,
                 request.headers.get("X-Proxy-Session-Domain", "public"),
             )

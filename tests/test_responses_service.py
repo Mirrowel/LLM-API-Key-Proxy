@@ -648,8 +648,14 @@ async def test_get_delete_and_list_input_items() -> None:
     response = await service.create_response({"model": "gpt-test", "input": ["Hello"]}, FakeClient())
 
     assert (await service.get_response(response["id"]))["id"] == response["id"]
-    assert await service.list_input_items(response["id"]) == {"object": "list", "data": ["Hello"]}
-    assert await service.delete_response(response["id"]) == {"id": response["id"], "object": "response.deleted", "deleted": True}
+    assert await service.list_input_items(response["id"]) == {
+        "object": "list",
+        "data": ["Hello"],
+        "first_id": None,
+        "last_id": None,
+        "has_more": False,
+    }
+    assert await service.delete_response(response["id"]) == {"id": response["id"], "object": "response", "deleted": True}
     with pytest.raises(ResponsesServiceError):
         await service.get_response(response["id"])
 
@@ -722,6 +728,49 @@ async def test_previous_response_trace_payload_skipped_without_logger() -> None:
     )
 
     assert parent.id == "resp_parent"
+
+
+def test_responses_error_payload_uses_official_string_codes() -> None:
+    not_found = ResponsesServiceError("Response not found: resp_x", status_code=404, error_type="not_found_error")
+    assert not_found.to_protocol_payload("responses")["error"]["code"] == "previous_response_not_found"
+
+    rate = ResponsesServiceError("slow", status_code=429, error_type="rate_limit")
+    assert rate.to_protocol_payload("responses")["error"]["code"] == "rate_limit_exceeded"
+
+    bad = ResponsesServiceError("bad", status_code=400, error_type="invalid_request_error")
+    code = bad.to_protocol_payload("responses")["error"]["code"]
+    assert isinstance(code, str) and not code.isdigit()
+
+
+@pytest.mark.asyncio
+async def test_provider_cancel_eligibility_requires_same_provider_provenance(monkeypatch) -> None:
+    from rotator_library.providers import PROVIDER_PLUGINS
+
+    class _ResponsesPlugin:
+        protocol_name = "responses"
+        transport_profiles = None
+        default_profile = None
+
+        def get_protocol_name(self, model: str = "", profile=None) -> str:
+            return "responses"
+
+    monkeypatch.setitem(PROVIDER_PLUGINS, "respprovider", _ResponsesPlugin)
+    service = ResponsesService(store=InMemoryResponsesStore())
+
+    def _row(provider: str, *, owned: bool) -> StoredResponse:
+        return StoredResponse(
+            id="resp_cancel",
+            model="respprovider/gpt-x",
+            status="completed",
+            request={},
+            response={"id": "resp_cancel"},
+            metadata={"provider": provider, "provider_owned": owned},
+            scope_key="public",
+        )
+
+    assert await service._best_effort_provider_cancel(_row("respprovider", owned=True)) is True
+    assert await service._best_effort_provider_cancel(_row("otherprovider", owned=True)) is False
+    assert await service._best_effort_provider_cancel(_row("respprovider", owned=False)) is False
 
 
 @pytest.mark.asyncio

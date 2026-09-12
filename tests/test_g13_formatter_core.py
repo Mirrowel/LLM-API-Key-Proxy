@@ -239,10 +239,76 @@ def test_gemini_idless_fragments_of_one_call_never_split() -> None:
 # ---------------------------------------------------------------- responses [DONE]
 
 
+_SDK_RESPONSE_FIELDS = (
+    "id",
+    "object",
+    "created_at",
+    "status",
+    "model",
+    "output",
+    "parallel_tool_calls",
+    "tool_choice",
+    "tools",
+    "reasoning",
+    "usage",
+    "error",
+    "incomplete_details",
+    "metadata",
+)
+
+
+def _responses_objects(out: str) -> list[dict]:
+    import json as _json
+
+    objects = []
+    for line in out.splitlines():
+        if line.startswith("data: {") and '"response"' in line:
+            payload = _json.loads(line[6:])
+            if isinstance(payload.get("response"), dict):
+                objects.append(payload["response"])
+    return objects
+
+
+def test_responses_formatter_sequence_is_single_sourced_and_monotonic() -> None:
+    """The formatter lane's own counter (created -> delta -> terminal) is the
+    single sequence authority: strictly increasing with no repeats."""
+    import json as _json
+
+    converter = _converter("responses")
+    out = "".join(converter.convert({"choices": [{"index": 0, "delta": {"content": "a"}}]}))
+    out += "".join(converter.convert({"choices": [{"index": 0, "delta": {"content": "b"}}]}))
+    out += "".join(converter.convert({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}))
+
+    sequences = []
+    for line in out.splitlines():
+        if line.startswith("data: {"):
+            payload = _json.loads(line[6:])
+            if "sequence_number" in payload:
+                sequences.append(payload["sequence_number"])
+    assert sequences == sorted(sequences)
+    assert len(set(sequences)) == len(sequences)
+    assert sequences[0] == 0
+
+
+def test_responses_formatter_objects_are_sdk_shaped() -> None:
+    """Every synthesized created/in_progress/terminal object carries the SDK
+    member set (one shared builder across the formatter lane)."""
+    converter = _converter("responses")
+    out = "".join(converter.convert({"choices": [{"index": 0, "delta": {"content": "hi"}}]}))
+    out += "".join(converter.convert({"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}))
+
+    objects = _responses_objects(out)
+    assert objects
+    for obj in objects:
+        for field in _SDK_RESPONSE_FIELDS:
+            assert field in obj, f"missing {field!r}: {sorted(obj)}"
+        assert obj["object"] == "response"
+
+
 def test_responses_terminals_have_no_chat_done_sentinel() -> None:
     converter = _converter("responses")
     out = "".join(converter.convert({"choices": [{"index": 0, "delta": {"content": "hi"}}]}))
     out += "".join(converter.convert("[DONE]"))
     assert "response.incomplete" in out or "response.completed" in out
-    assert "incomplete_details" not in out  # unknown reason never fabricates one
+    assert 'incomplete_details": {' not in out  # unknown reason never fabricates one
     assert "data: [DONE]" not in out

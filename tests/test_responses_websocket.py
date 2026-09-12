@@ -206,6 +206,24 @@ async def test_warmup_returns_chainable_id_and_caches_state_session_locally() ->
     assert frame["type"] == "response.completed"
     assert frame["response"]["object"] == "response"
     assert frame["response"]["output"] == []
+    # The warmup object is minted by the shared SDK-completeness builder.
+    for field in (
+        "id",
+        "object",
+        "created_at",
+        "status",
+        "model",
+        "output",
+        "parallel_tool_calls",
+        "tool_choice",
+        "tools",
+        "reasoning",
+        "usage",
+        "error",
+        "incomplete_details",
+        "metadata",
+    ):
+        assert field in frame["response"], f"warmup response missing {field!r}"
     response_id = frame["response"]["id"]
     # State is connection-local ONLY: nothing in the global store.
     assert await service.store.get(response_id) is None

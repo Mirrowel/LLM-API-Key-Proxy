@@ -123,6 +123,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, MutableMapping, Optional
 
+from ..protocols.canonical import complete_responses_object
 from .service import _safe_stored_request
 from .streaming import ResponsesStreamEvent
 from .types import StoredResponse, generate_response_id
@@ -574,6 +575,7 @@ class ResponsesWebSocketSession:
         self._worker_tasks: set[asyncio.Task] = set()
         self._closed = False
         self._close_code: Optional[int] = None
+        self._sequence = 0
         self.local_cache: MutableMapping[str, StoredResponse] = _LocalResponsesCache()
         self._formatter = ResponsesWebSocketFormatter()
 
@@ -582,15 +584,16 @@ class ResponsesWebSocketSession:
         return self._lanes
 
     def _next_sequence(self) -> int:
-        """Global fallback sequence for frames with no lane.
+        """Connection-local sequence for frames with no lane.
 
         Lane-attached frames use the lane's own counter (``_stamp_lane``):
         every provider-supplied number is replaced so each lane's observable
-        stream stays strictly monotonic on its own.
+        stream stays strictly monotonic on its own. Lane-less grammar/steer
+        frames draw this connection counter — never a process-global.
         """
-        from .streaming import next_sequence_value
 
-        return next_sequence_value()
+        self._sequence += 1
+        return self._sequence
 
     @staticmethod
     def _stamp_lane(frame: dict[str, Any], lane: LaneState) -> dict[str, Any]:
@@ -613,7 +616,7 @@ class ResponsesWebSocketSession:
         With a ``lane`` the frame is stamped using that lane's monotonic
         counter (replacing whatever sequence number the payload carried);
         without one (grammar-level failures before lane resolution) the
-        process-global counter is used.
+        connection-local counter is used.
         """
 
         frame = self._formatter.event_frame(ResponsesStreamEvent(event_name, payload), stream_id=stream_id)
@@ -749,13 +752,13 @@ class ResponsesWebSocketSession:
             id=response_id,
             model=model,
             status="completed",
-            response={
-                "id": response_id,
-                "object": "response",
-                "status": "completed",
-                "model": model,
-                "output": [],
-            },
+            # One shared builder keeps the warmup object SDK-shaped.
+            response=complete_responses_object(
+                {},
+                response_id=response_id,
+                model=model,
+                status="completed",
+            ),
             request=_safe_stored_request(body),
             input_items=_warmup_input_items(body.get("input")),
             metadata={"warmup": True},

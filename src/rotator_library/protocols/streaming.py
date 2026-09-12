@@ -22,6 +22,7 @@ from typing import Any
 
 from .canonical import (
     STOP_REASON_UNKNOWN,
+    complete_responses_object,
     format_stop_reason,
     ordered_message_blocks,
     tool_arguments_text,
@@ -1791,7 +1792,15 @@ def _responses_object(
         payload["usage"] = usage
     if error is not None:
         payload["error"] = error
-    return payload
+    # One shared builder fills the SDK-required members every mint site needs
+    # (created_at/parallel_tool_calls/tool_choice/tools/reasoning/metadata).
+    return complete_responses_object(
+        payload,
+        response_id=state.response_id,
+        model=state.model,
+        status=status,
+        created_at=state.created,
+    )
 
 
 def _is_terminal(event: UnifiedStreamEvent) -> bool:

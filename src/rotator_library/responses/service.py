@@ -5,10 +5,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import hmac
-import json
 import re
 import secrets
 import time
@@ -17,34 +15,36 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, MutableMapping, NoReturn, Optional
 
 from ..protocols import ProtocolContext
-from ..streaming import StreamEvent, StreamMonitor
-from ..config.experimental import get_stream_runtime_settings
+from ..protocols.canonical import complete_responses_object
+from ..session_tracking import SessionTrackingHints
 from ..client.scopes import derive_session_isolation_key
 from ..core.errors import StructuredAPIResponseError
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from ..protocols.responses import ResponsesProtocol
-from .bridge import PROXY_ROUTING_KEYS, ResponsesBridge, responses_session_hints
 from .store import InMemoryResponsesStore, ResponsesStore
-from .streaming import (
-    ResponsesSSEFormatter,
-    ResponsesStreamEvent,
-    ResponsesStreamState,
-    output_item_added_payload,
-    output_item_done_payload,
-    output_text_delta_payload,
-    parse_chat_sse_chunk,
-    response_completed_payload,
-    response_created_payload,
-    response_in_progress_payload,
-    content_part_added_payload,
-    content_part_done_payload,
-    output_text_done_payload,
-    next_sequence_value,
-    response_failed_payload,
-)
+from .streaming import ResponsesSSEFormatter, ResponsesStreamEvent
 from .types import ResponsesStoreSettings, StoredResponse
 from .types import generate_response_id
+
+
+# Proxy routing controls carried to RequestContextBuilder. Lives here (not the
+# retired chat bridge) because the native create/stream paths consume it.
+PROXY_ROUTING_KEYS = {"classifier", "api_keys", "providers", "private", "model_filters"}
+
+
+def responses_session_hints(
+    previous_response_id: Optional[str],
+) -> Optional[SessionTrackingHints]:
+    """Return proxy-internal sticky routing evidence for Responses continuations."""
+
+    if not previous_response_id:
+        return None
+    anchor = f"responses_previous_response_id:{previous_response_id}"
+    return SessionTrackingHints(
+        global_strong_anchors=[anchor],
+        affinity_key=anchor,
+    )
 
 
 _STORED_REQUEST_FIELDS = {
@@ -109,8 +109,9 @@ class ResponsesServiceError(ValueError):
                 "error": {
                     "message": str(self),
                     "type": self.error_type,
-                    # OpenAI error codes are strings or null — never ints.
-                    "code": str(self.status_code),
+                    # Official ResponseError string vocabulary — never the
+                    # numeric HTTP status (docs §2.2).
+                    "code": _RESPONSES_FAILURE_CODES.get(str(self.error_type), "server_error"),
                 }
             }
         normalized = {
@@ -128,24 +129,22 @@ class ResponsesServiceError(ValueError):
 
 
 class ResponsesService:
-    """Create, store, retrieve, and delete Responses API objects.
+    """Create, store, retrieve, cancel, and delete Responses API objects.
 
-    Phase 4 deliberately bridges through the existing chat-completions execution
-    path. Native Responses-capable provider execution will replace the bridge for
-    covered providers in later phases without changing the route/storage surface.
+    Execution is native: every request is sent to the provider through
+    ``client.agenerate(input_protocol="responses")``; the retired chat bridge
+    no longer participates in any path.
     """
 
     def __init__(
         self,
         *,
         protocol: Optional[ResponsesProtocol] = None,
-        bridge: Optional[ResponsesBridge] = None,
         store: Optional[ResponsesStore] = None,
         store_settings: Optional[ResponsesStoreSettings] = None,
     ) -> None:
         self.store_settings = store_settings or ResponsesStoreSettings()
         self.protocol = protocol or ResponsesProtocol()
-        self.bridge = bridge or ResponsesBridge(self.protocol)
         self.store = store or InMemoryResponsesStore(max_items=self.store_settings.max_items)
 
     @staticmethod
@@ -206,7 +205,7 @@ class ResponsesService:
         request_scope: Optional[ResponsesRequestScope] = None,
         previous_response_access_token: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Create a non-streaming Responses object through the chat bridge."""
+        """Create a non-streaming Responses object through native execution."""
 
         if not raw_request.get("model"):
             raise ResponsesServiceError("'model' is required", status_code=400)
@@ -242,7 +241,7 @@ class ResponsesService:
         except Exception as exc:
             self._log_transform_error(
                 transaction_logger,
-                "responses_bridge_chat_request",
+                "responses_lineage_expand",
                 exc,
                 _redact_sensitive_fields(unified.to_dict()),
             )
@@ -309,23 +308,13 @@ class ResponsesService:
         request_scope: Optional[ResponsesRequestScope] = None,
         previous_response_access_token: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
-        """Stream a Responses API request as HTTP SSE events."""
+        """Stream a Responses API request as HTTP SSE frames.
 
-        if hasattr(client, "agenerate"):
-            async for frame in self._stream_native_response(
-                raw_request,
-                client,
-                request=request,
-                transaction_logger=transaction_logger,
-                transport=transport,
-                request_scope=request_scope,
-                previous_response_access_token=previous_response_access_token,
-            ):
-                yield frame
-            return
+        Native-only: every in-tree client exposes ``agenerate``; the provider's
+        own Responses frames pass through unchanged.
+        """
 
-        formatter = ResponsesSSEFormatter()
-        async for event in self.stream_events(
+        async for frame in self._stream_native_response(
             raw_request,
             client,
             request=request,
@@ -334,27 +323,7 @@ class ResponsesService:
             request_scope=request_scope,
             previous_response_access_token=previous_response_access_token,
         ):
-            formatted = formatter.format_stream_event(event)
-            self._trace(
-                transaction_logger,
-                "responses_sse_formatted_event",
-                formatted,
-                direction="stream",
-                stage="final",
-                metadata={"event_name": event.event_name, "terminal": event.terminal, "transport": transport},
-                scrub_strings=True,
-            )
-            if event.heartbeat:
-                self._trace(
-                    transaction_logger,
-                    "responses_sse_formatted_heartbeat",
-                    formatted,
-                    direction="stream",
-                    stage="final",
-                    metadata={"transport": transport},
-                    scrub_strings=True,
-                )
-            yield formatted
+            yield frame
 
     async def stream_turn_events(
         self,
@@ -373,21 +342,7 @@ class ResponsesService:
         semantics as the SSE stream, with formatting left to the transport.
         """
 
-        if hasattr(client, "agenerate"):
-            async for event in self._stream_native_response(
-                raw_request,
-                client,
-                request=request,
-                transaction_logger=transaction_logger,
-                transport="websocket",
-                request_scope=request_scope,
-                previous_response_access_token=previous_response_access_token,
-                as_events=True,
-                local_cache=local_cache,
-            ):
-                yield event
-            return
-        async for event in self.stream_events(
+        async for event in self._stream_native_response(
             raw_request,
             client,
             request=request,
@@ -395,6 +350,7 @@ class ResponsesService:
             transport="websocket",
             request_scope=request_scope,
             previous_response_access_token=previous_response_access_token,
+            as_events=True,
             local_cache=local_cache,
         ):
             yield event
@@ -479,13 +435,20 @@ class ResponsesService:
                 session_info={"scope_access_hash": resolved_scope.access_token_hash},
                 as_events=as_events,
                 local_cache=local_cache,
+                last_sequence=-1,
             ):
                 yield frame
             # Finalize AFTER the terminal frames so the error records the
             # terminal path wrote land in metadata.
             self._finalize_stream_metadata(transaction_logger, error=exc)
             return
-        completed = False
+        terminal_seen = False
+        provider_error: Optional[Exception] = None
+        response_id: Optional[str] = None
+        # ONE sequence authority per response stream: the highest provider
+        # sequence_number observed. A synthesized terminal continues it; the
+        # module-global counter is never drawn on.
+        last_sequence = -1
         response_context = ProtocolContext(
             model=unified.model,
             source_protocol="responses",
@@ -505,9 +468,26 @@ class ResponsesService:
                     continue
                 event = self.protocol.parse_stream_event(raw_frame, response_context)
                 payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
+                if isinstance(payload, dict):
+                    sequence = payload.get("sequence_number")
+                    if isinstance(sequence, int) and sequence > last_sequence:
+                        last_sequence = sequence
                 response_payload = payload.get("response") if isinstance(payload, dict) and isinstance(payload.get("response"), dict) else None
-                if response_payload and event.type in {"response.completed", "response.failed", "response.incomplete"}:
-                    completed = True
+                if isinstance(response_payload, dict) and isinstance(response_payload.get("id"), str):
+                    response_id = response_payload["id"]
+                if response_payload and event.type in {"response.created", "response.in_progress"}:
+                    # store_in_progress is honored on the native path: the
+                    # provider's in-flight object is snapshotted so retrieval
+                    # surfaces see the same partial state the bridge used to.
+                    await self._store_stream_current_state(
+                        stream_request,
+                        response_payload,
+                        parent,
+                        transaction_logger=transaction_logger,
+                        session_info=session_info,
+                    )
+                terminal_event = event.type in {"response.completed", "response.failed", "response.incomplete"}
+                if response_payload and terminal_event:
                     _record_responses_session_anchor(session_info, response_payload)
                     self._trace_responses_usage(transaction_logger, response_payload, unified.model, source="responses_stream")
                     stored = await self._store_stream_response(
@@ -527,13 +507,28 @@ class ResponsesService:
                         stage="final",
                     )
                 if as_events:
-                    payload = event.extra.get("payload") if isinstance(event.extra, dict) else None
                     yield ResponsesStreamEvent(
                         str((payload or {}).get("type") or event.type or "response.event"),
                         payload if isinstance(payload, dict) else {"type": event.type or "response.event"},
                     )
                 else:
                     yield raw_frame
+                if terminal_event:
+                    # A provider terminal ENDS the stream — with or without a
+                    # nested response object. The synthesized failure only
+                    # fires when the provider sent NO terminal at all.
+                    terminal_seen = True
+                    break
+                if event.type == "error":
+                    # An out-of-band provider ``error`` event is terminal for
+                    # the whole stream too (docs §2.3); pass it through once.
+                    terminal_seen = True
+                    provider_error = ResponsesServiceError(
+                        _stream_error_message(payload if isinstance(payload, dict) else {}),
+                        status_code=502,
+                        error_type="upstream_error",
+                    )
+                    break
         except Exception as exc:
             # Post-start failures never escape into the transport: the client
             # receives a protocol-valid terminal sequence instead (defect 10).
@@ -546,13 +541,15 @@ class ResponsesService:
                 session_info=session_info,
                 as_events=as_events,
                 local_cache=local_cache,
+                response_id=response_id,
+                last_sequence=last_sequence,
             ):
                 yield frame
             # Finalize AFTER the terminal frames so their error records land
             # in metadata (order matters: finalize reads _error_records).
             self._finalize_stream_metadata(transaction_logger, error=exc)
             return
-        if not completed:
+        if not terminal_seen:
             # The stream ended without a terminal event — synthesize one.
             terminal_exc = ResponsesServiceError(
                 "Responses stream ended without a terminal response event",
@@ -568,12 +565,15 @@ class ResponsesService:
                 session_info=session_info,
                 as_events=as_events,
                 local_cache=local_cache,
+                response_id=response_id,
+                last_sequence=last_sequence,
             ):
                 yield frame
             self._finalize_stream_metadata(transaction_logger, error=terminal_exc)
             return
-        # Completed streams still get their L1 summary.
-        self._finalize_stream_metadata(transaction_logger)
+        # Terminal streams still get their L1 summary; a provider error
+        # terminal finalizes as an error.
+        self._finalize_stream_metadata(transaction_logger, error=provider_error)
 
     def _finalize_stream_metadata(
         self,
@@ -603,23 +603,34 @@ class ResponsesService:
         session_info: dict[str, Any],
         as_events: bool = False,
         local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
+        response_id: Optional[str] = None,
+        last_sequence: int = -1,
     ) -> AsyncGenerator[Any, None]:
         """Emit the terminal failure frames for a failed native stream.
 
         Frame emission is isolated from the store attempt: a failing store
         must never cost the client its terminal frames (double-failure
-        guard).
+        guard). ``response_id`` correlates the failure with a provider id the
+        stream already emitted (no fresh minting); ``last_sequence`` is the
+        stream's highest observed provider sequence_number so the synthesized
+        terminal continues the SAME counter instead of drawing the module
+        global.
         """
 
         error = _stream_failure_error(exc)
-        failed = {
-            "id": generate_response_id(),
-            "object": "response",
-            "status": "failed",
-            "model": model,
-            "output": [],
-            "error": error,
-        }
+        minted_id = response_id or generate_response_id()
+        failed = complete_responses_object(
+            {
+                "id": minted_id,
+                "status": "failed",
+                "model": model,
+                "output": [],
+                "error": error,
+            },
+            response_id=minted_id,
+            model=model,
+            status="failed",
+        )
         try:
             self._log_transform_error(transaction_logger, "responses_native_stream", exc, stream_request)
             stored = await self._store_stream_response(
@@ -653,7 +664,7 @@ class ResponsesService:
         # The event frame (not the nested response object) carries the
         # monotonic sequence_number per the streaming-events reference.
         failed_event = ResponsesStreamEvent("response.failed", {"type": "response.failed", "response": failed})
-        failed_event.payload["sequence_number"] = next_sequence_value()
+        failed_event.payload["sequence_number"] = last_sequence + 1
         if as_events:
             yield failed_event
             return
@@ -692,532 +703,6 @@ class ResponsesService:
                 raw_request_dict=raw_request,
             )
 
-    async def stream_events(
-        self,
-        raw_request: dict[str, Any],
-        client: Any,
-        *,
-        request: Optional[Any] = None,
-        transaction_logger: Optional[Any] = None,
-        transport: str = "sse",
-        request_scope: Optional[ResponsesRequestScope] = None,
-        previous_response_access_token: Optional[str] = None,
-        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
-    ) -> AsyncGenerator[ResponsesStreamEvent, None]:
-        """Yield transport-neutral Responses events for streaming transports."""
-
-        if not raw_request.get("model"):
-            raise ResponsesServiceError("'model' is required", status_code=400)
-        _reject_unsupported_lifecycles(raw_request)
-        stream_request = dict(raw_request)
-        stream_request["stream"] = True
-        resolved_scope = self._resolve_request_scope(stream_request, request_scope)
-        isolation_key = resolved_scope.key
-        safe_stream_request = _safe_stored_request(stream_request)
-        self._trace(transaction_logger, "responses_raw_request", safe_stream_request, direction="request", stage="client")
-        try:
-            unified = self.protocol.parse_request(stream_request, ProtocolContext(source_protocol="responses", transport=transport))
-        except Exception as exc:
-            self._log_transform_error(transaction_logger, "responses_parse_request", exc, safe_stream_request)
-            raise
-        if transaction_logger:
-            self._trace(transaction_logger, "responses_parsed_request", _redact_sensitive_fields(unified.to_dict()), direction="request", stage="protocol")
-        parent = await self._load_previous_response(
-            unified.previous_response_id,
-            transaction_logger,
-            expected_scope_key=isolation_key,
-            access_token=previous_response_access_token,
-            local_cache=local_cache,
-            provider_passthrough=_provider_continuation_eligible(raw_request),
-            raw_request_dict=raw_request,
-        )
-        try:
-            parent_lineage = await self._load_response_lineage(
-                parent,
-                expected_scope_key=isolation_key,
-                local_cache=local_cache,
-            )
-            chat_kwargs = self.bridge.to_chat_kwargs(unified, parent_responses=[stored.to_dict() for stored in parent_lineage] if parent_lineage else None)
-        except Exception as exc:
-            self._log_transform_error(
-                transaction_logger,
-                "responses_bridge_chat_request",
-                exc,
-                _redact_sensitive_fields(unified.to_dict()),
-            )
-            raise
-        bridge_metadata = chat_kwargs.pop("_responses_bridge", {})
-        session_hints = chat_kwargs.pop("_session_tracking_hints", None)
-        session_info: dict[str, Any] = {
-            "scope_access_hash": resolved_scope.access_token_hash,
-        }
-        chat_kwargs.update(_routing_kwargs(stream_request))
-        chat_kwargs.update(_internal_client_kwargs(client, session_hints, session_info))
-        chat_kwargs["stream"] = True
-        trace_chat_kwargs = _without_internal_kwargs(chat_kwargs)
-        self._trace(
-            transaction_logger,
-            "responses_bridge_chat_request",
-            trace_chat_kwargs,
-            direction="request",
-            stage="adapter",
-            metadata={
-                "bridge_metadata": {
-                    "extra_keys": sorted((bridge_metadata.get("extra") or {}).keys()),
-                    "has_session_hints": bool(session_hints),
-                },
-                "transport": transport,
-            },
-        )
-
-        response_id = generate_response_id()
-        state = ResponsesStreamState(response_id=response_id, model=unified.model)
-        usage = None
-        item_started = False
-        monitor = StreamMonitor(clock=time.monotonic)
-        stream_settings = get_stream_runtime_settings()
-        chat_stream = None
-        stream_iterator = None
-        upstream_closed = False
-        pending_next_task = None
-        pending_next_started_at = None
-        pending_next_last_heartbeat_at = None
-        acquire_task = None
-        acquire_started_at = None
-        acquire_last_heartbeat_at = None
-        ttfb_started_at = time.monotonic()
-
-        async def cancel_task(task: Any) -> None:
-            """Cancel and await an in-flight stream task before closing its source."""
-
-            if task is None or task.done():
-                return
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                return
-            except Exception:
-                return
-
-        async def close_upstream(reason: str) -> None:
-            """Best-effort close for upstream Responses bridge streams."""
-
-            nonlocal upstream_closed
-            if upstream_closed:
-                return
-            attempted = False
-            for candidate in (stream_iterator, chat_stream):
-                if candidate is None:
-                    continue
-                attempted = True
-                try:
-                    closer = getattr(candidate, "aclose", None)
-                    if callable(closer):
-                        await closer()
-                        upstream_closed = True
-                        self._trace(transaction_logger, "responses_stream_upstream_closed", {"reason": reason}, direction="stream", stage="provider", metadata={"transport": transport})
-                        return
-                    closer = getattr(candidate, "close", None)
-                    if callable(closer):
-                        closer()
-                        upstream_closed = True
-                        self._trace(transaction_logger, "responses_stream_upstream_closed", {"reason": reason}, direction="stream", stage="provider", metadata={"transport": transport})
-                        return
-                except Exception as exc:
-                    self._trace(transaction_logger, "responses_stream_upstream_close_failed", {"reason": reason, "error_type": type(exc).__name__}, direction="stream", stage="provider", metadata={"transport": transport})
-                    continue
-            if attempted:
-                self._trace(transaction_logger, "responses_stream_upstream_close_failed", {"reason": reason, "error_type": "no_close_method"}, direction="stream", stage="provider", metadata={"transport": transport})
-
-        async def next_upstream_chunk(*, first: bool) -> tuple[str, Any]:
-            """Return the next upstream chunk or a control marker."""
-
-            timeout = stream_settings.ttfb_timeout_seconds if first else stream_settings.stall_timeout_seconds
-            heartbeat = stream_settings.heartbeat_seconds
-            nonlocal pending_next_task, pending_next_started_at, pending_next_last_heartbeat_at
-            if pending_next_task is None:
-                pending_next_task = asyncio.create_task(stream_iterator.__anext__())
-                pending_next_started_at = time.monotonic()
-                pending_next_last_heartbeat_at = pending_next_started_at
-            next_task = pending_next_task
-            started_at = ttfb_started_at if first else (pending_next_started_at or time.monotonic())
-            while True:
-                if next_task.done():
-                    pending_next_task = None
-                    pending_next_started_at = None
-                    pending_next_last_heartbeat_at = None
-                    return "chunk", next_task.result()
-                if request is not None and await request.is_disconnected():
-                    self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected"}, direction="stream", stage="client", metadata={"transport": transport})
-                    if stream_settings.cancel_upstream_on_disconnect:
-                        await cancel_task(next_task)
-                        pending_next_task = None
-                        await close_upstream("client_disconnected")
-                    return "disconnect", None
-                elapsed = time.monotonic() - started_at
-                waits = []
-                if timeout is not None:
-                    remaining_timeout = timeout - elapsed
-                    if remaining_timeout <= 0:
-                        await cancel_task(next_task)
-                        pending_next_task = None
-                        await close_upstream("ttfb_timeout" if first else "stall_timeout")
-                        raise ResponsesServiceError(
-                            f"Responses stream {'TTFB' if first else 'stall'} timeout",
-                            status_code=504,
-                            error_type="api_connection",
-                        )
-                    waits.append(remaining_timeout)
-                if heartbeat is not None:
-                    last_heartbeat_at = pending_next_last_heartbeat_at or started_at
-                    remaining_heartbeat = heartbeat - (time.monotonic() - last_heartbeat_at)
-                    if remaining_heartbeat <= 0:
-                        pending_next_last_heartbeat_at = time.monotonic()
-                        return "heartbeat", None
-                    waits.append(remaining_heartbeat)
-                wait_timeout = min(waits) if waits else None
-                if wait_timeout is None:
-                    chunk = await next_task
-                    pending_next_task = None
-                    pending_next_started_at = None
-                    pending_next_last_heartbeat_at = None
-                    return "chunk", chunk
-                done, _ = await asyncio.wait({next_task}, timeout=wait_timeout)
-                if done:
-                    pending_next_task = None
-                    pending_next_started_at = None
-                    pending_next_last_heartbeat_at = None
-                    return "chunk", next_task.result()
-                last_heartbeat_at = pending_next_last_heartbeat_at or started_at
-                if heartbeat is not None and time.monotonic() - last_heartbeat_at >= heartbeat:
-                    pending_next_last_heartbeat_at = time.monotonic()
-                    return "heartbeat", None
-
-        async def acquire_upstream_stream() -> tuple[str, Any]:
-            """Acquire the upstream stream under the same TTFB/disconnect policy."""
-
-            nonlocal acquire_task, acquire_started_at, acquire_last_heartbeat_at
-            if acquire_task is None:
-                acquire_task = asyncio.create_task(client.acompletion(request=request, **chat_kwargs))
-                acquire_started_at = ttfb_started_at
-                acquire_last_heartbeat_at = acquire_started_at
-            task = acquire_task
-            started_at = acquire_started_at or time.monotonic()
-            timeout = stream_settings.ttfb_timeout_seconds
-            heartbeat = stream_settings.heartbeat_seconds
-            while True:
-                if task.done():
-                    acquire_task = None
-                    acquire_started_at = None
-                    acquire_last_heartbeat_at = None
-                    return "stream", task.result()
-                if request is not None and await request.is_disconnected():
-                    self._trace(transaction_logger, "responses_stream_disconnected", {"reason": "client_disconnected", "phase": "acquire"}, direction="stream", stage="client", metadata={"transport": transport})
-                    await cancel_task(task)
-                    acquire_task = None
-                    acquire_started_at = None
-                    acquire_last_heartbeat_at = None
-                    return "disconnect", None
-                waits = []
-                elapsed = time.monotonic() - started_at
-                if timeout is not None:
-                    remaining_timeout = timeout - elapsed
-                    if remaining_timeout <= 0:
-                        await cancel_task(task)
-                        acquire_task = None
-                        acquire_started_at = None
-                        acquire_last_heartbeat_at = None
-                        raise ResponsesServiceError("Responses stream TTFB timeout", status_code=504, error_type="api_connection")
-                    waits.append(remaining_timeout)
-                if heartbeat is not None:
-                    last_heartbeat_at = acquire_last_heartbeat_at or started_at
-                    remaining_heartbeat = heartbeat - (time.monotonic() - last_heartbeat_at)
-                    if remaining_heartbeat <= 0:
-                        acquire_last_heartbeat_at = time.monotonic()
-                        return "heartbeat", None
-                    waits.append(remaining_heartbeat)
-                wait_timeout = min(waits) if waits else None
-                if wait_timeout is None:
-                    stream = await task
-                    acquire_task = None
-                    acquire_started_at = None
-                    acquire_last_heartbeat_at = None
-                    return "stream", stream
-                done, _ = await asyncio.wait({task}, timeout=wait_timeout)
-                if done:
-                    acquire_task = None
-                    acquire_started_at = None
-                    acquire_last_heartbeat_at = None
-                    return "stream", task.result()
-                last_heartbeat_at = acquire_last_heartbeat_at or started_at
-                if heartbeat is not None and time.monotonic() - last_heartbeat_at >= heartbeat:
-                    acquire_last_heartbeat_at = time.monotonic()
-                    return "heartbeat", None
-
-        if transaction_logger:
-            self._trace(
-                transaction_logger,
-                "stream_started",
-                {"event": StreamEvent("started", protocol="responses").to_dict(), "metrics": monitor.metrics.to_dict()},
-                direction="stream",
-                stage="client",
-                metadata={"transport": transport},
-            )
-        created = response_created_payload(response_id, unified.model)
-        self._trace(transaction_logger, "responses_stream_event_created", created, direction="stream", stage="final", metadata={"transport": transport})
-        await self._store_stream_current_state(
-            stream_request,
-            created,
-            parent,
-            transaction_logger=transaction_logger,
-            session_info=session_info,
-        )
-        yield ResponsesStreamEvent("response.created", created)
-        # Documented lifecycle: created -> in_progress -> items -> terminal.
-        in_progress = response_in_progress_payload(response_id, unified.model)
-        yield ResponsesStreamEvent("response.in_progress", in_progress)
-        try:
-            while chat_stream is None:
-                marker, acquired = await acquire_upstream_stream()
-                if marker == "disconnect":
-                    return
-                if marker == "heartbeat":
-                    self._trace(transaction_logger, "responses_stream_heartbeat", {"comment": "heartbeat", "phase": "acquire"}, direction="stream", stage="transport", metadata={"transport": transport})
-                    yield ResponsesStreamEvent("heartbeat", {"comment": "heartbeat"})
-                    continue
-                chat_stream = acquired
-            stream_iterator = chat_stream.__aiter__()
-            first_chunk = True
-            # Bridge-side buffers for non-text deltas (tool calls, refusal,
-            # reasoning) that stream as native Responses items.
-            bridge_tools: dict[int, dict[str, Any]] = {}
-            bridge_refusal = ""
-            bridge_reasoning = ""
-            while True:
-                try:
-                    marker, raw_chunk = await next_upstream_chunk(first=first_chunk)
-                except StopAsyncIteration:
-                    break
-                if marker == "disconnect":
-                    return
-                if marker == "heartbeat":
-                    self._trace(transaction_logger, "responses_stream_heartbeat", {"comment": "heartbeat"}, direction="stream", stage="transport", metadata={"transport": transport})
-                    yield ResponsesStreamEvent("heartbeat", {"comment": "heartbeat"})
-                    continue
-                first_chunk = False
-                if monitor.metrics.first_byte_at is None:
-                    monitor.record_event(StreamEvent("raw_chunk", protocol="responses", raw=raw_chunk))
-                    if transaction_logger:
-                        self._trace(
-                            transaction_logger,
-                            "stream_first_byte",
-                            {"metrics": monitor.metrics.to_dict()},
-                            direction="stream",
-                            stage="provider",
-                            metadata={"transport": transport},
-                        )
-                self._trace(transaction_logger, "raw_chat_bridge_stream_chunk", raw_chunk, direction="stream", stage="provider")
-                cost_usage = _responses_sse_cost_usage(raw_chunk)
-                if cost_usage is not None:
-                    usage = _merge_responses_stream_usage(usage, cost_usage)
-                    self._trace(transaction_logger, "responses_stream_cost_event", cost_usage, direction="stream", stage="metadata", metadata={"transport": transport})
-                    continue
-                chunk = parse_chat_sse_chunk(raw_chunk)
-                if not chunk or chunk.get("type") == "done":
-                    continue
-                self._trace(transaction_logger, "parsed_unified_stream_event", chunk, direction="stream", stage="protocol")
-                if chunk.get("error") is not None or chunk.get("type") == "error":
-                    raise ResponsesServiceError(_stream_error_message(chunk), status_code=502, error_type="upstream_error")
-                if chunk.get("usage"):
-                    usage = _merge_responses_stream_usage(_responses_chunk_usage(chunk), usage)
-                # Tool-call / refusal / reasoning deltas stream as native
-                # Responses items — never silently dropped (H4).
-                delta_payload = _chunk_delta_payload(chunk)
-                for fragment in delta_payload.get("tool_calls") or []:
-                    if not isinstance(fragment, dict):
-                        continue
-                    call_index = fragment.get("index") if isinstance(fragment.get("index"), int) else 0
-                    entry = bridge_tools.setdefault(call_index, {"id": None, "name": "", "arguments": ""})
-                    if fragment.get("id"):
-                        entry["id"] = fragment["id"]
-                    function_fragment = fragment.get("function") if isinstance(fragment.get("function"), dict) else {}
-                    if function_fragment.get("name"):
-                        entry["name"] += function_fragment["name"]
-                    if function_fragment.get("arguments"):
-                        entry["arguments"] += function_fragment["arguments"]
-                        item_output_index = _bridge_tool_output_index(bridge_tools, has_reasoning=bool(bridge_reasoning), call_index=call_index)
-                        if not entry.get("added"):
-                            entry["added"] = True
-                            yield ResponsesStreamEvent("response.output_item.added", {
-                                "type": "response.output_item.added",
-                                "sequence_number": next_sequence_value(),
-                                "output_index": item_output_index,
-                                "item": {"id": f"fc_{call_index}", "type": "function_call", "call_id": entry.get("id") or f"fc_{call_index}", "name": entry.get("name") or "", "arguments": "", "status": "in_progress"},
-                            })
-                        arguments_event = {
-                            "type": "response.function_call_arguments.delta",
-                            "sequence_number": next_sequence_value(),
-                            "item_id": f"fc_{call_index}",
-                            "output_index": item_output_index,
-                            "delta": function_fragment["arguments"],
-                        }
-                        yield ResponsesStreamEvent("response.function_call_arguments.delta", arguments_event)
-                refusal_fragment = delta_payload.get("refusal")
-                if isinstance(refusal_fragment, str) and refusal_fragment:
-                    bridge_refusal += refusal_fragment
-                reasoning_fragment = delta_payload.get("reasoning_content")
-                if isinstance(reasoning_fragment, str) and reasoning_fragment:
-                    bridge_reasoning += reasoning_fragment
-                delta = _chunk_text_delta(chunk)
-                if not delta:
-                    continue
-                if not item_started:
-                    item_started = True
-                    added = output_item_added_payload(state)
-                    self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": transport})
-                    yield ResponsesStreamEvent("response.output_item.added", added)
-                    part_added = content_part_added_payload(state)
-                    yield ResponsesStreamEvent("response.content_part.added", part_added)
-                state = ResponsesStreamState(
-                    response_id=state.response_id,
-                    model=state.model,
-                    output_text=state.output_text + delta,
-                    output_item_id=state.output_item_id,
-                )
-                event = output_text_delta_payload(state, delta)
-                first_visible = monitor.metrics.first_visible_output_at is None
-                monitor.record_event(
-                    StreamEvent(
-                        "delta",
-                        protocol="responses",
-                        data=event,
-                        visible_output=True,
-                    )
-                )
-                if first_visible:
-                    if transaction_logger:
-                        self._trace(
-                            transaction_logger,
-                            "stream_first_visible_output",
-                            {"event": event, "metrics": monitor.metrics.to_dict()},
-                            direction="stream",
-                            stage="final",
-                            metadata={"transport": transport},
-                        )
-                self._trace(transaction_logger, "responses_stream_event_output_text_delta", event, direction="stream", stage="final", metadata={"transport": transport})
-                await self._store_stream_current_state(stream_request, _current_stream_payload(state), parent, transaction_logger=transaction_logger, session_info=session_info)
-                yield ResponsesStreamEvent("response.output_text.delta", event)
-
-            if not item_started:
-                added = output_item_added_payload(state)
-                self._trace(transaction_logger, "responses_stream_event_output_item_added", added, direction="stream", stage="final", metadata={"transport": transport})
-                yield ResponsesStreamEvent("response.output_item.added", added)
-                part_added = content_part_added_payload(state)
-                yield ResponsesStreamEvent("response.content_part.added", part_added)
-            text_done = output_text_done_payload(state)
-            yield ResponsesStreamEvent("response.output_text.done", text_done)
-            part_done = content_part_done_payload(state)
-            yield ResponsesStreamEvent("response.content_part.done", part_done)
-            done_item = output_item_done_payload(state)
-            self._trace(transaction_logger, "responses_stream_event_output_item_done", done_item, direction="stream", stage="final", metadata={"transport": transport})
-            yield ResponsesStreamEvent("response.output_item.done", done_item)
-            # Bridge-side non-text items (tool calls, refusal, reasoning)
-            # flush as native output items before the terminal. The
-            # completed frame is built AFTER the flush so its sequence
-            # number stays monotonic (it yields last, it sequences last).
-            extra_output: list[dict[str, Any]] = []
-            for tool_index, entry in sorted(bridge_tools.items()):
-                item_output_index = _bridge_tool_output_index(bridge_tools, has_reasoning=bool(bridge_reasoning), call_index=tool_index)
-                tool_item = {"id": f"fc_{tool_index}", "type": "function_call", "call_id": entry.get("id") or f"fc_{tool_index}", "name": entry.get("name") or "", "arguments": entry.get("arguments") or "", "status": "completed"}
-                if not entry.get("added"):
-                    yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": item_output_index, "item": dict(tool_item, status="in_progress")})
-                yield ResponsesStreamEvent("response.function_call_arguments.done", {"type": "response.function_call_arguments.done", "sequence_number": next_sequence_value(), "item_id": f"fc_{tool_index}", "output_index": item_output_index, "arguments": entry.get("arguments") or ""})
-                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": item_output_index, "item": tool_item})
-                extra_output.append(tool_item)
-            if bridge_reasoning:
-                reasoning_index = 1 + (max(bridge_tools) + 1 if bridge_tools else 0)
-                reasoning_item = {"id": "rs_0", "type": "reasoning", "summary": [{"type": "summary_text", "text": bridge_reasoning}], "status": "completed"}
-                yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": reasoning_index, "item": dict(reasoning_item, status="in_progress")})
-                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": reasoning_index, "item": reasoning_item})
-                extra_output.append(reasoning_item)
-            if bridge_refusal:
-                refusal_item = {"id": state.output_item_id + "_r", "type": "message", "role": "assistant", "content": [{"type": "refusal", "refusal": bridge_refusal}], "status": "completed"}
-                refusal_index = 1 + (max(bridge_tools) + 1 if bridge_tools else 0) + (1 if bridge_reasoning else 0)
-                yield ResponsesStreamEvent("response.output_item.added", {"type": "response.output_item.added", "sequence_number": next_sequence_value(), "output_index": refusal_index, "item": dict(refusal_item, status="in_progress")})
-                yield ResponsesStreamEvent("response.output_item.done", {"type": "response.output_item.done", "sequence_number": next_sequence_value(), "output_index": refusal_index, "item": refusal_item})
-                extra_output.append(refusal_item)
-            completed = response_completed_payload(state, _usage_to_responses_stream(usage))
-            completed["response"]["output"].extend(extra_output)
-            _record_responses_session_anchor(session_info, completed.get("response", completed))
-            self._trace_responses_usage(transaction_logger, completed, unified.model, source="responses_stream")
-            stored = await self._store_stream_response(stream_request, completed, parent, transaction_logger=transaction_logger, session_info=session_info, local_cache=local_cache)
-            if stored:
-                self._trace(transaction_logger, "responses_stored_stream_response", completed, direction="metadata", stage="final")
-            else:
-                self._trace(transaction_logger, "responses_store_skipped", {"response_id": completed.get("response", completed).get("id")}, direction="metadata", stage="final")
-            monitor.complete()
-            if transaction_logger:
-                self._trace(
-                    transaction_logger,
-                    "stream_completed",
-                    {"metrics": monitor.metrics.to_dict()},
-                    direction="stream",
-                    stage="final",
-                    metadata={"transport": transport},
-                )
-                self._trace(
-                    transaction_logger,
-                    "stream_metrics_final",
-                    {"metrics": monitor.metrics.to_dict()},
-                    direction="stream",
-                    stage="final",
-                    metadata={"transport": transport},
-                )
-            self._trace(transaction_logger, "responses_stream_event_completed", completed, direction="stream", stage="final", metadata={"transport": transport})
-            yield ResponsesStreamEvent("response.completed", completed)
-            self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport})
-            yield ResponsesStreamEvent("done", {}, terminal=True)
-            self._finalize_stream_metadata(transaction_logger)
-        except Exception as exc:
-            monitor.record_event(StreamEvent("error", protocol="responses", data={"error_type": exc.__class__.__name__}))
-            failed = response_failed_payload(response_id, unified.model, _stream_failure_error(exc))
-            if state.output_text:
-                # Partial output survives the failure record (event shape
-                # nests the response object).
-                failed["response"]["output"] = [output_item_done_payload(state)["item"]]
-            self._log_transform_error(transaction_logger, "responses_stream", exc, stream_request)
-            stored = await self._store_stream_response(stream_request, failed, parent, failed=True, transaction_logger=transaction_logger, session_info=session_info, local_cache=local_cache)
-            if stored:
-                self._trace(transaction_logger, "responses_stored_failed_stream_response", {"response_id": failed.get("response", failed).get("id"), "status": "failed"}, direction="metadata", stage="final")
-            self._trace(transaction_logger, "responses_stream_event_failed", failed, direction="stream", stage="final", metadata={"transport": transport}, scrub_strings=True)
-            if transaction_logger:
-                self._trace(
-                    transaction_logger,
-                    "stream_metrics_final",
-                    {"metrics": monitor.metrics.to_dict()},
-                    direction="stream",
-                    stage="final",
-                    metadata={"transport": transport, "failed": True},
-                )
-            yield ResponsesStreamEvent("response.failed", failed)
-            self._trace(transaction_logger, "stream_done_event", {"raw": "done"}, direction="stream", stage="final", metadata={"transport": transport, "failed": True})
-            yield ResponsesStreamEvent("done", {}, terminal=True)
-            # Finalize AFTER the failure frames so their error records land
-            # in metadata (order matters: finalize reads _error_records).
-            self._finalize_stream_metadata(transaction_logger, error=exc)
-        finally:
-            if chat_stream is None and acquire_task is not None and acquire_task.done() and not acquire_task.cancelled():
-                try:
-                    chat_stream = acquire_task.result()
-                    stream_iterator = chat_stream.__aiter__()
-                except Exception:
-                    chat_stream = None
-            await cancel_task(pending_next_task)
-            await cancel_task(acquire_task)
-            if chat_stream is not None and not upstream_closed:
-                await close_upstream("wrapper_exit")
-
     async def get_response(
         self,
         response_id: str,
@@ -1245,13 +730,13 @@ class ResponsesService:
         *,
         scope_key: str = "public",
     ) -> dict[str, Any]:
-        """Delete a stored response and return a compatible deletion object."""
+        """Delete a stored response and return the official deletion object."""
 
         await self._stored_or_not_found(response_id, scope_key)
         deleted = await self.store.delete(response_id, scope_key)
         if not deleted:
             raise ResponsesServiceError(f"Response not found: {response_id}", status_code=404, error_type="not_found_error")
-        return {"id": response_id, "object": "response.deleted", "deleted": True}
+        return {"id": response_id, "object": "response", "deleted": True}
 
     async def delete_response_with_access_token(
         self,
@@ -1264,28 +749,100 @@ class ResponsesService:
         deleted = await self.store.delete(response_id, stored.scope_key or "public")
         if not deleted:
             self._raise_response_not_found(response_id)
-        return {"id": response_id, "object": "response.deleted", "deleted": True}
+        return {"id": response_id, "object": "response", "deleted": True}
+
+    async def cancel_response(
+        self,
+        response_id: str,
+        *,
+        scope_key: str = "public",
+    ) -> dict[str, Any]:
+        """Cancel a stored response and return its cancelled response object.
+
+        Best-effort by contract: the stored row is marked ``cancelled`` and
+        surfaced. In-flight provider cancellation is a SEAM — no in-tree
+        provider exposes a cancel hook, so a provider-owned row only has its
+        eligibility checked (provenance + current target family); the durable
+        row is always updated locally.
+        """
+
+        stored = await self._stored_or_not_found(response_id, scope_key)
+        await self._best_effort_provider_cancel(stored)
+        return await self._mark_cancelled(stored)
+
+    async def cancel_response_with_access_token(
+        self,
+        response_id: str,
+        access_token: str = "public",
+    ) -> dict[str, Any]:
+        """Cancel a response only when the transport capability is valid."""
+
+        stored = await self._stored_for_access(response_id, access_token)
+        await self._best_effort_provider_cancel(stored)
+        return await self._mark_cancelled(stored)
+
+    async def _mark_cancelled(self, stored: StoredResponse) -> dict[str, Any]:
+        """Persist the cancelled status and return the client-facing object."""
+
+        stored.status = "cancelled"
+        response = stored.response if isinstance(stored.response, dict) else {}
+        response = complete_responses_object(
+            response,
+            response_id=stored.id,
+            model=stored.model,
+            status="cancelled",
+        )
+        response["status"] = "cancelled"
+        stored.response = response
+        try:
+            await self.store.save(stored)
+        except Exception as exc:
+            # Cancellation is best-effort: a store failure never turns the
+            # client's cancel into a 500.
+            self._log_transform_error(None, "responses_store_cancel", exc, {"response_id": stored.id})
+        return deepcopy(response)
+
+    async def _best_effort_provider_cancel(self, stored: StoredResponse) -> bool:
+        """Check whether a provider-side cancel would apply (the seam).
+
+        True only when the stored row is provider-owned AND the request's
+        current routing target is that same Responses-family provider. No
+        in-tree provider implements cancellation, so this reports eligibility
+        without a network call; a future provider hook plugs in here.
+        """
+
+        metadata = stored.metadata if isinstance(stored.metadata, dict) else {}
+        provider = metadata.get("provider")
+        if not metadata.get("provider_owned") or not provider:
+            return False
+        target = _provider_continuation_target({"model": stored.model})
+        return target is not None and target == provider
 
     async def list_input_items(
         self,
         response_id: str,
         *,
         scope_key: str = "public",
+        limit: int = 20,
+        after: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Return stored input items for a response continuation."""
+        """Return a paginated official input-items list envelope."""
 
         stored = await self._stored_or_not_found(response_id, scope_key)
-        return {"object": "list", "data": deepcopy(stored.input_items)}
+        return _input_items_page(stored.input_items, limit=limit, after=after)
 
     async def list_input_items_with_access_token(
         self,
         response_id: str,
         access_token: str = "public",
+        *,
+        limit: int = 20,
+        after: Optional[str] = None,
     ) -> dict[str, Any]:
         """Return input items only when the transport capability is valid."""
 
         stored = await self._stored_for_access(response_id, access_token)
-        return {"object": "list", "data": deepcopy(stored.input_items)}
+        return _input_items_page(stored.input_items, limit=limit, after=after)
 
     async def _stored_for_access(
         self,
@@ -1426,7 +983,7 @@ class ResponsesService:
                     "previous_response_id": response_id,
                     "output_count": len(parent.output_items),
                     "input_item_count": len(parent.input_items),
-                    "bridge_context_expanded": True,
+                    "context_expanded": True,
                 },
             )
         return parent
@@ -1666,6 +1223,49 @@ def _input_items(raw_request: dict[str, Any]) -> list[Any]:
     return deepcopy(value if isinstance(value, list) else [value])
 
 
+def _input_item_id(item: Any) -> Optional[str]:
+    """Return an input item's id when the item carries one, else ``None``."""
+
+    if isinstance(item, dict) and isinstance(item.get("id"), str):
+        return item["id"]
+    return None
+
+
+def _input_items_page(
+    items: list[Any],
+    *,
+    limit: int = 20,
+    after: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build the official paginated input-items list envelope.
+
+    ``limit`` defaults to 20 and caps at 100; ``after`` is an item id cursor
+    (the page starts after that id). ``first_id``/``last_id`` are the ids of
+    the returned page edges (null when the page is empty or the items carry no
+    ids), and ``has_more`` is true when another page follows.
+    """
+
+    try:
+        size = int(limit)
+    except (TypeError, ValueError):
+        size = 20
+    size = max(1, min(size, 100))
+    start = 0
+    if after:
+        for index, item in enumerate(items):
+            if _input_item_id(item) == after:
+                start = index + 1
+                break
+    page = items[start : start + size]
+    return {
+        "object": "list",
+        "data": deepcopy(page),
+        "first_id": _input_item_id(page[0]) if page else None,
+        "last_id": _input_item_id(page[-1]) if page else None,
+        "has_more": start + size < len(items),
+    }
+
+
 def _reject_unsupported_lifecycles(raw_request: dict[str, Any]) -> None:
     """Clear local rejections for spec conflicts this proxy cannot honor."""
 
@@ -1842,18 +1442,6 @@ def _redact_sensitive_fields(value: Any) -> Any:
     return deepcopy(value)
 
 
-def _current_stream_payload(state: ResponsesStreamState) -> dict[str, Any]:
-    """Return a retrievable in-progress Responses object for stream state."""
-
-    payload = response_completed_payload(state)
-    # response_completed_payload nests the response object under "response"
-    # (event shape); stored objects are flat response objects.
-    response_obj = payload.get("response") if isinstance(payload.get("response"), dict) else payload
-    response_obj = deepcopy(response_obj)
-    response_obj["status"] = "in_progress"
-    return response_obj
-
-
 def _expires_at(settings: ResponsesStoreSettings) -> Optional[float]:
     """Return the expiration timestamp for a new stored response, if enabled."""
 
@@ -1895,18 +1483,6 @@ def _capture_request_context(session_info: dict[str, Any]):
     return capture
 
 
-def _without_internal_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Return trace/provider-visible kwargs without proxy-internal controls."""
-
-    return _redact_sensitive_fields(
-        {
-            key: deepcopy(value)
-            for key, value in kwargs.items()
-            if not key.startswith("_") and key not in PROXY_ROUTING_KEYS
-        }
-    )
-
-
 def _record_responses_session_anchor(session_info: dict[str, Any], response_payload: dict[str, Any]) -> None:
     """Record emitted Responses IDs as response-derived session evidence."""
 
@@ -1936,148 +1512,47 @@ def _stream_error_message(chunk: dict[str, Any]) -> str:
     return str(message) if message else "Upstream stream error"
 
 
+# Official Responses ResponseError.code vocabulary for synthesized failures
+# (docs §2.2). Codes are STRINGS; the numeric HTTP status lives on the wire
+# status, never in the error object.
+_RESPONSES_FAILURE_CODES = {
+    "api_connection": "server_error",
+    "upstream_error": "server_error",
+    "server_error": "server_error",
+    "proxy_timeout": "server_error",
+    "rate_limit": "rate_limit_exceeded",
+    "rate_limit_error": "rate_limit_exceeded",
+    "quota_exceeded": "rate_limit_exceeded",
+    "invalid_request": "invalid_prompt",
+    "invalid_request_error": "invalid_prompt",
+    "context_window_exceeded": "invalid_prompt",
+    "request_too_large": "invalid_prompt",
+    "authentication": "invalid_api_key",
+    "authentication_error": "invalid_api_key",
+    "forbidden": "invalid_request_error",
+    "permission_error": "invalid_request_error",
+    "not_found": "previous_response_not_found",
+    "not_found_error": "previous_response_not_found",
+}
+
+
 def _stream_failure_error(exc: Exception) -> dict[str, Any]:
-    """Return a client-safe Responses stream failure object."""
+    """Return a client-safe Responses stream failure object.
+
+    ``code`` uses the official ResponseError string vocabulary; a numeric-only
+    code never reaches the Responses surface.
+    """
 
     error_type = getattr(exc, "error_type", None) or exc.__class__.__name__
-    result = {"message": str(exc), "type": str(error_type)}
+    result = {
+        "code": _RESPONSES_FAILURE_CODES.get(str(error_type), "server_error"),
+        "message": str(exc),
+        "type": str(error_type),
+    }
     if isinstance(exc, ResponsesServiceError) and error_type == "api_connection":
         text = str(exc).lower()
         if "ttfb" in text:
             result["timeout_type"] = "ttfb"
         elif "stall" in text:
             result["timeout_type"] = "stall"
-    return result
-
-
-def _responses_sse_cost_usage(chunk: Any) -> Optional[dict[str, Any]]:
-    """Extract Responses stream cost metadata from SSE comments/events."""
-
-    if not isinstance(chunk, str):
-        return None
-    payload = _responses_sse_cost_payload(chunk)
-    if payload is None:
-        return None
-    if isinstance(payload, (int, float, str)):
-        payload = {"provider_reported_cost": payload, "source": "responses_sse_cost"}
-    if not isinstance(payload, dict):
-        return None
-    cost = payload.get("provider_reported_cost", payload.get("request_cost_usd", payload.get("total_cost", payload.get("cost", payload.get("estimated_cost")))))
-    if cost is None:
-        return None
-    return {
-        "provider_reported_cost": cost,
-        "currency": payload.get("currency", "USD"),
-        "cost_details": payload,
-    }
-
-
-def _responses_chunk_usage(chunk: dict[str, Any]) -> Any:
-    """Return stream chunk usage with sibling cost metadata preserved."""
-
-    usage = chunk.get("usage")
-    if not isinstance(usage, dict):
-        return usage
-    merged = dict(usage)
-    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency", "costMetadata"):
-        if key in chunk and key not in merged:
-            merged[key] = deepcopy(chunk[key])
-    return merged
-
-
-def _responses_sse_cost_payload(chunk: str) -> Any:
-    event_type = None
-    data_lines: list[str] = []
-    for line in chunk.strip().splitlines():
-        stripped = line.strip()
-        if stripped.startswith(":"):
-            comment = stripped[1:].strip()
-            if comment.startswith("cost"):
-                return _parse_cost_text(comment[4:].strip())
-            continue
-        if stripped.startswith("event:"):
-            event_type = stripped[6:].strip()
-            continue
-        if stripped.startswith("data:"):
-            data_lines.append(stripped[5:].strip())
-    if event_type == "cost" and data_lines:
-        return _parse_cost_text("\n".join(data_lines).strip())
-    return None
-
-
-def _parse_cost_text(text: str) -> Any:
-    if not text:
-        return None
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        try:
-            return float(text)
-        except ValueError:
-            return None
-
-
-def _merge_responses_stream_usage(primary: Any, fallback_cost: Any) -> Any:
-    """Merge earlier stream cost metadata into later token usage when needed."""
-
-    if not isinstance(primary, dict):
-        return fallback_cost if primary is None else primary
-    if not isinstance(fallback_cost, dict):
-        return primary
-    merged = deepcopy(primary)
-    has_cost = any(key in merged for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd"))
-    if has_cost:
-        return merged
-    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency"):
-        if key in fallback_cost:
-            merged[key] = deepcopy(fallback_cost[key])
-    return merged
-
-
-def _chunk_text_delta(chunk: dict[str, Any]) -> str:
-    choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
-    if not choices:
-        return ""
-    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
-    if not isinstance(delta, dict):
-        return ""
-    content = delta.get("content")
-    return content if isinstance(content, str) else ""
-
-
-def _chunk_delta_payload(chunk: dict[str, Any]) -> dict[str, Any]:
-    """Full first-choice delta (tool_calls/refusal/reasoning included)."""
-
-    choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
-    if not choices:
-        return {}
-    delta = choices[0].get("delta") if isinstance(choices[0], dict) else None
-    return delta if isinstance(delta, dict) else {}
-
-
-def _bridge_tool_output_index(bridge_tools: dict[int, dict[str, Any]], *, has_reasoning: bool, call_index: int = 0) -> int:
-    """Stable index authority for bridge items: text=0, tools 1+N (call
-    index order, independent of reasoning arrival order), reasoning after
-    tools, refusal last. Live deltas and the terminal flush share it."""
-
-    return 1 + call_index
-
-
-def _usage_to_responses_stream(usage: Any) -> Any:
-    if not isinstance(usage, dict):
-        return usage
-    result = {
-        "input_tokens": usage.get("prompt_tokens", usage.get("input_tokens", 0)),
-        "output_tokens": usage.get("completion_tokens", usage.get("output_tokens", 0)),
-        "total_tokens": usage.get("total_tokens", 0),
-    }
-    prompt_details = usage.get("prompt_tokens_details") or usage.get("input_tokens_details")
-    if isinstance(prompt_details, dict):
-        result["input_tokens_details"] = {"cached_tokens": prompt_details.get("cached_tokens", 0)}
-    completion_details = usage.get("completion_tokens_details") or usage.get("output_tokens_details")
-    if isinstance(completion_details, dict):
-        result["output_tokens_details"] = {"reasoning_tokens": completion_details.get("reasoning_tokens", 0)}
-    for key in ("cost_details", "cost", "total_cost", "estimated_cost", "provider_reported_cost", "request_cost_usd", "currency"):
-        if key in usage:
-            result[key] = deepcopy(usage[key])
     return result

@@ -52,10 +52,9 @@ def _trace_text(log_dir):
     return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
 
 class FakeStreamingUsageClient:
-    async def acompletion(self, **kwargs):
+    async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
         async def gen():
-            yield 'data: {"id":"chunk_1","choices":[{"delta":{"content":"hi"}}]}\n\n'
-            yield 'data: {"id":"chunk_2","choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28,"completion_tokens_details":{"reasoning_tokens":3}}}\n\n'
+            yield 'event: response.completed\ndata: {"type":"response.completed","sequence_number":0,"response":{"id":"resp_usage_stream","object":"response","status":"completed","model":"gpt-test","output":[],"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28,"output_tokens_details":{"reasoning_tokens":3}}}}\n\n'
 
         return gen()
 

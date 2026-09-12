@@ -17,9 +17,8 @@ from ..protocols import serialize_value
 def generate_response_id() -> str:
     """Return a local Responses-compatible identifier.
 
-    Upstream IDs are preserved when providers return them. This helper is only
-    used by the bridge path when the current chat-completions backend has no
-    native Responses ID to expose.
+    Upstream IDs are preserved when providers return them; this helper mints a
+    local id only when a synthesized object has no provider id to correlate.
     """
 
     return f"resp_{secrets.token_urlsafe(18).replace('-', '').replace('_', '')[:24]}"

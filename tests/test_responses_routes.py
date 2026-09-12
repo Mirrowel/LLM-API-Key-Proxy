@@ -113,7 +113,7 @@ def test_responses_provider_error_uses_responses_protocol() -> None:
 
     assert response.status_code == 429
     assert response.json() == {
-        "error": {"code": "429", "message": "provider busy", "type": "rate_limit"}
+        "error": {"code": "rate_limit_exceeded", "message": "provider busy", "type": "rate_limit"}
     }
 
 
@@ -147,11 +147,18 @@ def test_get_delete_and_input_items_routes() -> None:
     assert get_response.status_code == 200
     assert get_response.json()["id"] == created["id"]
     assert input_items.status_code == 200
-    assert input_items.json() == {"object": "list", "data": ["hello"]}
+    assert input_items.json() == {
+        "object": "list",
+        "data": ["hello"],
+        "first_id": None,
+        "last_id": None,
+        "has_more": False,
+    }
     assert deleted.status_code == 200
-    assert deleted.json() == {"id": created["id"], "object": "response.deleted", "deleted": True}
+    assert deleted.json() == {"id": created["id"], "object": "response", "deleted": True}
     assert missing.status_code == 404
     assert missing.json()["error"]["type"] == "not_found_error"
+    assert missing.json()["error"]["code"] == "previous_response_not_found"
 
 
 def test_scoped_response_retrieval_requires_creation_domain_header() -> None:
@@ -232,6 +239,42 @@ def test_scoped_continuation_requires_parent_access_capability() -> None:
 
     assert denied.status_code == 404
     assert allowed.status_code == 200
+
+
+def test_input_items_pagination_honors_limit_and_after() -> None:
+    client = _client()
+    items = [
+        {"id": f"it_{index}", "type": "message", "role": "user", "content": str(index)}
+        for index in range(1, 4)
+    ]
+    created = client.post("/v1/responses", json={"model": "gpt-test", "input": items}).json()
+
+    first_page = client.get(f"/v1/responses/{created['id']}/input_items?limit=1").json()
+    second_page = client.get(f"/v1/responses/{created['id']}/input_items?limit=1&after=it_1").json()
+
+    assert first_page["object"] == "list"
+    assert [item["id"] for item in first_page["data"]] == ["it_1"]
+    assert first_page["first_id"] == "it_1"
+    assert first_page["last_id"] == "it_1"
+    assert first_page["has_more"] is True
+    assert [item["id"] for item in second_page["data"]] == ["it_2"]
+    assert second_page["has_more"] is True
+
+
+def test_cancel_response_route_marks_stored_row_and_404s_unknown() -> None:
+    client = _client()
+    created = client.post("/v1/responses", json={"model": "gpt-test", "input": "hello"}).json()
+
+    cancelled = client.post(f"/v1/responses/{created['id']}/cancel")
+    fetched = client.get(f"/v1/responses/{created['id']}")
+    missing = client.post("/v1/responses/does_not_exist/cancel")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["id"] == created["id"]
+    assert fetched.json()["status"] == "cancelled"
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "previous_response_not_found"
 
 
 def test_post_responses_stream_returns_sse_events() -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import time
 from typing import Any, Iterable, Optional
 
 from .types import (
@@ -1389,3 +1390,60 @@ def tool_result_object(value: Any) -> dict[str, Any]:
     if isinstance(normalized, dict):
         return normalized
     return {"result": serialize_value(normalized)}
+
+
+# The SDK-required members of a Responses ``Response`` object. Every mint site
+# (native service terminals, the formatter lane's created/in_progress/terminal
+# objects, WS warmup) shares ONE builder so a synthesized object is always
+# shape-valid; provider-authored values are authoritative and synthesis only
+# fills ABSENCE.
+_RESPONSES_OBJECT_DEFAULTS: tuple[tuple[str, Any], ...] = (
+    ("object", "response"),
+    ("output", []),
+    ("parallel_tool_calls", True),
+    ("tool_choice", "auto"),
+    ("tools", []),
+    ("reasoning", None),
+    ("usage", None),
+    ("metadata", {}),
+)
+
+
+def complete_responses_object(
+    base: Optional[dict[str, Any]],
+    *,
+    response_id: str,
+    model: str,
+    status: str,
+    created_at: Any = None,
+) -> dict[str, Any]:
+    """Return an SDK-conformant Responses object, filling only absences.
+
+    ``base`` is the partial object a mint site assembled from live state. Any
+    member it already carries (provider identity, usage, output, error,
+    metadata) wins; the helper adds the members official SDKs require so a
+    synthesized created/in_progress/completed/failed/incomplete object always
+    validates. ``created_at`` is an integer unix timestamp per the SDK type: a
+    provider value rides through, a missing/unusable value is stamped now.
+    ``error`` and ``incomplete_details`` are nullable and present (null when
+    not applicable), never a fabricated reason.
+    """
+
+    payload = dict(base) if isinstance(base, dict) else {}
+    payload.setdefault("id", response_id)
+    created = payload.get("created_at")
+    if created is None:
+        created = created_at
+    try:
+        payload["created_at"] = int(created) if created is not None else int(time.time())
+    except (TypeError, ValueError):
+        payload["created_at"] = int(time.time())
+    payload.setdefault("status", status)
+    payload.setdefault("model", model)
+    for key, default in _RESPONSES_OBJECT_DEFAULTS:
+        # Fresh mutable containers per call: the defaults tuple is module state
+        # and must never be shared by reference into a returned object.
+        payload.setdefault(key, list(default) if isinstance(default, list) else dict(default) if isinstance(default, dict) else default)
+    payload.setdefault("error", None)
+    payload.setdefault("incomplete_details", None)
+    return payload
