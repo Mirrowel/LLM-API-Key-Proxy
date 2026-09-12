@@ -385,15 +385,12 @@ def _register_providers():
         configured_protocol = raw.get("protocol_name")
         if configured_protocol:
             from ..protocols import get_protocol
+            from ..protocols.registry import is_generative_protocol
 
             protocol_name = get_protocol(str(configured_protocol).strip().lower()).name
-            if protocol_name not in {
-                "openai_chat",
-                "responses",
-                "anthropic_messages",
-                "gemini",
-                "ollama",
-            }:
+            # Registry-derived allowlist (G11) — matches the config surface;
+            # sibling variants (responses_stateful, ...) qualify.
+            if not is_generative_protocol(protocol_name):
                 raise ValueError(
                     f"Configured custom provider {provider_name!r} requires a supported generative protocol, got {protocol_name!r}"
                 )

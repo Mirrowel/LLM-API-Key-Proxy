@@ -109,18 +109,25 @@ _REQUEST_CORE_FIELDS = {
 }
 
 
-class ResponsesProtocol(ProtocolAdapter):
-    """Adapter for OpenAI Responses request, response, and event stream shapes.
+class ResponsesWireAdapter(ProtocolAdapter):
+    """Shared wire logic for the Responses protocol family (G11 siblings).
 
-    The protocol keeps output items in addition to parsed messages because later
-    response storage and continuation features need item-level fidelity.
+    The Responses format serves three lifecycles — stateless (full input
+    resend, store:false, ZDR), stateful (previous_response_id chains with
+    provider-side retention), and WebSocket (connection-local continuation
+    state). All three share this wire base; the concrete siblings
+    (ResponsesProtocol, ResponsesStatefulProtocol, ResponsesWebSocketProtocol)
+    differ only in registry identity, transports, and variant policy.
+    Providers opt into the non-default variants per transport_profiles
+    declarations; stateless is the baseline every responses-capable
+    provider has (operator ruling 2026-09-13).
     """
 
-    name: ClassVar[str] = "responses"
-    aliases: ClassVar[tuple[str, ...]] = ("openai_responses", "response_api")
+    name: ClassVar[str] = ""
+    aliases: ClassVar[tuple[str, ...]] = ()
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
     supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_RESPONSES,)
-    future_transports: ClassVar[tuple[str, ...]] = ("websocket",)
+    future_transports: ClassVar[tuple[str, ...]] = ()
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
@@ -1051,6 +1058,51 @@ class ResponsesProtocol(ProtocolAdapter):
             )
         )
         return payload
+
+
+class ResponsesProtocol(ResponsesWireAdapter):
+    """STATELESS Responses sibling — the family baseline (G11 Phase A).
+
+    Full input resend each turn; store defaults off from the proxy's
+    perspective; no provider-side continuation expectations. Every
+    responses-capable provider has this variant (it is what a bare
+    `protocol: responses` declaration means).
+    """
+
+    name: ClassVar[str] = "responses"
+    aliases: ClassVar[tuple[str, ...]] = ("openai_responses", "response_api")
+    base_family: ClassVar[str] = "responses"
+
+
+class ResponsesStatefulProtocol(ResponsesWireAdapter):
+    """STATEFUL Responses sibling — provider-side retention (opt-in only).
+
+    previous_response_id chains with the PROVIDER's storage (30-day default
+    retention upstream); instructions are NOT carried across chained turns;
+    chained prior input tokens bill as input every turn. Exists on a
+    provider only via an explicit transport_profiles declaration — today
+    that is OpenAI-shaped providers (and Fireworks); the ecosystem default
+    is stateless (OpenRouter 400s on stateful params).
+    """
+
+    name: ClassVar[str] = "responses_stateful"
+    base_family: ClassVar[str] = "responses"
+
+
+class ResponsesWebSocketProtocol(ResponsesWireAdapter):
+    """WEBSOCKET Responses sibling — connection-local continuation (opt-in).
+
+    The live-connection lifecycle: response.create turns, stream_id lanes
+    (same lane FIFO, lanes concurrent), connection-local in-memory
+    continuation cache compatible with store:false/ZDR, and mid-turn
+    steering. Exclusive to providers that declare it (OpenAI-shaped).
+    HTTP-reachable surfaces are NOT declared by this sibling — the
+    websocket transport is the sibling's identity.
+    """
+
+    name: ClassVar[str] = "responses_websocket"
+    supported_transports: ClassVar[tuple[str, ...]] = ("websocket",)
+    base_family: ClassVar[str] = "responses"
 
 
 def _responses_output_modalities(messages: list[UnifiedMessage]) -> list[str]:

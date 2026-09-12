@@ -1119,7 +1119,6 @@ async def anthropic_count_tokens(
 
 
 @app.post("/v1beta/models/{model:path}:generateContent")
-@app.post("/v1/models/{model:path}:generateContent")
 async def gemini_generate_content(
     model: str,
     request: Request,
@@ -1157,7 +1156,6 @@ async def gemini_generate_content(
 
 
 @app.post("/v1beta/models/{model:path}:streamGenerateContent")
-@app.post("/v1/models/{model:path}:streamGenerateContent")
 async def gemini_stream_generate_content(
     model: str,
     request: Request,
@@ -1237,7 +1235,6 @@ async def _gemini_json_array_response(
 
 
 @app.post("/v1beta/models/{model:path}:countTokens")
-@app.post("/v1/models/{model:path}:countTokens")
 async def gemini_count_tokens(
     model: str,
     request: Request,
@@ -1317,6 +1314,88 @@ async def gemini_models_discovery(
     if page_size > 0 and next_index < len(entries):
         payload["nextPageToken"] = str(next_index)
     return JSONResponse(content=payload)
+
+
+def _gemini_openai_model(model: str) -> str:
+    """Route a compat-face model reference onto the gemini:openai profile."""
+
+    normalized = str(model or "").strip()
+    if normalized.startswith("gemini:"):
+        return normalized
+    if normalized.startswith("gemini/"):
+        return f"gemini:openai/{normalized.removeprefix('gemini/')}"
+    return f"gemini:openai/{normalized}"
+
+
+@app.post("/v1beta/openai/chat/completions")
+async def gemini_openai_chat_completions(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """Google's OpenAI-compat face for Gemini (G11): straight-through chat.
+
+    Traffic on this URL rides the ``gemini:openai`` transport profile —
+    chat wire in, chat wire out, byte-identical on the fast path (no
+    conversion), Bearer-authed upstream per Google's compat contract.
+    """
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        status, content = route_error_response("Invalid JSON in request body.", protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="openai_chat"
+        )
+        return JSONResponse(status_code=status, content=content)
+    payload["model"] = _gemini_openai_model(str(payload.get("model") or ""))
+    try:
+        result = await client.agenerate(payload, input_protocol="openai_chat", request=request)
+        if isinstance(result, AsyncGenerator):
+            return StreamingResponse(
+                streaming_response_wrapper(request, payload, result, input_protocol="openai_chat"),
+                media_type="text/event-stream",
+                headers=SSE_HEADERS,
+            )
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Gemini openai-compat chat endpoint error: {error}")
+        status, content = route_error_response(error, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
+
+
+@app.get("/v1beta/openai/models")
+async def gemini_openai_models(
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """Model discovery for the compat face (OpenAI ``list`` shape)."""
+
+    try:
+        model_ids = [
+            str(model).removeprefix("gemini/")
+            for model in await client.get_all_available_models(grouped=False)
+            if str(model).startswith("gemini/")
+        ]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Gemini openai-compat models endpoint error: {error}")
+        status, content = route_error_response(error, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
+    return JSONResponse(
+        content={
+            "object": "list",
+            "data": [
+                {"id": model_id, "object": "model", "created": int(time.time()), "owned_by": "google"}
+                for model_id in model_ids
+            ],
+        }
+    )
 
 
 @app.post("/v1/embeddings")

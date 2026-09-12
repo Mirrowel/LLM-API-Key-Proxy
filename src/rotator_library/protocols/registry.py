@@ -81,6 +81,40 @@ def get_protocol_class(name: str) -> Type[ProtocolAdapter]:
     return PROTOCOL_PLUGINS[resolve_protocol_name(name)]
 
 
+# The generative operation vocabulary a provider-facing protocol may declare
+# (G11): sibling variants share these; operation-scoped adapters
+# (embeddings/audio/images/mcp) and the litellm passthrough do not.
+_GENERATIVE_OPERATIONS = frozenset(
+    {
+        "chat",
+        "messages",
+        "responses",
+        "generate",
+        "stream_generate",
+        "ollama_chat",
+        "ollama_generate",
+    }
+)
+
+
+def is_generative_protocol(name: str) -> bool:
+    """Whether a registered protocol serves provider-facing generative traffic.
+
+    The single source of truth for protocol allowlists (config providers,
+    transport profiles): any registered adapter declaring a generative
+    operation qualifies — sibling variants included. Deriving from the
+    registry keeps allowlists from drifting as protocols are added.
+    """
+
+    try:
+        cls = get_protocol_class(name)
+    except KeyError:
+        return False
+    if cls.name == "litellm_fallback":
+        return False
+    return any(op in _GENERATIVE_OPERATIONS for op in cls.supported_operations)
+
+
 def get_protocol(name: str) -> ProtocolAdapter:
     """Return a shared stateless protocol adapter instance by name or alias."""
 
@@ -115,6 +149,10 @@ def _register_protocols() -> None:
                 and issubclass(attribute, ProtocolAdapter)
                 and attribute is not ProtocolAdapter
                 and attribute.__module__ == module.__name__
+                # G11: unnamed wire-base classes (shared by sibling variants)
+                # are not registerable protocols — only concrete named
+                # adapters register.
+                and getattr(attribute, "name", "")
             ):
                 register_protocol(attribute)
 

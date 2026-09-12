@@ -33,13 +33,55 @@ def _strip_gemini_api_version(base: str) -> str:
 class GeminiProvider(ProviderInterface):
     """
     Provider implementation for the Google Gemini API.
+
+    G11: two transport faces share one provider identity — ``native``
+    (the Gemini format on /v1beta/models/..., x-goog-api-key) and
+    ``openai`` (Google's OpenAI-compat surface on /v1beta/openai/...,
+    Bearer). Default face: native. The gemini FORMAT itself stays a
+    normal declarable protocol (Google's AI Studio + Vertex + the rare
+    third-party native surface).
     """
 
     protocol_name = "gemini"
     native_streaming_supported = True
     default_api_base = "https://generativelanguage.googleapis.com"
+    default_profile = "native"
+    transport_profiles: Dict[str, Dict[str, Any]] = {
+        "native": {"protocol": "gemini"},
+        "openai": {
+            # Google's OpenAI-compat surface: Bearer auth, chat-completions
+            # wire, no Responses endpoint exists on this face.
+            "protocol": "openai_chat",
+            "endpoint_paths": {
+                "chat": "/v1beta/openai/chat/completions",
+                "models": "/v1beta/openai/models",
+            },
+            "auth_mode": "bearer",
+        },
+    }
 
-    def get_native_operation(self, model: str = "", request=None, stream: bool = False) -> str:
+    def get_protocol_name(self, model: str = "", profile: Optional[str] = None) -> str:
+        if profile and self.transport_profiles:
+            entry = self.transport_profiles.get(profile)
+            if isinstance(entry, dict) and entry.get("protocol"):
+                return str(entry["protocol"])
+        return self.protocol_name
+
+    def get_native_operation(
+        self,
+        model: str = "",
+        request=None,
+        stream: bool = False,
+        profile: Optional[str] = None,
+    ) -> str:
+        # Profile-aware (G11): the openai face speaks chat-completions
+        # vocabulary, not generateContent verbs.
+        if profile == "openai":
+            return "chat"
+        if profile and self.transport_profiles:
+            entry = self.transport_profiles.get(profile)
+            if isinstance(entry, dict) and str(entry.get("protocol")) != "gemini":
+                return "chat"
         return "stream_generate" if stream else "generate"
 
     def get_native_endpoint(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> str:
@@ -68,7 +110,22 @@ class GeminiProvider(ProviderInterface):
         action = "streamGenerateContent?alt=sse" if operation == "stream_generate" else "generateContent"
         return f"{base}/v1beta/models/{model}:{action}"
 
-    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
+    def get_native_headers(
+        self,
+        credential_identifier: str,
+        model: str = "",
+        operation: str = "chat",
+        profile: Optional[str] = None,
+    ) -> Dict[str, str]:
+        # Per-face auth (G11): the compat surface takes Bearer; native keeps
+        # the Google key header.
+        if profile == "openai" or (
+            profile
+            and self.transport_profiles
+            and isinstance(self.transport_profiles.get(profile), dict)
+            and str(self.transport_profiles[profile].get("protocol")) != "gemini"
+        ):
+            return {"Authorization": f"Bearer {credential_identifier}"}
         return {"x-goog-api-key": credential_identifier}
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:

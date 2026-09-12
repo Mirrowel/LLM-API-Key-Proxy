@@ -38,6 +38,11 @@ class ProtocolAdapter:
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
     future_transports: ClassVar[tuple[str, ...]] = ()
     supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_UNKNOWN,)
+    # G11: protocol family for variant-aware matching. Sibling variants of
+    # one wire format (responses stateless/stateful/websocket) share the
+    # family name so bare-name routing and the D13 priority list stay
+    # family-level; empty means the protocol is its own family.
+    base_family: ClassVar[str] = ""
 
     def supports_transport(self, transport_name: str) -> bool:
         """Return whether this protocol can format the requested transport."""

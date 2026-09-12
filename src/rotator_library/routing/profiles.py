@@ -207,14 +207,18 @@ def resolve_profile(
         )
     if default_profile and default_profile in names:
         default_protocol = _profile_protocol(declared_profiles, default_profile, protocol_name)
-        if not client_protocol or default_protocol == client_protocol:
+        if not client_protocol or _profile_protocol_family(default_protocol) == _client_protocol_family(client_protocol):
             return default_profile
     # Bare name with a non-default client protocol: the unique matching
     # profile, else convert through the priority list with a warning.
+    # Variant-aware (G11): a client speaking the family ("responses")
+    # matches sibling variants ("responses_stateful", ...) — the sibling is
+    # a SAME-FORMAT endpoint, not a conversion.
     matches = [
         str(name)
         for name in names
-        if _profile_protocol(declared_profiles, str(name), protocol_name) == client_protocol
+        if _profile_protocol_family(_profile_protocol(declared_profiles, str(name), protocol_name))
+        == _client_protocol_family(client_protocol)
     ]
     if len(matches) == 1:
         return matches[0]
@@ -228,12 +232,13 @@ def resolve_profile(
             f"provider:profile/model or declare one of them the default profile"
         )
     for candidate_protocol in DEFAULT_PROTOCOL_PRIORITY:
-        if candidate_protocol == client_protocol:
+        if _profile_protocol_family(candidate_protocol) == _client_protocol_family(client_protocol):
             continue
         offering = sorted(
             str(name)
             for name in names
-            if _profile_protocol(declared_profiles, str(name), protocol_name) == candidate_protocol
+            if _profile_protocol_family(_profile_protocol(declared_profiles, str(name), protocol_name))
+            == _profile_protocol_family(candidate_protocol)
         )
         if not offering:
             continue
@@ -265,3 +270,31 @@ def _profile_protocol(declared: dict, name: str, fallback: Optional[str]) -> Opt
         protocol = entry.get("protocol") or entry.get("protocol_name")
         return str(protocol) if protocol else fallback
     return fallback
+
+
+def _protocol_family(name: Optional[str]) -> str:
+    """Resolve a protocol name to its variant family (G11).
+
+    Sibling variants of one wire format share a family (responses,
+    responses_stateful, responses_websocket -> "responses"); a protocol
+    without a family is itself. Unknown names are themselves — an
+    unregistered protocol never silently joins a family.
+    """
+
+    if not name:
+        return ""
+    from ..protocols.registry import get_protocol_class
+
+    try:
+        cls = get_protocol_class(str(name))
+    except KeyError:
+        return str(name)
+    return getattr(cls, "base_family", "") or getattr(cls, "name", "") or str(name)
+
+
+def _profile_protocol_family(protocol: Optional[str]) -> str:
+    return _protocol_family(protocol)
+
+
+def _client_protocol_family(client_protocol: Optional[str]) -> str:
+    return _protocol_family(client_protocol)

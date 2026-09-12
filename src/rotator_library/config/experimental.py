@@ -548,15 +548,16 @@ def _configured_provider_protocol(value: Any) -> Optional[str]:
     """Return one protocol supported by the generative provider runtime."""
 
     protocol_name = _configured_protocol(value)
-    if protocol_name and protocol_name not in {
-        "openai_chat",
-        "responses",
-        "anthropic_messages",
-        "gemini",
-    }:
-        raise ExperimentalConfigError(
-            f"protocol_name must be a supported generative protocol, got {protocol_name!r}"
-        )
+    if protocol_name:
+        # Registry-derived allowlist (G11): every registered protocol
+        # declaring a generative operation qualifies — sibling variants
+        # included; the allowlist never drifts from the registry again.
+        from ..protocols.registry import is_generative_protocol
+
+        if not is_generative_protocol(str(protocol_name)):
+            raise ExperimentalConfigError(
+                f"protocol_name must be a supported generative protocol, got {protocol_name!r}"
+            )
     return protocol_name
 
 

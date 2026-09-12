@@ -11,7 +11,12 @@ def test_responses_protocol_is_discovered_with_aliases_and_websocket_support() -
     assert "responses" in list_protocols()
     assert get_protocol("openai_responses") is adapter
     assert adapter.supports_transport("websocket") is False
-    assert adapter.is_future_transport("websocket") is True
+    # G11: the websocket lifecycle is its own SIBLING protocol now —
+    # declared transport of the WS variant, not a future transport on
+    # the stateless baseline.
+    ws = get_protocol("responses_websocket")
+    assert ws.supports_transport("websocket") is True
+    assert "responses_stateful" in list_protocols()
 
 
 def test_responses_request_round_trip_preserves_previous_response_and_tools() -> None:
