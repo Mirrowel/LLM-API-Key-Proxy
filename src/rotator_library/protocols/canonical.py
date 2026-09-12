@@ -1446,4 +1446,23 @@ def complete_responses_object(
         payload.setdefault(key, list(default) if isinstance(default, list) else dict(default) if isinstance(default, dict) else default)
     payload.setdefault("error", None)
     payload.setdefault("incomplete_details", None)
+    # Null-echoed optional members (the official cancel example carries every
+    # one of these as an explicit null): strict clients asserting key presence
+    # on synthesized objects see them; provider values ride through untouched.
+    for absent in (
+        "instructions",
+        "temperature",
+        "top_p",
+        "truncation",
+        "user",
+        "previous_response_id",
+        "text",
+        "store",
+        "background",
+        "completed_at",
+        "conversation",
+        "max_output_tokens",
+        "service_tier",
+    ):
+        payload.setdefault(absent, None)
     return payload

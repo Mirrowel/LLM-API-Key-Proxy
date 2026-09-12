@@ -782,8 +782,22 @@ class ResponsesService:
         return await self._mark_cancelled(stored)
 
     async def _mark_cancelled(self, stored: StoredResponse) -> dict[str, Any]:
-        """Persist the cancelled status and return the client-facing object."""
+        """Persist the cancelled status and return the client-facing object.
 
+        Terminal states never rewrite history: a completed/failed/incomplete
+        response returns its current object unchanged (official cancel is a
+        background-response lifecycle operation; this proxy exposes it as a
+        foreground extension, so cancelling a finished row is a no-op).
+        """
+
+        if str(stored.status) in {"completed", "failed", "incomplete"}:
+            response = stored.response if isinstance(stored.response, dict) else {}
+            return deepcopy(complete_responses_object(
+                response,
+                response_id=stored.id,
+                model=stored.model,
+                status=str(stored.status),
+            ))
         stored.status = "cancelled"
         response = stored.response if isinstance(stored.response, dict) else {}
         response = complete_responses_object(
@@ -825,11 +839,12 @@ class ResponsesService:
         scope_key: str = "public",
         limit: int = 20,
         after: Optional[str] = None,
+        order: str = "desc",
     ) -> dict[str, Any]:
         """Return a paginated official input-items list envelope."""
 
         stored = await self._stored_or_not_found(response_id, scope_key)
-        return _input_items_page(stored.input_items, limit=limit, after=after)
+        return _input_items_page(stored.input_items, limit=limit, after=after, order=order)
 
     async def list_input_items_with_access_token(
         self,
@@ -838,11 +853,12 @@ class ResponsesService:
         *,
         limit: int = 20,
         after: Optional[str] = None,
+        order: str = "desc",
     ) -> dict[str, Any]:
         """Return input items only when the transport capability is valid."""
 
         stored = await self._stored_for_access(response_id, access_token)
-        return _input_items_page(stored.input_items, limit=limit, after=after)
+        return _input_items_page(stored.input_items, limit=limit, after=after, order=order)
 
     async def _stored_for_access(
         self,
@@ -1236,13 +1252,17 @@ def _input_items_page(
     *,
     limit: int = 20,
     after: Optional[str] = None,
+    order: str = "desc",
 ) -> dict[str, Any]:
     """Build the official paginated input-items list envelope.
 
     ``limit`` defaults to 20 and caps at 100; ``after`` is an item id cursor
-    (the page starts after that id). ``first_id``/``last_id`` are the ids of
-    the returned page edges (null when the page is empty or the items carry no
-    ids), and ``has_more`` is true when another page follows.
+    (the page starts after that id); ``order`` defaults to ``desc`` — the
+    official default — with ``asc`` accepted. An unknown ``after`` cursor
+    yields an empty page (never a silent reset to the first page).
+    ``first_id``/``last_id`` are the ids of the returned page edges (null
+    when the page is empty or the items carry no ids), and ``has_more`` is
+    true when another page follows.
     """
 
     try:
@@ -1250,19 +1270,24 @@ def _input_items_page(
     except (TypeError, ValueError):
         size = 20
     size = max(1, min(size, 100))
+    ordered = list(reversed(items)) if str(order).lower() == "desc" else list(items)
     start = 0
     if after:
-        for index, item in enumerate(items):
+        start = None
+        for index, item in enumerate(ordered):
             if _input_item_id(item) == after:
                 start = index + 1
                 break
-    page = items[start : start + size]
+        if start is None:
+            ordered = []
+            start = 0
+    page = ordered[start : start + size]
     return {
         "object": "list",
         "data": deepcopy(page),
         "first_id": _input_item_id(page[0]) if page else None,
         "last_id": _input_item_id(page[-1]) if page else None,
-        "has_more": start + size < len(items),
+        "has_more": start + size < len(ordered),
     }
 
 
@@ -1536,6 +1561,21 @@ _RESPONSES_FAILURE_CODES = {
 }
 
 
+def _nested_response_error_code(exc_type: str) -> str:
+    """Map an error type onto the official ``ResponseError.code`` enum.
+
+    The enum admits ``server_error``/``rate_limit_exceeded``/
+    ``invalid_prompt`` (plus image/vector-store family codes) — NOT the
+    top-level API-error vocabulary (``invalid_api_key``,
+    ``previous_response_not_found``, ``invalid_request_error``). A
+    synthesized failed ``Response`` must carry an in-enum code or strict
+    SDK validators reject the object.
+    """
+
+    code = _RESPONSES_FAILURE_CODES.get(str(exc_type), "server_error")
+    return code if code in {"server_error", "rate_limit_exceeded", "invalid_prompt"} else "server_error"
+
+
 def _stream_failure_error(exc: Exception) -> dict[str, Any]:
     """Return a client-safe Responses stream failure object.
 
@@ -1545,7 +1585,9 @@ def _stream_failure_error(exc: Exception) -> dict[str, Any]:
 
     error_type = getattr(exc, "error_type", None) or exc.__class__.__name__
     result = {
-        "code": _RESPONSES_FAILURE_CODES.get(str(error_type), "server_error"),
+        # In-enum only — the nested Response.error position admits the
+        # ResponseError vocabulary, never the top-level API-error codes.
+        "code": _nested_response_error_code(str(error_type)),
         "message": str(exc),
         "type": str(error_type),
     }

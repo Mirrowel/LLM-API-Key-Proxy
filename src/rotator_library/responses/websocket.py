@@ -575,7 +575,6 @@ class ResponsesWebSocketSession:
         self._worker_tasks: set[asyncio.Task] = set()
         self._closed = False
         self._close_code: Optional[int] = None
-        self._sequence = 0
         self.local_cache: MutableMapping[str, StoredResponse] = _LocalResponsesCache()
         self._formatter = ResponsesWebSocketFormatter()
 
@@ -584,16 +583,18 @@ class ResponsesWebSocketSession:
         return self._lanes
 
     def _next_sequence(self) -> int:
-        """Connection-local sequence for frames with no lane.
+        """Sequence for frames with no resolved lane.
 
         Lane-attached frames use the lane's own counter (``_stamp_lane``):
         every provider-supplied number is replaced so each lane's observable
-        stream stays strictly monotonic on its own. Lane-less grammar/steer
-        frames draw this connection counter — never a process-global.
+        stream stays strictly monotonic on its own. Lane-less frames share
+        the DEFAULT lane's counter — on the default lane those frames are
+        observable, so they must not regress against its turn events.
         """
 
-        self._sequence += 1
-        return self._sequence
+        lane = self._lane(None)
+        lane.sequence += 1
+        return lane.sequence
 
     @staticmethod
     def _stamp_lane(frame: dict[str, Any], lane: LaneState) -> dict[str, Any]:

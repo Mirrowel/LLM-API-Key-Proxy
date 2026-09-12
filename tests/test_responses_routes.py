@@ -250,29 +250,60 @@ def test_input_items_pagination_honors_limit_and_after() -> None:
     created = client.post("/v1/responses", json={"model": "gpt-test", "input": items}).json()
 
     first_page = client.get(f"/v1/responses/{created['id']}/input_items?limit=1").json()
-    second_page = client.get(f"/v1/responses/{created['id']}/input_items?limit=1&after=it_1").json()
+    second_page = client.get(f"/v1/responses/{created['id']}/input_items?limit=1&after=it_3").json()
+    ascending = client.get(f"/v1/responses/{created['id']}/input_items?order=asc").json()
+    unknown_cursor = client.get(f"/v1/responses/{created['id']}/input_items?after=nope").json()
 
+    # Official default order is desc — newest edge first; the cursor pages
+    # in the same direction (after the newest edge -> the next-newest).
     assert first_page["object"] == "list"
-    assert [item["id"] for item in first_page["data"]] == ["it_1"]
-    assert first_page["first_id"] == "it_1"
-    assert first_page["last_id"] == "it_1"
+    assert [item["id"] for item in first_page["data"]] == ["it_3"]
+    assert first_page["first_id"] == "it_3"
+    assert first_page["last_id"] == "it_3"
     assert first_page["has_more"] is True
     assert [item["id"] for item in second_page["data"]] == ["it_2"]
     assert second_page["has_more"] is True
+    assert [item["id"] for item in ascending["data"]] == ["it_1", "it_2", "it_3"]
+    # Unknown cursor: an empty page, never a silent reset to page one.
+    assert unknown_cursor["data"] == []
+    assert unknown_cursor["has_more"] is False
 
 
-def test_cancel_response_route_marks_stored_row_and_404s_unknown() -> None:
+async def test_cancel_response_route_marks_stored_row_and_404s_unknown() -> None:
     client = _client()
     created = client.post("/v1/responses", json={"model": "gpt-test", "input": "hello"}).json()
 
-    cancelled = client.post(f"/v1/responses/{created['id']}/cancel")
+    # Terminal states never rewrite history: cancelling a completed row
+    # returns its current object unchanged (official cancel is a
+    # background lifecycle op; this proxy's foreground extension no-ops).
+    completed_cancel = client.post(f"/v1/responses/{created['id']}/cancel")
+    assert completed_cancel.status_code == 200
+    assert completed_cancel.json()["status"] == "completed"
     fetched = client.get(f"/v1/responses/{created['id']}")
-    missing = client.post("/v1/responses/does_not_exist/cancel")
+    assert fetched.json()["status"] == "completed"
 
+    # A non-terminal row transitions to cancelled and persists.
+    service = client.app.state.responses_service
+    from rotator_library.responses.types import StoredResponse
+    import time as _time
+
+    row = StoredResponse(
+        id="resp_inprogress",
+        created_at=_time.time(),
+        model="gpt-test",
+        status="in_progress",
+        request={"model": "gpt-test"},
+        response={"id": "resp_inprogress"},
+        input_items=[],
+        output_items=[],
+        metadata={},
+        scope_key="public",
+    )
+    await service.store.save(row)
+    cancelled = client.post("/v1/responses/resp_inprogress/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
-    assert cancelled.json()["id"] == created["id"]
-    assert fetched.json()["status"] == "cancelled"
+    missing = client.post("/v1/responses/does_not_exist/cancel")
     assert missing.status_code == 404
     assert missing.json()["error"]["code"] == "previous_response_not_found"
 

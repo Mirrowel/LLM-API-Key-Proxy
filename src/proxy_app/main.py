@@ -932,6 +932,7 @@ async def responses_input_items(
     request: Request,
     limit: int = 20,
     after: Optional[str] = None,
+    order: str = "desc",
     service: ResponsesService = Depends(get_responses_service),
     _=Depends(verify_api_key),
 ):
@@ -949,6 +950,7 @@ async def responses_input_items(
                 request.headers.get("X-Proxy-Session-Domain", "public"),
                 limit=limit,
                 after=after,
+                order=order,
             )
         )
     except ResponsesServiceError as e:
