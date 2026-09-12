@@ -57,11 +57,33 @@ class GeminiHandler:
             request=raw_request,
         )
 
-    def count_tokens(self, payload: dict[str, Any], *, model: str) -> dict[str, int]:
-        """Count a Gemini request locally using its canonical Chat projection."""
+    async def count_tokens(self, payload: dict[str, Any], *, model: str) -> dict[str, Any]:
+        """Count tokens natively (provider countTokens) with an opt-in local estimate.
+
+        G14: the official operation passes through to whichever provider the
+        request routes to. When that provider cannot serve it, the honest
+        error surfaces unless the operator opted into the local projection
+        estimate via COUNT_TOKENS_LOCAL_ESTIMATE=1.
+        """
+
+        from ..client.executor import RoutingExecutionError
 
         request_payload = dict(payload)
         request_payload["model"] = self._routable_model(model)
+        try:
+            return await self._client.agenerate(
+                request_payload,
+                input_protocol="gemini",
+                _requested_operation=OPERATION_COUNT_TOKENS,
+            )
+        except RoutingExecutionError as error:
+            if getattr(error, "error_type", "") != "operation_unsupported" or not _local_estimate_enabled():
+                raise
+            return self._local_count_estimate(request_payload)
+
+    def _local_count_estimate(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        """Legacy local estimate: canonical Chat projection token counting."""
+
         gemini = get_protocol("gemini")
         unified = gemini.parse_request(
             request_payload,
@@ -92,7 +114,7 @@ class GeminiHandler:
                 model=request_payload["model"],
                 text=json.dumps(tools, separators=(",", ":")),
             )
-        return {"totalTokens": total}
+        return {"totalTokens": total, "x-proxy-estimate": "local-projection"}
 
     @staticmethod
     def _routable_model(model: str) -> str:
@@ -105,3 +127,11 @@ class GeminiHandler:
 
         routes = load_routing_config_from_env().model_routes
         return normalized if normalized.lower() in routes else f"gemini/{normalized}"
+
+
+def _local_estimate_enabled() -> bool:
+    """COUNT_TOKENS_LOCAL_ESTIMATE=1 opts into the local projection fallback."""
+
+    import os
+
+    return str(os.environ.get("COUNT_TOKENS_LOCAL_ESTIMATE", "") or "").strip().lower() in ("1", "true", "yes", "on")

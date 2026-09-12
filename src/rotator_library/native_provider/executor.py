@@ -12,7 +12,7 @@ from typing import Any, AsyncGenerator, Dict, Optional
 from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.types import is_provider_continuation_path
-from ..core.errors import StreamedAPIError, structured_api_response_error
+from ..core.errors import StreamedAPIError, StructuredAPIResponseError, structured_api_response_error
 from ..streaming.relay import RelayStreamItem, StreamRepairState
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..hooks.types import HookAction, TransportView
@@ -619,6 +619,10 @@ class NativeProviderExecutor:
             # Request-side edits (usage overlays) do NOT block relay: they
             # change what we ASK, not the fidelity of the answer's bytes.
             parse_stream_events_plural = getattr(protocol, "parse_stream_events", None)
+            # G14: the protocol's declared transport selects the framing
+            # decoder. Ollama declares jsonl (NDJSON); the four generative
+            # protocols keep the SSE default.
+            frame_transport = "jsonl" if protocol.supports_transport("jsonl") else "sse"
 
             async def _frame_iterator():
                 # Prefer the G4 raw-frame seam; legacy transports (custom
@@ -629,7 +633,7 @@ class NativeProviderExecutor:
 
                 frames = getattr(transport, "stream_raw_frames", None)
                 if frames is not None:
-                    async for frame in frames(send_endpoint, headers=send_headers, payload=provider_request, **stream_kwargs):
+                    async for frame in frames(send_endpoint, headers=send_headers, payload=provider_request, transport=frame_transport, **stream_kwargs):
                         yield frame
                     return
                 async for chunk in transport.stream_json_lines(send_endpoint, headers=send_headers, payload=provider_request, **stream_kwargs):

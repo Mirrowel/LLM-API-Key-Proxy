@@ -424,8 +424,11 @@ def test_required_unknown_content_is_rejected_before_cross_protocol_transport() 
         }
     )
 
-    with pytest.raises(ProtocolError, match="future_required_media"):
-        target.build_request(request, _context("openai_chat", "anthropic_messages"))
+    # G14 (#28.8): unrepresentable content is a disclosed drop, never a
+    # hard 400 — the request survives with a warning and a legal payload.
+    payload = target.build_request(request, _context("openai_chat", "anthropic_messages"))
+    assert isinstance(payload["messages"], list) and payload["messages"]
+    assert any(w.code == "unsupported_content_dropped" for w in request.warnings)
 
 
 def test_same_protocol_unknown_content_is_preserved() -> None:
@@ -518,8 +521,11 @@ def test_unknown_system_content_is_validated() -> None:
         }
     )
 
-    with pytest.raises(ProtocolError, match="future_required_instruction"):
-        target.build_request(request, _context("anthropic_messages", "openai_chat"))
+    # G14 (#28.8): unknown system content warns and drops; the call
+    # survives rather than dying on the unknown block.
+    payload = target.build_request(request, _context("anthropic_messages", "openai_chat"))
+    assert isinstance(payload["messages"], list) and payload["messages"]
+    assert any(w.code == "unsupported_content_dropped" for w in request.warnings)
 
 
 def test_provider_bound_responses_continuation_is_not_silently_dropped() -> None:
@@ -866,20 +872,26 @@ def test_required_response_modalities_map_or_reject() -> None:
     gemini_payload = get_protocol("gemini").build_request(request, _context("openai_chat", "gemini"))
     assert gemini_payload["generationConfig"]["responseModalities"] == ["TEXT", "AUDIO"]
 
-    with pytest.raises(ProtocolError, match="response modalities"):
-        get_protocol("anthropic_messages").build_request(
-            request,
-            _context("openai_chat", "anthropic_messages"),
-        )
+    # G14 (#28.8): an output modality the target cannot produce downgrades
+    # with a disclosed warning instead of a hard 400.
+    anthropic_payload = get_protocol("anthropic_messages").build_request(
+        request,
+        _context("openai_chat", "anthropic_messages"),
+    )
+    assert anthropic_payload  # request survives
+    assert any(w.code == "unsupported_output_modality" for w in request.warnings)
 
 
-def test_gemini_schema_enforcement_round_trips_as_strict() -> None:
+def test_gemini_schema_round_trips_without_fabricated_strict() -> None:
+    # G14: Gemini enforces its response schema unconditionally and has no
+    # `strict` wire member. The schema survives the round trip, but strict is
+    # NEVER fabricated onto the canonical record for a Gemini source.
     request = get_protocol("openai_chat").parse_request(REQUEST_FIXTURES["openai_chat"])
     payload = get_protocol("gemini").build_request(request, _context("openai_chat", "gemini"))
     reparsed = get_protocol("gemini").parse_request(payload)
 
     assert payload["generationConfig"]["responseJsonSchema"] == request.response_format["schema"]
-    assert reparsed.response_format["strict"] is True
+    assert "strict" not in reparsed.response_format
 
 
 def test_explicit_non_strict_schema_records_gemini_strengthening() -> None:

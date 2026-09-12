@@ -1068,7 +1068,8 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
                 payload = None
         retry_after = get_retry_after(e)
         if isinstance(payload, dict):
-            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            raw_details = payload.get("details")
+            details = raw_details if isinstance(raw_details, list) else ({} if not isinstance(raw_details, dict) else raw_details)
             message = str(payload.get("message") or "")
             if _structured_quota_signal(payload, details, message, status_code):
                 quota_value, quota_id = _extract_quota_details(body_text)
@@ -1472,11 +1473,22 @@ _QUOTA_MESSAGE_TOKENS = (
 
 
 def _structured_quota_signal(
-    payload: dict, details: dict, message: str, status_code: Optional[int]
+    payload: dict, details, message: str, status_code: Optional[int]
 ) -> bool:
-    """Return whether structured evidence marks this error as quota at any status."""
+    """Whether structured evidence marks this error as quota at any status."""
 
-    for source in (payload, details):
+    sources: list = [payload]
+    if isinstance(details, dict):
+        sources.append(details)
+    elif isinstance(details, list):
+        # google.rpc details[] members are authoritative quota evidence —
+        # QuotaFailure always; RetryInfo alone is NOT (it is generic retry
+        # advice that also rides UNAVAILABLE/DEADLINE_EXCEEDED server
+        # errors; classifying those as quota would rotate keys on overload).
+        for detail in details:
+            if isinstance(detail, dict) and "QuotaFailure" in str(detail.get("@type", "")):
+                return True
+    for source in sources:
         for key in ("code", "status", "type", "error_code"):
             value = source.get(key)
             if value in (None, ""):
@@ -1495,14 +1507,17 @@ def _structured_quota_signal(
                 "8",
             }:
                 return True
-        # google.rpc details[] members are authoritative quota evidence
+        # google.rpc details[] members are authoritative quota evidence —
+        # QuotaFailure always; RetryInfo alone is NOT (it is generic retry
+        # advice that also rides UNAVAILABLE/DEADLINE_EXCEEDED server
+        # errors; classifying those as quota would rotate keys on overload).
         raw_details = source.get("details")
         if isinstance(raw_details, list):
             for detail in raw_details:
                 if not isinstance(detail, dict):
                     continue
                 detail_type = str(detail.get("@type", ""))
-                if "QuotaFailure" in detail_type or "RetryInfo" in detail_type:
+                if "QuotaFailure" in detail_type:
                     return True
     # Body-carried numeric 429 inside a DIFFERENT effective status (5xx-
     # wrapped or compat-400 quota bodies). When the body code is itself

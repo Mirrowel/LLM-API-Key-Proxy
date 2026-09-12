@@ -173,11 +173,20 @@ class DynamicOpenAICompatibleProvider:
             defaults = {
                 "openai_chat": {"chat": "/chat/completions"},
                 "responses": {"responses": "/responses"},
-                "anthropic_messages": {"messages": "/messages"},
+                "anthropic_messages": {
+                    "messages": "/messages",
+                    # G14: official count endpoint shares the messages body.
+                    "count_tokens": "/messages/count_tokens",
+                },
                 "gemini": {
                     "generate": "/models/{model}:generateContent",
                     "stream_generate": "/models/{model}:streamGenerateContent?alt=sse",
                     "count_tokens": "/models/{model}:countTokens",
+                },
+                "ollama": {
+                    "ollama_chat": "/api/chat",
+                    "ollama_generate": "/api/generate",
+                    "embeddings": "/api/embed",
                 },
             }
             path = defaults.get(protocol, {}).get(operation)
@@ -383,6 +392,7 @@ def _register_providers():
                 "responses",
                 "anthropic_messages",
                 "gemini",
+                "ollama",
             }:
                 raise ValueError(
                     f"Configured custom provider {provider_name!r} requires a supported generative protocol, got {protocol_name!r}"

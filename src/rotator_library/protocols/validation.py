@@ -19,19 +19,30 @@ from .types import MediaSource, ProtocolContext, ProtocolError, UnifiedRequest, 
 
 
 _CONTENT_CAPABILITIES: dict[str, set[str]] = {
-    "openai_chat": {"text", "image", "audio", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
+    # G14: openai-compatible is a collective standard, not OpenAI's alone —
+    # video input parts exist across the compatible ecosystem (Qwen-VL,
+    # vLLM, Gemini's own compat surface), so chat carries video INPUT.
+    "openai_chat": {"text", "image", "audio", "video", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
     # Refusal turns degrade to text with refusal stop semantics (D7
     # equivalent construct) rather than blocking the whole request.
     "anthropic_messages": {"text", "image", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
     "responses": {"text", "image", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
     "gemini": {"text", "image", "audio", "video", "file", "document", "reasoning", "tool_call", "tool_result", "refusal"},
+    # Ollama vision models take base64 images on the message; there is no
+    # audio/video/file content part on the native wire (disclose-drop).
+    "ollama": {"text", "image", "reasoning", "tool_call", "tool_result"},
 }
 
 _RESPONSE_MODALITIES: dict[str, set[str]] = {
     "openai_chat": {"text", "audio"},
     "anthropic_messages": {"text"},
-    "responses": {"text", "audio"},
+    # Officially text-only by default; image output exists via the
+    # image_generation hosted tool's output items. Audio output is NOT a
+    # Responses capability (the official audio guide routes audio through
+    # Chat Completions) — the prior {text, audio} claim over-reached.
+    "responses": {"text", "image"},
     "gemini": {"text", "audio", "image"},
+    "ollama": {"text"},
 }
 
 
@@ -87,6 +98,11 @@ def validate_generative_request(
                 "candidateCount", "seed", "frequencyPenalty", "presencePenalty",
                 "responseMimeType", "responseSchema", "responseJsonSchema",
                 "thinkingConfig", "thinkingLevel", "responseModalities",
+                # The text sub-config of responseFormat maps onto the canonical
+                # structured-output control; only its audio/image siblings have
+                # no representation (disclosed below, one warning per fact —
+                # never the whole-envelope drop warning this key used to raise).
+                "responseFormat",
             }
             for key in source_generation:
                 if key not in mapped:
@@ -97,6 +113,17 @@ def validate_generative_request(
                         field=f"generationConfig.{key}",
                         target_protocol=target_protocol,
                     )
+            response_format_cfg = source_generation.get("responseFormat")
+            if isinstance(response_format_cfg, dict):
+                for sibling in ("audio", "image"):
+                    if isinstance(response_format_cfg.get(sibling), dict):
+                        add_conversion_warning(
+                            request,
+                            code="unsupported_optional_control",
+                            message=f"generationConfig.responseFormat.{sibling} has no cross-protocol representation; dropped",
+                            field=f"generationConfig.responseFormat.{sibling}",
+                            target_protocol=target_protocol,
+                        )
     # Opaque function-call signatures (Gemini thought signatures) dropping
     # at foreign boundaries are disclosed — never silent (Gemini 3 rejects
     # unsigned current-turn calls on the way back).
@@ -177,13 +204,18 @@ def validate_generative_request(
             pass_name="validate_request",
             payload={"field": "safety_settings"},
         )
+    # G14 (#28.8): an output modality the target cannot produce is a
+    # disclosed downgrade, not a request-killing 400 — the request still
+    # goes, producing what the target CAN produce.
     unsupported_modalities = set(request.modalities) - _RESPONSE_MODALITIES.get(target_protocol, {"text"})
     if unsupported_modalities:
-        raise ProtocolError(
-            f"{target_protocol} cannot produce required response modalities: {sorted(unsupported_modalities)}",
-            protocol=target_protocol,
-            pass_name="validate_request",
-            payload={"field": "modalities", "unsupported": sorted(unsupported_modalities)},
+        request.modalities = [m for m in request.modalities if m not in unsupported_modalities]
+        add_conversion_warning(
+            request,
+            code="unsupported_output_modality",
+            message=f"{target_protocol} cannot produce requested response modalities {sorted(unsupported_modalities)}; downgraded to {request.modalities or ['text']}",
+            field="modalities",
+            target_protocol=target_protocol,
         )
     supported = _CONTENT_CAPABILITIES.get(target_protocol, set())
     block_groups = [("system", request.system)] + [
@@ -191,6 +223,7 @@ def validate_generative_request(
         for message_index, message in enumerate(request.messages)
     ]
     for group_name, blocks in block_groups:
+        dropped: list[int] = []
         for block_index, block in enumerate(blocks):
             if block.type in supported:
                 if block.type in {"image", "audio", "video", "file", "document"} and not _has_media_identity(block.source):
@@ -201,12 +234,21 @@ def validate_generative_request(
                         payload={"group": group_name, "content_index": block_index, "content_type": block.type},
                     )
                 continue
-            raise ProtocolError(
-                f"Cannot represent required content type '{block.type}' in {target_protocol}",
-                protocol=target_protocol,
-                pass_name="validate_request",
-                payload={"group": group_name, "content_index": block_index, "content_type": block.type},
+            # G14 (#28.8): unrepresentable content is a warning-logged drop,
+            # never a hard reject — the rest of the request survives.
+            dropped.append(block_index)
+            add_conversion_warning(
+                request,
+                code="unsupported_content_dropped",
+                message=f"content block of type '{block.type}' has no {target_protocol} representation; dropped",
+                field=f"{group_name}.content[{block_index}]",
+                target_protocol=target_protocol,
             )
+        if dropped:
+            surviving = [block for index, block in enumerate(blocks) if index not in dropped]
+            # A dialect-legal placeholder keeps emptied messages/anchors
+            # intact when every block was unrepresentable.
+            blocks[:] = surviving or [blocks[0].__class__(type="text", text="")]
     choice = request.generation_params.get("tool_choice") if isinstance(request.generation_params, dict) else None
     if (
         isinstance(choice, dict)
@@ -270,6 +312,19 @@ def validate_generative_request(
                         "file_search",
                         "googleSearchRetrieval",
                         "google_search_retrieval",
+                        # G14: newer hosted union members are Gemini-native
+                        # (representable at the target) — mapped by identity
+                        # envelope, never fabricated as a function.
+                        "computerUse",
+                        "computer_use",
+                        "mcpServers",
+                        "mcp_servers",
+                        "enterpriseWebSearch",
+                        "enterprise_web_search",
+                        "exaAiSearch",
+                        "exa_ai_search",
+                        "parallelAiSearch",
+                        "parallel_ai_search",
                     )
                 ):
                     raise ProtocolError(
@@ -284,9 +339,22 @@ def validate_generative_request(
     else:
         supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):
+        if request.source_protocol == "gemini" and target_protocol != "gemini":
+            hosted_kind = tool.extra.get("gemini_hosted_tool") or tool.extra.get("gemini_unmodeled_tool")
+            if hosted_kind:
+                # Gemini hosted tools (googleSearch/computerUse/mcpServers/...)
+                # are provider-executed envelopes with no foreign dialect: an
+                # honest, named rejection beats a fabricated client-callable
+                # function (or a silently empty hosted envelope).
+                raise ProtocolError(
+                    f"Cannot safely translate hosted Gemini tool '{hosted_kind}' into {target_protocol}",
+                    protocol=target_protocol,
+                    pass_name="validate_request",
+                    payload={"tool_index": tool_index, "tool_type": tool.type, "tool_name": hosted_kind},
+                )
         if tool.type not in supported_tool_types:
             raise ProtocolError(
-                f"Cannot safely translate tool type '{tool.type}' into {target_protocol}",
+                f"Cannot safely translate tool '{tool.name or tool.type}' (type '{tool.type}') into {target_protocol}",
                 protocol=target_protocol,
                 pass_name="validate_request",
                 payload={"tool_index": tool_index, "tool_type": tool.type, "tool_name": tool.name},

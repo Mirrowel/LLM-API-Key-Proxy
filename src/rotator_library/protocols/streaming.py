@@ -106,6 +106,12 @@ class StreamFormatState:
     provider_model_seen: str = ""
     system_fingerprint: str | None = None
     service_tier: str | None = None
+    # G14: response-level Gemini metadata that must survive the stream once
+    # (blocked-prompt promptFeedback and modelStatus). Latched on the first
+    # chunk that carries it, emitted on the first formatted frame.
+    prompt_feedback: dict[str, Any] | None = None
+    model_status: dict[str, Any] | None = None
+    gemini_meta_emitted: bool = False
     emitted_tools: set[str] = field(default_factory=set)
     # Block-identity bookkeeping (defect 8): events that carry explicit
     # content/output indexes use them directly; identity-less wires (chat
@@ -295,6 +301,8 @@ def format_canonical_stream_event(
         frames = _format_responses(event, state)
     elif target_protocol == "gemini":
         frames = _format_gemini(event, state)
+    elif target_protocol == "ollama":
+        frames = _format_ollama(event, state)
     else:
         raise ProtocolError(
             f"Canonical streaming is not supported for {target_protocol}",
@@ -407,6 +415,12 @@ def _lift_provider_identity(state: "StreamFormatState", event: UnifiedStreamEven
     service_tier = extra.get("service_tier") or payload.get("service_tier")
     if state.service_tier is None and isinstance(service_tier, str) and service_tier:
         state.service_tier = service_tier
+    prompt_feedback = payload.get("promptFeedback")
+    if state.prompt_feedback is None and isinstance(prompt_feedback, dict):
+        state.prompt_feedback = deepcopy(prompt_feedback)
+    model_status = payload.get("modelStatus")
+    if state.model_status is None and isinstance(model_status, dict):
+        state.model_status = deepcopy(model_status)
 
 
 def _gemini_identity(state: "StreamFormatState") -> dict[str, Any]:
@@ -419,6 +433,52 @@ def _gemini_identity(state: "StreamFormatState") -> dict[str, Any]:
     if model:
         fields["modelVersion"] = model
     return fields
+
+
+_GEMINI_PART_RESIDUAL_KEYS = ("videoMetadata", "partMetadata", "mediaResolution", "audioTranscription")
+
+
+def _gemini_meta_fields(state: "StreamFormatState") -> dict[str, Any]:
+    """Response-level Gemini metadata emitted once on the first frame.
+
+    ``promptFeedback`` (a blocked prompt's blockReason) and ``modelStatus``
+    live at the response root, not on a candidate; the stream must carry them
+    or a blocked prompt reads as an empty success.
+    """
+
+    fields: dict[str, Any] = {}
+    if state.gemini_meta_emitted:
+        return fields
+    if state.prompt_feedback is not None:
+        fields["promptFeedback"] = deepcopy(state.prompt_feedback)
+    if state.model_status is not None:
+        fields["modelStatus"] = deepcopy(state.model_status)
+    if fields:
+        state.gemini_meta_emitted = True
+    return fields
+
+
+def _gemini_same_protocol(state: "StreamFormatState", event: UnifiedStreamEvent | None) -> bool:
+    """Whether the stream source and destination are both Gemini."""
+
+    source = (getattr(event, "source_protocol", None) if event is not None else None) or state.source_protocol
+    return source == "gemini" and state.protocol == "gemini"
+
+
+def _merge_gemini_part_residuals(part: dict[str, Any], block: Any) -> None:
+    """Replay part-level Gemini residuals (same-protocol via raw extras).
+
+    videoMetadata/partMetadata/mediaResolution/audioTranscription are legal
+    Part members with no cross-protocol home; a same-protocol stream must not
+    silently drop them.
+    """
+
+    extra = getattr(block, "extra", None)
+    if not isinstance(extra, dict):
+        return
+    for key in _GEMINI_PART_RESIDUAL_KEYS:
+        if key in extra and key not in part:
+            part[key] = deepcopy(extra[key])
 
 
 def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[str]:
@@ -769,6 +829,8 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
                 # clients (multi-turn replay contract); foreign-source
                 # signatures stay suppressed (cache-owned, D8).
                 thought_part["thoughtSignature"] = block.reasoning.signature
+            if _gemini_same_protocol(state, event):
+                _merge_gemini_part_residuals(thought_part, block)
             parts.append(thought_part)
         elif block.type == "refusal":
             # Gemini has no refusal part: the text survives as a plain part
@@ -789,6 +851,8 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
                 # No Gemini part carries annotations; the text survives, the
                 # citation evidence is disclosed as dropped.
                 _stream_disclose_unrepresentable(state, "citations", "no Gemini part-level annotation shape")
+            if _gemini_same_protocol(state, event):
+                _merge_gemini_part_residuals(text_part, block)
             parts.append(text_part)
         elif block.type in {"image", "audio", "video", "file", "document"}:
             # Media parts stream as inlineData/fileData exactly like the
@@ -801,6 +865,8 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
                     # Opaque part-level signature on the media extra: same
                     # D8 gate as text/thought parts.
                     media_part["thoughtSignature"] = media_signature
+                if _gemini_same_protocol(state, event):
+                    _merge_gemini_part_residuals(media_part, block)
                 parts.append(media_part)
         elif block.type == "builtin_tool":
             # Native union members (executableCode, server toolCall, ...)
@@ -864,10 +930,11 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         if not parts and not current_finish and usage_ready:
             # Pre-finish usage-only frame: the clean usageMetadata chunk —
             # never an empty-candidate husk (undocumented shape).
-            usage = _gemini_usage(state.usage or event.usage)
+            usage = _gemini_usage(state.usage or event.usage, preserve_source=_gemini_same_protocol(state, event))
             if usage:
                 payload = {"usageMetadata": usage}
                 payload.update(_gemini_identity(state))
+                payload.update(_gemini_meta_fields(state))
                 frames.append(_data_frame(payload))
             state.completion_emitted = True
             if _is_terminal(event):
@@ -882,7 +949,8 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             candidate["finishReason"] = current_finish
         payload: dict[str, Any] = {"candidates": [candidate]}
         payload.update(_gemini_identity(state))
-        usage = _gemini_usage(state.usage or event.usage)
+        payload.update(_gemini_meta_fields(state))
+        usage = _gemini_usage(state.usage or event.usage, preserve_source=_gemini_same_protocol(state, event))
         if usage and not state.completion_emitted:
             payload["usageMetadata"] = usage
         frames.append(_data_frame(payload))
@@ -896,19 +964,186 @@ def _format_gemini(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
             }
             closing_payload: dict[str, Any] = {"candidates": [closing]}
             closing_payload.update(_gemini_identity(state))
+            closing_payload.update(_gemini_meta_fields(state))
             frames.append(_data_frame(closing_payload))
             state.finished_choices.add(open_candidate)
     elif event.usage is not None and state.completion_emitted and not parts and not finish_reason:
         # Terminal usage after the last finish frame: a usage-only chunk —
         # never an empty-candidate husk (undocumented shape).
-        usage = _gemini_usage(state.usage or event.usage)
+        usage = _gemini_usage(state.usage or event.usage, preserve_source=_gemini_same_protocol(state, event))
         if usage:
             payload = {"usageMetadata": usage}
             payload.update(_gemini_identity(state))
+            payload.update(_gemini_meta_fields(state))
             frames.append(_data_frame(payload))
+    if not frames and not state.gemini_meta_emitted and (state.prompt_feedback is not None or state.model_status is not None):
+        # Blocked-prompt / status-only chunk: the response root metadata has
+        # no candidate to ride — emit it on its own frame rather than losing
+        # the blockReason (or modelStatus) entirely.
+        meta_payload = _gemini_meta_fields(state)
+        if meta_payload:
+            meta_payload.update(_gemini_identity(state))
+            frames.append(_data_frame(meta_payload))
     if _is_terminal(event):
         state.terminal = True
     return frames
+
+
+def _ollama_json_line(payload: dict[str, Any]) -> str:
+    """One newline-terminated NDJSON frame (Ollama's streaming wire)."""
+
+    return json.dumps(serialize_value(payload), ensure_ascii=False) + "\n"
+
+
+def _ollama_timestamp(created: int) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created))
+
+
+def _ollama_stream_usage(usage: Usage | None) -> dict[str, Any]:
+    """Terminal statistics block: counts plus verbatim nanosecond durations."""
+
+    if usage is None:
+        return {}
+    payload: dict[str, Any] = {}
+    if isinstance(usage.raw, dict):
+        for key, value in usage.raw.items():
+            if key.endswith("duration"):
+                payload[key] = deepcopy(value)
+    if usage.input_tokens:
+        payload["prompt_eval_count"] = usage.input_tokens
+    if usage.output_tokens:
+        payload["eval_count"] = usage.output_tokens
+    if usage.cache_read_tokens:
+        payload["prompt_eval_count_cached"] = usage.cache_read_tokens
+    return payload
+
+
+def _ollama_parse_arguments(text: str) -> Any:
+    if not text:
+        return {} if text == "" else None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _ollama_stream_tool_calls(
+    blocks: list[ContentBlock],
+    state: StreamFormatState,
+    terminal: bool,
+) -> list[dict[str, Any]]:
+    """Accumulate tool-call fragments into complete Ollama function calls.
+
+    Ollama requires ``function.arguments`` to be a JSON object, so fragments
+    are buffered until they parse (or the stream terminates) — partial JSON is
+    never emitted as an object.
+    """
+
+    calls: list[dict[str, Any]] = []
+    for block in blocks:
+        call = block.tool_call
+        if call is None:
+            continue
+        identity = call.index if call.index is not None else (call.id or call.name or "default")
+        key = f"tool:{identity}"
+        state.tool_names[key] = call.name or state.tool_names.get(key, "")
+        if call.id and not call.extra.get("synthetic_id"):
+            state.tool_ids[key] = call.id
+        if key in state.emitted_tools:
+            continue
+        fragment = tool_arguments_text(call.arguments)
+        state.tool_arguments[key] = state.tool_arguments.get(key, "") + fragment
+        arguments = _ollama_parse_arguments(state.tool_arguments[key])
+        if arguments is None:
+            if not terminal:
+                continue
+            accumulated = state.tool_arguments[key]
+            _stream_warn(
+                state,
+                "tool_arguments_incomplete",
+                "Ollama stream ended with an incomplete tool-call argument fragment; emitted the accumulated prefix as-is",
+                "tool_calls",
+            )
+            arguments = json.loads(accumulated) if _is_json(accumulated) else {"_incomplete": accumulated}
+        calls.append({"function": {"name": state.tool_names.get(key, ""), "arguments": arguments}})
+        state.emitted_tools.add(key)
+    return calls
+
+
+def _format_ollama(event: UnifiedStreamEvent, state: StreamFormatState) -> list[str]:
+    """Format one canonical event as an Ollama NDJSON line.
+
+    Wire shape: ``{"message": {...}, "done": false}`` per delta and a terminal
+    ``{"done": true, "done_reason": ..., ...counts/durations}`` object. Ollama
+    has no official mid-stream error frame; an ``{"error": {...}}`` object line
+    is emitted (plexus reference) and the stream terminates.
+    """
+
+    if event.type == "error" or event.error is not None:
+        state.terminal = True
+        return [_ollama_json_line({"error": _error_payload(event.error, "ollama")})]
+
+    message = event.delta or event.message
+    terminal = _is_terminal(event)
+    blocks = ordered_message_blocks(message) if message is not None else []
+    if terminal:
+        # Terminal snapshots repeat content already delivered as deltas; only
+        # tool calls still awaiting emission ride the final frame.
+        content_text = ""
+        reasoning_text = ""
+        blocks = [block for block in blocks if block.tool_call]
+    else:
+        content_text = "".join(block.text or "" for block in blocks if block.type == "text" and not block.reasoning)
+        reasoning_text = "".join(block.reasoning.text or "" for block in blocks if block.reasoning)
+
+    if event.stop_reason:
+        state.stop_reason = event.stop_reason
+    elif event.extra.get("stop_reason"):
+        state.stop_reason = str(event.extra["stop_reason"])
+
+    tool_calls = _ollama_stream_tool_calls(blocks, state, terminal)
+    model = state.provider_model_seen or state.model
+    created = _ollama_timestamp(state.created)
+
+    if terminal:
+        message_payload: dict[str, Any] = {"role": "assistant", "content": content_text}
+        if reasoning_text:
+            message_payload["thinking"] = reasoning_text
+        if tool_calls:
+            message_payload["tool_calls"] = tool_calls
+        payload: dict[str, Any] = {
+            "model": model,
+            "created_at": created,
+            "message": message_payload,
+            "done": True,
+        }
+        native_done = event.extra.get("done_reason")
+        if isinstance(native_done, str) and native_done:
+            payload["done_reason"] = native_done
+        else:
+            mapped = _ollama_done_reason(event.stop_reason or state.stop_reason)
+            if mapped is not None:
+                payload["done_reason"] = mapped
+        payload.update(_ollama_stream_usage(state.usage or event.usage))
+        state.terminal = True
+        return [_ollama_json_line(payload)]
+
+    if not content_text and not reasoning_text and not tool_calls:
+        return []
+    message_payload = {"role": "assistant", "content": content_text}
+    if reasoning_text:
+        message_payload["thinking"] = reasoning_text
+    if tool_calls:
+        message_payload["tool_calls"] = tool_calls
+    return [_ollama_json_line({"model": model, "created_at": created, "message": message_payload, "done": False})]
+
+
+def _ollama_done_reason(stop_reason: str | None) -> str | None:
+    if stop_reason == "stop":
+        return "stop"
+    if stop_reason == "max_tokens":
+        return "length"
+    return None
 
 
 def _gemini_skip_signature_sentinel() -> dict[str, Any]:
@@ -1884,14 +2119,14 @@ def _responses_usage(usage: Usage | None) -> dict[str, Any] | None:
     return payload
 
 
-def _gemini_usage(usage: Usage | None) -> dict[str, int] | None:
+def _gemini_usage(usage: Usage | None, *, preserve_source: bool = False) -> dict[str, Any] | None:
     if usage is None:
         return None
     # Canonical input_tokens is cache-INCLUSIVE (H2) — matching Gemini's own
     # convention (promptTokenCount includes cachedContentTokenCount).
     # Detail keys emit only when non-zero (symmetric with the non-stream
     # formatter; zero-valued detail counts are not wire facts).
-    payload: dict[str, int] = {
+    payload: dict[str, Any] = {
         "promptTokenCount": usage.input_tokens,
         "candidatesTokenCount": usage.output_tokens,
         "totalTokenCount": usage.total_tokens,
@@ -1900,6 +2135,24 @@ def _gemini_usage(usage: Usage | None) -> dict[str, int] | None:
         payload["cachedContentTokenCount"] = usage.cache_read_tokens
     if usage.reasoning_tokens:
         payload["thoughtsTokenCount"] = usage.reasoning_tokens
+    tool_prompt = (usage.extra or {}).get("tool_use_prompt_tokens")
+    if tool_prompt:
+        # The tool-prompt bucket is a real Gemini usage member; the stream
+        # must not drop it (non-stream already emits it).
+        payload["toolUsePromptTokenCount"] = int(tool_prompt)
+    if preserve_source and isinstance(usage.raw, dict):
+        # Same-protocol stream replay of the raw detail arrays and tier
+        # fields (mirror of the non-stream formatter).
+        for key in (
+            "promptTokensDetails",
+            "cacheTokensDetails",
+            "candidatesTokensDetails",
+            "toolUsePromptTokensDetails",
+            "trafficType",
+            "serviceTier",
+        ):
+            if key in usage.raw and key not in payload:
+                payload[key] = deepcopy(usage.raw[key])
     return payload
 
 

@@ -601,6 +601,25 @@ class RequestExecutor:
 
         target = _current_route_target(context)
         execution = target.execution if target else "auto"
+        # G14: a requested operation (count_tokens) is only served by the
+        # native path — LiteLLM/custom paths execute generative calls and
+        # would silently answer a count with a generation.
+        requested_operation = getattr(context, "requested_operation", "") or ""
+        if requested_operation:
+            # Only the native path serves non-generative requested
+            # operations (count_tokens): LiteLLM/custom would silently
+            # answer a count with a generation. Auto mode routes the
+            # request natively; the native branch validates support.
+            if execution in ("litellm_fallback", "custom"):
+                raise RoutingExecutionError(
+                    f"Provider {provider} cannot serve requested operation {requested_operation} via {execution} execution",
+                    error_type="operation_unsupported",
+                )
+            if execution == "auto" and not (plugin and getattr(plugin, "get_protocol_name", lambda _m: "")(model)):
+                raise RoutingExecutionError(
+                    f"Provider {provider} has no native protocol for requested operation {requested_operation}",
+                    error_type="operation_unsupported",
+                )
         self._log_executor_trace(
             context,
             "pre_provider_execution_request",
@@ -621,7 +640,7 @@ class RequestExecutor:
             self._record_litellm_fallback_identity(context, provider, plugin, model, stream=False)
             return self._format_execution_response(response, "openai_chat", context)
 
-        if execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic()):
+        if not requested_operation and (execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic())):
             if not plugin or not plugin.has_custom_logic():
                 raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
             kwargs["credential_identifier"] = credential_secret
@@ -923,8 +942,22 @@ class RequestExecutor:
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
         # Operation resolution is profile-aware (D13): the selected profile's
-        # protocol vocabulary governs, not the default profile's.
-        operation = _call_profile_aware_operation(plugin, native_model, stream, profile)
+        # protocol vocabulary governs, not the default profile's. A
+        # client-requested operation (G14: count_tokens) overrides the
+        # stream-derived default when the provider's protocol declares it.
+        requested_operation = getattr(context, "requested_operation", "") or ""
+        if requested_operation:
+            if not _supports_profile_operation(plugin, native_model, requested_operation, profile):
+                # G14: an operation the provider cannot serve natively is an
+                # honest, failover-eligible gap (not_found family) — a
+                # fallback group may contain a provider that serves it.
+                raise RoutingExecutionError(
+                    f"Provider {provider} does not support native operation {requested_operation}",
+                    error_type="operation_unsupported",
+                )
+            operation = requested_operation
+        else:
+            operation = _call_profile_aware_operation(plugin, native_model, stream, profile)
         if not _supports_profile_operation(plugin, native_model, operation, profile):
             raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
         try:
@@ -1769,7 +1802,10 @@ class RequestExecutor:
                                 return normalized_response
 
                             except RoutingExecutionError as e:
-                                if e.error_type == "configuration_error":
+                                if e.error_type in ("configuration_error", "operation_unsupported"):
+                                    # Config gaps stop the chain; an operation
+                                    # the provider cannot serve is provider-scoped —
+                                    # credential rotation cannot fix it, fail over.
                                     raise
                                 last_exception = e
                                 action = await self._handle_error_with_context(
@@ -1813,7 +1849,7 @@ class RequestExecutor:
                     except PreRequestCallbackError:
                         raise
                     except RoutingExecutionError as exc:
-                        if exc.error_type == "configuration_error":
+                        if exc.error_type in ("configuration_error", "operation_unsupported"):
                             raise
                     except StructuredAPIResponseError:
                         # Client-visible addressing/validation failures
@@ -2443,7 +2479,7 @@ class RequestExecutor:
                                     continue  # Retry
 
                                 except RoutingExecutionError as e:
-                                    if e.error_type == "configuration_error":
+                                    if e.error_type in ("configuration_error", "operation_unsupported"):
                                         raise
                                     last_exception = e
                                     classified = classify_error(e, provider)

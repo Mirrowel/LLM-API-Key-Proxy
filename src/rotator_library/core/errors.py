@@ -149,7 +149,15 @@ class StructuredAPIResponseError(Exception):
                     status = "UNAVAILABLE"
                 elif self.http_status == 504:
                     status = "DEADLINE_EXCEEDED"
-            return {"error": {"code": self.http_status, "message": message, "status": status}}
+            envelope = {"code": self.http_status, "message": message, "status": status}
+            # G14: a same-protocol gemini client keeps the provider's own
+            # google.rpc details[] (QuotaFailure/RetryInfo/ErrorInfo/Help)
+            # verbatim — quota ids, retry delays, and reset timestamps the
+            # upstream sent must not vanish at the proxy boundary.
+            original = self.response.get("error") if isinstance(self.response, dict) else None
+            if isinstance(original, dict) and isinstance(original.get("details"), list) and original.get("status") == status:
+                envelope["details"] = [dict(d) if isinstance(d, dict) else d for d in original["details"]]
+            return {"error": envelope}
         # openai_chat / responses default branch: official error-object
         # vocabulary (invalid_request_error, rate_limit_error, ...) with a
         # separate machine `code` and the spec's `param` key.

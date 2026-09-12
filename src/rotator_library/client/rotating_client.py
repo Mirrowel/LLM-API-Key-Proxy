@@ -100,8 +100,16 @@ def _add_configured_no_auth_credentials(
 
     active = config or load_experimental_config()
     for provider in provider_names:
+        if credentials.get(provider):
+            continue
         runtime = get_provider_runtime_config(provider, config=active)
-        if runtime.api_base and runtime.auth_mode == "none" and not credentials.get(provider):
+        if runtime.api_base and runtime.auth_mode == "none":
+            credentials[provider] = [NO_AUTH_CREDENTIAL]
+            continue
+        # Code providers may declare a zero-credential default (local Ollama):
+        # they still need one internal rotation/accounting slot.
+        plugin = PROVIDER_PLUGINS.get(provider)
+        if plugin is not None and getattr(plugin, "default_auth_mode", None) == "none":
             credentials[provider] = [NO_AUTH_CREDENTIAL]
 
 
@@ -689,10 +697,10 @@ class RotatingClient:
             raw_request=raw_request,
         )
 
-    def gemini_count_tokens(self, payload: Dict[str, Any], *, model: str) -> Dict[str, int]:
-        """Return Gemini-compatible local token usage for a request."""
+    async def gemini_count_tokens(self, payload: Dict[str, Any], *, model: str) -> Dict[str, Any]:
+        """Execute a Gemini countTokens request natively through the runtime."""
 
-        return self._gemini_handler.count_tokens(payload, model=model)
+        return await self._gemini_handler.count_tokens(payload, model=model)
 
     def _model_cache_key(
         self,

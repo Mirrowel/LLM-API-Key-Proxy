@@ -842,6 +842,14 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 raw_source = deepcopy(block.get("input_audio") or block.get("audio") or block.get("source"))
                 source = _openai_media_source(raw_source, kind="audio")
                 blocks.append(ContentBlock(type="audio", source=source, raw=deepcopy(block), extra=_without(block, {"type", "input_audio", "audio", "source"})))
+            elif block_type in {"video_url", "video", "input_video"}:
+                # Collective-standard capability (G14): video parts exist
+                # across the openai-compatible ecosystem (Qwen-VL, vLLM,
+                # Gemini's compat surface) even though OpenAI's own docs
+                # omit them — parse to a canonical video block.
+                raw_source = deepcopy(block.get("video_url") or block.get("video") or block.get("source"))
+                source = _openai_media_source(raw_source, kind="video")
+                blocks.append(ContentBlock(type="video", source=source, raw=deepcopy(block), extra=_without(block, {"type", "video_url", "video", "source"})))
             elif block_type in {"file", "input_file"}:
                 # Documented Chat shape nests identity/data under "file":
                 # {"type":"file","file":{"file_id"|"file_data","filename"}}.

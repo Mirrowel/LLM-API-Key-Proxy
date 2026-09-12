@@ -120,6 +120,11 @@ def route_error_response(
         error_type, status_code = classify_route_error(error)
     else:
         error_type, status_code = "invalid_request", 400
+    if canonical == "ollama":
+        # Ollama's native error convention is a plain string body under the
+        # top-level ``error`` key — never a nested protocol envelope.
+        message = str(error) if str(error) else "Request failed"
+        return status_code, {"error": message}
     return protocol_error_payload(
         error, canonical, error_type=error_type, status_code=status_code
     )
@@ -131,6 +136,8 @@ def protocol_for_route_path(path: str | None) -> str:
     path = path or ""
     if path.endswith((":generateContent", ":streamGenerateContent", ":countTokens")):
         return "gemini"
+    if path.startswith("/api/"):
+        return "ollama"
     if path.startswith("/v1/messages"):
         return "anthropic_messages"
     if path.startswith("/v1/responses"):
@@ -174,6 +181,9 @@ def _stream_error_frames(error: BaseException, *, input_protocol: str) -> list[s
             status_code=500,
         )
         return [f"event: error\ndata: {json.dumps(payload)}\n\n"]
+    if input_protocol == "ollama":
+        # NDJSON terminal error frame: one object line, no SSE framing.
+        return [json.dumps({"error": str(error) or "Provider stream failed"}) + "\n"]
     _, payload = format_client_protocol_error(
         input_protocol="openai_chat",
         error=error,

@@ -77,25 +77,52 @@ def _strip_anthropic(payload: dict, *, mutate: bool) -> list[str] | None:
     return stripped or None
 
 
+# Gemini-3 validates thought signatures on function-call parts. When a bound
+# signature is stripped for a foreign provider but a SIBLING call in the same
+# turn carried one, the now-unsigned call must carry the documented skip
+# sentinel or the provider rejects it. The literal STRING value form is the
+# only shape Gemini accepts (canonical build conservative rule).
+_GEMINI_SKIP_SENTINEL = "skip_thought_signature_validator"
+_GEMINI_FUNCTION_CALL_KEYS = ("functionCall", "function_call")
+
+
 def _strip_gemini(payload: dict, *, mutate: bool) -> list[str] | None:
     stripped: list[str] = []
     contents = payload.get("contents")
-    if isinstance(contents, list):
-        for c_position, content in enumerate(contents):
-            parts = content.get("parts") if isinstance(content, dict) else None
-            if not isinstance(parts, list):
+    if not isinstance(contents, list):
+        return None
+    for c_position, content in enumerate(contents):
+        parts = content.get("parts") if isinstance(content, dict) else None
+        if not isinstance(parts, list):
+            continue
+        signed_calls = {
+            p_position
+            for p_position, part in enumerate(parts)
+            if isinstance(part, dict)
+            and any(key in part for key in _GEMINI_FUNCTION_CALL_KEYS)
+            and any(key in part for key in _GEMINI_SIGNATURE_KEYS)
+        }
+        for p_position, part in enumerate(parts):
+            if not isinstance(part, dict):
                 continue
-            for p_position, part in enumerate(parts):
-                if not isinstance(part, dict):
-                    continue
-                for key in _GEMINI_SIGNATURE_KEYS:
-                    if key in part:
-                        # The any-part rule means the signature key can ride
-                        # any part; the part itself (text/functionCall/...) is
-                        # legal without it.
-                        stripped.append(f"contents[{c_position}].parts[{p_position}].{key}")
-                        if mutate:
-                            part.pop(key, None)
+            is_function_call = any(key in part for key in _GEMINI_FUNCTION_CALL_KEYS)
+            for key in _GEMINI_SIGNATURE_KEYS:
+                if key in part:
+                    # The any-part rule means the signature key can ride
+                    # any part; the part itself (text/functionCall/...) is
+                    # legal without it.
+                    stripped.append(f"contents[{c_position}].parts[{p_position}].{key}")
+                    if mutate:
+                        part.pop(key, None)
+            if is_function_call and any(other != p_position for other in signed_calls):
+                # Conservative: the sentinel never appears unless another call
+                # in THIS turn was signed. Gated on the sibling-signed condition
+                # so an all-unsigned conversation is untouched.
+                stripped.append(
+                    f"contents[{c_position}].parts[{p_position}].thoughtSignature=sentinel"
+                )
+                if mutate:
+                    part["thoughtSignature"] = _GEMINI_SKIP_SENTINEL
     return stripped or None
 
 

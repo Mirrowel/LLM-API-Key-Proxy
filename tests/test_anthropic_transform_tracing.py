@@ -60,6 +60,15 @@ class FakeCountingClient:
     def __init__(self) -> None:
         self.calls: list[dict] = []
 
+    async def agenerate(self, payload, **kwargs):
+        # G14: no native count support on this fake — the honest
+        # operation_unsupported error drives the (env-opted) estimate path.
+        from rotator_library.client.executor import RoutingExecutionError
+
+        raise RoutingExecutionError(
+            "no native count support", error_type="operation_unsupported"
+        )
+
     def token_count(self, *, model, messages=None, text=None):
         self.calls.append({"model": model, "messages": messages, "text": text})
         return 3
@@ -128,8 +137,9 @@ async def test_anthropic_handler_traces_boundary_when_logging_enabled(tmp_path, 
 
 
 @pytest.mark.asyncio
-async def test_anthropic_count_tokens_projects_through_chat_view() -> None:
+async def test_anthropic_count_tokens_projects_through_chat_view(monkeypatch) -> None:
     client = FakeCountingClient()
+    monkeypatch.setenv("COUNT_TOKENS_LOCAL_ESTIMATE", "1")
     payload = {
         "model": "openai/gpt-test",
         "messages": [{"role": "user", "content": "hello"}],

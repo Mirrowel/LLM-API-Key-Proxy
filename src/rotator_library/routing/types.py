@@ -18,6 +18,7 @@ DEFAULT_FAILOVER_ON = frozenset(
         "server_error",
         "api_connection",
         "unsupported_operation",
+        "operation_unsupported",
         # Credential-scoped failures advance the chain too (operator-approved
         # matrix, error-reference 5.9): a dead key on provider A must not
         # stop provider B from being tried, and a missing model is a

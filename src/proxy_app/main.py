@@ -141,7 +141,7 @@ with _console.status("[dim]Loading FastAPI framework...", spinner="dots"):
     from contextlib import asynccontextmanager
     from fastapi import FastAPI, Request, HTTPException, Depends, WebSocket
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import StreamingResponse, JSONResponse
+    from fastapi.responses import StreamingResponse, JSONResponse, Response
     from fastapi.security import APIKeyHeader
 
 print("  → Loading core dependencies...")
@@ -1185,6 +1185,12 @@ async def gemini_stream_generate_content(
             model=model,
             raw_request=request,
         )
+        # G14: official wire behavior — bare :streamGenerateContent answers a
+        # JSON array of GenerateContentResponse chunks; ?alt=sse opts into
+        # SSE framing. google-genai omits alt, so array mode is the default.
+        alt = str(request.query_params.get("alt", "") or "").strip().lower()
+        if alt != "sse":
+            return await _gemini_json_array_response(request, response_stream)
         return StreamingResponse(
             streaming_response_wrapper(request, payload, response_stream, input_protocol="gemini"),
             media_type="text/event-stream",
@@ -1196,6 +1202,38 @@ async def gemini_stream_generate_content(
         logging.error(f"Gemini streamGenerateContent endpoint error: {error}")
         status, content = route_error_response(error, protocol="gemini")
         return JSONResponse(status_code=status, content=content)
+
+
+async def _gemini_json_array_response(
+    request: Request, response_stream: AsyncGenerator
+) -> Response:
+    """Collect a gemini stream and answer it as the official JSON array."""
+
+    chunks: list[Any] = []
+    error_payload: Optional[dict[str, Any]] = None
+    async for chunk_str in response_stream:
+        if await request.is_disconnected():
+            logging.warning("Client disconnected, stopping stream.")
+            break
+        text = str(chunk_str)
+        if not text.strip():
+            continue
+        body = text[len("data:") :].strip() if text.startswith("data:") else text
+        if body == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(body)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(chunk, dict) and isinstance(chunk.get("error"), dict):
+            # Mid-stream provider errors arrive as error chunks at HTTP 200
+            # in array mode (official behavior) — surface the first one.
+            error_payload = chunk["error"]
+            continue
+        chunks.append(chunk)
+    if error_payload is not None and not chunks:
+        return JSONResponse(status_code=500, content={"error": error_payload})
+    return JSONResponse(content=chunks)
 
 
 @app.post("/v1beta/models/{model:path}:countTokens")
@@ -1221,7 +1259,7 @@ async def gemini_count_tokens(
         )
         return JSONResponse(status_code=status, content=content)
     try:
-        result = client.gemini_count_tokens(payload, model=model)
+        result = await client.gemini_count_tokens(payload, model=model)
         return JSONResponse(content=result)
     except HTTPException:
         raise
@@ -1229,6 +1267,56 @@ async def gemini_count_tokens(
         logging.error(f"Gemini countTokens endpoint error: {error}")
         status, content = route_error_response(error, protocol="gemini")
         return JSONResponse(status_code=status, content=content)
+
+
+@app.get("/v1beta/models")
+async def gemini_models_discovery(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-native model discovery ingress (``ListModels`` shape).
+
+    google-genai / Gemini CLI clients call ``.models.list()`` (``GET
+    /v1beta/models``) before anything else; serving the proxy's Gemini model
+    surface in the official ``{"models": [...]}`` shape keeps that first call
+    from 404ing. ``pageSize``/``pageToken`` are honored for parity with the
+    upstream pagination contract.
+    """
+    try:
+        model_ids = [str(model).removeprefix("gemini/") for model in await client.get_all_available_models(grouped=False) if str(model).startswith("gemini/")]
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Gemini models discovery endpoint error: {error}")
+        status, content = route_error_response(error, protocol="gemini")
+        return JSONResponse(status_code=status, content=content)
+
+    entries = [
+        {
+            "name": f"models/{model_id}",
+            "displayName": model_id,
+            "supportedGenerationMethods": ["generateContent", "streamGenerateContent", "countTokens"],
+        }
+        for model_id in model_ids
+    ]
+    try:
+        page_size = int(request.query_params.get("pageSize") or 0)
+    except (TypeError, ValueError):
+        page_size = 0
+    page_token = str(request.query_params.get("pageToken") or "")
+    start = 0
+    if page_token:
+        try:
+            start = int(page_token)
+        except (TypeError, ValueError):
+            start = 0
+    page = entries[start : start + page_size] if page_size > 0 else entries[start:]
+    payload: dict[str, Any] = {"models": page}
+    next_index = start + len(page)
+    if page_size > 0 and next_index < len(entries):
+        payload["nextPageToken"] = str(next_index)
+    return JSONResponse(content=payload)
 
 
 @app.post("/v1/embeddings")
@@ -1288,6 +1376,169 @@ async def embeddings(
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
         status, content = route_error_response(e, protocol="openai_chat")
+        return JSONResponse(status_code=status, content=content)
+
+
+def _ollama_stream_flag(payload: dict[str, Any]) -> bool | None:
+    """Ollama streaming defaults to true; reject non-boolean spellings."""
+
+    value = payload.get("stream", True)
+    if not isinstance(value, bool):
+        return None
+    return value
+
+
+async def _ollama_ingress(
+    request: Request,
+    client: RotatingClient,
+    operation: str,
+) -> Any:
+    """Shared body for the native /api/chat and /api/generate routes."""
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        status, content = route_error_response("Invalid JSON in request body.", protocol="ollama")
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="ollama"
+        )
+        return JSONResponse(status_code=status, content=content)
+    stream_flag = _ollama_stream_flag(payload)
+    if stream_flag is None:
+        status, content = route_error_response(
+            ValueError("stream must be a boolean"), protocol="ollama"
+        )
+        return JSONResponse(status_code=status, content=content)
+    payload["stream"] = stream_flag
+    try:
+        if stream_flag:
+            response_generator = await client.agenerate(
+                payload,
+                input_protocol="ollama",
+                request=request,
+                _requested_operation=operation,
+            )
+            return StreamingResponse(
+                streaming_response_wrapper(
+                    request, payload, response_generator, input_protocol="ollama"
+                ),
+                media_type="application/x-ndjson",
+            )
+        return await client.agenerate(
+            payload,
+            input_protocol="ollama",
+            request=request,
+            _requested_operation=operation,
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Ollama {operation} endpoint error: {error}")
+        status, content = route_error_response(error, protocol="ollama")
+        return JSONResponse(status_code=status, content=content)
+
+
+@app.post("/api/chat")
+async def ollama_chat(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """Ollama-native ``/api/chat`` ingress (NDJSON when streaming)."""
+
+    return await _ollama_ingress(request, client, "ollama_chat")
+
+
+@app.post("/api/generate")
+async def ollama_generate(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """Ollama-native ``/api/generate`` ingress (NDJSON when streaming)."""
+
+    return await _ollama_ingress(request, client, "ollama_generate")
+
+
+@app.post("/api/embed")
+async def ollama_embed(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """Ollama-native ``/api/embed``.
+
+    Dispatches through the runtime as a native ``embeddings`` operation. The
+    general embeddings batcher path is not protocol-native yet (group G9); this
+    route documents and uses the native-protocol seam instead of rebuilding the
+    embeddings subsystem.
+    """
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        status, content = route_error_response("Invalid JSON in request body.", protocol="ollama")
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="ollama"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not payload.get("model"):
+        status, content = route_error_response(
+            ValueError("Field required: 'model'"), protocol="ollama"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if "input" not in payload and "prompt" not in payload:
+        status, content = route_error_response(
+            ValueError("Field required: 'input'"), protocol="ollama"
+        )
+        return JSONResponse(status_code=status, content=content)
+    payload["stream"] = False
+    try:
+        return await client.agenerate(
+            payload,
+            input_protocol="ollama",
+            request=request,
+            _requested_operation="embeddings",
+        )
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Ollama /api/embed endpoint error: {error}")
+        status, content = route_error_response(error, protocol="ollama")
+        return JSONResponse(status_code=status, content=content)
+
+
+def _ollama_tag_name(model_id: Any) -> str:
+    text = str(model_id or "")
+    return text[len("ollama/") :] if text.startswith("ollama/") else text
+
+
+@app.get("/api/tags")
+async def ollama_tags(
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_api_key),
+):
+    """List the ollama provider's models in the native ``/api/tags`` shape."""
+
+    try:
+        model_ids = await client.get_all_available_models(grouped=False)
+        ollama_models = [m for m in model_ids if str(m).startswith("ollama/")]
+        selected = ollama_models or list(model_ids)
+        models = [
+            {"name": _ollama_tag_name(model_id), "model": _ollama_tag_name(model_id)}
+            for model_id in selected
+        ]
+        return {"models": models}
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Ollama /api/tags endpoint error: {error}")
+        status, content = route_error_response(error, protocol="ollama")
         return JSONResponse(status_code=status, content=content)
 
 

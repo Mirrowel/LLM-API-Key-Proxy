@@ -72,6 +72,16 @@ _STOP_REASON_ALIASES = {
     "image_prohibited_content": STOP_REASON_CONTENT_FILTER,
     "image_other": STOP_REASON_CONTENT_FILTER,
     "model_armor": STOP_REASON_CONTENT_FILTER,
+    "image_recitation": STOP_REASON_CONTENT_FILTER,
+    # G14 finishReason drift batch (v1beta revision 20260803): a missing
+    # thought signature means the provider REJECTED our replay (fixable by
+    # strip+sentinel, an error-class signal); NO_IMAGE is a generation
+    # refusal; ESCALATION routes content to a stronger safety tier.
+    "missing_thought_signature": STOP_REASON_ERROR,
+    "no_image": STOP_REASON_CONTENT_FILTER,
+    "unexpected_tool_call": STOP_REASON_ERROR,
+    "escalation": STOP_REASON_CONTENT_FILTER,
+    "finish_reason_unspecified": STOP_REASON_UNKNOWN,
 }
 
 
@@ -148,7 +158,9 @@ def format_stop_reason(value: Optional[str], target_protocol: str) -> Optional[s
     alias = canonical_stop_reason(value)
     if alias in table:
         return table[alias]
-    return value
+    # Fail closed: an unrecognized value renders as the target's unknown
+    # entry — never an invented spelling on the wire.
+    return table.get(STOP_REASON_UNKNOWN)
 
 
 def is_same_protocol(
@@ -739,6 +751,16 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
             "stop_sequence (the matched sequence text) has no representation outside Anthropic; only the stop reason survives",
             "stop_reason",
         )
+    native_stop_message = metadata.get("native_stop_message") if isinstance(metadata, dict) else None
+    if native_stop_message is not None and target_protocol != "gemini":
+        # Gemini's finishMessage detail (the human-readable qualifier next to
+        # finishReason) has no representation outside Gemini; only the
+        # finish reason survives cross-protocol.
+        _disclose(
+            "stop_message_dropped",
+            f"provider finish message {native_stop_message!r} has no representation outside Gemini; only the stop reason survives",
+            "finishMessage",
+        )
     if target_protocol != "anthropic_messages" and isinstance(extra.get("stop_details"), dict):
         # Refusal stop_details (category: cyber/bio/reasoning_extraction/
         # frontier_llm) qualify the refusal semantics — dropped elsewhere
@@ -1042,11 +1064,31 @@ def canonical_structured_output(value: Any, source_protocol: str) -> dict[str, A
             "strict": format_value.get("strict"),
         }
     if source_protocol == "gemini":
-        normalized = deepcopy(value)
-        if normalized.get("type") == "json_schema" and normalized.get("schema") is not None:
-            normalized.setdefault("strict", True)
-        return normalized
+        # Gemini enforces its response schema unconditionally; a `strict`
+        # flag is NOT part of the wire dialect — fabricating strict:true
+        # would put an unrequested guarantee on the canonical record.
+        return deepcopy(value)
     return deepcopy(value)
+
+
+def _lowercase_schema_types(value: Any) -> Any:
+    """Lowercase JSON Schema ``type`` values (Gemini OpenAPI dialect -> JSON Schema).
+
+    Gemini's OpenAPI dialect spells schema types UPPERCASE (OBJECT, STRING);
+    JSON Schema (used by Chat/Responses and provider-side structured output)
+    requires lowercase. Only the ``type`` keyword's string values change —
+    property names, enum/const literals, and every other keyword are copied
+    verbatim.
+    """
+
+    if isinstance(value, dict):
+        return {
+            key: (item.lower() if key == "type" and isinstance(item, str) else _lowercase_schema_types(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_lowercase_schema_types(item) for item in value]
+    return value
 
 
 def format_structured_output(value: Any, target_protocol: str) -> Any:
@@ -1055,6 +1097,9 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
     if not isinstance(value, dict):
         return None
     output_type = value.get("type") or "json_schema"
+    schema = value.get("schema")
+    if schema is not None and target_protocol in {"openai_chat", "responses"}:
+        schema = _lowercase_schema_types(schema)
     if target_protocol == "openai_chat":
         if output_type == "json_object":
             return {"type": "json_object"}
@@ -1072,7 +1117,7 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
                 key: deepcopy(item)
                 for key, item in {
                     "name": value.get("name") or "response",
-                    "schema": value.get("schema") or {},
+                    "schema": schema or {},
                     "strict": value.get("strict"),
                 }.items()
                 if item is not None
@@ -1092,7 +1137,7 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
             for key, item in {
                 "type": "json_schema",
                 "name": value.get("name") or "response",
-                "schema": value.get("schema") or {},
+                "schema": schema or {},
                 "strict": value.get("strict"),
             }.items()
             if item is not None

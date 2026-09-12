@@ -69,7 +69,7 @@ class NativeHTTPTransport:
             return response.json()
         return response
 
-    async def stream_json_lines(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float | None = None) -> AsyncIterator[Any]:
+    async def stream_json_lines(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float | None = None, transport: str | None = None) -> AsyncIterator[Any]:
         """Yield provider stream chunks from an injected streaming-capable client.
 
         Provider-specific test clients can still expose `stream_json_lines()`.
@@ -78,20 +78,25 @@ class NativeHTTPTransport:
         seam without enabling any provider that has not opted in safely.
         """
 
-        async for frame in self.stream_raw_frames(endpoint, headers=headers, payload=payload, timeout_seconds=timeout_seconds):
+        async for frame in self.stream_raw_frames(endpoint, headers=headers, payload=payload, timeout_seconds=timeout_seconds, transport=transport):
             if frame.is_comment:
                 # Parsed-dict consumers skip comment frames (pre-G4
                 # behavior); only stream_raw_frames exposes them.
                 continue
             yield frame.parsed
 
-    async def stream_raw_frames(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float | None = None) -> AsyncIterator[RawStreamFrame]:
+    async def stream_raw_frames(self, endpoint: str, *, headers: dict[str, str], payload: dict[str, Any], timeout_seconds: float | None = None, transport: str | None = None) -> AsyncIterator[RawStreamFrame]:
         """Yield raw provider stream events (wire text + parsed payload).
 
         The G4 relay seam: the executor can relay ``frame.raw`` bytes to the
         client untouched while feeding ``frame.parsed`` to the observing
         pipeline (usage/anchors/metrics/repair). Callers that cannot provide
         bytes yield frames with ``raw=None``.
+
+        ``transport`` selects the framing decoder: the protocol-declared
+        ``"jsonl"`` (NDJSON, Ollama-native) or the default SSE decoder. The
+        executor passes the protocol's declared transport through
+        :meth:`ProtocolAdapter.supports_transport`.
         """
 
         if hasattr(self.client, "stream_raw_frames"):
@@ -106,7 +111,7 @@ class NativeHTTPTransport:
             async with self.client.stream("POST", endpoint, headers=headers, json=payload) as response:
                 await _raise_for_http_error(response, read_stream=True)
                 if hasattr(response, "aiter_lines"):
-                    decoder = _SSEFrameDecoder()
+                    decoder = _frame_decoder(transport)
                     async for line in response.aiter_lines():
                         for frame in decoder.feed(line):
                             yield frame
@@ -115,7 +120,7 @@ class NativeHTTPTransport:
                     return
                 if hasattr(response, "aiter_bytes"):
                     buffer = ""
-                    decoder = _SSEFrameDecoder()
+                    decoder = _frame_decoder(transport)
                     async for chunk in response.aiter_bytes():
                         text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
                         buffer += text
@@ -130,6 +135,14 @@ class NativeHTTPTransport:
                         yield frame
                     return
         raise NotImplementedError("Injected native HTTP client does not expose streaming support")
+
+
+def _frame_decoder(transport: str | None) -> Any:
+    """Return the framing decoder for a declared transport (SSE by default)."""
+
+    if transport == "jsonl":
+        return _NDJSONFrameDecoder()
+    return _SSEFrameDecoder()
 
 
 async def _raise_for_http_error(response: Any, *, read_stream: bool = False) -> None:
@@ -271,3 +284,27 @@ class _SSEFrameDecoder:
             parsed["type"] = event_name
         frames.append(RawStreamFrame(raw=raw, parsed=parsed, event_name=event_name))
         return frames
+
+
+class _NDJSONFrameDecoder:
+    """Decode newline-delimited JSON (Ollama-native) stream frames.
+
+    One JSON value per line; no ``data:`` prefix, no blank-line event
+    delimiter, and no ``[DONE]`` sentinel — ``done:true`` is an ordinary
+    frame the protocol parser interprets. The original line text is preserved
+    verbatim for relay/tracing.
+    """
+
+    def feed(self, line: Any) -> list[RawStreamFrame]:
+        text = line.decode("utf-8", errors="replace") if isinstance(line, (bytes, bytearray)) else str(line)
+        text = text.rstrip("\r")
+        if not text.strip():
+            return []
+        try:
+            parsed: Any = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = text
+        return [RawStreamFrame(raw=text, parsed=parsed)]
+
+    def flush(self) -> list[RawStreamFrame]:
+        return []

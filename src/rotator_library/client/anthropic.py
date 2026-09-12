@@ -113,11 +113,37 @@ class AnthropicHandler:
             anthropic_logger.log_response(anthropic_response, filename="anthropic_response.json")
         return anthropic_response
 
-    async def count_tokens(self, request: Dict[str, Any]) -> dict[str, int]:
-        """Count an Anthropic request locally using its canonical Chat projection."""
+    async def count_tokens(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Count tokens natively (upstream count_tokens) with an opt-in local estimate.
+
+        G14: the official operation passes through to the routed provider;
+        the local projection estimate only serves when the operator opted in
+        via COUNT_TOKENS_LOCAL_ESTIMATE=1.
+        """
 
         payload = dict(request)
+        payload.setdefault("model", "")
         model = str(payload.get("model") or "")
+        try:
+            return await self._client.agenerate(
+                payload,
+                input_protocol="anthropic_messages",
+                _requested_operation=OPERATION_COUNT_TOKENS,
+            )
+        except Exception as error:
+            from ..client.executor import RoutingExecutionError
+
+            if not (
+                isinstance(error, RoutingExecutionError)
+                and getattr(error, "error_type", "") == "operation_unsupported"
+                and _local_estimate_enabled()
+            ):
+                raise
+        return self._local_count_estimate(payload, model)
+
+    def _local_count_estimate(self, payload: Dict[str, Any], model: str) -> Dict[str, Any]:
+        """Legacy local estimate via the canonical Chat projection."""
+
         anthropic = get_protocol("anthropic_messages")
         unified = anthropic.parse_request(
             payload,
@@ -162,3 +188,11 @@ class AnthropicHandler:
         # approximates images/PDFs and may include prior-turn thinking the
         # upstream counter ignores). Anthropic clients ignore unknown keys.
         return {"input_tokens": total, "x-proxy-estimate": "local-projection"}
+
+
+def _local_estimate_enabled() -> bool:
+    """COUNT_TOKENS_LOCAL_ESTIMATE=1 opts into the local projection fallback."""
+
+    import os
+
+    return str(os.environ.get("COUNT_TOKENS_LOCAL_ESTIMATE", "") or "").strip().lower() in ("1", "true", "yes", "on")

@@ -81,6 +81,10 @@ class RequestContext:
     session_isolation_key: Optional[str] = None
     request: Optional[Any] = None  # FastAPI Request object
     pre_request_callback: Optional[Callable] = None
+    # G14: client-requested operation (e.g. count_tokens) — providers that
+    # cannot serve it natively fail honestly (failover-eligible) instead of
+    # silently degrading to a generate call.
+    requested_operation: str = ""
     transaction_logger: Optional[Any] = None
     usage_manager_key: Optional[str] = None
     provider_config: Optional[Dict[str, Any]] = None

@@ -58,7 +58,7 @@ class SurfaceClient:
 
         return stream()
 
-    def gemini_count_tokens(self, payload, *, model):
+    async def gemini_count_tokens(self, payload, *, model):
         self.calls.append({"payload": payload, "model": model, "operation": "count_tokens"})
         return {"totalTokens": 7}
 
@@ -139,13 +139,31 @@ def test_gemini_stream_generate_route_preserves_native_stream_shape() -> None:
     client, rotating = _surface_client()
 
     response = client.post(
-        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent?alt=sse",
         json={"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
     )
 
     assert response.status_code == 200
     assert "gemini-stream" in response.text
+    assert response.headers["content-type"].startswith("text/event-stream")
     assert rotating.calls[0]["operation"] == "stream_generate"
+
+
+def test_gemini_stream_generate_defaults_to_official_json_array() -> None:
+    """G14: bare :streamGenerateContent answers the official JSON array."""
+
+    client, _ = _surface_client()
+
+    response = client.post(
+        "/v1beta/models/gemini-2.5-pro:streamGenerateContent",
+        json={"contents": [{"role": "user", "parts": [{"text": "hello"}]}]},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("application/json")
+    chunks = response.json()
+    assert isinstance(chunks, list) and len(chunks) == 1
+    assert chunks[0]["candidates"][0]["content"]["parts"][0]["text"] == "gemini-stream"
 
 
 def test_gemini_generate_rejects_stream_flag_until_stream_route_exists() -> None:

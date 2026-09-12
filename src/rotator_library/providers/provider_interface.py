@@ -330,6 +330,9 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # the LiteLLM-backed path.
     protocol_name: Optional[str] = None
     adapter_names: Tuple[str, ...] = ()
+    # Zero-credential providers (e.g. a local Ollama) declare this so routing
+    # can mint the internal no-auth rotation slot when no secret is configured.
+    default_auth_mode: Optional[str] = None
     # G2 hookable pipeline: class-level hook declarations (PipelineHook
     # classes, instances, or factories). JSON config ``hooks`` and globally
     # registered hook names add to this declaration (hooks/registry.py).
@@ -569,6 +572,14 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             return "responses"
         if protocol_name == "gemini":
             return "stream_generate" if stream else "generate"
+        if protocol_name == "ollama":
+            # Both /api/chat and /api/generate stream via the body `stream`
+            # flag, so the operation does not fork on the stream bit; chat is
+            # the canonical shape for conversational requests.
+            request = request if isinstance(request, dict) else {}
+            if "prompt" in request and "messages" not in request:
+                return "ollama_generate"
+            return "ollama_chat"
         return "chat"
 
     def should_use_native_protocol(self, model: str = "", operation: str = "chat", *, stream: bool = False, execution: str = "auto") -> bool:
@@ -623,6 +634,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             raise NotImplementedError(
                 "Gemini endpoints are model-ridden; declare endpoint_paths for gemini profiles"
             )
+        if protocol == "ollama":
+            return {
+                "ollama_chat": "/api/chat",
+                "ollama_generate": "/api/generate",
+                "embeddings": "/api/embed",
+            }.get(operation, "/api/chat")
         return "/chat/completions"
 
     def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> Dict[str, str]:

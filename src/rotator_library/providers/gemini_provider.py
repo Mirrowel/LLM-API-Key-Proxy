@@ -3,13 +3,31 @@
 
 import httpx
 import logging
-from typing import List, Dict, Any
-from .provider_interface import ProviderInterface
+from typing import List, Dict, Any, Optional
+from .provider_interface import ProviderInterface, declared_endpoint_path, render_endpoint_path
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False  # Ensure this logger doesn't propagate to root
 if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
+
+_GEMINI_API_VERSION_SUFFIXES = ("/v1beta", "/v1")
+
+
+def _strip_gemini_api_version(base: str) -> str:
+    """Normalize a configured Gemini base so paths never double-append.
+
+    ``GEMINI_API_BASE`` is commonly configured WITH the version path
+    (``.../v1beta``); the endpoint builder appends ``/v1beta/...`` itself, so
+    a trailing version suffix is stripped — otherwise every request becomes
+    ``/v1beta/v1beta/...``.
+    """
+
+    trimmed = str(base or "").rstrip("/")
+    for suffix in _GEMINI_API_VERSION_SUFFIXES:
+        if trimmed.endswith(suffix):
+            return trimmed[: -len(suffix)].rstrip("/")
+    return trimmed
 
 
 class GeminiProvider(ProviderInterface):
@@ -24,8 +42,26 @@ class GeminiProvider(ProviderInterface):
     def get_native_operation(self, model: str = "", request=None, stream: bool = False) -> str:
         return "stream_generate" if stream else "generate"
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
+    def get_native_endpoint(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> str:
+        base = _strip_gemini_api_version(self.get_provider_api_base() or self.default_api_base or "")
+        # File-based transport profiles may declare their own endpoint path
+        # (D13); a declared path wins over the conventional model-ridden ones.
+        entry: Optional[Any] = None
+        if profile and self.transport_profiles:
+            entry = self.transport_profiles.get(profile)
+        path = declared_endpoint_path(entry, operation)
+        if not path:
+            path = declared_endpoint_path(self._get_runtime_config(model), operation)
+        if path:
+            rendered = render_endpoint_path(
+                path,
+                model=self.normalize_native_model(model),
+                operation=operation,
+                provider=self._provider_config_key() or "",
+            )
+            if rendered.startswith(("http://", "https://")):
+                return rendered
+            return f"{base}/{rendered.lstrip('/')}"
         if operation == "count_tokens":
             # Token counting is its own action (never :generateContent).
             return f"{base}/v1beta/models/{model}:countTokens"
@@ -38,17 +74,34 @@ class GeminiProvider(ProviderInterface):
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
         Fetches the list of available models from the Google Gemini API.
+
+        Uses the provider's configured base (never the hardcoded public URL) so
+        proxies/mirrors are honored, and paginates via ``nextPageToken``.
         """
+        base = _strip_gemini_api_version(self.get_provider_api_base() or self.default_api_base or "")
         try:
-            response = await client.get(
-                "https://generativelanguage.googleapis.com/v1beta/models",
-                headers={"x-goog-api-key": api_key},
-            )
-            response.raise_for_status()
-            return [
-                f"gemini/{model['name'].replace('models/', '')}"
-                for model in response.json().get("models", [])
-            ]
+            models: List[str] = []
+            page_token: Optional[str] = None
+            while True:
+                params: Dict[str, Any] = {"pageSize": 1000}
+                if page_token:
+                    params["pageToken"] = page_token
+                response = await client.get(
+                    f"{base}/v1beta/models",
+                    headers={"x-goog-api-key": api_key},
+                    params=params,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                for model in payload.get("models", []) or []:
+                    name = model.get("name") if isinstance(model, dict) else model
+                    normalized = str(name or "").replace("models/", "")
+                    if normalized:
+                        models.append(f"gemini/{normalized}")
+                page_token = payload.get("nextPageToken") if isinstance(payload, dict) else None
+                if not page_token:
+                    break
+            return models
         except httpx.RequestError as e:
             lib_logger.error(f"Failed to fetch Gemini models: {e}")
             return []

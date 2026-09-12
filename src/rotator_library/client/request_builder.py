@@ -235,6 +235,7 @@ class RequestContextBuilder:
         parent_log_dir = kwargs.pop("_parent_log_dir", None)
         disable_provider_continuation = bool(kwargs.pop("_disable_provider_continuation", False))
         requested_input_protocol = str(kwargs.pop("_input_protocol", "openai_chat") or "openai_chat")
+        requested_operation = str(kwargs.pop("_requested_operation", "") or "")
         input_protocol = get_protocol(requested_input_protocol)
         # R1 client entry: the payload passes through the request_received
         # slot BEFORE any snapshot, normalization, or routing — hook edits are
@@ -273,6 +274,7 @@ class RequestContextBuilder:
             target_protocol=input_protocol.name,
             input_protocol=input_protocol.name,
             client_protocol=input_protocol.name,
+            metadata={"operation": requested_operation} if requested_operation else None,
         )
         unified_request = input_protocol.parse_request(protocol_request, protocol_context)
         if input_protocol.name != "openai_chat":
@@ -455,6 +457,7 @@ class RequestContextBuilder:
             protocol_request=protocol_request,
             unified_request=unified_request,
             input_provider=provider,
+            requested_operation=requested_operation,
             disable_provider_continuation=disable_provider_continuation,
             routing_group=routing_decision.group if routing_decision else None,
             pipeline_run=pipeline_run,
