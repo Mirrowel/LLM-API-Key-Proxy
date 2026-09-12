@@ -5,7 +5,13 @@ import importlib
 import pkgutil
 import os
 from typing import Any, Dict, Mapping, Optional, Type
-from .provider_interface import ProviderInterface
+
+from .provider_interface import (
+    ProviderInterface,
+    auth_header_pair,
+    declared_endpoint_path,
+    render_endpoint_path,
+)
 
 # --- Provider Plugin System ---
 
@@ -64,6 +70,15 @@ class DynamicOpenAICompatibleProvider:
             raise ValueError(
                 f"API base URL is required for dynamic provider {provider_name!r}"
             )
+
+        # D13 profile surface (fix-pass G7): JSON-declared transport profiles
+        # bind onto the instance; env-only dynamics default to native
+        # openai_chat (W11) instead of silently falling back to LiteLLM.
+        self.transport_profiles = (
+            dict(runtime.transport_profiles) if runtime.transport_profiles else None
+        )
+        self.default_profile = runtime.default_profile
+        self.protocol_name = runtime.protocol_name or "openai_chat"
 
         # Import model definitions
         from ..model_definitions import ModelDefinitions
@@ -131,39 +146,47 @@ class DynamicOpenAICompatibleProvider:
         model: str = "",
         request: Optional[Dict[str, Any]] = None,
         stream: bool = False,
+        profile: Optional[str] = None,
     ) -> str:
-        protocol = self.get_protocol_name(model)
-        if protocol == "responses":
-            return "responses"
-        if protocol == "anthropic_messages":
-            return "messages"
-        if protocol == "gemini":
-            return "stream_generate" if stream else "generate"
-        return "chat"
+        return ProviderInterface.get_native_operation(
+            self, model, request, stream=stream, profile=profile
+        )
 
     def normalize_native_model(self, model: str = "") -> str:
         prefix = f"{self.provider_name}/"
         return model[len(prefix):] if model.startswith(prefix) else model
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+    def get_native_endpoint(
+        self,
+        model: str = "",
+        operation: str = "chat",
+        profile: Optional[str] = None,
+    ) -> str:
         runtime = self._runtime_config(model)
-        protocol = self.get_protocol_name(model) or "openai_chat"
-        defaults = {
-            "openai_chat": {"chat": "/chat/completions"},
-            "responses": {"responses": "/responses"},
-            "anthropic_messages": {"messages": "/messages"},
-            "gemini": {
-                "generate": "/models/{model}:generateContent",
-                "stream_generate": "/models/{model}:streamGenerateContent?alt=sse",
-                "count_tokens": "/models/{model}:countTokens",
-            },
-        }
-        path = runtime.endpoint_paths.get(operation) or defaults.get(protocol, {}).get(operation)
+        protocol = self.get_protocol_name(model, profile=profile) if profile else self.get_protocol_name(model)
+        protocol = protocol or "openai_chat"
+        entry: Optional[Any] = None
+        if profile and self.transport_profiles:
+            entry = self.transport_profiles.get(profile)
+        path = declared_endpoint_path(entry, operation) or runtime.endpoint_paths.get(operation)
+        if not path:
+            defaults = {
+                "openai_chat": {"chat": "/chat/completions"},
+                "responses": {"responses": "/responses"},
+                "anthropic_messages": {"messages": "/messages"},
+                "gemini": {
+                    "generate": "/models/{model}:generateContent",
+                    "stream_generate": "/models/{model}:streamGenerateContent?alt=sse",
+                    "count_tokens": "/models/{model}:countTokens",
+                },
+            }
+            path = defaults.get(protocol, {}).get(operation)
         if not path:
             raise NotImplementedError(
                 f"Dynamic provider {self.provider_name} has no endpoint for {protocol}/{operation}"
             )
-        rendered = path.format(
+        rendered = render_endpoint_path(
+            path,
             model=self.normalize_native_model(model),
             operation=operation,
             provider=self.provider_name,
@@ -177,25 +200,27 @@ class DynamicOpenAICompatibleProvider:
         credential_identifier: str,
         model: str = "",
         operation: str = "chat",
+        profile: Optional[str] = None,
     ) -> Dict[str, str]:
         runtime = self._runtime_config(model)
+        auth_mode = runtime.auth_mode
+        auth_header_name = runtime.auth_header_name
+        if profile and self.transport_profiles:
+            entry = self.transport_profiles.get(profile)
+            if isinstance(entry, Mapping):
+                auth_mode = entry.get("auth_mode") or auth_mode
+                auth_header_name = entry.get("auth_header_name") or auth_header_name
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if operation == "stream_generate":
             headers["Accept"] = "text/event-stream"
-        if runtime.auth_mode == "none":
-            return headers
-        if runtime.auth_mode == "x-api-key":
-            headers["x-api-key"] = credential_identifier
-        elif runtime.auth_mode == "x-goog-api-key":
-            headers["x-goog-api-key"] = credential_identifier
-        elif runtime.auth_mode == "custom":
-            if not runtime.auth_header_name:
-                raise ValueError(
-                    f"Dynamic provider {self.provider_name} requires auth_header_name for custom auth"
-                )
-            headers[runtime.auth_header_name] = credential_identifier
-        else:
-            headers["Authorization"] = f"Bearer {credential_identifier}"
+        headers.update(
+            auth_header_pair(
+                credential_identifier,
+                auth_mode,
+                auth_header_name,
+                provider=self.provider_name,
+            )
+        )
         return headers
 
 
@@ -336,6 +361,9 @@ def _register_providers():
                 "auth_mode",
                 "auth_header_name",
                 "models",
+                "transport_profiles",
+                "profiles",
+                "default_profile",
             } & set(raw if isinstance(raw, dict) else {})
             if transport_keys:
                 raise ValueError(

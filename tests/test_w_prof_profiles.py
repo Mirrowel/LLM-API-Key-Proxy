@@ -127,13 +127,34 @@ def test_bare_name_matches_unique_profile_for_other_client_protocol() -> None:
     )
 
 
-def test_bare_name_errors_when_no_profile_speaks_client_protocol() -> None:
-    with pytest.raises(ModelReferenceError, match="no endpoint"):
+def test_bare_name_converts_through_priority_list_with_warning() -> None:
+    """D13 revision: zero protocol match auto-converts through the priority
+    list (openai_chat first) with a terminal warning — never a hard error."""
+    result = resolve_profile(
+        declared_profiles=PROFILES,
+        default_profile="responses",
+        protocol_name=None,
+        client_protocol="gemini",
+        requested_profile=None,
+        provider="synthetic",
+    )
+    # gemini is unavailable; openai_chat is the first offered protocol.
+    assert result == "chat"
+
+
+def test_bare_name_ambiguity_errors_listing_candidates() -> None:
+    """Several profiles speaking the client protocol with no default match
+    is endpoint ambiguity: error lists them and suggests a default."""
+    profiles = {
+        "fast": {"protocol": "openai_chat"},
+        "cheap": {"protocol": "openai_chat"},
+    }
+    with pytest.raises(ModelReferenceError, match="multiple profiles"):
         resolve_profile(
-            declared_profiles=PROFILES,
-            default_profile="chat",
+            declared_profiles=profiles,
+            default_profile=None,
             protocol_name=None,
-            client_protocol="gemini",
+            client_protocol="openai_chat",
             requested_profile=None,
             provider="synthetic",
         )
@@ -337,9 +358,11 @@ def test_native_context_resolves_bare_and_explicit_profiles() -> None:
     assert explicit.metadata.get("execution_profile") == "responses"
 
 
-def test_native_context_bare_name_unmatched_protocol_errors() -> None:
+def test_native_context_bare_name_unmatched_protocol_converts() -> None:
+    """D13 revision at the executor level: an unmatched bare-name protocol
+    resolves via the priority list instead of a 400 (conversion warning is
+    emitted once per substitution)."""
     from rotator_library.client.executor import RequestExecutor
-    from rotator_library.core.errors import StructuredAPIResponseError
     from rotator_library.core.types import RequestContext
 
     executor = RequestExecutor.__new__(RequestExecutor)
@@ -354,10 +377,234 @@ def test_native_context_bare_name_unmatched_protocol_errors() -> None:
         deadline=0,
         input_protocol_name="gemini",
     )
-    with pytest.raises(StructuredAPIResponseError, match="no endpoint"):
-        executor._build_native_provider_context(
-            "synthetic", "synthetic/m", plugin, "sk-test", "cred-1", context, None
+    native_context = executor._build_native_provider_context(
+        "synthetic", "synthetic/m", plugin, "sk-test", "cred-1", context, None
+    )
+    # Converted to the first offered priority protocol (openai_chat).
+    assert native_context.protocol_name == "openai_chat"
+    assert native_context.client_protocol_name == "gemini"
+
+
+# --- Plan 2.8 endpoint declarations (plural map + placeholders) ---
+
+
+def test_profile_endpoint_paths_map_and_placeholder_rendering() -> None:
+    class GeminiProfileProvider(MultiProfileProvider):
+        transport_profiles = {
+            "native": {
+                "protocol": "gemini",
+                "endpoint_paths": {
+                    "generate": "/v1beta/models/{model}:generateContent",
+                    "stream_generate": "/v1beta/models/{model}:streamGenerateContent?alt=sse",
+                },
+            },
+        }
+        default_profile = "native"
+
+    provider = GeminiProfileProvider()
+    assert provider.get_native_endpoint("gemini-3-pro", "generate", profile="native") == (
+        "https://synthetic.example/v1/v1beta/models/gemini-3-pro:generateContent"
+    )
+    assert provider.get_native_endpoint("gemini-3-pro", "stream_generate", profile="native") == (
+        "https://synthetic.example/v1/v1beta/models/gemini-3-pro:streamGenerateContent?alt=sse"
+    )
+
+
+def test_profile_endpoint_plural_map_wins_over_singular_fallback() -> None:
+    class MixedPathProvider(MultiProfileProvider):
+        transport_profiles = {
+            "chat": {
+                "protocol": "openai_chat",
+                "endpoint_paths": {"chat": "/v1/chat/completions"},
+                "endpoint_path": "/legacy/chat",
+            },
+        }
+        default_profile = "chat"
+
+    provider = MixedPathProvider()
+    assert provider.get_native_endpoint("m", "chat", profile="chat") == (
+        "https://synthetic.example/v1/v1/chat/completions"
+    )
+    # A different operation falls back to the singular declaration.
+    assert provider.get_native_endpoint("m", "embeddings", profile="chat") == (
+        "https://synthetic.example/v1/legacy/chat"
+    )
+
+
+def test_profile_endpoint_declarations_win_over_provider_level() -> None:
+    from rotator_library.config.experimental import load_config_from_mapping
+
+    class ProviderLevelPaths(MultiProfileProvider):
+        provider_env_name = "provider_level_paths"
+        transport_profiles = {"chat": {"protocol": "openai_chat", "endpoint_paths": {"chat": "/profile/chat"}}}
+        default_profile = "chat"
+
+    provider = ProviderLevelPaths()
+    provider.bind_runtime_config(
+        load_config_from_mapping(
+            {"providers": {"provider_level_paths": {"endpoint_paths": {"chat": "/provider/chat"}}}}
         )
+    )
+    assert provider.get_native_endpoint("m", "chat", profile="chat").endswith("/profile/chat")
+
+
+# --- Plan 2.8 per-profile auth ---
+
+
+def test_profile_auth_declarations_override_provider_level() -> None:
+    from rotator_library.config.experimental import load_config_from_mapping
+
+    class ProfileAuthProvider(MultiProfileProvider):
+        provider_env_name = "profile_auth_provider"
+        transport_profiles = {
+            "anthropic": {
+                "protocol": "anthropic_messages",
+                "endpoint_path": "/v1/messages",
+                "auth_mode": "x-api-key",
+            },
+        }
+        default_profile = "anthropic"
+
+    provider = ProfileAuthProvider()
+    provider.bind_runtime_config(
+        load_config_from_mapping({"providers": {"profile_auth_provider": {"auth_mode": "x-goog-api-key"}}})
+    )
+    assert provider.get_native_headers("secret", profile="anthropic") == {"x-api-key": "secret"}
+    assert provider.get_native_headers("secret") == {"x-goog-api-key": "secret"}
+
+
+# --- Dynamic provider profile surface (G7) ---
+
+
+def test_dynamic_provider_accepts_json_transport_profiles(tmp_path, monkeypatch) -> None:
+    import json
+
+    from rotator_library.providers import _create_dynamic_plugin_class
+
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "profiled_dynamic": {
+                        "api_base": "https://dynamic.example",
+                        "profiles": {
+                            "chat": {
+                                "protocol": "openai_chat",
+                                "endpoint_paths": {"chat": "/v1/chat/completions"},
+                            },
+                            "anthropic": {
+                                "protocol": "anthropic_messages",
+                                "endpoint_path": "/v1/messages",
+                                "auth_mode": "x-api-key",
+                            },
+                        },
+                        "default_profile": "chat",
+                        "models": ["m"],
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LLM_PROXY_CONFIG_FILE", str(config_path))
+
+    provider = _create_dynamic_plugin_class("profiled_dynamic")()
+    assert provider.transport_profiles is not None
+    assert provider.get_protocol_name("profiled_dynamic/m", profile="anthropic") == "anthropic_messages"
+    assert provider.get_native_endpoint("profiled_dynamic/m", "chat", profile="chat") == (
+        "https://dynamic.example/v1/chat/completions"
+    )
+    assert provider.get_native_endpoint("profiled_dynamic/m", "messages", profile="anthropic") == (
+        "https://dynamic.example/v1/messages"
+    )
+    assert provider.get_native_headers("secret", profile="anthropic")["x-api-key"] == "secret"
+    assert provider.get_native_headers("secret", profile="chat")["Authorization"] == "Bearer secret"
+
+
+def test_env_only_dynamic_provider_defaults_native_openai_chat(monkeypatch) -> None:
+    from rotator_library.providers import _create_dynamic_plugin_class
+
+    monkeypatch.delenv("LLM_PROXY_CONFIG_FILE", raising=False)
+    monkeypatch.delenv("PROXY_CONFIG_FILE", raising=False)
+    monkeypatch.setenv("ENVONLY_DYNAMIC_API_BASE", "https://envonly.example/v1")
+
+    provider = _create_dynamic_plugin_class("envonly_dynamic")()
+    assert provider.get_api_base() == "https://envonly.example/v1"
+    assert provider.get_protocol_name("envonly_dynamic/m") == "openai_chat"
+
+
+# --- Embeddings profile loudness + acompletion input_protocol (G7) ---
+
+
+@pytest.mark.asyncio
+async def test_embedding_request_with_profile_fails_loud(monkeypatch) -> None:
+    monkeypatch.delenv("FALLBACK_GROUPS", raising=False)
+    from rotator_library.client.request_builder import RequestContextBuilder
+
+    async def _scope(provider, classifier, request_api_keys, request_providers, private):
+        return {
+            "credentials": ["cred"],
+            "usage_manager_key": provider,
+            "provider_config": {},
+            "credential_secrets": {},
+            "classifier": "global",
+        }
+
+    builder = RequestContextBuilder(
+        resolve_scope_for_provider=_scope,
+        model_resolver=type("R", (), {"resolve_model_id": lambda self, model, provider: model})(),
+        session_tracker=type(
+            "S",
+            (),
+            {
+                "infer_session": lambda self, *a, **k: type(
+                    "Session",
+                    (),
+                    {"session_id": "s", "affinity_key": None, "tracking_namespace": "n"},
+                )()
+            },
+        )(),
+        get_global_timeout=lambda: 30,
+        get_enable_request_logging=lambda: False,
+    )
+
+    with pytest.raises(ModelReferenceError, match="[Ee]mbedding"):
+        await builder.build_embedding_context(
+            None, None, {"model": "synthetic:responses/embed-1", "input": "hi"}
+        )
+
+
+def test_acompletion_input_protocol_parameter_is_authoritative() -> None:
+    import asyncio
+
+    from rotator_library.client.rotating_client import RotatingClient
+
+    captured: dict = {}
+
+    class _Builder:
+        async def build_completion_context(self, request, callback, kwargs):
+            captured.update(kwargs)
+            return object()
+
+    class _Executor:
+        async def execute(self, context):
+            return "ok"
+
+    client = RotatingClient.__new__(RotatingClient)
+    client._request_builder = _Builder()
+    client._executor = _Executor()
+
+    assert asyncio.run(client.acompletion(input_protocol="anthropic_messages", model="synthetic/m", messages=[])) == "ok"
+    assert captured["_input_protocol"] == "anthropic_messages"
+
+    captured.clear()
+    asyncio.run(client.acompletion(_input_protocol="gemini", model="synthetic/m", messages=[]))
+    assert captured["_input_protocol"] == "gemini"
+
+    captured.clear()
+    asyncio.run(client.acompletion(input_protocol="responses", _input_protocol="gemini", model="synthetic/m"))
+    assert captured["_input_protocol"] == "responses"
 
 
 # --- Identity normalization ---
@@ -367,10 +614,6 @@ def test_profile_addressing_normalizes_to_provider_identity() -> None:
     """Usage pools, session namespaces, and cache scopes see only the bare
     provider — the grammar must not leak profiles into identity keys."""
 
-    from rotator_library.routing.profiles import split_profile_from_provider
-
-    assert split_profile_from_provider("synthetic") == ("synthetic", None)
-    assert split_profile_from_provider("synthetic:responses") == ("synthetic", "responses")
     # The request builder normalizes model strings before any identity use:
     ref = parse_model_reference("synthetic:responses/m")
     assert ref.bare == "synthetic/m"

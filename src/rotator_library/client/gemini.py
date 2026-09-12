@@ -6,7 +6,7 @@ import json
 from typing import TYPE_CHECKING, Any, Optional
 
 from ..protocols import OPERATION_COUNT_TOKENS, ProtocolContext, get_protocol
-from ..routing import load_routing_config_from_env
+from ..routing import load_routing_config_from_env  # noqa: F401  (kept for test import compatibility)
 
 if TYPE_CHECKING:
     from .rotating_client import RotatingClient
@@ -101,5 +101,7 @@ class GeminiHandler:
         normalized = str(model or "").removeprefix("models/")
         if "/" in normalized:
             return normalized
+        from ..routing.config import load_routing_config_from_env
+
         routes = load_routing_config_from_env().model_routes
         return normalized if normalized.lower() in routes else f"gemini/{normalized}"

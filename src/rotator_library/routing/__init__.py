@@ -5,31 +5,27 @@
 
 from .config import RoutingConfigError, load_routing_config_from_env, parse_route_target
 from .attempts import clone_context_for_target
-from .executor import FallbackAttemptRunner, FallbackExhaustedError
 from .policy import FallbackPolicy
 from .profiles import (
+    DEFAULT_PROTOCOL_PRIORITY,
     ModelReference,
     ModelReferenceError,
     parse_model_reference,
     resolve_profile,
-    split_profile_from_provider,
     valid_profile_name,
 )
 from .resolver import FallbackResolver
-from .types import FallbackGroup, RouteTarget, RoutingConfig, RoutingDecision, TargetGroup, TargetSelector
+from .types import FallbackGroup, RouteTarget, RoutingConfig, RoutingDecision
 
 __all__ = [
+    "DEFAULT_PROTOCOL_PRIORITY",
     "FallbackGroup",
-    "FallbackAttemptRunner",
-    "FallbackExhaustedError",
     "FallbackPolicy",
     "FallbackResolver",
     "RouteTarget",
     "RoutingConfig",
     "RoutingConfigError",
     "RoutingDecision",
-    "TargetGroup",
-    "TargetSelector",
     "clone_context_for_target",
     "load_routing_config_from_env",
     "parse_route_target",

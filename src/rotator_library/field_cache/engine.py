@@ -46,6 +46,24 @@ def _safe_scope_value(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _canonical_model(provider: Optional[str], model: str) -> str:
+    """Canonicalize the model scope dimension to the stripped form.
+
+    Provider and model are separate scope dimensions, so a prefixed model
+    (``openai/gpt-4``) and its stripped form (``gpt-4``) are the SAME cache
+    identity. Strip the provider prefix only when the first ``/`` segment
+    equals the provider; nested model ids (``openrouter/meta/llama``) keep
+    their slashes.
+    """
+
+    if not provider or not model:
+        return model
+    prefix = f"{provider}/"
+    if model.startswith(prefix) and len(model) > len(prefix):
+        return model[len(prefix):]
+    return model
+
+
 def _unsupported_store_keyword(error: TypeError) -> bool:
     message = str(error).lower()
     return "unexpected keyword" in message or "keyword argument" in message
@@ -112,6 +130,9 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
                 # a rule scoped to it never pools across unknown classifiers.
                 return None
             value = "_none"
+        if scope == "model":
+            # Canonicalize stripped vs prefixed forms to one identity.
+            value = _canonical_model(context.provider, value)
         safe_value = _safe_scope_value(value)
         parts.append(f"{scope}={safe_value}")
     return "|".join(parts)

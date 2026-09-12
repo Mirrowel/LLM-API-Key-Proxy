@@ -16,8 +16,19 @@ from rotator_library.config.experimental import (
 )
 
 
-def test_missing_config_file_returns_empty(tmp_path) -> None:
-    config = load_experimental_config(tmp_path / "missing.json", env={})
+def test_missing_explicit_config_path_fails_loud(tmp_path) -> None:
+    """G7: an explicitly configured-but-missing path is an operator error,
+    never a silent 'no config'."""
+    from rotator_library.config.experimental import ExperimentalConfigError
+
+    with pytest.raises(ExperimentalConfigError, match="Config file not found"):
+        load_experimental_config(tmp_path / "missing.json", env={})
+    with pytest.raises(ExperimentalConfigError, match="Config file not found"):
+        load_experimental_config(env={"LLM_PROXY_CONFIG_FILE": str(tmp_path / "missing.json")})
+
+
+def test_unset_config_path_returns_empty() -> None:
+    config = load_experimental_config(env={})
 
     assert config.is_empty
 

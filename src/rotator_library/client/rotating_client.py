@@ -617,9 +617,15 @@ class RotatingClient:
         self,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
+        *,
+        input_protocol: Optional[str] = None,
         **kwargs,
     ) -> Union[Any, AsyncGenerator[str, None]]:
         request_context_callback = kwargs.pop("_request_context_callback", None)
+        # The keyword argument is authoritative when given; the magic-string
+        # ``_input_protocol`` path is kept for internal callers (agenerate).
+        if input_protocol:
+            kwargs["_input_protocol"] = input_protocol
         context = await self._request_builder.build_completion_context(
             request, pre_request_callback, kwargs
         )

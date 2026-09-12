@@ -35,8 +35,17 @@ class ModelRef:
 def parse_model_ref(text: str) -> Optional[ModelRef]:
     if not isinstance(text, str) or "/" not in text:
         return None
-    provider, _, model = text.partition("/")
-    provider = provider.strip()
+    provider_segment, _, model = text.partition("/")
+    provider_segment = provider_segment.strip()
+    # Compatibility members are identity declarations: a transport profile
+    # in the provider segment must be dropped, never folded into the
+    # provider name (``openai:chat/gpt-4`` -> provider ``openai``).
+    if ":" in provider_segment:
+        provider_name, _, profile_name = provider_segment.partition(":")
+        if not provider_name.strip() or not profile_name.strip():
+            return None
+        provider_segment = provider_name
+    provider = provider_segment.strip()
     model = model.strip()
     if not provider or not model:
         return None

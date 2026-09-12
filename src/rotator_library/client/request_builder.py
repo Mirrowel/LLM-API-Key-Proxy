@@ -4,11 +4,13 @@
 """RequestContext construction for RotatingClient public request methods."""
 
 import inspect
+import logging
 import time
 from copy import deepcopy
+from dataclasses import replace
 from typing import Any, Awaitable, Callable, Dict, Optional
 
-from ..routing.profiles import PROFILE_SEPARATOR
+from ..routing.profiles import PROFILE_SEPARATOR, ModelReferenceError
 
 from ..core.types import RequestContext
 from ..hooks.binding import make_pipeline_run
@@ -86,20 +88,21 @@ class RequestContextBuilder:
         raise ValueError(f"Invalid model format or no credentials for provider: {model}")
 
     def _resolve_routing_decision(self, model: str) -> Optional[RoutingDecision]:
-        """Resolve env-configured fallback routing, if any applies."""
+        """Resolve env-configured fallback routing, if any applies.
+
+        Broken routing config never silently degrades: load and resolve
+        errors surface (fail-loud), because an operator's fallback chain
+        silently disappearing is the exact surprise this module exists to
+        prevent.
+        """
 
         config = load_routing_config_from_env()
         if not config.fallback_groups and not config.model_routes:
             return None
-        try:
-            decision = FallbackResolver(config).resolve(model)
-            if decision.reason == "direct_provider_model" and model.lower() not in config.model_routes:
-                return None
-            return decision
-        except RoutingConfigError:
-            if "/" in model:
-                return None
-            raise
+        decision = FallbackResolver(config).resolve(model)
+        if decision.reason == "direct_provider_model" and model.lower() not in config.model_routes:
+            return None
+        return decision
 
     @staticmethod
     def _with_request_scope(target: RouteTarget, scope: Dict[str, Any]) -> RouteTarget:
@@ -112,17 +115,10 @@ class RequestContextBuilder:
             "provider_config": scope["provider_config"],
             "credential_secrets": dict(scope["credential_secrets"]),
         }
-        return RouteTarget(
-            provider=target.provider,
-            model=target.model,
-            name=target.name,
-            protocol=target.protocol,
-            execution=target.execution,
-            priority=target.priority,
-            weight=target.weight,
-            conditions=dict(target.conditions),
-            metadata=metadata,
-        )
+        # dataclasses.replace keeps every field (profile included) — the
+        # historical bug here was a hand-written reconstruction that
+        # dropped the transport profile (fix-pass G7).
+        return replace(target, metadata=metadata)
 
     async def _get_session_hints(
         self,
@@ -314,7 +310,11 @@ class RequestContextBuilder:
             self._raise_no_provider(model)
 
         if routing_targets:
+            # Skip-and-record (D17 breaker): a later target without
+            # credentials is skipped, not fatal — the chain proceeds and
+            # only a fully unserviceable decision raises.
             scoped_targets = []
+            skipped: list[str] = []
             for index, target in enumerate(routing_targets):
                 target_scope = scope if index == 0 else await self._resolve_scope_for_provider(
                     target.provider,
@@ -324,8 +324,17 @@ class RequestContextBuilder:
                     private,
                 )
                 if not target_scope["credentials"]:
-                    self._raise_no_provider(target.prefixed_model)
+                    skipped.append(target.prefixed_model)
+                    continue
                 scoped_targets.append(self._with_request_scope(target, target_scope))
+            if skipped:
+                logging.getLogger("rotator_library").warning(
+                    "Skipping %d fallback target(s) without credentials: %s",
+                    len(skipped),
+                    ", ".join(skipped),
+                )
+            if not scoped_targets:
+                self._raise_no_provider(model)
             routing_targets = tuple(scoped_targets)
 
         resolved_model = self._model_resolver.resolve_model_id(routing_targets[0].prefixed_model if routing_targets else model, provider)
@@ -395,6 +404,7 @@ class RequestContextBuilder:
                         "provider": target.provider,
                         "model": target.prefixed_model,
                         "protocol": target.protocol,
+                        "profile": target.profile,
                         "execution": target.execution,
                     }
                     for target in (routing_targets or ())
@@ -480,9 +490,15 @@ class RequestContextBuilder:
     ) -> RequestContext:
         # Same D13 grammar as completions: normalize addressing before any
         # identity use. Embedding transport is single-protocol today, so a
-        # requested profile is dropped after normalization (no multi-protocol
-        # embedding profiles exist to address).
-        _normalize_profile_reference(kwargs)
+        # requested profile cannot be served — fail loud rather than silently
+        # dropping the operator's transport choice (fix-pass G7).
+        requested_profile = _normalize_profile_reference(kwargs)
+        if requested_profile:
+            raise ModelReferenceError(
+                f"Embedding requests do not support transport profiles "
+                f"(got profile {requested_profile!r}); remove the ':{requested_profile}' "
+                "segment from the model reference"
+            )
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
@@ -545,8 +561,11 @@ def _normalize_profile_reference(kwargs: Dict[str, Any]) -> Optional[str]:
 
     The grammar applies only when the PROVIDER segment (before the first
     ``/``) contains the separator - model segments keep their colons
-    (OpenRouter ``:free``, Ollama ``model:tag``). Returns the requested
-    profile, or None for plain references.
+    (OpenRouter ``:free``, Ollama ``model:tag``). The value written back is
+    always the bare ``provider/model`` form: the profile is stripped, the
+    provider/profile segments are trimmed by the parser, and the model
+    segment is preserved verbatim. Returns the requested profile, or None
+    for plain references.
     """
 
     model = str(kwargs.get("model", "") or "")
@@ -556,6 +575,9 @@ def _normalize_profile_reference(kwargs: Dict[str, Any]) -> Optional[str]:
 
     reference = parse_model_reference(model)
     if reference.profile:
+        # provider:profile/model -> provider/model: every identity sink
+        # downstream (usage, cooldowns, sessions, cache scopes) sees only
+        # the stripped provider-level form.
         kwargs["model"] = reference.bare
         return reference.profile
     return None

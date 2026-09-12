@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from rotator_library.routing import FallbackResolver, FallbackGroup, RouteTarget, RoutingConfig
+from rotator_library.routing import FallbackResolver, FallbackGroup, FallbackPolicy, RouteTarget, RoutingConfig
 from rotator_library.routing.config import RoutingConfigError, load_routing_config_from_env, parse_route_target
-from rotator_library.routing.executor import FallbackAttemptRunner
 
 
 def test_parse_route_target_supports_execution_suffix() -> None:
@@ -66,21 +65,19 @@ def test_resolver_rejects_missing_group_route() -> None:
 
 
 @pytest.mark.asyncio
-async def test_fallback_runner_uses_decision_group_policy() -> None:
+async def test_group_policy_governs_failover_decisions() -> None:
+    """Pin the live policy contract the executor loops consume (the dead
+    FallbackAttemptRunner was removed in fix-pass G7 — one loop, one policy)."""
     group = FallbackGroup(name="main", targets=(RouteTarget("a", "one"), RouteTarget("b", "two")), failover_on=frozenset({"rate_limit"}))
     decision = FallbackResolver(RoutingConfig(fallback_groups={"main": group}, model_routes={"alias": "group:main"})).resolve("alias")
-    attempts: list[str] = []
+    policy = FallbackPolicy()
 
     class RateLimitError(RuntimeError):
         error_type = "rate_limit"
 
-    async def attempt(target, index):
-        attempts.append(target.prefixed_model)
-        if target.provider == "a":
-            raise RateLimitError("rate limit")
-        return "ok"
+    class AuthError(RuntimeError):
+        error_type = "invalid_request"
 
-    result = await FallbackAttemptRunner().run(decision, attempt)
-
-    assert result == "ok"
-    assert attempts == ["a/one", "b/two"]
+    assert decision.group is group
+    assert policy.should_fallback("rate_limit", group=decision.group, stream=False, emitted_output=False) is True
+    assert policy.should_fallback("invalid_request", group=decision.group, stream=False, emitted_output=False) is False

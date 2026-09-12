@@ -892,6 +892,28 @@ class RequestExecutor:
         protocol_name = _provider_native_protocol(plugin, model, target, profile=profile)
         if not protocol_name:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
+        # D13 revision: single-protocol providers convert silently today —
+        # surface the substitution as a terminal warning, once per distinct
+        # substitution (same discipline as routing/profiles.resolve_profile).
+        client_protocol = context.input_protocol_name
+        if (
+            client_protocol
+            and protocol_name
+            and client_protocol != protocol_name
+            and getattr(plugin, "transport_profiles", None) is None
+        ):
+            from ..routing.profiles import _warned_substitutions, lib_logger as _profiles_logger
+
+            _warn_key = (provider, client_protocol, protocol_name, "single-protocol")
+            if _warn_key not in _warned_substitutions:
+                _warned_substitutions.add(_warn_key)
+                _profiles_logger.warning(
+                    "Provider %s speaks %r natively — serving %r converted "
+                    "per the default protocol priority",
+                    provider,
+                    protocol_name,
+                    client_protocol,
+                )
         public_model = model
         native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
         # Operation resolution is profile-aware (D13): the selected profile's
@@ -901,7 +923,7 @@ class RequestExecutor:
             raise RoutingExecutionError(f"Provider {provider} does not support native operation {operation}")
         try:
             endpoint = _call_profile_aware(plugin, "get_native_endpoint", native_model, operation, profile)
-            headers = plugin.get_native_headers(credential_secret, model=native_model, operation=operation)
+            headers = _call_profile_aware_headers(plugin, credential_secret, native_model, operation, profile)
         except NotImplementedError as exc:
             raise RoutingExecutionError(str(exc)) from exc
         # G2: thread tri-source hook declarations and the shared per-request
@@ -3185,6 +3207,19 @@ def _call_profile_aware(plugin: Any, method_name: str, model: str, operation: st
     return method(model=model, operation=operation)
 
 
+def _call_profile_aware_headers(plugin: Any, credential_identifier: str, model: str, operation: str, profile: Optional[str]) -> Dict[str, str]:
+    """Call ``get_native_headers`` with the profile when the hook accepts it.
+
+    Signature inspection (like ``_call_profile_aware``): single-protocol
+    provider overrides predate D13 and must keep working.
+    """
+
+    method = getattr(plugin, "get_native_headers")
+    if profile and _accepts_profile_param(method):
+        return method(credential_identifier, model=model, operation=operation, profile=profile)
+    return method(credential_identifier, model=model, operation=operation)
+
+
 def _accepts_profile_param(method: Any) -> bool:
     try:
         import inspect
@@ -3219,15 +3254,51 @@ def _supports_profile_operation(plugin: Any, model: str, operation: str, profile
 
 
 def _provider_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], profile: Optional[str] = None) -> Optional[str]:
-    """Resolve native protocol from target override or provider declaration."""
+    """Resolve native protocol from target override or provider declaration.
 
-    if target and target.protocol:
+    Precedence (D13): an explicitly requested profile always decides the
+    dialect — a runtime ``protocol_name`` override (target or provider
+    config) applies only when no profile governs the request. A silent
+    override of an explicit ``provider:profile`` address is forbidden.
+    """
+
+    if profile and target and target.protocol and target.protocol != _target_profile_protocol(plugin, target, profile):
+        # Explicit profile wins over a target-level protocol override.
+        return _target_profile_protocol(plugin, target, profile)
+    if not profile and target and target.protocol:
         return target.protocol
     if plugin and hasattr(plugin, "get_protocol_name"):
         method = plugin.get_protocol_name
         if profile and _accepts_profile_param(method):
             return method(model, profile=profile)
-        return method(model)
+        result = method(model)
+        if profile:
+            # get_protocol_name ignored the requested profile (non-aware
+            # override path): fall back to the profile's declared protocol.
+            declared = _declared_profile_protocol(plugin, profile)
+            if declared:
+                return declared
+        return result
+    return None
+
+
+def _target_profile_protocol(plugin: Any, target: RouteTarget, profile: str) -> Optional[str]:
+    """Protocol declared for the requested profile (override-safe lookup)."""
+
+    declared = _declared_profile_protocol(plugin, profile)
+    if declared:
+        return declared
+    return getattr(plugin, "protocol_name", None) if plugin else None
+
+
+def _declared_profile_protocol(plugin: Any, profile: str) -> Optional[str]:
+    declared_profiles = getattr(plugin, "transport_profiles", None) if plugin else None
+    if not isinstance(declared_profiles, dict):
+        return None
+    entry = declared_profiles.get(profile)
+    if isinstance(entry, dict):
+        protocol = entry.get("protocol") or entry.get("protocol_name")
+        return str(protocol) if protocol else None
     return None
 
 
@@ -3721,6 +3792,7 @@ def _target_failure_summary(target: RouteTarget, error_type: str, *, status_code
         "target": target.name,
         "provider": target.provider,
         "model": target.prefixed_model,
+        "profile": target.profile,
         "execution": target.execution,
         "error_type": normalize_route_error_type(error_type),
         # Provider error text can contain raw upstream payload fragments or
@@ -3753,6 +3825,7 @@ def _append_routing_attempt_history(
         "target": target.name,
         "provider": target.provider,
         "model": target.prefixed_model,
+        "profile": target.profile,
         "execution": target.execution,
         "success": success,
     }

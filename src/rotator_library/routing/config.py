@@ -1,7 +1,15 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""Environment parser for Phase 6 fallback routing configuration."""
+"""Routing configuration parsing: env overrides over the JSON config layer.
+
+Fail-loud contract (fix-pass G7): every malformed value raises
+``RoutingConfigError`` at load time — nothing silently disables failover,
+nothing degrades to direct routing, and no bare ``ValueError`` escapes as
+a request-time 500. Group names never contain ``:``; ``@execution``
+suffixes split only against the known vocabulary so Ollama ``@digest``
+model ids survive.
+"""
 
 from __future__ import annotations
 
@@ -9,26 +17,41 @@ import os
 from collections.abc import Mapping
 
 from .policy import normalize_route_error_set
-from .types import DEFAULT_FAILOVER_ON, DEFAULT_STOP_ON, HARD_STOP_ON, FallbackGroup, RouteTarget, RoutingConfig
+from .profiles import valid_profile_name
+from .types import (
+    DEFAULT_FAILOVER_ON,
+    DEFAULT_STOP_ON,
+    HARD_STOP_ON,
+    FallbackGroup,
+    RouteTarget,
+    RoutingConfig,
+    RoutingConfigError,
+)
 
+# `@execution` splits only against this vocabulary — anything else after an
+# `@` is part of the model id (Ollama digests, not a mode typo to swallow).
+_KNOWN_EXECUTION_MODES = frozenset({"auto", "native", "custom", "litellm_fallback"})
 
-class RoutingConfigError(ValueError):
-    """Raised when fallback routing configuration is invalid."""
+__all__ = [
+    "RoutingConfigError",
+    "parse_route_target",
+    "load_routing_config_from_env",
+]
 
 
 def parse_route_target(spec: str) -> RouteTarget:
     """Parse `provider/model`, `provider:profile/model`, optional `@execution`.
 
-    The suffix is intentionally small because Phase 6 prioritizes ordered
-    fallback groups. Rich selector syntax belongs to the config polish phase.
     Profile addressing (D13) splits on the provider segment only — model
-    segments may contain colons.
+    segments may contain colons and ``@`` fragments. The ``@execution``
+    suffix splits ONLY when the text after the final ``@`` names a known
+    mode, so ``ollama/llama3:8b@sha256:abc`` keeps its digest.
     """
 
     text = spec.strip()
     if not text:
         raise RoutingConfigError("route target cannot be empty")
-    target_text, _, execution = text.partition("@")
+    target_text, execution = _split_execution(text)
     if "/" not in target_text:
         raise RoutingConfigError(f"route target requires provider/model: {spec}")
     provider_segment, model = target_text.split("/", 1)
@@ -39,6 +62,8 @@ def parse_route_target(spec: str) -> RouteTarget:
         profile = profile_text.strip() or None
         if profile is None:
             raise RoutingConfigError(f"route target profile name cannot be empty: {spec}")
+        if not valid_profile_name(profile):
+            raise RoutingConfigError(f"route target has invalid profile name {profile!r}: {spec}")
     if not provider or not model:
         raise RoutingConfigError(f"route target requires provider/model: {spec}")
     return RouteTarget(
@@ -47,6 +72,17 @@ def parse_route_target(spec: str) -> RouteTarget:
         profile=profile,
         execution=(execution.strip() or "auto"),
     )
+
+
+def _split_execution(text: str) -> tuple[str, str]:
+    """Split a trailing ``@mode`` only when it names a known mode."""
+
+    if "@" not in text:
+        return text, ""
+    candidate_text, _, candidate_mode = text.rpartition("@")
+    if candidate_mode.strip().lower() in _KNOWN_EXECUTION_MODES and candidate_text:
+        return candidate_text, candidate_mode.strip().lower()
+    return text, ""
 
 
 def load_routing_config_from_env(env: Mapping[str, str] | None = None, config: object | None = None) -> RoutingConfig:
@@ -68,6 +104,7 @@ def load_routing_config_from_env(env: Mapping[str, str] | None = None, config: o
     if len(group_names) != len(set(group_names)):
         raise RoutingConfigError("fallback group names must be unique")
     for name in group_names:
+        _validate_group_name(name)
         key = f"FALLBACK_GROUP_{_env_key(name)}"
         target_specs = _csv(source.get(key, ""))
         if not target_specs:
@@ -81,11 +118,33 @@ def load_routing_config_from_env(env: Mapping[str, str] | None = None, config: o
     for key, value in source.items():
         if not key.startswith("MODEL_ROUTE_"):
             continue
-        model_alias = key[len("MODEL_ROUTE_") :].lower()
+        model_alias = key[len("MODEL_ROUTE_") :].lower().strip()
         route = value.strip()
         model_routes[model_alias] = route
     _validate_model_routes(model_routes, groups)
+    _detect_group_key_collisions(groups, source)
     return RoutingConfig(fallback_groups=groups, model_routes=model_routes)
+
+
+def _validate_group_name(name: str) -> None:
+    if ":" in name:
+        raise RoutingConfigError(f"fallback group names must not contain ':': {name!r}")
+    if not name.strip():
+        raise RoutingConfigError("fallback group names must not be blank")
+
+
+def _detect_group_key_collisions(groups: Mapping[str, FallbackGroup], source: Mapping[str, str]) -> None:
+    """Reject distinct group names that collapse onto one env key."""
+
+    seen: dict[str, str] = {}
+    for name in groups:
+        normalized = _env_key(name)
+        if normalized in seen and seen[normalized] != name:
+            raise RoutingConfigError(
+                f"fallback group names {seen[normalized]!r} and {name!r} collide on "
+                f"environment key FALLBACK_GROUP_{normalized}"
+            )
+        seen[normalized] = name
 
 
 def _groups_from_json_config(config: object) -> dict[str, FallbackGroup]:
@@ -102,13 +161,21 @@ def _groups_from_json_config(config: object) -> dict[str, FallbackGroup]:
         raw_targets = raw_group.get("targets", [])
         if not isinstance(raw_targets, list) or not raw_targets:
             raise RoutingConfigError(f"fallback group {name} has no targets")
+        max_targets = raw_group.get("max_targets")
+        if max_targets is not None:
+            try:
+                max_targets = int(max_targets)
+            except (TypeError, ValueError) as exc:
+                raise RoutingConfigError(
+                    f"fallback group {name} max_targets must be an integer: {max_targets!r}"
+                ) from exc
         groups[str(name)] = FallbackGroup(
             name=str(name),
             targets=tuple(parse_route_target(str(spec)) for spec in raw_targets),
             failover_on=_policy_set(raw_group.get("failover_on"), DEFAULT_FAILOVER_ON, str(name)),
             stop_on=_policy_set(raw_group.get("stop_on"), DEFAULT_STOP_ON, str(name), allow_hard_stop=True),
             streaming_policy=_streaming_policy(raw_group.get("streaming_policy", "pre_output_only"), str(name)),
-            max_targets=int(raw_group["max_targets"]) if raw_group.get("max_targets") is not None else None,
+            max_targets=max_targets,
             metadata=dict(raw_group.get("metadata", {})) if isinstance(raw_group.get("metadata", {}), Mapping) else {},
         )
     return groups
@@ -121,7 +188,7 @@ def _model_routes_from_json_config(config: object) -> dict[str, str]:
     raw_routes = routing.get("model_routes", {})
     if not isinstance(raw_routes, Mapping):
         raise RoutingConfigError("routing.model_routes must be an object")
-    return {str(alias).lower(): str(route).strip() for alias, route in raw_routes.items()}
+    return {str(alias).lower().strip(): str(route).strip() for alias, route in raw_routes.items()}
 
 
 def _validate_model_routes(model_routes: Mapping[str, str], groups: Mapping[str, FallbackGroup]) -> None:
@@ -132,18 +199,19 @@ def _validate_model_routes(model_routes: Mapping[str, str], groups: Mapping[str,
             parse_route_target(route)
 
 
-def _string_set(value: object, default: frozenset[str]) -> frozenset[str]:
-    if value is None:
-        return default
+def _string_set(value: object) -> frozenset[str]:
     if isinstance(value, str):
         return frozenset(_csv(value))
     if isinstance(value, list):
-        return frozenset(str(item) for item in value)
+        return frozenset(str(item).strip() for item in value)
     raise RoutingConfigError("routing policy lists must be strings or arrays")
 
 
 def _policy_set(value: object, default: frozenset[str], group_name: str, *, allow_hard_stop: bool = False) -> frozenset[str]:
-    values = normalize_route_error_set(_string_set(value, default))
+    if value is None or (isinstance(value, str) and not value.strip()) or (isinstance(value, list) and not value):
+        # Empty means "unspecified", never "disable failover silently".
+        return default
+    values = normalize_route_error_set(_string_set(value))
     unsafe = values & HARD_STOP_ON
     if unsafe and not allow_hard_stop:
         raise RoutingConfigError(f"fallback group {group_name} failover_on cannot include hard-stop errors: {', '.join(sorted(unsafe))}")

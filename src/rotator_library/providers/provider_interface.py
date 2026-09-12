@@ -11,6 +11,7 @@ from typing import (
     AsyncGenerator,
     Union,
     FrozenSet,
+    Mapping,
     Tuple,
     TYPE_CHECKING,
 )
@@ -92,6 +93,59 @@ TierPriorityMap = Dict[str, int]  # tier_name -> priority
 UsageConfigKey = Union[FrozenSet[int], str]  # frozenset of priorities OR "default"
 UsageConfigMap = Dict[UsageConfigKey, UsageResetConfigDef]  # priority_set -> config
 QuotaGroupMap = Dict[str, List[str]]  # group_name -> [models]
+
+
+def declared_endpoint_path(entry: Any, operation: str) -> Optional[str]:
+    """Return an endpoint path for one operation from a declaration block.
+
+    Plan 2.8 (D13): ``endpoint_paths`` is a map keyed by operation; the
+    singular ``endpoint_path`` is the legacy fallback applied to any
+    operation. Accepts a mapping (class/JSON profile entry) or the
+    ``ProviderRuntimeConfig`` dataclass (provider-level JSON config).
+    """
+
+    if entry is None:
+        return None
+    if isinstance(entry, Mapping):
+        paths = entry.get("endpoint_paths")
+        singular = entry.get("endpoint_path")
+    else:
+        paths = getattr(entry, "endpoint_paths", None)
+        singular = getattr(entry, "endpoint_path", None)
+    if isinstance(paths, Mapping):
+        candidate = paths.get(operation)
+        if candidate:
+            return str(candidate)
+    return str(singular) if singular else None
+
+
+def render_endpoint_path(path: str, *, model: str = "", operation: str = "", provider: str = "") -> str:
+    """Render ``{model}``/``{operation}``/``{provider}`` placeholders."""
+
+    return path.format(model=model, operation=operation, provider=provider)
+
+
+def auth_header_pair(
+    credential_identifier: str,
+    auth_mode: Optional[str],
+    auth_header_name: Optional[str],
+    *,
+    provider: str = "",
+) -> Dict[str, str]:
+    """Build the credential header for a normalized auth declaration."""
+
+    if auth_mode == "none":
+        return {}
+    if auth_mode == "x-api-key":
+        return {"x-api-key": credential_identifier}
+    if auth_mode == "x-goog-api-key":
+        return {"x-goog-api-key": credential_identifier}
+    if auth_mode == "custom":
+        if not auth_header_name:
+            owner = f" for provider {provider!r}" if provider else ""
+            raise ValueError(f"auth_header_name is required for custom auth{owner}")
+        return {auth_header_name: credential_identifier}
+    return {"Authorization": f"Bearer {credential_identifier}"}
 
 
 class ProviderInterface(ABC, metaclass=SingletonABCMeta):
@@ -350,30 +404,36 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         Multi-profile providers (D13) resolve per profile; single-protocol
         providers ignore the profile argument. Returning ``None`` keeps the
-        LiteLLM fallback execution behavior.
+        LiteLLM fallback execution behavior. An explicitly requested
+        profile always decides the dialect — a runtime ``protocol_name``
+        override applies only to profile-less requests (a silent override
+        of an explicit ``provider:profile`` address is forbidden).
         """
 
+        if self.transport_profiles and profile:
+            entry = self.transport_profiles.get(profile)
+            if not isinstance(entry, dict):
+                from ..routing.profiles import ModelReferenceError
+
+                raise ModelReferenceError(
+                    f"{self.__class__.__name__} has no profile {profile!r}; "
+                    f"known: {sorted(self.transport_profiles)}"
+                )
+            protocol = entry.get("protocol") or entry.get("protocol_name") or self.protocol_name
+            return str(protocol) if protocol else None
         configured = self._get_runtime_config(model).protocol_name
         if configured:
             return configured
         if self.transport_profiles:
             from ..routing.profiles import ModelReferenceError
 
-            if profile:
-                entry = self.transport_profiles.get(profile)
-                if not isinstance(entry, dict):
-                    raise ModelReferenceError(
-                        f"{self.__class__.__name__} has no profile {profile!r}; "
-                        f"known: {sorted(self.transport_profiles)}"
-                    )
-            else:
-                if self.default_profile and self.default_profile not in self.transport_profiles:
-                    raise ModelReferenceError(
-                        f"{self.__class__.__name__} declares default profile "
-                        f"{self.default_profile!r} but no such profile exists; "
-                        f"known: {sorted(self.transport_profiles)}"
-                    )
-                entry = self.transport_profiles.get(self.default_profile or "") or {}
+            if self.default_profile and self.default_profile not in self.transport_profiles:
+                raise ModelReferenceError(
+                    f"{self.__class__.__name__} declares default profile "
+                    f"{self.default_profile!r} but no such profile exists; "
+                    f"known: {sorted(self.transport_profiles)}"
+                )
+            entry = self.transport_profiles.get(self.default_profile or "") or {}
             protocol = entry.get("protocol") or self.protocol_name
             return str(protocol) if protocol else None
         return self.protocol_name
@@ -521,25 +581,36 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     def get_native_endpoint(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> str:
         """Return the upstream endpoint for a native operation.
 
-        The default derives from the transport base plus the profile's
-        endpoint path (D13); profiles without an explicit path get the
-        per-protocol conventional path. Single-protocol providers that did
-        not override and have no default_api_base fail loudly here.
+        The default derives from the transport base plus the selected
+        profile's endpoint declarations (D13 / plan 2.8): the plural
+        ``endpoint_paths`` map keyed by operation wins, the singular
+        ``endpoint_path`` is the fallback, and ``{model}``/``{operation}``
+        placeholders are rendered here. The profile's declarations win over
+        provider-level JSON declarations; profiles without an explicit path
+        get the per-protocol conventional path. Single-protocol providers
+        that did not override and have no endpoint declaration fail loudly.
         """
 
+        entry: Optional[Any] = None
         if self.transport_profiles and profile:
-            base = self.get_provider_api_base()
-            if not base:
-                raise NotImplementedError(
-                    f"{self.__class__.__name__} declares profiles but has no transport base; "
-                    "set default_api_base or {PROVIDER}_API_BASE"
-                )
             entry = self.transport_profiles.get(profile) or {}
-            path = entry.get("endpoint_path") or self._default_endpoint_path(
-                str(entry.get("protocol") or self.protocol_name or ""), operation
+        path = declared_endpoint_path(entry, operation)
+        if not path:
+            path = declared_endpoint_path(self._get_runtime_config(model), operation)
+        if not path:
+            if entry is None:
+                raise NotImplementedError(
+                    f"{self.__class__.__name__} does not define a native endpoint"
+                )
+            protocol = str(entry.get("protocol") or entry.get("protocol_name") or self.protocol_name or "")
+            path = self._default_endpoint_path(protocol, operation)
+        base = self.get_provider_api_base()
+        if not base:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} has no transport base; "
+                "set default_api_base or {PROVIDER}_API_BASE"
             )
-            return f"{base}{path}"
-        raise NotImplementedError(f"{self.__class__.__name__} does not define a native endpoint")
+        return f"{base}{render_endpoint_path(path, model=self.normalize_native_model(model), operation=operation, provider=self._provider_config_key())}"
 
     def _default_endpoint_path(self, protocol: str = "", operation: str = "chat") -> str:
         """Conventional per-protocol endpoint path (profiles without one)."""
@@ -550,19 +621,38 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             return "/v1/messages"
         if protocol == "gemini":
             raise NotImplementedError(
-                "Gemini endpoints are model-ridden; declare endpoint_path for gemini profiles"
+                "Gemini endpoints are model-ridden; declare endpoint_paths for gemini profiles"
             )
         return "/chat/completions"
 
-    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat") -> Dict[str, str]:
+    def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> Dict[str, str]:
         """Return non-payload HTTP headers for native requests.
 
         The default covers bearer-token OpenAI-compatible providers
         (native-by-default, W11); providers with different auth schemes
-        (e.g. Gemini's ``x-goog-api-key``) override this.
+        (e.g. Gemini's ``x-goog-api-key``) override this. Per-profile auth
+        declarations (``auth_mode``/``auth_header_name``) override
+        provider-level JSON declarations when the profile declares them.
         """
 
-        return {"Authorization": f"Bearer {credential_identifier}"}
+        auth_mode: Optional[str] = None
+        auth_header_name: Optional[str] = None
+        if self.transport_profiles and profile:
+            entry = self.transport_profiles.get(profile)
+            if isinstance(entry, Mapping):
+                auth_mode = entry.get("auth_mode")
+                auth_header_name = entry.get("auth_header_name")
+        runtime = self._get_runtime_config(model)
+        if auth_mode is None:
+            auth_mode = getattr(runtime, "auth_mode", None)
+        if auth_header_name is None:
+            auth_header_name = getattr(runtime, "auth_header_name", None)
+        return auth_header_pair(
+            credential_identifier,
+            auth_mode,
+            auth_header_name,
+            provider=self._provider_config_key(),
+        )
 
     def get_provider_api_base(self) -> Optional[str]:
         """Return this provider's transport base URL.

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from .config import RoutingConfigError, parse_route_target
+from .profiles import parse_model_reference
 from .types import FallbackGroup, RouteTarget, RoutingConfig, RoutingDecision
 
 
@@ -25,13 +26,13 @@ class FallbackResolver:
             if not group:
                 raise RoutingConfigError(f"unknown fallback group {group_name}")
             targets = _promote_requested_target(group, requested_model)
-            reason = "model_route_group_promoted" if targets != group.targets else "model_route_group"
+            reason = "model_route_group_promoted" if targets != group.effective_targets() else "model_route_group"
             return RoutingDecision(requested_model=requested_model, group_name=group.name, group=group, targets=targets, reason=reason)
         if route:
             return RoutingDecision(requested_model=requested_model, targets=(parse_route_target(route),), reason="model_route_target")
         for group in self.config.fallback_groups.values():
             targets = _promote_requested_target(group, requested_model)
-            if targets != group.targets or any(_same_target(target, requested_model) for target in group.targets):
+            if targets != group.effective_targets() or any(_same_target(target, requested_model) for target in group.effective_targets()):
                 return RoutingDecision(requested_model=requested_model, group_name=group.name, group=group, targets=targets, reason="provider_model_group_promoted")
         if "/" in requested_model:
             return RoutingDecision(requested_model=requested_model, targets=(parse_route_target(requested_model),), reason="direct_provider_model")
@@ -39,14 +40,39 @@ class FallbackResolver:
 
 
 def _promote_requested_target(group: FallbackGroup, requested_model: str) -> tuple[RouteTarget, ...]:
-    """Return group targets with the requested provider/model attempted first."""
+    """Return capped, deduplicated targets with the requested one first.
 
-    matching = [target for target in group.targets if _same_target(target, requested_model)]
-    if not matching:
-        return group.targets
-    selected = matching[0]
-    return (selected, *(target for target in group.targets if target is not selected))
+    Promotion is profile-aware (D13): an explicit ``provider:profile``
+    request matches only that profile variant, and duplicate attempts on
+    the same (provider, profile, model) identity are collapsed.
+    """
+
+    targets = group.effective_targets()
+    matching = [target for target in targets if _same_target(target, requested_model)]
+    ordered = targets
+    if matching:
+        selected = matching[0]
+        ordered = (selected, *(target for target in targets if target is not selected))
+    deduplicated: list[RouteTarget] = []
+    seen: set[tuple[str, str, str]] = set()
+    for target in ordered:
+        identity = target.identity_key()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        deduplicated.append(target)
+    return tuple(deduplicated)
 
 
 def _same_target(target: RouteTarget, requested_model: str) -> bool:
-    return target.prefixed_model.lower() == requested_model.lower()
+    """Profile-aware match: provider, profile, and model must all agree."""
+
+    try:
+        reference = parse_model_reference(requested_model)
+    except Exception:
+        return False
+    return (
+        target.provider.lower() == reference.provider.lower()
+        and (target.profile or "").lower() == (reference.profile or "").lower()
+        and target.model.lower() == reference.model.lower()
+    )

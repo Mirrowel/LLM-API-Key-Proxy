@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal
 
 ExecutionMode = Literal["auto", "native", "custom", "litellm_fallback"]
 StreamingFallbackPolicy = Literal["pre_output_only", "never"]
@@ -61,6 +61,10 @@ HARD_STOP_ON = frozenset(
 )
 
 
+class RoutingConfigError(ValueError):
+    """Routing configuration is malformed; never silently degraded around."""
+
+
 @dataclass(frozen=True)
 class RouteTarget:
     """One concrete provider/model execution target in a fallback chain."""
@@ -73,24 +77,30 @@ class RouteTarget:
     # stays provider-level; the profile only steers transport.
     profile: str | None = None
     execution: ExecutionMode = "auto"
-    priority: int | None = None
-    weight: float | None = None
-    conditions: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.provider or not self.model:
-            raise ValueError("route targets require provider and model")
+            raise RoutingConfigError("route targets require provider and model")
         if self.execution not in {"auto", "custom", "native", "litellm_fallback"}:
-            raise ValueError(f"unsupported execution mode: {self.execution}")
+            raise RoutingConfigError(f"unsupported execution mode: {self.execution}")
         if not self.name:
-            object.__setattr__(self, "name", f"{self.provider}/{self.model}")
+            object.__setattr__(
+                self,
+                "name",
+                f"{self.provider}:{self.profile}/{self.model}" if self.profile else f"{self.provider}/{self.model}",
+            )
 
     @property
     def prefixed_model(self) -> str:
         """Return `provider/model` without double-prefixing an already-prefixed model."""
 
         return self.model if self.model.startswith(f"{self.provider}/") else f"{self.provider}/{self.model}"
+
+    def identity_key(self) -> tuple[str, str, str]:
+        """Profile-aware comparison identity (provider, profile, model)."""
+
+        return (self.provider.lower(), (self.profile or "").lower(), self.model.lower())
 
 
 @dataclass(frozen=True)
@@ -107,13 +117,20 @@ class FallbackGroup:
 
     def __post_init__(self) -> None:
         if not self.name:
-            raise ValueError("fallback group name is required")
+            raise RoutingConfigError("fallback group name is required")
         if not self.targets:
-            raise ValueError("fallback groups require at least one target")
+            raise RoutingConfigError("fallback groups require at least one target")
         if self.max_targets is not None and self.max_targets <= 0:
-            raise ValueError("max_targets must be positive")
+            raise RoutingConfigError("max_targets must be positive")
         if self.max_targets is not None and len(self.targets) > self.max_targets:
-            raise ValueError("fallback group target count exceeds max_targets")
+            raise RoutingConfigError("fallback group target count exceeds max_targets")
+
+    def effective_targets(self) -> tuple[RouteTarget, ...]:
+        """Runtime attempt chain: declaration order, capped by max_targets."""
+
+        if self.max_targets is not None:
+            return self.targets[: self.max_targets]
+        return self.targets
 
 
 @dataclass(frozen=True)
@@ -132,32 +149,4 @@ class RoutingDecision:
     targets: tuple[RouteTarget, ...]
     group_name: str | None = None
     group: FallbackGroup | None = None
-    selected_target_index: int = 0
     reason: str = "direct"
-
-
-@dataclass(frozen=True)
-class RouteAttemptResult:
-    """Result summary for one attempted route target."""
-
-    target: RouteTarget
-    success: bool
-    error_type: str | None = None
-    emitted_output: bool = False
-    usage: dict[str, Any] = field(default_factory=dict)
-
-
-class TargetSelector(Protocol):
-    """Future target-group selector seam; Phase 6 keeps ordered fallback only."""
-
-    def select(self, targets: tuple[RouteTarget, ...]) -> RouteTarget:
-        """Return one target from a richer target group."""
-
-
-@dataclass(frozen=True)
-class TargetGroup:
-    """Future richer target group; not used for Phase 6 ordered fallback."""
-
-    name: str
-    targets: tuple[RouteTarget, ...]
-    selector: str = "ordered"
