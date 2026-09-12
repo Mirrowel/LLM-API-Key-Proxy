@@ -49,7 +49,7 @@ awk -v url_out="$URL_OUT" -v ctx_out="$CTX_OUT" -v boot_out="$BOOT_OUT" \
     -v actor="${GITHUB_ACTOR:-unknown}" \
     -v thread="${SHARE_CTX_THREAD:-}" -v head="${SHARE_CTX_HEAD:-}" \
     -v detail="${SHARE_CTX_DETAIL:-}" '
-BEGIN { captured = 0; booted = 0; md = sprintf("%c%c", 194, 183) }  # UTF-8 middle dot
+BEGIN { captured = 0; booted = 0 }
 {
   if (!booted) { printf "" > boot_out; booted = 1 }
   # Model-header line ("> build <middot> <model>" / "> plan ...", possibly
@@ -61,7 +61,7 @@ BEGIN { captured = 0; booted = 0; md = sprintf("%c%c", 194, 183) }  # UTF-8 midd
     esc = sprintf("%c", 27)
     gsub(esc "\\[[0-9;]*m", "", line)
     sub(/[\r ]+$/, "", line)
-    sep = " " md " "
+    sep = " · "   # literal UTF-8 middle dot: byte-stable on mawk/MSYS, char-stable on gawk
     si = index(line, sep)
     if (si > 0) {
       mode = substr(line, 3, si - 3)
