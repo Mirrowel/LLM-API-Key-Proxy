@@ -26,6 +26,7 @@ from .canonical import (
     ordered_message_blocks,
     tool_arguments_text,
 )
+from .canonical import family_wire_name
 from .types import (
     ContentBlock,
     ConversionWarning,
@@ -224,7 +225,7 @@ def stream_format_state(
         return state
     model = str((context.model if context else None) or metadata.get("model") or "")
     request_id = str((context.request_id if context else None) or metadata.get("request_id") or uuid.uuid4().hex)
-    prefix = {"openai_chat": "chatcmpl", "anthropic_messages": "msg", "responses": "resp"}.get(protocol, "stream")
+    prefix = {"openai_chat": "chatcmpl", "anthropic_messages": "msg", "responses": "resp"}.get(family_wire_name(protocol), "stream")
     state = StreamFormatState(protocol=protocol, response_id=f"{prefix}_{request_id}", model=model)
     states[protocol] = state
     return state
@@ -297,7 +298,7 @@ def format_canonical_stream_event(
         frames = _format_openai(event, state)
     elif target_protocol == "anthropic_messages":
         frames = _format_anthropic(event, state)
-    elif target_protocol == "responses":
+    elif family_wire_name(target_protocol) == "responses":
         frames = _format_responses(event, state)
     elif target_protocol == "gemini":
         frames = _format_gemini(event, state)
@@ -2020,7 +2021,7 @@ def _error_payload(error: Any, target_protocol: str) -> dict[str, Any]:
     message = _error_message(error, payload)
     if target_protocol == "anthropic_messages":
         return {"type": _ANTHROPIC_ERROR_TYPES.get(family, "api_error"), "message": message}
-    if target_protocol == "responses":
+    if family_wire_name(target_protocol) == "responses":
         return {"code": _RESPONSES_ERROR_CODES.get(family, "server_error"), "message": message}
     if target_protocol == "gemini":
         code, status = _GEMINI_ERROR_ENVELOPES.get(family, (500, "INTERNAL"))

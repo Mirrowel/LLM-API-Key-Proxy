@@ -44,6 +44,7 @@ from litellm.exceptions import (
 
 from ..core.types import RequestContext, ErrorAction
 from ..core.utils import normalize_usage_for_response
+from ..protocols.canonical import family_wire_name
 from ..protocols.opaque_strip import (
     payload_carries_opaque_state,
     signature_rejection_message,
@@ -1004,7 +1005,10 @@ class RequestExecutor:
             # D4 raw fast path: same-protocol requests carry the pristine
             # client payload as the transport basis. (Streaming never reads
             # this field — the neutral-event pipeline owns stream transport.)
-            raw_client_request=deepcopy(context.protocol_request) if (context.input_protocol_name == protocol_name and context.protocol_request) else None,
+            raw_client_request=deepcopy(context.protocol_request) if (
+                context.protocol_request
+                and family_wire_name(context.input_protocol_name) == family_wire_name(protocol_name)
+            ) else None,
             headers=headers,
             credential_id=credential_id,
             session_id=context.session_id,

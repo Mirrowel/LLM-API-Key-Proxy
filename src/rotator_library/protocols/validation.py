@@ -58,6 +58,13 @@ def validate_generative_request(
     source-native object can never be emitted as a malformed foreign object.
     """
 
+    # G11: wire-level dispatch is FAMILY-level — sibling variants of one
+    # format (responses stateless/stateful/websocket) share tables and
+    # same-wire semantics; only the registry name differs.
+    from .canonical import family_wire_name
+
+    wire_protocol = family_wire_name(target_protocol)
+
     if is_same_protocol(context, target_protocol, request.source_protocol):
         return
     # Cross-protocol extension fields have no foreign representation by
@@ -67,7 +74,7 @@ def validate_generative_request(
     # bound envelope fields) — one disclosure per fact, never two.
     gemini_bound_keys = {"cachedContent", "labels", "serviceTier", "store"}
     for extra_key in sorted(request.extra):
-        if target_protocol == "gemini" and extra_key in gemini_bound_keys:
+        if wire_protocol == "gemini" and extra_key in gemini_bound_keys:
             continue
         add_conversion_warning(
             request,
@@ -77,7 +84,7 @@ def validate_generative_request(
             target_protocol=target_protocol,
         )
     # Metadata dictionaries ride only where a target has a metadata field.
-    if request.metadata and target_protocol == "gemini":
+    if request.metadata and wire_protocol == "gemini":
         add_conversion_warning(
             request,
             code="unsupported_optional_control",
@@ -90,7 +97,7 @@ def validate_generative_request(
     # gemini-target build-time warnings; parse cannot know the target).
     # Bound envelope fields (cachedContent/labels/...) ride request.extra —
     # covered by the generic extra disclosure above.
-    if request.source_protocol == "gemini" and target_protocol != "gemini":
+    if request.source_protocol == "gemini" and wire_protocol != "gemini":
         source_generation = request.extensions.get("gemini", {}).get("generationConfig")
         if isinstance(source_generation, dict):
             mapped = {
@@ -127,7 +134,7 @@ def validate_generative_request(
     # Opaque function-call signatures (Gemini thought signatures) dropping
     # at foreign boundaries are disclosed — never silent (Gemini 3 rejects
     # unsigned current-turn calls on the way back).
-    if request.source_protocol == "gemini" and target_protocol != "gemini":
+    if request.source_protocol == "gemini" and wire_protocol != "gemini":
         for message in request.messages:
             for call in message_tool_calls(message):
                 if getattr(call, "signature", None):
@@ -138,7 +145,7 @@ def validate_generative_request(
                         field="tool_call.signature",
                         target_protocol=target_protocol,
                     )
-    if target_protocol != "anthropic_messages":
+    if wire_protocol != "anthropic_messages":
         # Block-level cache hints are Anthropic provider policy: drops at
         # foreign targets are disclosed (same-protocol replay keeps them
         # verbatim via raw). Source-agnostic — any source may carry hints,
@@ -178,7 +185,7 @@ def validate_generative_request(
                 field="cache_control",
                 target_protocol=target_protocol,
             )
-    if request.previous_response_id and target_protocol != "responses":
+    if request.previous_response_id and wire_protocol != "responses":
         raise ProtocolError(
             "A provider-bound previous_response_id cannot be translated safely",
             protocol=target_protocol,
@@ -190,14 +197,14 @@ def validate_generative_request(
         for field in ("background", "conversation", "prompt")
         if request.generation_params.get(field) not in (None, False)
     ]
-    if provider_bound_responses_fields and target_protocol != "responses":
+    if provider_bound_responses_fields and wire_protocol != "responses":
         raise ProtocolError(
             "Provider-bound Responses controls cannot be translated safely",
             protocol=target_protocol,
             pass_name="validate_request",
             payload={"fields": provider_bound_responses_fields},
         )
-    if request.generation_params.get("safety_settings") and target_protocol != "gemini":
+    if request.generation_params.get("safety_settings") and wire_protocol != "gemini":
         raise ProtocolError(
             "Gemini safety settings have no equivalent in the selected provider protocol",
             protocol=target_protocol,
@@ -207,7 +214,7 @@ def validate_generative_request(
     # G14 (#28.8): an output modality the target cannot produce is a
     # disclosed downgrade, not a request-killing 400 — the request still
     # goes, producing what the target CAN produce.
-    unsupported_modalities = set(request.modalities) - _RESPONSE_MODALITIES.get(target_protocol, {"text"})
+    unsupported_modalities = set(request.modalities) - _RESPONSE_MODALITIES.get(wire_protocol, {"text"})
     if unsupported_modalities:
         request.modalities = [m for m in request.modalities if m not in unsupported_modalities]
         add_conversion_warning(
@@ -217,7 +224,7 @@ def validate_generative_request(
             field="modalities",
             target_protocol=target_protocol,
         )
-    supported = _CONTENT_CAPABILITIES.get(target_protocol, set())
+    supported = _CONTENT_CAPABILITIES.get(wire_protocol, set())
     block_groups = [("system", request.system)] + [
         (f"message:{message_index}", message.content)
         for message_index, message in enumerate(request.messages)
@@ -253,7 +260,7 @@ def validate_generative_request(
     if (
         isinstance(choice, dict)
         and choice.get("mode") == "validated"
-        and target_protocol != "gemini"
+        and wire_protocol != "gemini"
     ):
         add_conversion_warning(
             request,
@@ -289,7 +296,7 @@ def validate_generative_request(
             "apply_patch",
             "tool_search",
         }
-    elif target_protocol == "gemini":
+    elif wire_protocol == "gemini":
         # Gemini hosts googleSearch/codeExecution/urlContext natively and
         # maps web_search server tools onto googleSearch; other hosted
         # families (bash, text_editor, computer) have no Gemini home.
@@ -339,7 +346,7 @@ def validate_generative_request(
     else:
         supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):
-        if request.source_protocol == "gemini" and target_protocol != "gemini":
+        if request.source_protocol == "gemini" and wire_protocol != "gemini":
             hosted_kind = tool.extra.get("gemini_hosted_tool") or tool.extra.get("gemini_unmodeled_tool")
             if hosted_kind:
                 # Gemini hosted tools (googleSearch/computerUse/mcpServers/...)
@@ -369,7 +376,7 @@ def validate_generative_request(
     for message_index, message in enumerate(request.messages):
         for call_index, call in enumerate(message_tool_calls(message)):
             arguments = canonical_tool_arguments(call.arguments)
-            if not call.name or (target_protocol != "gemini" and not call.id):
+            if not call.name or (wire_protocol != "gemini" and not call.id):
                 raise ProtocolError(
                     "Tool calls require a name and correlation ID",
                     protocol=target_protocol,
@@ -391,7 +398,7 @@ def validate_generative_request(
                     pass_name="validate_request",
                     payload={"message_index": message_index, "result_index": result_index},
                 )
-            if target_protocol == "gemini" and not result.name:
+            if wire_protocol == "gemini" and not result.name:
                 raise ProtocolError(
                     "Gemini tool results require the originating function name",
                     protocol=target_protocol,
@@ -425,7 +432,10 @@ def validate_generative_request(
 def validate_generative_response(response: UnifiedResponse, target_protocol: str) -> None:
     """Reject failed provider responses that a target success envelope cannot express."""
 
-    if response.stop_reason == STOP_REASON_ERROR and target_protocol != "responses":
+    from .canonical import family_wire_name
+
+    wire_protocol = family_wire_name(target_protocol)
+    if response.stop_reason == STOP_REASON_ERROR and wire_protocol != "responses":
         raise ProtocolError(
             f"{target_protocol} cannot represent a failed provider response as a successful completion",
             protocol=target_protocol,

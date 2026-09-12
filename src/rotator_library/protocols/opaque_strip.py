@@ -51,7 +51,9 @@ def strip_foreign_opaque_state(payload: Any, protocol_name: str, *, mutate: bool
         return _strip_gemini(payload, mutate=mutate)
     if protocol_name == "openai_chat":
         return _strip_chat(payload, mutate=mutate)
-    if protocol_name == "responses":
+    from .canonical import family_wire_name as _family
+
+    if _family(protocol_name) == "responses":
         return _strip_responses(payload, mutate=mutate)
     return None
 

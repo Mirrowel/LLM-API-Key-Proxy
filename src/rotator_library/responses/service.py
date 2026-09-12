@@ -232,6 +232,7 @@ class ResponsesService:
             expected_scope_key=isolation_key,
             access_token=previous_response_access_token,
             provider_passthrough=_provider_continuation_eligible(raw_request),
+                raw_request_dict=raw_request,
         )
         try:
             parent_lineage = await self._load_response_lineage(
@@ -287,9 +288,8 @@ class ResponsesService:
             response_payload.get("status") != "failed" or self.store_settings.store_failed
         )
         if should_store:
-            stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-            if await self._safe_store(stored, transaction_logger, "responses_store_response"):
-                self._trace(transaction_logger, "responses_stored_response", stored.to_dict(), direction="metadata", stage="final")
+            if await self._safe_store(raw_request, response_payload, parent, session_info, transaction_logger, "responses_store_response"):
+                self._trace(transaction_logger, "responses_stored_response", response_payload, direction="metadata", stage="final")
 
         self._trace(transaction_logger, "responses_final_response", response_payload, direction="response", stage="final")
         # W12: the responses route never calls log_response (no chat-shaped
@@ -439,6 +439,7 @@ class ResponsesService:
                 access_token=previous_response_access_token,
                 local_cache=local_cache,
                 provider_passthrough=_provider_continuation_eligible(raw_request),
+                raw_request_dict=raw_request,
             )
             parent_lineage = await self._load_response_lineage(
                 parent,
@@ -681,6 +682,7 @@ class ResponsesService:
                 expected_scope_key=resolved_scope.key,
                 access_token=previous_response_access_token,
                 provider_passthrough=_provider_continuation_eligible(raw_request),
+                raw_request_dict=raw_request,
             )
 
     async def stream_events(
@@ -719,6 +721,8 @@ class ResponsesService:
             expected_scope_key=isolation_key,
             access_token=previous_response_access_token,
             local_cache=local_cache,
+            provider_passthrough=_provider_continuation_eligible(raw_request),
+            raw_request_dict=raw_request,
         )
         try:
             parent_lineage = await self._load_response_lineage(
@@ -1359,6 +1363,7 @@ class ResponsesService:
         access_token: Optional[str] = None,
         local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
         provider_passthrough: bool = False,
+        raw_request_dict: Optional[dict[str, Any]] = None,
     ) -> Optional[StoredResponse]:
         if not response_id:
             return None
@@ -1370,6 +1375,19 @@ class ResponsesService:
         if expected_scope_key == "public":
             stored = await self.store.get(response_id, "public")
             if stored is not None and stored.scope_key == "public":
+                # G11 hybrid, second turn: a row the PROVIDER minted (our
+                # store is just a mirror) continues on the provider's own
+                # chain — replaying locally would sever its hidden prefix
+                # (encrypted reasoning, cache keys) behind our stored suffix.
+                # Riding the id keeps the provider chain; the provider
+                # switched (fallback/redirect) → local replay instead
+                # (cross-provider continuation can never succeed).
+                if (
+                    provider_passthrough
+                    and stored.metadata.get("provider_owned")
+                    and _provider_continuation_eligible(raw_request_dict or {})
+                ):
+                    return None
                 parent = stored
             elif provider_passthrough:
                 # G11 hybrid: public-scope miss on a provider that speaks
@@ -1439,6 +1457,16 @@ class ResponsesService:
                 # retrieval fallback and continuation routing key on it.
                 "provider": session_info.get("provider"),
                 "provider_created_at": provider_created_at,
+                # G11 hybrid ownership: this row is a local MIRROR of a
+                # provider-minted response (we forwarded a provider id with
+                # no local lineage and an eligible target). The provider's
+                # own chain stays authoritative — later turns ride the id
+                # instead of replaying our stored suffix.
+                "provider_owned": (
+                    parent is None
+                    and bool(raw_request.get("previous_response_id"))
+                    and _provider_continuation_eligible(raw_request)
+                ),
             },
             session_id=session_info.get("session_id") or (parent.session_id if parent else None),
             scope_key=(
@@ -1518,25 +1546,39 @@ class ResponsesService:
 
     async def _safe_store(
         self,
-        stored: StoredResponse,
+        raw_request: dict[str, Any],
+        response_payload: dict[str, Any],
+        parent: Optional[StoredResponse],
+        session_info: Optional[dict[str, Any]],
         transaction_logger: Optional[Any],
         stage: str,
     ) -> bool:
         """Persist one response without ever failing the delivered answer.
 
-        A storage failure is recorded as a transform error plus a store-specific
-        trace record; it never propagates. Returns ``True`` only when the write
+        Row construction lives INSIDE the guard: an id-less or non-conformant
+        provider payload is a store problem, not a client problem. A storage
+        failure is recorded as a transform error plus a store-specific trace
+        record; it never propagates. Returns ``True`` only when the write
         actually landed, so callers can still report the observed outcome.
         """
 
         try:
+            stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
+        except Exception as exc:
+            self._log_transform_error(transaction_logger, f"{stage}_build", exc, {"model": raw_request.get("model")})
+            return False
+        try:
             await self.store.save(stored)
         except Exception as exc:
-            self._log_transform_error(transaction_logger, stage, exc, stored.to_dict())
+            try:
+                diagnostic = stored.to_dict()
+            except Exception:
+                diagnostic = {"response_id": getattr(stored, "id", "?")}
+            self._log_transform_error(transaction_logger, stage, exc, diagnostic)
             self._trace(
                 transaction_logger,
                 f"{stage}_error",
-                {"response_id": stored.id, "error": str(exc)},
+                {"response_id": getattr(stored, "id", "?"), "error": str(exc)},
                 direction="metadata",
                 stage="final",
             )
@@ -1561,19 +1603,26 @@ class ResponsesService:
         # "succeed" against empty lineage instead of missing.
         if failed and not self.store_settings.store_failed:
             return False
+        # Local-cache copies build under the same never-fail contract as the
+        # durable save: an id-less payload degrades to no cache entry, never
+        # a failed turn.
+        cached_row: Optional[StoredResponse] = None
+        if build_and_cache:
+            try:
+                cached_row = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
+            except Exception as exc:
+                self._log_transform_error(transaction_logger, "responses_store_stream_cache_build", exc, {})
         if not raw_request.get("store", True):
-            if build_and_cache:
+            if build_and_cache and cached_row is not None:
                 # WebSocket mode: store=false turns still land in the
                 # connection-local in-memory cache (never the global store,
                 # never disk) so the next turn's previous_response_id
                 # resolves for ZDR-style chains.
-                stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-                local_cache[stored.id] = stored
+                local_cache[cached_row.id] = cached_row
             return False
-        stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-        saved = await self._safe_store(stored, transaction_logger, "responses_store_stream_response")
-        if build_and_cache:
-            local_cache[stored.id] = stored
+        saved = await self._safe_store(raw_request, response_payload, parent, session_info, transaction_logger, "responses_store_stream_response")
+        if build_and_cache and cached_row is not None:
+            local_cache[cached_row.id] = cached_row
         return saved
 
     async def _store_stream_current_state(
@@ -1589,8 +1638,7 @@ class ResponsesService:
 
         if not self.store_settings.store_in_progress or not raw_request.get("store", True):
             return False
-        stored = self._stored_response(raw_request, response_payload, parent, session_info=session_info)
-        if not await self._safe_store(stored, transaction_logger, "responses_store_stream_current_state"):
+        if not await self._safe_store(raw_request, response_payload, parent, session_info, transaction_logger, "responses_store_stream_current_state"):
             return False
         self._trace(
             transaction_logger,
@@ -1644,18 +1692,47 @@ def _provider_continuation_eligible(raw_request: dict[str, Any]) -> bool:
     try:
         from ..providers import PROVIDER_PLUGINS
         from ..routing.config import load_routing_config_from_env
-        from ..routing.profiles import parse_model_reference
+        from ..routing.profiles import parse_model_reference, resolve_profile
 
         target = model
         config = load_routing_config_from_env()
         routes = getattr(config, "model_routes", None) or {}
         target = str(routes.get(model.lower(), target))
+        groups = getattr(config, "groups", None) or {}
+        group = groups.get(target.removeprefix("group:"))
+        if group is not None and getattr(group, "targets", None):
+            target = str(group.targets[0])
 
         reference = parse_model_reference(target)
-        plugin = PROVIDER_PLUGINS.get(reference.provider)
-        if plugin is None:
+        plugin_class = PROVIDER_PLUGINS.get(reference.provider)
+        if plugin_class is None:
             return False
-        protocol_name = plugin.get_protocol_name(reference.model or "", profile=reference.profile or None)
+        # PROVIDER_PLUGINS stores CLASSES (SingletonABCMeta) — unbound
+        # method calls bind the model string as self and explode; use the
+        # executor convention and talk to the singleton instance.
+        plugin = plugin_class()
+        # Resolve the profile the WAY ROUTING WOULD for a responses client:
+        # the default profile's protocol is NOT the answer when a sibling
+        # profile family-matches (bare-name false negative, G11 verify P1).
+        declared = getattr(plugin, "transport_profiles", None)
+        protocol_name: Optional[str] = None
+        if reference.profile:
+            protocol_name = plugin.get_protocol_name(reference.model or "", profile=reference.profile)
+        elif declared:
+            try:
+                chosen = resolve_profile(
+                    declared_profiles=declared,
+                    default_profile=getattr(plugin, "default_profile", None),
+                    protocol_name=getattr(plugin, "protocol_name", None),
+                    client_protocol="responses",
+                    requested_profile=None,
+                    provider=reference.provider,
+                )
+                protocol_name = plugin.get_protocol_name(reference.model or "", profile=chosen)
+            except Exception:
+                protocol_name = None
+        if not protocol_name:
+            protocol_name = plugin.get_protocol_name(reference.model or "", profile=None)
         if not protocol_name:
             return False
         from ..protocols.registry import get_protocol_class

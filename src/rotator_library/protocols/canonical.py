@@ -152,7 +152,7 @@ def format_stop_reason(value: Optional[str], target_protocol: str) -> Optional[s
 
     if value is None:
         return None
-    table = _TARGET_STOP_REASONS.get(target_protocol, {})
+    table = _TARGET_STOP_REASONS.get(family_wire_name(target_protocol), {})
     if value in table:
         return table[value]
     alias = canonical_stop_reason(value)
@@ -161,6 +161,27 @@ def format_stop_reason(value: Optional[str], target_protocol: str) -> Optional[s
     # Fail closed: an unrecognized value renders as the target's unknown
     # entry — never an invented spelling on the wire.
     return table.get(STOP_REASON_UNKNOWN)
+
+
+def family_wire_name(protocol_name: str) -> str:
+    """Dispatch name for wire-level protocol equivalence (G11).
+
+    Sibling variants of one wire format (responses stateless/stateful/
+    websocket) share a base_family — for every table lookup, capability
+    check, and same-protocol comparison the FAMILY is the wire name.
+    A protocol without a family is itself; an unregistered name is
+    itself (never silently joins a family).
+    """
+
+    if not protocol_name:
+        return protocol_name
+    from .registry import get_protocol_class
+
+    try:
+        cls = get_protocol_class(str(protocol_name))
+    except KeyError:
+        return str(protocol_name)
+    return getattr(cls, "base_family", "") or getattr(cls, "name", "") or str(protocol_name)
 
 
 def is_same_protocol(
@@ -173,10 +194,15 @@ def is_same_protocol(
     A missing context is not proof of ownership. Parsed unified objects carry
     their source protocol, so direct parse/build calls still preserve native
     fields without making manually constructed or foreign objects unsafe.
+    Family-aware (G11): sibling variants of one wire format are the same
+    wire — a responses client on a responses_stateful endpoint replays
+    raw fields, not a conversion.
     """
 
     effective_source = context.source_protocol if context and context.source_protocol else source_protocol
-    return effective_source == protocol_name
+    if not effective_source:
+        return False
+    return family_wire_name(str(effective_source)) == family_wire_name(protocol_name)
 
 
 def source_extensions(
@@ -339,6 +365,10 @@ _EFFORT_TO_BUDGET_TOKENS = {
 # Protocols whose native reasoning vocabulary is the OpenAI effort scale:
 # effort labels pass through verbatim between them (xhigh/max included);
 # the approximation table only serves foreign-vocabulary targets.
+def _is_effort_native(protocol: str) -> bool:
+    return family_wire_name(protocol) in {"openai_chat", "responses"}
+
+
 _EFFORT_NATIVE_PROTOCOLS = {"openai_chat", "responses"}
 
 
@@ -432,7 +462,7 @@ def format_reasoning_controls(
         if effort == "none":
             return effort, False
         if effort not in _EFFORT_TO_BUDGET_TOKENS:
-            if target_protocol in _EFFORT_NATIVE_PROTOCOLS:
+            if _is_effort_native(target_protocol):
                 # Same vocabulary (current docs: none/minimal/low/medium/
                 # high/xhigh/max — plus forward-compatible labels): verbatim.
                 return effort, False
@@ -606,7 +636,7 @@ def format_reasoning_controls(
                 "reasoning summary preference has no Anthropic Messages representation",
                 "reasoning.summary",
             )
-    elif target_protocol == "responses":
+    elif family_wire_name(target_protocol) == "responses":
         if enabled is False:
             _warn(
                 "reasoning_disabled_omitted",
@@ -998,7 +1028,7 @@ def format_tool_choice(value: Any, target_protocol: str) -> Any:
         if no_parallel:
             payload["disable_parallel_tool_use"] = True
         return payload
-    if target_protocol == "responses":
+    if family_wire_name(target_protocol) == "responses":
         if mode == "named":
             return {"type": "function", "name": name or ""}
         if isinstance(choice.get("namespaced"), dict):
@@ -1048,7 +1078,7 @@ def canonical_structured_output(value: Any, source_protocol: str) -> dict[str, A
         if output_type == "json_object":
             return {"type": "json_object"}
         return deepcopy(value)
-    if source_protocol == "responses":
+    if family_wire_name(source_protocol) == "responses":
         return {
             "type": value.get("type") or "json_schema",
             "name": value.get("name"),
@@ -1098,7 +1128,7 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
         return None
     output_type = value.get("type") or "json_schema"
     schema = value.get("schema")
-    if schema is not None and target_protocol in {"openai_chat", "responses"}:
+    if schema is not None and family_wire_name(target_protocol) in {"openai_chat", "responses"}:
         schema = _lowercase_schema_types(schema)
     if target_protocol == "openai_chat":
         if output_type == "json_object":
@@ -1123,7 +1153,7 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
                 if item is not None
             },
         }
-    if target_protocol == "responses":
+    if family_wire_name(target_protocol) == "responses":
         if output_type == "json_object":
             return {"type": "json_object"}
         if output_type == "text":

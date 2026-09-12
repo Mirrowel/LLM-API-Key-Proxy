@@ -13,6 +13,7 @@ from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.types import is_provider_continuation_path
 from ..core.errors import StreamedAPIError, StructuredAPIResponseError, structured_api_response_error
+from ..protocols.canonical import family_wire_name
 from ..streaming.relay import RelayStreamItem, StreamRepairState
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..hooks.types import HookAction, TransportView
@@ -201,7 +202,8 @@ class NativeProviderExecutor:
             # protocol and no semantic edits are pending, the ORIGINAL client
             # payload is the transport basis — no canonical rebuild can strip
             # source-native fields. Every deviation is a traced overlay.
-            same_protocol = input_protocol.name == provider_protocol.name
+            # Family-aware (G11): sibling variants are the same wire.
+            same_protocol = family_wire_name(input_protocol.name) == family_wire_name(provider_protocol.name)
             raw_wire = context.raw_client_request if same_protocol and isinstance(context.raw_client_request, dict) else None
             overlays: list[dict[str, Any]] = []
             raw_basis_used = False

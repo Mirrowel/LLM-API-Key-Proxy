@@ -1317,13 +1317,28 @@ async def gemini_models_discovery(
 
 
 def _gemini_openai_model(model: str) -> str:
-    """Route a compat-face model reference onto the gemini:openai profile."""
+    """Route a compat-face model reference onto the gemini:openai profile.
+
+    The URL binds the face: any client-supplied profile addressing is
+    stripped (a ``gemini:``/``gemini:profile/`` reference cannot rebind a
+    compat request onto the native face), and the common Google prefixes
+    (``gemini/``, ``models/``, ``google/``) reduce to the bare model id
+    the compat endpoint expects.
+    """
 
     normalized = str(model or "").strip()
+    if not normalized:
+        return "gemini:openai/"
+    # strip client-supplied profile addressing (gemini:, gemini:profile/)
+    import re
+
+    normalized = re.sub(r"^gemini(?::[\w.-]+)?/", "", normalized)
     if normalized.startswith("gemini:"):
-        return normalized
-    if normalized.startswith("gemini/"):
-        return f"gemini:openai/{normalized.removeprefix('gemini/')}"
+        normalized = normalized.split("/", 1)[-1]
+    for prefix in ("models/", "google/", "gemini/"):
+        if normalized.startswith(prefix):
+            normalized = normalized.removeprefix(prefix)
+            break
     return f"gemini:openai/{normalized}"
 
 

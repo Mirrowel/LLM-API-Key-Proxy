@@ -9,6 +9,10 @@ from rotator_library.responses.types import StoredResponse
 # ------------------------------------------------- eligibility resolution
 
 class _ResponsesFamilyPlugin:
+    # G11 verify-fix: eligibility instantiates plugin CLASSES (the registry
+    # convention) — the fake must be a class, not a pre-built instance.
+    protocol_name = "responses"
+
     def get_protocol_name(self, model: str = "", profile=None) -> str:
         return "responses"
 
@@ -16,7 +20,7 @@ class _ResponsesFamilyPlugin:
 def test_eligibility_requires_responses_family_target(monkeypatch) -> None:
     from rotator_library.providers import PROVIDER_PLUGINS
 
-    monkeypatch.setitem(PROVIDER_PLUGINS, "respprovider", _ResponsesFamilyPlugin())
+    monkeypatch.setitem(PROVIDER_PLUGINS, "respprovider", _ResponsesFamilyPlugin)
     assert _provider_continuation_eligible({"model": "respprovider/gpt-x", "previous_response_id": "resp_foreign"}) is True
 
 

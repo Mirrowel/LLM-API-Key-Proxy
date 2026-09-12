@@ -91,7 +91,13 @@ class InMemoryResponsesStore:
 
     def _prune_expired(self) -> None:
         for key, response in list(self._responses.items()):
-            if response.is_expired():
+            try:
+                expired = response.is_expired()
+            except Exception:
+                # Poison row: same containment as reads — drop it, never
+                # fail the save that triggered pruning.
+                expired = True
+            if expired:
                 self._responses.pop(key, None)
 
     def _prune_overflow(self) -> None:

@@ -568,9 +568,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             protocol_name = None
         if protocol_name == "anthropic_messages":
             return "messages"
-        if protocol_name == "responses":
+        from ..protocols.canonical import family_wire_name
+
+        wire = family_wire_name(protocol_name or "")
+        if wire == "responses":
             return "responses"
-        if protocol_name == "gemini":
+        if wire == "gemini":
             return "stream_generate" if stream else "generate"
         if protocol_name == "ollama":
             # Both /api/chat and /api/generate stream via the body `stream`
@@ -626,7 +629,9 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     def _default_endpoint_path(self, protocol: str = "", operation: str = "chat") -> str:
         """Conventional per-protocol endpoint path (profiles without one)."""
 
-        if protocol == "responses":
+        from ..protocols.canonical import family_wire_name
+
+        if family_wire_name(protocol or "") == "responses":
             return "/responses"
         if protocol == "anthropic_messages":
             return "/v1/messages"
