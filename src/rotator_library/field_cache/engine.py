@@ -108,15 +108,26 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
     D11: provider+model are the required identity; credential and session
     are optional refinements — a missing optional dimension participates as
     ``_none`` instead of disabling the rule. Provider/model absence still
-    disables (identity is non-negotiable).
+    disables (identity is non-negotiable). G3 floor hardening: the
+    provider+model terms are ALWAYS part of the key even when a raw plugin
+    rule declares a narrower scope — a ``scope=("session",)`` rule must
+    never share one key across providers (that reopens the cross-provider
+    leak the compatibility classes exist to prevent).
     """
 
     parts = [f"rule={_safe_scope_value(rule.cache_key or rule.name)}"]
+    provider_value = context.value_for_scope("provider")
+    model_value = context.value_for_scope("model")
+    if not provider_value or not model_value:
+        return None
+    parts.append(f"provider={_safe_scope_value(provider_value)}")
+    parts.append(f"model={_safe_scope_value(_canonical_model(provider_value, model_value))}")
+    floor = {"rule", "provider", "model"}
     for scope in rule.scope:
+        if scope in floor:
+            continue
         value = context.value_for_scope(scope)
         if value is None or value == "":
-            if scope in ("provider", "model"):
-                return None
             if scope == "session":
                 # Continuation state binds strict session ALWAYS — the
                 # lenient allow_missing_session flag never widens it
@@ -130,9 +141,6 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
                 # a rule scoped to it never pools across unknown classifiers.
                 return None
             value = "_none"
-        if scope == "model":
-            # Canonicalize stripped vs prefixed forms to one identity.
-            value = _canonical_model(context.provider, value)
         safe_value = _safe_scope_value(value)
         parts.append(f"{scope}={safe_value}")
     return "|".join(parts)

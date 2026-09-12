@@ -286,7 +286,9 @@ def test_gemini_skip_signature_sentinel_only_when_signatures_expected() -> None:
     frames += [f for event in source.parse_stream_events(unsigned, ctx) for f in format_canonical_stream_event(event, "gemini", ctx, state=state)]
     joined = "".join(frames)
     assert "sig-a" in joined
-    assert '"skip_thought_signature_validator": true' in joined
+    # G3: wire-legal sentinel shape — the LITERAL STRING value on
+    # thoughtSignature, never a sibling boolean key.
+    assert '"thoughtSignature": "skip_thought_signature_validator"' in joined
 
 
 def test_gemini_no_sentinel_when_no_signatures_seen() -> None:

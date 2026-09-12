@@ -918,9 +918,12 @@ def _gemini_skip_signature_sentinel() -> dict[str, Any]:
     conversation is known to carry signatures (``state.tool_signatures`` saw
     them for sibling calls) but this call never got one, the caller must say
     so explicitly rather than emit an unsigned part the provider rejects.
+    Wire-legal shape: the LITERAL STRING value on ``thoughtSignature`` —
+    verified against the official docs and reference implementations
+    (a sibling boolean key is not a shape Gemini accepts).
     """
 
-    return {"skip_thought_signature_validator": True}
+    return {"thoughtSignature": "skip_thought_signature_validator"}
 
 
 def _gemini_function_call_part(

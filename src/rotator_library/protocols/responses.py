@@ -34,6 +34,7 @@ from .canonical import (
     format_tool_choice,
     instruction_blocks,
     is_same_protocol,
+    may_emit_opaque_provider_state,
     message_reasoning,
     message_tool_calls,
     message_tool_results,
@@ -149,6 +150,7 @@ class ResponsesProtocol(ProtocolAdapter):
     def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
         validate_generative_request(unified_request, self.name, context)
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
+        emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
         payload: dict[str, Any] = {
             "model": unified_request.model,
             "input": self._format_input(
@@ -157,6 +159,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 # single instructions field below.
                 list(unified_request.messages) if preserve_source else conversation_messages(unified_request),
                 preserve_source=preserve_source,
+                emit_opaque_state=emit_opaque_state,
                 warnings=unified_request.warnings,
             ),
         }
@@ -257,6 +260,7 @@ class ResponsesProtocol(ProtocolAdapter):
         disclose_response_drops(unified_response, self.name)
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
+        emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
         assistants = [m for m in unified_response.messages if m.role in {"assistant", "model"}]
         candidate_backed = len(assistants) > 1 and all(m.index is not None for m in assistants)
         if not preserve_source:
@@ -278,9 +282,9 @@ class ResponsesProtocol(ProtocolAdapter):
             for fallback_index, message in enumerate(unified_response.messages):
                 output_index = message.extra.get("_output_index", fallback_index)
                 if isinstance(output_index, int) and 0 <= output_index < len(output):
-                    output[output_index] = self._format_output_message(message, output_index)
+                    output[output_index] = self._format_output_message(message, output_index, unified_response=unified_response, emit_opaque_state=emit_opaque_state)
                 else:
-                    output.append(self._format_output_message(message, fallback_index))
+                    output.append(self._format_output_message(message, fallback_index, unified_response=unified_response, emit_opaque_state=emit_opaque_state))
         elif candidate_backed:
             # D9 first-wins: a Responses object is one logical answer; extra
             # candidates degrade to the first with a recorded summary, never
@@ -290,9 +294,9 @@ class ResponsesProtocol(ProtocolAdapter):
                 code="candidates_first_wins",
                 message=f"{len(assistants) - 1} additional candidate(s) dropped: single-response object (first candidate wins)",
             )
-            output = self._format_canonical_output(assistants[0], unified_response)
+            output = self._format_canonical_output(assistants[0], unified_response, emit_opaque_state=emit_opaque_state)
         else:
-            output = self._format_canonical_output(coalesce_assistant_message(unified_response.messages), unified_response)
+            output = self._format_canonical_output(coalesce_assistant_message(unified_response.messages), unified_response, emit_opaque_state=emit_opaque_state)
         native_status = unified_response.metadata.get("native_status")
         non_terminal = native_status in {"in_progress", "queued", "cancelled"}
         payload = {
@@ -491,7 +495,7 @@ class ResponsesProtocol(ProtocolAdapter):
             )
         return UnifiedMessage(role=str(item.get("role") or "user"), content=[ContentBlock(type=str(item_type or "unknown"), raw=deepcopy(item))], raw=deepcopy(item))
 
-    def _format_input(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool, warnings: list | None = None) -> list[dict[str, Any]]:
+    def _format_input(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool, emit_opaque_state: bool = True, warnings: list | None = None) -> list[dict[str, Any]]:
         """Format canonical turns into ordered Responses input items."""
 
         items: list[dict[str, Any]] = []
@@ -522,11 +526,19 @@ class ResponsesProtocol(ProtocolAdapter):
                             reasoning_item["id"] = message.raw["id"]
                         if block.reasoning.text:
                             reasoning_item["summary"] = [{"type": "summary_text", "text": block.reasoning.text}]
-                        if block.reasoning.encrypted_content:
+                        if block.reasoning.encrypted_content and emit_opaque_state:
                             # Bound opaque state (D8): survives same-protocol
-                            # rebuilds byte-for-byte; never emitted by foreign
-                            # formatters.
+                            # rebuilds for a compatible provider pair only;
+                            # foreign pairs keep the portable summary text and
+                            # disclose the dropped blob.
                             reasoning_item["encrypted_content"] = block.reasoning.encrypted_content
+                        elif block.reasoning.encrypted_content:
+                            _warn_responses_list_once(
+                                warnings,
+                                code="opaque_state_suppressed",
+                                message="reasoning encrypted_content is provider-bound; dropped for this provider pair (summary text kept)",
+                                field="input[reasoning].encrypted_content",
+                            )
                         if preserve_source and isinstance(block.raw, dict):
                             # Full-shape replay: content[] (full reasoning
                             # text items) + status ride the raw item.
@@ -627,7 +639,7 @@ class ResponsesProtocol(ProtocolAdapter):
             return UnifiedMessage(role="assistant", content=[ContentBlock(type="builtin_tool", builtin_tool=builtin, raw=deepcopy(item))], raw=deepcopy(item))
         return None
 
-    def _format_output_message(self, message: UnifiedMessage, index: int) -> dict[str, Any]:
+    def _format_output_message(self, message: UnifiedMessage, index: int, *, unified_response: UnifiedResponse | None = None, emit_opaque_state: bool = True) -> dict[str, Any]:
         if isinstance(message.raw, dict):
             payload = deepcopy(message.raw)
             item_type = payload.get("type")
@@ -637,6 +649,18 @@ class ResponsesProtocol(ProtocolAdapter):
                 return payload
             if item_type == "reasoning" and message.reasoning:
                 payload["summary"] = [{"type": "summary_text", "text": message.reasoning[0].text or ""}]
+                if not emit_opaque_state and "encrypted_content" in payload:
+                    # D8: the client keeps the portable summary text; a
+                    # foreign provider's encrypted blob never leaves the
+                    # cache. Disclosed, never a silent mutation.
+                    payload.pop("encrypted_content", None)
+                    if unified_response is not None:
+                        _warn_responses_once(
+                            unified_response,
+                            code="opaque_state_suppressed",
+                            message="reasoning encrypted_content is provider-bound; dropped for this provider pair (summary text kept)",
+                            field="output[reasoning].encrypted_content",
+                        )
                 return payload
             if item_type in {"function_call", "custom_tool_call"} and message.tool_calls:
                 call = message.tool_calls[0]
@@ -657,7 +681,7 @@ class ResponsesProtocol(ProtocolAdapter):
                 return payload
         return {"id": f"msg_{index}", "type": "message", "role": message.role, "content": self._format_content(message.content, role=message.role, output=True, preserve_source=False)}
 
-    def _format_canonical_output(self, message: UnifiedMessage, unified_response: UnifiedResponse | None = None) -> list[dict[str, Any]]:
+    def _format_canonical_output(self, message: UnifiedMessage, unified_response: UnifiedResponse | None = None, *, emit_opaque_state: bool = True) -> list[dict[str, Any]]:
         """Build ordered Responses output items from one canonical assistant turn."""
 
         output: list[dict[str, Any]] = []
@@ -691,8 +715,18 @@ class ResponsesProtocol(ProtocolAdapter):
                     }
                     if block.reasoning.text:
                         reasoning_output["summary"] = [{"type": "summary_text", "text": block.reasoning.text}]
-                    if block.reasoning.encrypted_content:
+                    if block.reasoning.encrypted_content and emit_opaque_state:
                         reasoning_output["encrypted_content"] = block.reasoning.encrypted_content
+                    elif block.reasoning.encrypted_content and unified_response is not None:
+                        # D8: own-provider state toward a client that did not
+                        # mint it — summary survives, the blob is disclosed as
+                        # dropped.
+                        _warn_responses_once(
+                            unified_response,
+                            code="opaque_state_suppressed",
+                            message="reasoning encrypted_content is provider-bound; dropped for this provider pair (summary text kept)",
+                            field="output[reasoning].encrypted_content",
+                        )
                     output.append(reasoning_output)
                     item_index += 1
             elif block.tool_call:
@@ -1031,17 +1065,6 @@ def _responses_output_modalities(messages: list[UnifiedMessage]) -> list[str]:
     return modalities
 
 
-def _warn_responses_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning to a plain list sink."""
-
-    if warnings is None:
-        return
-    for warning in warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="responses"))
-
-
 def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:
     """Append a deduplicated ConversionWarning (formatting may run twice)."""
 
@@ -1051,6 +1074,17 @@ def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, messag
     unified_response.warnings.append(
         ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="responses")
     )
+
+
+def _warn_responses_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
+    """Append a deduplicated ConversionWarning to a plain list sink."""
+
+    if warnings is None:
+        return
+    for warning in warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="responses"))
 
 
 _BUILTIN_TOOL_ITEM_TYPES = {

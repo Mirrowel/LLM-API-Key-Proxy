@@ -210,6 +210,25 @@ class NativeProviderExecutor:
                 if _wire_view_matches_unified(wire_view, unified_request):
                     provider_request = deepcopy(raw_wire)
                     raw_basis_used = True
+                    # G3 provider-switch strip: opaque per-provider state
+                    # (signatures, encrypted reasoning) that the CLIENT
+                    # echoed back is foreign to any other executing
+                    # provider — strip it in place as a DISCLOSED edit.
+                    # Same provider (or no switch visible) keeps the byte
+                    # path verbatim. Cache rows are never touched: the
+                    # stripped state stays stored under its origin keys
+                    # for the conversation's return home.
+                    input_provider = context.metadata.get("input_provider")
+                    if input_provider and input_provider != context.provider:
+                        from ..protocols.opaque_strip import strip_foreign_opaque_state
+
+                        stripped_fields = strip_foreign_opaque_state(provider_request, input_protocol.name)
+                        if stripped_fields:
+                            overlays.append({
+                                "kind": "foreign_bound_state_stripped",
+                                "from_provider": input_provider,
+                                "fields": stripped_fields,
+                            })
                     if "model" in provider_request and provider_request.get("model") != context.model:
                         # Model overlay: traced, in-body only. Protocols whose
                         # model rides the endpoint (Gemini) keep their native
@@ -924,6 +943,12 @@ class NativeProviderExecutor:
             self._trace(context, "after_metadata_field_cache_injection", metadata, direction="metadata", stage="adapter", snapshot=False)
         if metadata == context.metadata:
             return context
+        # G3 reserved-key guard: identity fields the runtime owns can never
+        # be overwritten by cache injection — a rule that smuggled a new
+        # ``input_provider`` would defeat provider-switch detection.
+        for reserved in ("input_provider", "public_model", "execution_profile"):
+            if reserved in context.metadata and metadata.get(reserved) != context.metadata[reserved]:
+                metadata[reserved] = context.metadata[reserved]
         return replace(context, metadata=metadata)
 
     async def _inject_unified_request(
@@ -1004,6 +1029,12 @@ def _wire_view_matches_unified(wire_view: Any, unified_request: Any) -> bool:
     if wire_view.extensions != unified_request.extensions:
         return False
     if wire_view.extra != unified_request.extra:
+        return False
+    if wire_view.operation != unified_request.operation:
+        return False
+    if wire_view.logical_operation != unified_request.logical_operation:
+        return False
+    if wire_view.input != unified_request.input:
         return False
     return True
 

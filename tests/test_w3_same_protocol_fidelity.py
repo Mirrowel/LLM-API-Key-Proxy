@@ -325,6 +325,8 @@ def test_encrypted_reasoning_survives_responses_round_trip() -> None:
         target_protocol="responses",
         input_protocol="responses",
         client_protocol="responses",
+        source_provider="provider-a",
+        target_provider="provider-a",
     )
     built = responses.build_request(parsed, ctx)
     reasoning_items = [item for item in built["input"] if item.get("type") == "reasoning"]

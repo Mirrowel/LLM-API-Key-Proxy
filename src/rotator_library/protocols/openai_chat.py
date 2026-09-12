@@ -37,6 +37,7 @@ from .canonical import (
     instruction_messages,
     normalize_reasoning_controls,
     is_same_protocol,
+    may_emit_opaque_provider_state,
     retain_supported_generation_params,
     resolve_tool_result_names,
     source_extensions,
@@ -180,6 +181,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
         validate_generative_request(unified_request, self.name, context)
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
+        emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
         # Chat can express system/developer messages anywhere: canonical
         # message order is preserved verbatim (D7 level 1 — interleaved
         # instructions never hoisted). A separate canonical `system` field
@@ -204,6 +206,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             "messages": self._format_request_messages(
                 wire_messages,
                 preserve_source=preserve_source,
+                emit_opaque_state=emit_opaque_state,
                 warnings=unified_request.warnings,
             ),
         }
@@ -612,7 +615,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 return "".join(texts)
         return content
 
-    def _format_request_messages(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool, warnings: Optional[list[ConversionWarning]] = None) -> list[dict[str, Any]]:
+    def _format_request_messages(self, messages: Iterable[UnifiedMessage], *, preserve_source: bool, emit_opaque_state: bool = True, warnings: Optional[list[ConversionWarning]] = None) -> list[dict[str, Any]]:
         """Format messages, expanding protocols that embed tool results in user turns."""
 
         formatted: list[dict[str, Any]] = []
@@ -624,7 +627,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     residual_message = deepcopy(message)
                     residual_message.content = residual
                     residual_message.tool_call_id = None
-                    formatted.append(self._format_message(residual_message, preserve_source=preserve_source, warnings=warnings))
+                    formatted.append(self._format_message(residual_message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings))
                 for block in result_blocks:
                     result = block.tool_result
                     if result is None:
@@ -647,10 +650,10 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         }
                     )
                 continue
-            formatted.append(self._format_message(message, preserve_source=preserve_source, warnings=warnings))
+            formatted.append(self._format_message(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings))
         return formatted
 
-    def _format_message(self, message: UnifiedMessage, *, preserve_source: bool = True, direction: str = "request", warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
+    def _format_message(self, message: UnifiedMessage, *, preserve_source: bool = True, direction: str = "request", warnings: Optional[list[ConversionWarning]] = None, emit_opaque_state: bool = True) -> dict[str, Any]:
         payload: dict[str, Any] = {"role": message.role}
         if message.name:
             payload["name"] = message.name
@@ -733,6 +736,15 @@ class OpenAIChatProtocol(ProtocolAdapter):
                         break
                 if synthesized is not None:
                     extra["audio"] = synthesized
+        if not emit_opaque_state and _drop_chat_signature_entries(extra):
+            # D8: the Gemini-compat vendor signature is provider-bound; the
+            # portable content/reasoning stay, the signature drops disclosed.
+            _warn_once(
+                warnings,
+                code="opaque_state_suppressed",
+                message="vendor thought signature on a chat message is provider-bound; suppressed for this provider pair",
+                field="messages.extra_content.google.thought_signature",
+            )
         legacy_function_call = extra.get("function_call")
         tool_calls = _message_tool_calls(message)
         if tool_calls:
@@ -742,7 +754,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
                 call = tool_calls[0]
                 extra["function_call"] = {"name": call.name or "", "arguments": tool_arguments_text(call.arguments)}
             else:
-                payload["tool_calls"] = [self._format_tool_call(call, preserve_source=preserve_source, warnings=warnings) for call in tool_calls]
+                payload["tool_calls"] = [self._format_tool_call(call, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings) for call in tool_calls]
         if message.reasoning and (
             preserve_source
             or direction == "response"
@@ -1030,7 +1042,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
             extra={**_without(function, {"name", "arguments"}), **_without(payload, {"id", "function", "type", "index", "name"})},
         )
 
-    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool = True, warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
+    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool = True, emit_opaque_state: bool = True, warnings: Optional[list[ConversionWarning]] = None) -> dict[str, Any]:
         if call.type in {"custom", "custom_tool_call"}:
             # Responses custom_tool_call maps onto Chat's native custom
             # envelope — the narrowing is disclosed, never silent (the
@@ -1043,6 +1055,15 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     field="tool_calls",
                 )
             payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
+            if not emit_opaque_state and _drop_chat_signature_entries(payload):
+                # D8: a vendor-keyed signature bound to the call is
+                # provider-owned; suppressed for a foreign provider pair.
+                _warn_once(
+                    warnings,
+                    code="opaque_state_suppressed",
+                    message="vendor thought signature on a chat tool call is provider-bound; suppressed for this provider pair",
+                    field="tool_calls.extra_content.google.thought_signature",
+                )
             payload["type"] = "custom"
             if call.id:
                 payload["id"] = call.id
@@ -1054,6 +1075,13 @@ class OpenAIChatProtocol(ProtocolAdapter):
             payload["custom"] = custom
             return payload
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
+        if not emit_opaque_state and _drop_chat_signature_entries(payload):
+            _warn_once(
+                warnings,
+                code="opaque_state_suppressed",
+                message="vendor thought signature on a chat tool call is provider-bound; suppressed for this provider pair",
+                field="tool_calls.extra_content.google.thought_signature",
+            )
         payload["type"] = "function"
         if call.id:
             payload["id"] = call.id
@@ -1417,6 +1445,30 @@ def _warn_once(
         if warning.code == code and warning.message == message and warning.field == field:
             return
     warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="openai_chat"))
+
+
+def _drop_chat_signature_entries(container: dict[str, Any]) -> bool:
+    """Strip vendor-keyed thought signatures from an extra/raw copy.
+
+    The Gemini-compat surface binds opaque state at
+    ``extra_content.google.thought_signature`` (message- and tool-call
+    level). Plaintext ``reasoning_content`` is PORTABLE and never touched.
+    Returns True when an entry was removed; prunes emptied parents so the
+    chat wire never carries an empty ``extra_content`` husk.
+    """
+
+    extra_content = container.get("extra_content")
+    if not isinstance(extra_content, dict):
+        return False
+    google = extra_content.get("google")
+    if not isinstance(google, dict) or "thought_signature" not in google:
+        return False
+    google.pop("thought_signature", None)
+    if not google:
+        extra_content.pop("google", None)
+        if not extra_content:
+            container.pop("extra_content", None)
+    return True
 
 
 def _warn_chat_once(unified_response: UnifiedResponse, *, code: str, message: str, field: Optional[str] = None) -> None:

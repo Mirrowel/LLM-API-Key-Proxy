@@ -349,8 +349,9 @@ async def test_fast_path_flips_to_rebuild_on_canonical_hook_edit():
 
 @pytest.mark.asyncio
 async def test_isolation_two_concurrent_runs_share_nothing():
-    r1_events: list = []
-    r2_events: list = []
+    r1_states: list = []
+    r2_states: list = []
+    token_counter = {"next": 0}
 
     def make_hook(sink):
         class Sink(PipelineHook):
@@ -358,8 +359,11 @@ async def test_isolation_two_concurrent_runs_share_nothing():
             stages = ("parsed_canonical", "response_formatted")
 
             async def __call__(self, invocation, context):
-                sink.append((id(context), context.state))
-                context.state["owner"] = id(context)
+                # Monotonic ownership token written into the run's state
+                # bag: sharing would be observable as a foreign owner.
+                token_counter["next"] += 1
+                context.state["owner"] = token_counter["next"]
+                sink.append(context.state)
                 return None
         return Sink()
 
@@ -372,7 +376,12 @@ async def test_isolation_two_concurrent_runs_share_nothing():
         )
 
     import asyncio as _aio
-    await _aio.gather(drive("one", r1_events), drive("two", r2_events))
-    ctx1 = {c for c, _ in r1_events}
-    ctx2 = {c for c, _ in r2_events}
-    assert ctx1 and ctx2 and ctx1.isdisjoint(ctx2), "runs must not share context objects"
+    await _aio.gather(drive("one", r1_states), drive("two", r2_states))
+    # each run saw ONE state-bag object across its stages
+    assert len(r1_states) == 2 and r1_states[0] is r1_states[1]
+    assert len(r2_states) == 2 and r2_states[0] is r2_states[1]
+    # the runs never shared a bag, and no owner token leaked across
+    assert r1_states[0] is not r2_states[0]
+    owners1 = {r1_states[0].get("owner")}
+    assert all(s.get("owner") in owners1 for s in r1_states)
+    assert all(s.get("owner") not in owners1 for s in r2_states)

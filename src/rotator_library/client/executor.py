@@ -44,6 +44,11 @@ from litellm.exceptions import (
 
 from ..core.types import RequestContext, ErrorAction
 from ..core.utils import normalize_usage_for_response
+from ..protocols.opaque_strip import (
+    payload_carries_opaque_state,
+    signature_rejection_message,
+    strip_foreign_opaque_state,
+)
 from ..core.errors import (
     NoAvailableKeysError,
     PreRequestCallbackError,
@@ -1627,6 +1632,7 @@ class RequestExecutor:
                             )
 
                         # Execute request with retries
+                        signature_strip_retried = False
                         for attempt in range(self._max_retries):
                             try:
                                 lib_logger.info(
@@ -1636,15 +1642,45 @@ class RequestExecutor:
                                 # Pre-request callback
                                 await self._run_pre_request_callback(context, kwargs)
 
-                                response = await self._execute_provider_request(
-                                    provider,
-                                    model,
-                                    plugin,
-                                    credential_secret,
-                                    cred_context.stable_id,
-                                    kwargs,
-                                    context,
-                                )
+                                try:
+                                    response = await self._execute_provider_request(
+                                        provider,
+                                        model,
+                                        plugin,
+                                        credential_secret,
+                                        cred_context.stable_id,
+                                        kwargs,
+                                        context,
+                                    )
+                                except Exception as request_error:
+                                    # G3 reactive strip-and-retry (the safety
+                                    # net for switches the proxy cannot see:
+                                    # a client directly addressing B while
+                                    # carrying A's echoed signatures). One
+                                    # bounded retry on the SAME credential
+                                    # after stripping the opaque carriers
+                                    # from the payloads — bounded once per
+                                    # request, never on rotation-class
+                                    # errors. The pristine snapshot is
+                                    # REBOUND (never mutated in place): other
+                                    # fallback targets keep the original.
+                                    if (
+                                        not signature_strip_retried
+                                        and signature_rejection_message(request_error)
+                                        and payload_carries_opaque_state(context.protocol_request, context.input_protocol_name)
+                                    ):
+                                        stripped_kwargs = strip_foreign_opaque_state(kwargs, context.input_protocol_name)
+                                        if stripped_kwargs:
+                                            signature_strip_retried = True
+                                            stripped_snapshot = deepcopy(context.protocol_request)
+                                            if strip_foreign_opaque_state(stripped_snapshot, context.input_protocol_name):
+                                                context.protocol_request = stripped_snapshot
+                                            lib_logger.warning(
+                                                "Provider rejected echoed signatures (foreign opaque state); "
+                                                f"stripped {len(stripped_kwargs)} carrier(s) and retrying once"
+                                            )
+                                            continue
+                                    raise
                                 trace_response = _redact_context_field_cache_paths(
                                     response,
                                     context,

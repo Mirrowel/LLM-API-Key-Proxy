@@ -92,6 +92,33 @@ def _warn_gemini_once(unified_response: UnifiedResponse, *, code: str, message: 
     )
 
 
+def _warn_gemini_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
+    """Append a deduplicated ConversionWarning to a plain list sink."""
+
+    if warnings is None:
+        return
+    for warning in warnings:
+        if warning.code == code and warning.message == message and warning.field == field:
+            return
+    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="gemini"))
+
+
+def _drop_gemini_signatures(payload: dict[str, Any]) -> bool:
+    """Remove provider-bound thought-signature keys from a part copy.
+
+    Returns True when at least one key was present. Both wire spellings are
+    dropped: the camelCase union member and the snake_case alias a foreign
+    client may have supplied.
+    """
+
+    dropped = False
+    for key in ("thoughtSignature", "thought_signature"):
+        if key in payload:
+            payload.pop(key, None)
+            dropped = True
+    return dropped
+
+
 class GeminiProtocol(ProtocolAdapter):
     """Adapter for Gemini ``generateContent`` and stream event shapes.
 
@@ -635,14 +662,30 @@ class GeminiProtocol(ProtocolAdapter):
         emit_opaque_state: bool = True,
         warnings: list | None = None,
     ) -> list[dict[str, Any]]:
+        block_list = list(blocks)
+        # Sibling signatures decide whether a suppressed/absent signature must
+        # be replaced by the documented skip sentinel (Gemini-3 validates
+        # thought signatures on function-call parts). Conservative: the
+        # sentinel never appears unless another call in THIS turn carried one.
+        tool_calls = [block.tool_call for block in block_list if block.tool_call is not None]
         parts = []
-        for block in blocks:
+        for block in block_list:
             if block.tool_call:
-                parts.append(self._format_tool_call(block.tool_call, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state))
+                sibling_signatures = preserve_source and any(
+                    other is not block.tool_call and other.signature for other in tool_calls
+                )
+                parts.append(
+                    self._format_tool_call(
+                        block.tool_call,
+                        preserve_source=preserve_source,
+                        emit_opaque_state=emit_opaque_state,
+                        sibling_signatures=sibling_signatures,
+                    )
+                )
             elif block.tool_result:
-                parts.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source))
+                parts.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings))
             elif block.type in {"image", "audio", "video", "file", "document"}:
-                part = _format_gemini_media(block, preserve_source=preserve_source, warnings=warnings)
+                part = _format_gemini_media(block, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings)
                 if part is not None:
                     parts.append(part)
             elif block.reasoning:
@@ -673,11 +716,31 @@ class GeminiProtocol(ProtocolAdapter):
                     # never inject a fabricated "text" key (illegal union).
                     if preserve_source:
                         payload.update(deepcopy(block.extra))
+                    # D8: even unknown parts can carry a bound thought
+                    # signature; it is provider-owned and drops with the rest
+                    # when the provider pair cannot prove compatibility.
+                    if not emit_opaque_state and _drop_gemini_signatures(payload):
+                        _warn_gemini_list_once(
+                            warnings,
+                            code="opaque_state_suppressed",
+                            message="thought signature on a Gemini part is provider-bound; suppressed for this provider pair",
+                            field="content[part]",
+                        )
                     parts.append(payload)
                     continue
                 payload["text"] = block.text or ""
                 if preserve_source:
                     payload.update(deepcopy(block.extra))
+                # D8: a signature may ride a PLAIN text part (the any-part
+                # rule). The text is portable and stays; the signature is
+                # provider-bound and drops when emit is off.
+                if not emit_opaque_state and _drop_gemini_signatures(payload):
+                    _warn_gemini_list_once(
+                        warnings,
+                        code="opaque_state_suppressed",
+                        message="thought signature on a Gemini text part is provider-bound; suppressed for this provider pair",
+                        field="content[text]",
+                    )
                 parts.append(payload)
         return parts
 
@@ -816,7 +879,7 @@ class GeminiProtocol(ProtocolAdapter):
         declaration["parameters"] = deepcopy(tool.input_schema)
         return {"functionDeclarations": [declaration]}
 
-    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, emit_opaque_state: bool = True) -> dict[str, Any]:
+    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, emit_opaque_state: bool = True, sibling_signatures: bool = False) -> dict[str, Any]:
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
         # Sanitize the raw replay down to the legal union-part shape.
         payload.pop("functionCall", None)
@@ -834,9 +897,16 @@ class GeminiProtocol(ProtocolAdapter):
             # D8: the signature replays with the call part for compatible
             # providers (Gemini 3 rejects unsigned first-per-step calls).
             payload["thoughtSignature"] = signature
+        elif preserve_source and sibling_signatures:
+            # D8 degrade: this call's bound signature is suppressed (foreign
+            # provider pair) or absent, but a sibling call in the same turn
+            # carried one. Gemini-3 validates every function-call part, so a
+            # bare unsigned call would be rejected — emit the documented
+            # skip sentinel. NEVER fabricated when no sibling was signed.
+            payload["thoughtSignature"] = "skip_thought_signature_validator"
         return payload
 
-    def _format_tool_result(self, result: ToolResult, *, preserve_source: bool) -> dict[str, Any]:
+    def _format_tool_result(self, result: ToolResult, *, preserve_source: bool, emit_opaque_state: bool = True, warnings: list | None = None) -> dict[str, Any]:
         payload = deepcopy(result.raw) if preserve_source and isinstance(result.raw, dict) else {}
         payload.pop("functionResponse", None)
         payload.pop("function_response", None)
@@ -855,10 +925,19 @@ class GeminiProtocol(ProtocolAdapter):
             response["id"] = result.tool_call_id
         payload["functionResponse"] = response
         part_signature = result.extra.get("thought_signature")
-        if part_signature:
+        if part_signature and emit_opaque_state:
             # Part-level signatures ride the outer part (Gemini contract),
             # same as functionCall parts.
             payload["thoughtSignature"] = part_signature
+        elif not emit_opaque_state and _drop_gemini_signatures(payload):
+            # D8: the bound signature (extra or raw replay) drops for foreign
+            # provider pairs — the functionResponse itself stays legal.
+            _warn_gemini_list_once(
+                warnings,
+                code="opaque_state_suppressed",
+                message="thought signature on a Gemini function response is provider-bound; suppressed for this provider pair",
+                field="content[tool_result]",
+            )
         return payload
 
     def _format_generation_params(self, request: UnifiedRequest, *, preserve_source: bool) -> tuple[dict[str, Any], list[Any], dict[str, Any]]:
@@ -1196,11 +1275,20 @@ def _coerce_media_source(value: Any) -> MediaSource:
     )
 
 
-def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, warnings: list | None = None) -> dict[str, Any] | None:
+def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, emit_opaque_state: bool = True, warnings: list | None = None) -> dict[str, Any] | None:
     """Format canonical media as a Gemini content part (None = dropped)."""
 
     source = _coerce_media_source(block.source)
     payload = deepcopy(block.raw) if preserve_source and isinstance(block.raw, dict) else {}
+    # D8: a media part's raw replay can carry a bound thought signature
+    # (the any-part rule); foreign provider pairs must not re-emit it.
+    if not emit_opaque_state and _drop_gemini_signatures(payload):
+        _warn_gemini_list_once(
+            warnings,
+            code="opaque_state_suppressed",
+            message="thought signature on Gemini media is provider-bound; suppressed for this provider pair",
+            field="content[media]",
+        )
     if source.data:
         if source.media_type:
             payload["inlineData"] = {"mimeType": source.media_type, "data": source.data}
