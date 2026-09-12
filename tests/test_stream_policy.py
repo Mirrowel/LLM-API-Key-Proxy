@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+
 from rotator_library.client.stream_retry_policy import can_retry_stream_after_error as compat_retry_policy
-from rotator_library.client.streaming import StreamingHandler
 from rotator_library.core.errors import StreamedAPIError
 from rotator_library.streaming.policy import can_retry_stream_after_error, is_visible_stream_output
 
@@ -62,15 +63,29 @@ def test_visible_output_detection_for_anthropic_and_gemini_events() -> None:
 
 
 def test_stream_handler_rejects_string_and_event_level_error_payloads() -> None:
-    handler = StreamingHandler()
+    from rotator_library.client.stream_ops import (
+        ChatWireStreamAdapter,
+        StreamUsageTracker,
+    )
+
+    def parse_chunk(chunk):
+        async def run():
+            adapter = ChatWireStreamAdapter("gpt-test")
+            async def source():
+                yield chunk
+            return [
+                event
+                async for event in adapter.events(source(), StreamUsageTracker("gpt-test"))
+            ]
+        return asyncio.run(run())
 
     for chunk in (
         'data: {"error":"provider failed"}\n\n',
-        'event: error\ndata: {"type":"rate_limit","message":"slow down"}\n\n',
+        {"type": "error", "error": {"type": "rate_limit", "message": "slow down"}},
         {"type": "response.failed", "response": {"error": {"type": "server_error", "message": "unavailable"}}},
     ):
         try:
-            handler._process_chunk(chunk, None, False)
+            parse_chunk(chunk)
         except StreamedAPIError as error:
             assert error.data["error"]["message"]
         else:

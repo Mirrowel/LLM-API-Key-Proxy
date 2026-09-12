@@ -13,6 +13,7 @@ from ..adapters import get_adapter, run_adapter_chain
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.types import is_provider_continuation_path
 from ..core.errors import StreamedAPIError, structured_api_response_error
+from ..streaming.relay import RelayStreamItem, StreamRepairState
 from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..hooks.types import HookAction, TransportView
 from ..hooks.runner import PipelineRun, run_slot
@@ -40,6 +41,21 @@ from ..usage.costs import CostCalculator
 from .context import NativeProviderContext
 from .http import NativeHTTPTransport
 from .streaming import stream_event_payload
+
+# Terminal vocabulary mirror of client/stream_ops._CHAT_TERMINAL_EVENT_TYPES
+# (kept local to avoid a client-layer import cycle; stream_ops owns the
+# canonical set). G4: widened so native anthropic/responses terminals take
+# the authoritative terminal path, not just chat `done`.
+_NATIVE_TERMINAL_EVENT_TYPES = frozenset(
+    {
+        "done",
+        "message_stop",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+        "completed",
+    }
+)
 
 
 class _HookBlock(Exception):
@@ -572,71 +588,141 @@ class NativeProviderExecutor:
             )
             event_index = -1
             stream_error: BaseException | None = None
+            if root_context.stream_repair_state is None:
+                root_context.stream_repair_state = StreamRepairState()
             stream_kwargs: dict[str, Any] = {}
             if transport_view.timeout_seconds is not None:
                 stream_kwargs["timeout_seconds"] = transport_view.timeout_seconds
+            # G4 conditional re-serialization: frames carry their raw wire
+            # text alongside parsed events; the PIPELINE owns the relay
+            # decision (protocol match + framing + per-frame edit signals —
+            # repair_state.edited_by_hook flips on any hook/adapter edit).
+            # Request-side edits (usage overlays) do NOT block relay: they
+            # change what we ASK, not the fidelity of the answer's bytes.
+            parse_stream_events_plural = getattr(protocol, "parse_stream_events", None)
+
+            async def _frame_iterator():
+                # Prefer the G4 raw-frame seam; legacy transports (custom
+                # stream_json_lines implementations) yield parsed chunks
+                # wrapped as raw-less frames — relay impossible, formatter
+                # path unaffected.
+                from .http import RawStreamFrame
+
+                frames = getattr(transport, "stream_raw_frames", None)
+                if frames is not None:
+                    async for frame in frames(send_endpoint, headers=send_headers, payload=provider_request, **stream_kwargs):
+                        yield frame
+                    return
+                async for chunk in transport.stream_json_lines(send_endpoint, headers=send_headers, payload=provider_request, **stream_kwargs):
+                    yield RawStreamFrame(raw=None, parsed=chunk)
+
             try:
-                async for raw_chunk in transport.stream_json_lines(send_endpoint, headers=send_headers, payload=provider_request, **stream_kwargs):
+                async for raw_frame in _frame_iterator():
+                    if raw_frame.is_comment:
+                        # Provider heartbeat frames relay/observe as comments.
+                        yield RelayStreamItem(events=[], raw=raw_frame.raw, is_comment=True)
+                        continue
+                    raw_chunk = raw_frame.parsed
                     self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
-                    event = protocol.parse_stream_event(raw_chunk, response_context)
-                    self._trace(context, "parsed_native_unified_stream_event", event, direction="stream", stage="protocol", snapshot=False)
-                    if event.type == "error" or event.error is not None:
-                        error = event.error if isinstance(event.error, dict) else {"message": str(event.error or "Provider stream failed")}
+                    if parse_stream_events_plural is not None:
+                        frame_events = list(parse_stream_events_plural(raw_chunk, response_context))
+                    else:
+                        frame_events = [protocol.parse_stream_event(raw_chunk, response_context)]
+                    for parsed_event in frame_events:
+                        self._trace(context, "parsed_native_unified_stream_event", parsed_event, direction="stream", stage="protocol", snapshot=False)
+                    error_event = next(
+                        (e for e in frame_events if e.type == "error" or e.error is not None),
+                        None,
+                    )
+                    if error_event is not None:
+                        error = error_event.error if isinstance(error_event.error, dict) else {"message": str(error_event.error or "Provider stream failed")}
                         raise StreamedAPIError(
                             str(error.get("message") or error.get("type") or error.get("code") or "Provider stream failed"),
                             data={"error": deepcopy(error)},
                         )
-                    usage_record = _merge_stream_usage_records(
-                        usage_record,
-                        extract_usage_record(serialize_value(event), provider=context.provider, model=context.model, source="native_stream_event"),
-                        extract_usage_record(raw_chunk, provider=context.provider, model=context.model, source="native_raw_stream_event"),
-                    )
-                    is_terminal = event.type == "done"
-                    event_index += 1
+                    for parsed_event in frame_events:
+                        usage_record = _merge_stream_usage_records(
+                            usage_record,
+                            extract_usage_record(serialize_value(parsed_event), provider=context.provider, model=context.model, source="native_stream_event"),
+                            extract_usage_record(raw_chunk, provider=context.provider, model=context.model, source="native_raw_stream_event"),
+                        )
+                    terminal_event = next((e for e in frame_events if e.type in _NATIVE_TERMINAL_EVENT_TYPES), None)
+                    is_terminal = terminal_event is not None
+                    if terminal_event is None:
+                        event_index += 1
+                    # G4 repair evidence (provider's own reasons survive EOF).
+                    for parsed_event in frame_events:
+                        if parsed_event.stop_reason:
+                            root_context.stream_repair_state.last_provider_reason = parsed_event.stop_reason
+                            output_index = getattr(parsed_event, "output_index", None)
+                            try:
+                                choice_key = int(output_index) if output_index is not None else 0
+                            except (TypeError, ValueError):
+                                choice_key = 0
+                            root_context.stream_repair_state.held_reasons[choice_key] = parsed_event.stop_reason
+                        delta = parsed_event.delta or parsed_event.message
+                        if delta is not None and getattr(delta, "tool_calls", None):
+                            root_context.stream_repair_state.tools_seen = True
                     # G2 S2 (stream_event): hooks own EVERY event, including
                     # the terminal one (D3 — done no longer bypasses slots).
-                    outcome = await self._fire(context, "stream_event", event, direction="stream", is_terminal=is_terminal, event_index=event_index)
-                    if outcome.action is HookAction.DROP:
-                        if is_terminal:
-                            # Dropping the terminal event ends the read loop;
-                            # the operational layer synthesizes a terminal if
-                            # none was emitted (completion gate).
-                            break
-                        continue
-                    event = outcome.payload
-                    if is_terminal:
-                        # Terminal provider signal: hand the operational layer the
-                        # authoritative event and stop reading the wire.
-                        self._trace(context, "parsed_native_stream_event", stream_event_payload(event), direction="stream", stage="protocol")
-                        root_context.stream_usage_record = usage_record
-                        context.stream_usage_record = usage_record
-                        yield event
-                        break
+                    fired_events = []
+                    hook_modified = False
+                    for parsed_event in frame_events:
+                        outcome = await self._fire(context, "stream_event", parsed_event, direction="stream", is_terminal=is_terminal, event_index=event_index)
+                        if outcome.action is HookAction.DROP:
+                            if is_terminal:
+                                break
+                            continue
+                        if outcome.modified:
+                            hook_modified = True
+                        fired_events.append(outcome.payload)
+                    if hook_modified:
+                        root_context.stream_repair_state.edited_by_hook = True
                     # W7 contract (plan §2.5): stream adapters run on the NEUTRAL
                     # parsed event — provider frames are SSE-wrapped transport,
                     # not discrete wire payloads; neutral is the protocol-free
-                    # seam where adapter edits stay client-agnostic.
-                    adapter_context = context.adapter_context()
-                    # Native stream traces apply field-cache path redaction below.
-                    # Suppress generic adapter-chain snapshots here so provider state
-                    # cannot leak before rule-aware redaction runs.
-                    adapter_context.transaction_logger = None
-                    event = await run_adapter_chain(adapters, event, adapter_context, stage="stream_event")
-                    self._trace(context, "after_stream_event_adapter_chain", event, direction="stream", stage="adapter", snapshot=False)
-                    await cache_engine.extract("unified_stream_event", serialize_value(event), context.field_cache_context(), transaction_logger=logger)
-                    self._trace(context, "after_unified_stream_event_field_cache_extraction", {"source": "unified_stream_event"}, direction="stream", stage="adapter", snapshot=False)
-                    event_payload = stream_event_payload(event)
-                    self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
-                    await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
-                    self._trace(
-                        context,
-                        "after_field_cache_stream_extraction",
-                        {"source": "stream_event"},
-                        direction="stream",
-                        stage="adapter",
-                        snapshot=False,
-                    )
-                    yield event
+                    # seam where adapter edits stay client-agnostic. Terminal
+                    # events run the SAME pass (continuation ids live in
+                    # response.completed — extraction must see them).
+                    for idx, parsed_event in enumerate(fired_events):
+                        adapter_context = context.adapter_context()
+                        # Native stream traces apply field-cache path redaction below.
+                        # Suppress generic adapter-chain snapshots here so provider state
+                        # cannot leak before rule-aware redaction runs.
+                        adapter_context.transaction_logger = None
+                        adapted = parsed_event
+                        if terminal_event is None and adapters:
+                            # Adapter chain contract: neutral non-terminal
+                            # events only (the historical seam); extracts
+                            # below still run for terminals. An EMPTY chain
+                            # must not flip edited_by_hook — run_adapter_chain
+                            # deep-copies even with no adapters.
+                            adapted = await run_adapter_chain(adapters, parsed_event, adapter_context, stage="stream_event")
+                            if adapted is not parsed_event:
+                                root_context.stream_repair_state.edited_by_hook = True
+                            fired_events[idx] = adapted
+                            self._trace(context, "after_stream_event_adapter_chain", adapted, direction="stream", stage="adapter", snapshot=False)
+                        await cache_engine.extract("unified_stream_event", serialize_value(adapted), context.field_cache_context(), transaction_logger=logger)
+                        self._trace(context, "after_unified_stream_event_field_cache_extraction", {"source": "unified_stream_event"}, direction="stream", stage="adapter", snapshot=False)
+                        event_payload = stream_event_payload(adapted)
+                        self._trace(context, "parsed_native_stream_event", event_payload, direction="stream", stage="protocol")
+                        await cache_engine.extract("stream_event", event_payload, context.field_cache_context(), transaction_logger=logger)
+                        self._trace(
+                            context,
+                            "after_field_cache_stream_extraction",
+                            {"source": "stream_event"},
+                            direction="stream",
+                            stage="adapter",
+                            snapshot=False,
+                        )
+                    if terminal_event is not None and fired_events:
+                        # Terminal provider signal: hand the operational layer
+                        # the authoritative events and stop reading the wire.
+                        root_context.stream_usage_record = usage_record
+                        context.stream_usage_record = usage_record
+                        yield RelayStreamItem(events=fired_events, raw=raw_frame.raw)
+                        break
+                    yield RelayStreamItem(events=fired_events, raw=raw_frame.raw)
                 # Post-loop success path: S3 fires INSIDE the try so S4
                 # (finally) is always the last stream stage.
                 root_context.stream_usage_record = usage_record
@@ -976,18 +1062,6 @@ def _without_provider_continuation_rules(context: NativeProviderContext) -> Nati
         )
     )
     return context if rules == context.field_cache_rules else replace(context, field_cache_rules=rules)
-
-
-def _usage_record_has_values(record: Any) -> bool:
-    return bool(
-        record.input_tokens
-        or record.completion_tokens
-        or record.reasoning_tokens
-        or record.cache_read_tokens
-        or record.cache_write_tokens
-        or record.raw_total_tokens
-        or record.provider_reported_cost is not None
-    )
 
 
 def _usage_record_has_token_values(record: Any) -> bool:

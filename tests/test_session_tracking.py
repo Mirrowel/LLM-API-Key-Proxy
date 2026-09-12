@@ -18,9 +18,75 @@ from rotator_library.session_tracking import (
     SessionTrackingHints,
     _AnchorRecord,
 )
-from rotator_library.client.streaming import StreamingHandler
+from rotator_library.client.stream_ops import (
+    ChatWireStreamAdapter,
+    NeutralStreamPipeline,
+    StreamUsageTracker,
+    _assembled_tool_calls,
+    _completion_signal,
+)
+from rotator_library.protocols.types import (
+    ContentBlock,
+    ProtocolContext,
+    ToolCall,
+    UnifiedMessage,
+    UnifiedStreamEvent,
+    Usage,
+)
 from rotator_library.client.rotating_client import _resolve_session_persistence_settings
 from rotator_library.client.request_builder import RequestContextBuilder
+
+
+def _stream_protocol_context(model: str = "model") -> ProtocolContext:
+    return ProtocolContext(
+        provider="openai",
+        model=model,
+        source_protocol="openai_chat",
+        target_protocol="openai_chat",
+        input_protocol="openai_chat",
+        provider_protocol="openai_chat",
+        client_protocol="openai_chat",
+        transport="sse",
+    )
+
+
+def _stream_pipeline(model: str = "model", **kwargs) -> NeutralStreamPipeline:
+    return NeutralStreamPipeline(
+        client_protocol_name="openai_chat",
+        protocol_context=_stream_protocol_context(model),
+        model=model,
+        **kwargs,
+    )
+
+
+def _tool_event(call_id, name, arguments, *, index=0, output_index=0) -> UnifiedStreamEvent:
+    call = ToolCall(id=call_id, name=name, arguments=arguments, index=index)
+    return UnifiedStreamEvent(
+        type="message_delta",
+        source_protocol="openai_chat",
+        output_index=output_index,
+        delta=UnifiedMessage(role="assistant", content=[], tool_calls=[call]),
+    )
+
+
+def _collect_neutral_events(sse_string: str, model: str = "model"):
+    """Parse one raw chat SSE frame string into live neutral events."""
+
+    async def _run():
+        adapter = ChatWireStreamAdapter(model)
+        async def _source():
+            yield sse_string
+        return [event async for event in adapter.events(_source(), StreamUsageTracker(model))]
+
+    return asyncio.run(_run())
+
+
+def _consume_chat_stream(pipeline: NeutralStreamPipeline, raw_stream, model: str = "model"):
+    async def _run():
+        adapter = ChatWireStreamAdapter(model, repair_state=pipeline.repair_state)
+        return [frame async for frame in pipeline.run(adapter.events(raw_stream, pipeline.usage))]
+
+    return asyncio.run(_run())
 
 
 class SessionTrackerTests(unittest.TestCase):
@@ -4153,41 +4219,43 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertEqual(tracker._anchors, {})
 
     def test_streaming_chunk_collector_preserves_response_anchors(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         assistant_parts = []
         tool_call_ids = []
 
-        handler._collect_session_response_anchors(
-            'data: {"choices":[{"delta":{"content":"hello ","tool_calls":[{"id":"call_1"}]}}]}\n\n',
-            assistant_parts,
-            tool_call_ids,
+        event = UnifiedStreamEvent(
+            type="message_delta",
+            source_protocol="openai_chat",
+            delta=UnifiedMessage(
+                role="assistant",
+                content=[ContentBlock(type="text", text="hello ")],
+                tool_calls=[ToolCall(id="call_1")],
+            ),
         )
+        pipeline._collect_anchors(event, assistant_parts, tool_call_ids, {})
 
         self.assertEqual(assistant_parts, ["hello "])
         self.assertEqual(tool_call_ids, ["call_1"])
 
     def test_streaming_collector_reassembles_structural_tool_event(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         assistant_parts = []
         tool_call_ids = []
         tool_call_events = {}
-        handler._collect_session_response_anchors(
-            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1",'
-            '"function":{"name":"read_file","arguments":"{\\"path\\":"}}]}}]}'
-            "\n\n",
+        pipeline._collect_anchors(
+            _tool_event("call_1", "read_file", '{"path":'),
             assistant_parts,
             tool_call_ids,
             tool_call_events,
         )
-        handler._collect_session_response_anchors(
-            'data: {"choices":[{"delta":{"tool_calls":[{"index":0,'
-            '"function":{"arguments":"\\"a.py\\"}"}}]}}]}\n\n',
+        pipeline._collect_anchors(
+            _tool_event(None, None, '"a.py"}'),
             assistant_parts,
             tool_call_ids,
             tool_call_events,
         )
 
-        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+        assembled = _assembled_tool_calls(tool_call_ids, tool_call_events)
 
         self.assertEqual(
             assembled,
@@ -4203,52 +4271,23 @@ class SessionTrackerTests(unittest.TestCase):
         )
 
     def test_streaming_tool_events_separate_choices_with_shared_indexes(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         tool_call_ids = []
         tool_call_events = {}
-        handler._collect_session_response_anchors(
-            "data: "
-            + json.dumps(
-                {
-                    "choices": [
-                        {
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "call_a",
-                                        "function": {
-                                            "name": "read_file",
-                                            "arguments": '{"path":"a.py"}',
-                                        },
-                                    }
-                                ]
-                            }
-                        },
-                        {
-                            "delta": {
-                                "tool_calls": [
-                                    {
-                                        "index": 0,
-                                        "id": "call_b",
-                                        "function": {
-                                            "name": "read_file",
-                                            "arguments": '{"path":"b.py"}',
-                                        },
-                                    }
-                                ]
-                            }
-                        },
-                    ]
-                }
-            )
-            + "\n\n",
+        pipeline._collect_anchors(
+            _tool_event("call_a", "read_file", '{"path":"a.py"}', output_index=0),
+            [],
+            tool_call_ids,
+            tool_call_events,
+        )
+        pipeline._collect_anchors(
+            _tool_event("call_b", "read_file", '{"path":"b.py"}', output_index=1),
             [],
             tool_call_ids,
             tool_call_events,
         )
 
-        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+        assembled = _assembled_tool_calls(tool_call_ids, tool_call_events)
 
         self.assertEqual([call["id"] for call in assembled], ["call_a", "call_b"])
         self.assertEqual(
@@ -4257,43 +4296,26 @@ class SessionTrackerTests(unittest.TestCase):
         )
 
     def test_streaming_tool_events_use_choice_index_across_separate_frames(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         tool_call_ids = []
         tool_call_events = {}
         for choice_index, call_id, path in (
             (0, "call_a", "a.py"),
             (1, "call_b", "b.py"),
         ):
-            handler._collect_session_response_anchors(
-                "data: "
-                + json.dumps(
-                    {
-                        "choices": [
-                            {
-                                "index": choice_index,
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": 0,
-                                            "id": call_id,
-                                            "function": {
-                                                "name": "read_file",
-                                                "arguments": json.dumps({"path": path}),
-                                            },
-                                        }
-                                    ]
-                                },
-                            }
-                        ]
-                    }
-                )
-                + "\n\n",
+            pipeline._collect_anchors(
+                _tool_event(
+                    call_id,
+                    "read_file",
+                    json.dumps({"path": path}),
+                    output_index=choice_index,
+                ),
                 [],
                 tool_call_ids,
                 tool_call_events,
             )
 
-        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+        assembled = _assembled_tool_calls(tool_call_ids, tool_call_events)
 
         self.assertEqual([call["id"] for call in assembled], ["call_a", "call_b"])
         self.assertEqual(
@@ -4302,39 +4324,18 @@ class SessionTrackerTests(unittest.TestCase):
         )
 
     def test_streaming_cumulative_argument_snapshots_replace_instead_of_append(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         tool_call_ids = []
         tool_call_events = {}
         for arguments in ('{"path":', '{"path":"a.py"}'):
-            handler._collect_session_response_anchors(
-                "data: "
-                + json.dumps(
-                    {
-                        "choices": [
-                            {
-                                "delta": {
-                                    "tool_calls": [
-                                        {
-                                            "index": 0,
-                                            "id": "call_1",
-                                            "function": {
-                                                "name": "read_file",
-                                                "arguments": arguments,
-                                            },
-                                        }
-                                    ]
-                                }
-                            }
-                        ]
-                    }
-                )
-                + "\n\n",
+            pipeline._collect_anchors(
+                _tool_event("call_1", "read_file", arguments),
                 [],
                 tool_call_ids,
                 tool_call_events,
             )
 
-        assembled = handler._assembled_tool_calls(tool_call_ids, tool_call_events)
+        assembled = _assembled_tool_calls(tool_call_ids, tool_call_events)
 
         self.assertEqual(
             assembled[0]["function"]["arguments"],
@@ -4342,7 +4343,6 @@ class SessionTrackerTests(unittest.TestCase):
         )
 
     def test_completed_streamed_tool_call_bridges_closed_event_across_provider(self):
-        handler = StreamingHandler()
         tracker = SessionTracker(ttl_seconds=3600)
         user_message = {
             "role": "user",
@@ -4409,19 +4409,9 @@ class SessionTrackerTests(unittest.TestCase):
                 }
             ) + "\n\n"
 
-        async def consume():
-            return [
-                chunk
-                async for chunk in handler.wrap_stream(
-                    stream(),
-                    "credential",
-                    "model",
-                    response_callback=record,
-                )
-            ]
-
-        asyncio.run(consume())
-        assistant = responses[0]["choices"][0]["message"]
+        pipeline = _stream_pipeline("model", response_callback=record)
+        _consume_chat_stream(pipeline, stream(), "model")
+        assistant = responses[0]["messages"][0]
         continued = tracker.infer_session(
             {
                 "messages": [
@@ -4442,7 +4432,7 @@ class SessionTrackerTests(unittest.TestCase):
         self.assertEqual(continued.confidence, "probable")
 
     def test_streaming_chunk_collector_ignores_non_evidence_payloads(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         assistant_parts = []
         tool_call_ids = []
         payloads = (
@@ -4457,37 +4447,35 @@ class SessionTrackerTests(unittest.TestCase):
         )
 
         for payload in payloads:
-            handler._collect_session_response_anchors(
-                payload,
-                assistant_parts,
-                tool_call_ids,
-            )
+            try:
+                events = _collect_neutral_events(payload)
+            except Exception:
+                # Malformed frames are ignored, exactly as the legacy collector did.
+                continue
+            for event in events:
+                pipeline._collect_anchors(event, assistant_parts, tool_call_ids, {})
 
         self.assertEqual(assistant_parts, [])
         self.assertEqual(tool_call_ids, [])
 
     def test_streaming_chunk_collector_accepts_event_frames_and_data_without_space(self):
-        handler = StreamingHandler()
+        pipeline = _stream_pipeline()
         assistant_parts = []
         tool_call_ids = []
-        handler._collect_session_response_anchors(
+        frames = (
             'event: message\ndata:{"choices":[{"delta":{"content":"hello ",'
             '"tool_calls":[{"id":"call_1"}]}}]}\n\n',
-            assistant_parts,
-            tool_call_ids,
-        )
-        handler._collect_session_response_anchors(
             'data: {"choices":[{"delta":{"content":"world",'
             '"tool_calls":[{"id":"call_1"}]}}]}\n\n',
-            assistant_parts,
-            tool_call_ids,
         )
+        for frame in frames:
+            for event in _collect_neutral_events(frame):
+                pipeline._collect_anchors(event, assistant_parts, tool_call_ids, {})
 
         self.assertEqual(assistant_parts, ["hello ", "world"])
         self.assertEqual(tool_call_ids, ["call_1"])
 
     def test_stream_eof_without_completion_signal_does_not_record_response_identity(self):
-        handler = StreamingHandler()
         responses = []
 
         async def partial_stream():
@@ -4500,24 +4488,13 @@ class SessionTrackerTests(unittest.TestCase):
                 ]
             }
 
-        async def consume():
-            return [
-                item
-                async for item in handler.wrap_stream(
-                    partial_stream(),
-                    "credential",
-                    "model",
-                    response_callback=responses.append,
-                )
-            ]
-
-        output = asyncio.run(consume())
+        pipeline = _stream_pipeline("model", response_callback=responses.append)
+        output = _consume_chat_stream(pipeline, partial_stream(), "model")
 
         self.assertEqual(responses, [])
         self.assertEqual(output[-1], "data: [DONE]\n\n")
 
     def test_raw_stream_early_finish_reason_without_usage_does_not_record_identity(self):
-        handler = StreamingHandler()
         responses = []
 
         async def truncated_stream():
@@ -4526,44 +4503,37 @@ class SessionTrackerTests(unittest.TestCase):
                 '"finish_reason":"stop"}]}\n\n'
             )
 
-        async def consume():
-            return [
-                item
-                async for item in handler.wrap_stream(
-                    truncated_stream(),
-                    "credential",
-                    "model",
-                    response_callback=responses.append,
-                )
-            ]
-
-        output = asyncio.run(consume())
+        pipeline = _stream_pipeline("model", response_callback=responses.append)
+        output = _consume_chat_stream(pipeline, truncated_stream(), "model")
 
         self.assertEqual(responses, [])
         self.assertEqual(output[-1], "data: [DONE]\n\n")
 
-    def test_raw_sse_completion_requires_done_or_usage_backing(self):
-        handler = StreamingHandler()
-
+    def test_completion_signal_requires_done_or_usage_backing(self):
+        self.assertTrue(_completion_signal(UnifiedStreamEvent(type="done")))
+        self.assertTrue(
+            _completion_signal(
+                UnifiedStreamEvent(
+                    type="message_delta",
+                    stop_reason="stop",
+                    usage=Usage(input_tokens=3),
+                )
+            )
+        )
+        self.assertTrue(
+            _completion_signal(
+                UnifiedStreamEvent(
+                    type="message_delta",
+                    usage=Usage(input_tokens=3),
+                )
+            )
+        )
         self.assertFalse(
-            handler._sse_has_completion_signal(
-                'data: {"choices":[{"finish_reason":"stop"}]}\n\n'
-            )
+            _completion_signal(UnifiedStreamEvent(type="message_delta", stop_reason="stop"))
         )
-        self.assertTrue(
-            handler._sse_has_completion_signal(
-                'data: {"choices":[{"finish_reason":"stop"}],"usage":{}}\n\n'
-            )
-        )
-        self.assertTrue(
-            handler._sse_has_completion_signal(
-                'data: {"choices":[],"usage":{"completion_tokens":3}}\n\n'
-            )
-        )
-        self.assertTrue(handler._sse_has_completion_signal("data: [DONE]\n\n"))
+        self.assertFalse(_completion_signal(UnifiedStreamEvent(type="message_delta")))
 
     def test_stream_finish_reason_records_completed_response_identity(self):
-        handler = StreamingHandler()
         responses = []
 
         async def complete_stream():
@@ -4589,22 +4559,12 @@ class SessionTrackerTests(unittest.TestCase):
                 },
             }
 
-        async def consume():
-            return [
-                item
-                async for item in handler.wrap_stream(
-                    complete_stream(),
-                    "credential",
-                    "model",
-                    response_callback=responses.append,
-                )
-            ]
-
-        output = asyncio.run(consume())
+        pipeline = _stream_pipeline("model", response_callback=responses.append)
+        output = _consume_chat_stream(pipeline, complete_stream(), "model")
 
         self.assertEqual(len(responses), 1)
         self.assertEqual(
-            responses[0]["choices"][0]["message"]["content"],
+            responses[0]["messages"][0]["content"],
             "complete assistant evidence",
         )
         self.assertEqual(output[-1], "data: [DONE]\n\n")

@@ -21,7 +21,7 @@
 ├── docker-compose.yml          # Docker Compose configuration
 ├── requirements.txt            # Python dependencies
 ├── pytest.ini                  # Pytest configuration (asyncio_mode = auto)
-├── decrypt_share_link.py       # Mirrobot share-link decryptor (CI tooling)
+├── start_proxy.bat             # Windows launcher scripts (start_proxy.bat, start_proxy_directly.bat)
 ├── DOCUMENTATION.md            # Detailed technical documentation
 └── README.md                   # Project overview
 ```
@@ -31,7 +31,7 @@
 **`src/proxy_app/`:**
 - Purpose: FastAPI application serving as the user-facing proxy gateway
 - Contains: Route handlers, Pydantic models, TUI tools, startup/lifespan logic
-- Key files: `main.py` (thin route surface), `route_helpers.py` (stream framing with in-band terminal error frames, request overrides, embedding fan-out), `startup.py` (OAuth credential bootstrap), `key_policy.py` (default-key policy: the well-known default `PROXY_API_KEY` is accepted only on localhost binds; interactive enter/generate/skip prompt, hard block without a terminal — the launcher and credential tool reuse its primitives), `launcher_tui.py`, `quota_viewer.py`, `batch_manager.py`, `request_logger.py`, `detailed_logger.py`, `build.py`, `provider_urls.py`, `settings_tool.py`, `model_filter_gui.py`
+- Key files: `main.py` (thin route surface), `route_helpers.py` (stream framing with in-band terminal error frames, request overrides, embedding fan-out, and the shell error bridge `classify_route_error()` / `route_error_response()` over the library classifier), `startup.py` (OAuth credential bootstrap), `key_policy.py` (default-key policy: the well-known default `PROXY_API_KEY` is accepted only on localhost binds; interactive enter/generate/skip prompt, hard block without a terminal — the launcher and credential tool reuse its primitives; ASGI-server launches are detected via argv and the import stack and unprovable binds fail closed as public), `launcher_tui.py`, `quota_viewer.py`, `batch_manager.py`, `request_logger.py`, `detailed_logger.py`, `build.py`, `provider_urls.py`, `settings_tool.py`, `model_filter_gui.py`
 
 **`src/rotator_library/`:**
 - Purpose: Portable resilience library for multi-provider API key rotation
@@ -69,7 +69,7 @@
 
 **`src/rotator_library/routing/`:**
 - Purpose: Resolve model names to ordered execution targets — direct `provider/model` references, env-configured fallback groups, and `provider:profile/model` transport-profile addressing; identity stays provider-level (usage pools, cooldowns, classifiers, session namespaces, cache provenance key on the bare provider name — the profile only steers transport)
-- Key files: `types.py` (`RouteTarget` with `profile` and `execution` ∈ {`auto`, `native`, `custom`, `litellm_fallback`}, `FallbackGroup`, `RoutingDecision`, failover/stop error vocabularies `DEFAULT_FAILOVER_ON` / `DEFAULT_STOP_ON` / `HARD_STOP_ON`), `config.py` (`parse_route_target()` — `provider/model[@execution]`, profile split on the provider segment only so model names keep their colons; `load_routing_config_from_env()` — env vars are the final override layer), `resolver.py` (`FallbackResolver` — model routes, `group:` aliases, requested-target promotion), `executor.py` (`FallbackAttemptRunner`, `FallbackExhaustedError`), `policy.py` (`FallbackPolicy` — error alias normalization and failover/stop decisions), `attempts.py` (`clone_context_for_target()` — per-target context copies preserving the original for traceability), `profiles.py` (`parse_model_reference()`, `resolve_profile()`, `split_profile_from_provider()` — explicit profiles must exist; bare names pick the default profile or the unique profile matching the client protocol, else a fail-fast error, never silent conversion)
+- Key files: `types.py` (`RouteTarget` with `profile` and `execution` ∈ {`auto`, `native`, `custom`, `litellm_fallback`}, `FallbackGroup`, `RoutingDecision`, failover/stop error vocabularies `DEFAULT_FAILOVER_ON` / `DEFAULT_STOP_ON` / `HARD_STOP_ON` — credential-scoped classes (`authentication`, `forbidden`, `not_found`, `conflict`) sit in the default failover set per the operator matrix), `config.py` (`parse_route_target()` — `provider/model[@execution]`, profile split on the provider segment only so model names keep their colons; `load_routing_config_from_env()` — env vars are the final override layer), `resolver.py` (`FallbackResolver` — model routes, `group:` aliases, requested-target promotion), `executor.py` (`FallbackAttemptRunner`, `FallbackExhaustedError`), `policy.py` (`FallbackPolicy` — error alias normalization and failover/stop decisions), `attempts.py` (`clone_context_for_target()` — per-target context copies preserving the original for traceability), `profiles.py` (`parse_model_reference()`, `resolve_profile()`, `split_profile_from_provider()` — explicit profiles must exist; bare names pick the default profile or the unique profile matching the client protocol, else a fail-fast error, never silent conversion)
 - Integration: `RequestContextBuilder._resolve_routing_decision()` stamps `routing_targets` / `routing_group_name` / `routing_group` / `routing_target_index` / `routing_attempt_history` on `RequestContext`; `RequestExecutor` dispatches each target with its `execution` mode
 
 **`src/rotator_library/providers/`:**
@@ -149,7 +149,7 @@
 
 **`src/rotator_library/core/`:**
 - Purpose: Shared types, constants, utilities, and error definitions
-- Key files: `types.py` (`RequestContext` with session tracking fields: `session_affinity_key`, `session_tracker`, `session_possible_compaction`, `session_lineage_parent_id`, `session_tracking_namespace`), `config.py`, `constants.py`, `errors.py`, `utils.py`
+- Key files: `types.py` (`RequestContext` with session tracking fields: `session_affinity_key`, `session_tracker`, `session_possible_compaction`, `session_lineage_parent_id`, `session_tracking_namespace`), `config.py`, `constants.py`, `errors.py` (re-exports `classify_error()`, `should_rotate_on_error()`, `should_retry_same_key()`; `StructuredAPIResponseError` with per-dialect `to_protocol_payload()`, `structured_api_response_error()`, `protocol_error_payload()`), `utils.py`
 
 **`src/rotator_library/config/`:**
 - Purpose: Centralized configuration defaults
@@ -162,7 +162,7 @@
 **`tests/`:**
 - Purpose: Test suite organized by feature area
 - Contains: Unit and integration tests for the rotator library
-- Key files: `test_selection_engine.py`, `test_fair_cycle_and_custom_caps.py`, `test_fallback_groups.py`, `test_error_handler.py`, `test_executor_session_forwarding.py`, `test_session_tracking.py`, `test_protocol_streaming_matrix.py`, `test_w2_neutral_completeness.py`, `test_w3_same_protocol_fidelity.py`, `test_w4_cross_protocol_conversion.py`, `test_w5_stream_parity.py`, `test_w7_adapter_staging.py`, `test_w11_native_default.py`, `test_w12_transaction_tiers.py`, `test_w13_cache_replay.py`, `test_w_prof_profiles.py`, `test_proxy_key_policy.py`, `test_anthropic_transform_tracing.py`, `test_transaction_logger_json_safety.py`
+- Key files: `test_selection_engine.py`, `test_fair_cycle_and_custom_caps.py`, `test_fallback_groups.py`, `test_error_handler.py`, `test_executor_session_forwarding.py`, `test_session_tracking.py`, `test_protocol_streaming_matrix.py`, `test_w2_neutral_completeness.py`, `test_w3_same_protocol_fidelity.py`, `test_w4_cross_protocol_conversion.py`, `test_w5_stream_parity.py`, `test_w7_adapter_staging.py`, `test_w11_native_default.py`, `test_w12_transaction_tiers.py`, `test_w13_cache_replay.py`, `test_w_prof_profiles.py`, `test_proxy_key_policy.py`, `test_anthropic_transform_tracing.py`, `test_transaction_logger_json_safety.py`, `test_g1_error_taxonomy.py`, `test_g1_fail_escape.py`, `test_g1_shell_error_ladder.py`, `test_g15_secrets_hygiene.py`
 
 **`tests/refactor/`:**
 - Purpose: Tests verifying parity after refactoring from monolithic client.py

@@ -342,7 +342,9 @@ async def test_chat_wire_intermediate_finish_reasons_are_held_back() -> None:
 
 @pytest.mark.asyncio
 async def test_chat_wire_tool_finish_priority() -> None:
-    # Simpler: final frame with finish_reason stop after tool calls.
+    # G4 ruling: the provider's own final-frame reason wins — a final frame
+    # that says `stop` after tool calls stays `stop`. Tools-seen only fills
+    # in when the provider never stated a reason.
     async def stream2():
         yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-1", "function": {"name": "f", "arguments": "{}"}}]}}]}
         yield {"choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
@@ -351,7 +353,16 @@ async def test_chat_wire_tool_finish_priority() -> None:
     adapter = ChatWireStreamAdapter("model-a")
     events = [event async for event in adapter.events(stream2(), tracker)]
 
-    assert events[-1].stop_reason == "tool_calls"
+    assert events[-1].stop_reason == "stop"
+
+    # Complementary: provider never states a reason → tools-seen infers.
+    async def stream3():
+        yield {"choices": [{"delta": {"tool_calls": [{"index": 0, "id": "call-2", "function": {"name": "g", "arguments": "{}"}}]}}]}
+        yield {"choices": [{"delta": {}, "finish_reason": None}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+    adapter3 = ChatWireStreamAdapter("model-a")
+    events3 = [event async for event in adapter3.events(stream3(), StreamUsageTracker("model-a"))]
+    assert events3[-1].stop_reason == "tool_calls"
 
 
 @pytest.mark.asyncio

@@ -946,15 +946,36 @@ class TransactionLogger:
         if not chunks:
             return {}
 
-        final_message: Dict[str, Any] = {"role": "assistant"}
-        aggregated_tool_calls: Dict[int, Dict[str, Any]] = {}
+        # Per-choice aggregation: a stream may carry n>1 siblings, each with
+        # its own content, tool calls, and finish reason. Choices are keyed by
+        # their provider-assigned index and re-emitted with that index intact.
+        # Lifecycle: an index is initialized on first sight and kept in
+        # `choice_order` so the final response preserves arrival order.
+        choice_messages: Dict[int, Dict[str, Any]] = {}
+        choice_tools: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        choice_finish: Dict[int, Optional[str]] = {}
+        choice_order: list[int] = []
         usage_data = None
-        finish_reason = None
 
         for chunk in chunks:
-            if "choices" in chunk and chunk["choices"]:
-                choice = chunk["choices"][0]
+            if not isinstance(chunk, dict):
+                continue
+
+            for choice in chunk.get("choices") or []:
+                if not isinstance(choice, dict):
+                    continue
+                index = choice.get("index", 0)
+                if index not in choice_messages:
+                    choice_messages[index] = {"role": "assistant"}
+                    choice_tools[index] = {}
+                    choice_finish[index] = None
+                    choice_order.append(index)
+
+                final_message = choice_messages[index]
+                aggregated_tool_calls = choice_tools[index]
                 delta = choice.get("delta", {})
+                if not isinstance(delta, dict):
+                    delta = {}
 
                 # Dynamically aggregate all fields from the delta
                 for key, value in delta.items():
@@ -968,31 +989,26 @@ class TransactionLogger:
                             final_message["content"] += value
 
                     elif key == "tool_calls":
-                        for tc_chunk in value:
-                            index = tc_chunk.get("index", 0)
-                            if index not in aggregated_tool_calls:
-                                aggregated_tool_calls[index] = {
+                        for tc_chunk in value or []:
+                            tc_index = tc_chunk.get("index", 0)
+                            if tc_index not in aggregated_tool_calls:
+                                aggregated_tool_calls[tc_index] = {
                                     "type": "function",
                                     "function": {"name": "", "arguments": ""},
                                 }
-                            if "function" not in aggregated_tool_calls[index]:
-                                aggregated_tool_calls[index]["function"] = {
-                                    "name": "",
-                                    "arguments": "",
-                                }
+                            entry = aggregated_tool_calls[tc_index]
+                            if "function" not in entry:
+                                entry["function"] = {"name": "", "arguments": ""}
                             if tc_chunk.get("id"):
-                                aggregated_tool_calls[index]["id"] = tc_chunk["id"]
-                            if "function" in tc_chunk:
-                                if "name" in tc_chunk["function"]:
-                                    if tc_chunk["function"]["name"] is not None:
-                                        aggregated_tool_calls[index]["function"][
-                                            "name"
-                                        ] += tc_chunk["function"]["name"]
-                                if "arguments" in tc_chunk["function"]:
-                                    if tc_chunk["function"]["arguments"] is not None:
-                                        aggregated_tool_calls[index]["function"][
-                                            "arguments"
-                                        ] += tc_chunk["function"]["arguments"]
+                                entry["id"] = tc_chunk["id"]
+                            tc_function = tc_chunk.get("function")
+                            if isinstance(tc_function, dict):
+                                if tc_function.get("name") is not None:
+                                    entry["function"]["name"] += tc_function["name"]
+                                if tc_function.get("arguments") is not None:
+                                    entry["function"]["arguments"] += tc_function[
+                                        "arguments"
+                                    ]
 
                     elif key == "function_call":
                         if "function_call" not in final_message:
@@ -1025,35 +1041,50 @@ class TransactionLogger:
                             # keep logging robust by taking the latest value.
                             final_message[key] = value
 
-                if "finish_reason" in choice and choice["finish_reason"]:
-                    finish_reason = choice["finish_reason"]
+                # Provider-stated finish wins. Last non-empty statement per
+                # choice is retained; the "tool_calls"/"stop" fallback applies
+                # only when the provider never stated a reason for that choice.
+                if choice.get("finish_reason"):
+                    choice_finish[index] = choice["finish_reason"]
 
-            if "usage" in chunk and chunk["usage"]:
+            if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                 usage_data = chunk["usage"]
 
         # Final Response Construction
-        if aggregated_tool_calls:
-            final_message["tool_calls"] = list(aggregated_tool_calls.values())
-            finish_reason = "tool_calls"
+        final_choices: list[Dict[str, Any]] = []
+        for index in choice_order:
+            final_message = choice_messages[index]
+            aggregated_tool_calls = choice_tools[index]
 
-        # Ensure standard fields are present
-        for field in ["content", "tool_calls", "function_call"]:
-            if field not in final_message:
-                final_message[field] = None
+            if aggregated_tool_calls:
+                final_message["tool_calls"] = list(aggregated_tool_calls.values())
 
-        first_chunk = chunks[0]
-        final_choice = {
-            "index": 0,
-            "message": final_message,
-            "finish_reason": finish_reason,
-        }
+            # Ensure standard fields are present
+            for field in ["content", "tool_calls", "function_call"]:
+                if field not in final_message:
+                    final_message[field] = None
+
+            finish_reason = choice_finish[index]
+            if not finish_reason:
+                # Infer only when the provider stated nothing for this choice.
+                finish_reason = "tool_calls" if aggregated_tool_calls else "stop"
+
+            final_choices.append(
+                {
+                    "index": index,
+                    "message": final_message,
+                    "finish_reason": finish_reason,
+                }
+            )
+
+        first_chunk = chunks[0] if isinstance(chunks[0], dict) else {}
 
         full_response = {
             "id": first_chunk.get("id"),
             "object": "chat.completion",
             "created": first_chunk.get("created"),
             "model": first_chunk.get("model"),
-            "choices": [final_choice],
+            "choices": final_choices,
             "usage": usage_data,
         }
 

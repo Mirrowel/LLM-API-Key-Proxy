@@ -295,13 +295,14 @@ async def test_stream_parity_hook_declaration_vs_adapter_names():
 
     async def texts_for(context) -> list[str]:
         collected: list[str] = []
-        async for event in NativeProviderExecutor().stream(
+        async for item in NativeProviderExecutor().stream(
             {"model": "gpt-test", "messages": [{"role": "user", "content": "hello"}], "stream": True},
             context,
             NativeHTTPTransport(_FakeStreamClient(chunks())),
         ):
-            if event.type == "message_delta" and event.delta is not None:
-                collected.append("".join(b.text or "" for b in (event.delta.content or []) if getattr(b, "type", "") == "text"))
+            for event in getattr(item, "events", [item]):
+                if event.type == "message_delta" and event.delta is not None:
+                    collected.append("".join(b.text or "" for b in (event.delta.content or []) if getattr(b, "type", "") == "text"))
         return collected
 
     via_adapters = await texts_for(_context(adapter_names=("g2_upper_stream",)))

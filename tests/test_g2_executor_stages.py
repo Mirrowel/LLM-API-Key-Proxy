@@ -214,12 +214,12 @@ async def test_stream_stages_fire_including_terminal_and_cleanup():
     context = _context(hook_class_declarations=(recorder,))
     executor = NativeProviderExecutor()
     events = []
-    async for event in executor.stream(
+    async for item in executor.stream(
         {"model": "gpt-test", "messages": [{"role": "user", "content": "hello"}], "stream": True},
         context,
         NativeHTTPTransport(_FakeStreamClient(_stream_chunks())),
     ):
-        events.append(event)
+        events.extend(getattr(item, "events", [item]))
     stages = [s for s, d, t in recorder.seen]
     # terminal flows through the S2 slot (D3 — no more done-bypass)
     stream_events = [(s, t) for s, d, t in recorder.seen if s == "stream_event"]
@@ -273,13 +273,14 @@ async def test_stream_event_drop_and_replace():
     chunks.insert(1, {"id": "c1", "object": "chat.completion.chunk", "created": 1, "model": "gpt-test",
                       "choices": [{"index": 0, "delta": {"content": "secret-bit"}, "finish_reason": None}]})
     texts = []
-    async for event in executor.stream(
+    async for item in executor.stream(
         {"model": "gpt-test", "messages": [{"role": "user", "content": "hello"}], "stream": True},
         context,
         NativeHTTPTransport(_FakeStreamClient(chunks)),
     ):
-        if event.type == "message_delta" and event.delta is not None:
-            texts.append("".join(b.text or "" for b in (event.delta.content or []) if getattr(b, "type", "") == "text"))
+        for event in getattr(item, "events", [item]):
+            if event.type == "message_delta" and event.delta is not None:
+                texts.append("".join(b.text or "" for b in (event.delta.content or []) if getattr(b, "type", "") == "text"))
     assert "HE" in texts and "secret-bit" not in texts
     assert filt.dropped == 1 and filt.replaced == 1
 

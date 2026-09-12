@@ -27,6 +27,7 @@ from rotator_library.core.errors import (
     protocol_error_payload,
 )
 from rotator_library.error_handler import classify_error
+from rotator_library.transaction_logger import TransactionLogger
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -238,85 +239,14 @@ async def streaming_response_wrapper(
 
 
 def _aggregate_chat_chunks(response_chunks: list[dict[str, Any]]) -> dict[str, Any]:
-    """Assemble streamed chat chunks into one final response shape."""
+    """Assemble streamed chat chunks into one final response shape.
 
-    final_message: dict[str, Any] = {"role": "assistant"}
-    aggregated_tool_calls: dict[int, dict[str, Any]] = {}
-    usage_data = None
-    finish_reason = None
+    Delegates to the canonical assembler so every aggregation surface shares
+    one ruling: per-choice sibling retention, provider finish wins, and the
+    infer-only-when-absent fallback.
+    """
 
-    for chunk in response_chunks:
-        if "choices" in chunk and chunk["choices"]:
-            choice = chunk["choices"][0]
-            delta = choice.get("delta", {})
-
-            for key, value in delta.items():
-                if value is None:
-                    continue
-                if key == "content":
-                    final_message.setdefault("content", "")
-                    if value:
-                        final_message["content"] += value
-                elif key == "tool_calls":
-                    for tc_chunk in value:
-                        index = tc_chunk["index"]
-                        entry = aggregated_tool_calls.setdefault(
-                            index,
-                            {"type": "function", "function": {"name": "", "arguments": ""}},
-                        )
-                        if tc_chunk.get("id"):
-                            entry["id"] = tc_chunk["id"]
-                        if "function" in tc_chunk:
-                            if tc_chunk["function"].get("name"):
-                                entry["function"]["name"] += tc_chunk["function"]["name"]
-                            if tc_chunk["function"].get("arguments"):
-                                entry["function"]["arguments"] += tc_chunk["function"]["arguments"]
-                elif key == "function_call":
-                    call = final_message.setdefault("function_call", {"name": "", "arguments": ""})
-                    if value.get("name"):
-                        call["name"] += value["name"]
-                    if value.get("arguments"):
-                        call["arguments"] += value["arguments"]
-                else:
-                    # Role always replaces; other keys concatenate strings,
-                    # extend lists, or replace on shape changes (provider
-                    # extension fields can change shape across chunks).
-                    if key == "role":
-                        final_message[key] = value
-                    elif key not in final_message:
-                        final_message[key] = value
-                    elif isinstance(final_message.get(key), str) and isinstance(value, str):
-                        final_message[key] += value
-                    elif isinstance(final_message.get(key), list) and isinstance(value, list):
-                        final_message[key].extend(value)
-                    else:
-                        final_message[key] = value
-
-            if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
-
-        if chunk.get("usage"):
-            usage_data = chunk["usage"]
-
-    if aggregated_tool_calls:
-        final_message["tool_calls"] = list(aggregated_tool_calls.values())
-        # Agentic systems continue the conversation loop on this reason.
-        finish_reason = "tool_calls"
-
-    for field in ("content", "tool_calls", "function_call"):
-        final_message.setdefault(field, None)
-
-    first_chunk = response_chunks[0]
-    return {
-        "id": first_chunk.get("id"),
-        "object": "chat.completion",
-        "created": first_chunk.get("created"),
-        "model": first_chunk.get("model"),
-        "choices": [
-            {"index": 0, "message": final_message, "finish_reason": finish_reason}
-        ],
-        "usage": usage_data,
-    }
+    return TransactionLogger.assemble_streaming_response(response_chunks)
 
 
 def apply_temperature_override(request_data: dict[str, Any]) -> None:

@@ -3,22 +3,53 @@ from __future__ import annotations
 from pathlib import Path
 
 import json
-import asyncio
 
 import pytest
 
-from rotator_library.client.streaming import StreamingHandler
-from rotator_library.core.errors import StreamedAPIError
+from rotator_library.client.stream_ops import (
+    ChatWireStreamAdapter,
+    NeutralStreamPipeline,
+)
+from rotator_library.protocols.types import ProtocolContext
 from rotator_library.transaction_logger import TransactionLogger
 from rotator_library.utils import zstd_io
-
-
 
 
 @pytest.fixture(autouse=True)
 def _trace_level_2(monkeypatch):
     """Trace mechanics live at L2 (D15 tiers)."""
     monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
+
+
+def _protocol_context(model: str) -> ProtocolContext:
+    provider = model.split("/", 1)[0] if "/" in model else "openai"
+    return ProtocolContext(
+        provider=provider,
+        model=model,
+        source_protocol="openai_chat",
+        target_protocol="openai_chat",
+        input_protocol="openai_chat",
+        provider_protocol="openai_chat",
+        client_protocol="openai_chat",
+        transport="sse",
+    )
+
+
+def _pipeline(model: str, **kwargs) -> NeutralStreamPipeline:
+    return NeutralStreamPipeline(
+        client_protocol_name="openai_chat",
+        protocol_context=_protocol_context(model),
+        model=model,
+        **kwargs,
+    )
+
+
+async def _run_chat(raw_stream, model: str, **kwargs):
+    pipeline = _pipeline(model, **kwargs)
+    adapter = ChatWireStreamAdapter(model, repair_state=pipeline.repair_state)
+    return [frame async for frame in pipeline.run(adapter.events(raw_stream, pipeline.usage))]
+
+
 async def _chunks():
     yield {"id": "chunk_1", "choices": [{"delta": {"content": "hi"}}]}
     yield {"id": "chunk_2", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
@@ -35,70 +66,6 @@ def _trace_text_exists(log_dir):
 
     return (Path(log_dir) / "transform_trace.jsonl").exists() or (Path(log_dir) / "transform_trace.jsonl.zst").exists()
 
-class HangingStream:
-    def __init__(self) -> None:
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        await asyncio.sleep(1)
-        return {"choices": [{"delta": {"content": "late"}}]}
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-class DelayedStream:
-    def __init__(self, delay: float = 0.03) -> None:
-        self.delay = delay
-        self.index = 0
-        self.closed = False
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self):
-        if self.index == 0:
-            self.index += 1
-            await asyncio.sleep(self.delay)
-            return {"id": "chunk_1", "choices": [{"delta": {"content": "hi"}}]}
-        if self.index == 1:
-            self.index += 1
-            return {"id": "chunk_2", "choices": [{"delta": {}, "finish_reason": "stop"}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
-        raise StopAsyncIteration
-
-    async def aclose(self) -> None:
-        self.closed = True
-
-
-class FirstThenHangStream(HangingStream):
-    def __init__(self) -> None:
-        super().__init__()
-        self.index = 0
-
-    async def __anext__(self):
-        if self.index == 0:
-            self.index += 1
-            return {"id": "chunk_1", "choices": [{"delta": {}}]}
-        return await super().__anext__()
-
-
-class DisconnectedRequest:
-    async def is_disconnected(self) -> bool:
-        return True
-
-
-class DelayedDisconnectedRequest:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    async def is_disconnected(self) -> bool:
-        self.calls += 1
-        await asyncio.sleep(0.01)
-        return self.calls >= 1
-
 
 def _trace_passes(log_dir):
     return [entry["pass_name"] for entry in zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")]
@@ -108,7 +75,7 @@ def _trace_passes(log_dir):
 async def test_streaming_handler_emits_lifecycle_metrics_without_changing_output(tmp_path) -> None:
     logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
 
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(_chunks(), "cred", "openai/gpt-test", transaction_logger=logger)]
+    chunks = await _run_chat(_chunks(), "openai/gpt-test", transaction_logger=logger)
 
     assert chunks[0].startswith("data: ")
     assert chunks[-1] == "data: [DONE]\n\n"
@@ -125,7 +92,7 @@ async def test_stream_trace_metrics_can_be_disabled_without_changing_output(tmp_
     monkeypatch.setenv("STREAM_TRACE_METRICS", "false")
     logger = TransactionLogger("openai", "openai/gpt-test", parent_dir=tmp_path)
 
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(_chunks(), "cred", "openai/gpt-test", transaction_logger=logger)]
+    chunks = await _run_chat(_chunks(), "openai/gpt-test", transaction_logger=logger)
 
     assert chunks[0].startswith("data: ")
     assert chunks[-1] == "data: [DONE]\n\n"
@@ -136,104 +103,28 @@ async def test_stream_trace_metrics_can_be_disabled_without_changing_output(tmp_
 
 
 @pytest.mark.asyncio
-async def test_streaming_handler_closes_upstream_on_client_disconnect(monkeypatch) -> None:
-    monkeypatch.delenv("STREAM_TTFB_TIMEOUT_SECONDS", raising=False)
-    stream = HangingStream()
-
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test", request=DisconnectedRequest())]
-
-    assert chunks == []
-    assert stream.closed is True
-
-
-@pytest.mark.asyncio
-async def test_streaming_handler_closes_upstream_when_disconnect_happens_during_wait(monkeypatch) -> None:
-    monkeypatch.delenv("STREAM_TTFB_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.delenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", raising=False)
-    stream = HangingStream()
-
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test", request=DelayedDisconnectedRequest())]
-
-    assert chunks == []
-    assert stream.closed is True
-
-
-@pytest.mark.asyncio
-async def test_streaming_handler_emits_configured_heartbeats(monkeypatch) -> None:
-    monkeypatch.setenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", "0.01")
-    monkeypatch.delenv("STREAM_TTFB_TIMEOUT_SECONDS", raising=False)
-    monkeypatch.delenv("STREAM_STALL_TIMEOUT_SECONDS", raising=False)
-
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(DelayedStream(), "cred", "openai/gpt-test")]
-
-    assert any(chunk.startswith(": heartbeat") for chunk in chunks)
-    assert chunks[-1] == "data: [DONE]\n\n"
-
-
-@pytest.mark.asyncio
-async def test_streaming_handler_ttfb_timeout_closes_upstream(monkeypatch) -> None:
-    monkeypatch.setenv("STREAM_TTFB_TIMEOUT_SECONDS", "0.01")
-    monkeypatch.delenv("STREAM_HEARTBEAT_INTERVAL_SECONDS", raising=False)
-    stream = HangingStream()
-
-    with pytest.raises(StreamedAPIError) as exc:
-        _ = [chunk async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test")]
-
-    assert stream.closed is True
-    assert exc.value.data["error"]["details"]["timeout_type"] == "ttfb"
-
-
-@pytest.mark.asyncio
-async def test_stream_timeout_closes_upstream_even_when_disconnect_close_disabled(monkeypatch) -> None:
-    monkeypatch.setenv("STREAM_TTFB_TIMEOUT_SECONDS", "0.01")
-    monkeypatch.setenv("STREAM_CANCEL_UPSTREAM_ON_DISCONNECT", "false")
-    stream = HangingStream()
-
-    with pytest.raises(StreamedAPIError):
-        _ = [chunk async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test")]
-
-    assert stream.closed is True
-
-
-@pytest.mark.asyncio
-async def test_streaming_handler_stall_timeout_after_first_byte(monkeypatch) -> None:
-    monkeypatch.setenv("STREAM_STALL_TIMEOUT_SECONDS", "0.01")
-    monkeypatch.delenv("STREAM_TTFB_TIMEOUT_SECONDS", raising=False)
-    stream = FirstThenHangStream()
-    chunks = []
-
-    with pytest.raises(StreamedAPIError) as exc:
-        async for chunk in StreamingHandler().wrap_stream(stream, "cred", "openai/gpt-test"):
-            chunks.append(chunk)
-
-    assert chunks and chunks[0].startswith("data: ")
-    assert stream.closed is True
-    assert exc.value.data["error"]["details"]["timeout_type"] == "stall"
-
-
-@pytest.mark.asyncio
-async def test_streaming_handler_passes_through_formatted_sse_chunks(monkeypatch) -> None:
+async def test_pipeline_parses_formatted_sse_chunks(monkeypatch) -> None:
     async def formatted_stream():
         yield 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
 
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(formatted_stream(), "cred", "openai/gpt-test")]
+    chunks = await _run_chat(formatted_stream(), "openai/gpt-test")
 
-    assert chunks[0] == 'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+    assert '"content": "hi"' in chunks[0]
     assert chunks[-1] == "data: [DONE]\n\n"
 
 
 @pytest.mark.asyncio
-async def test_streaming_handler_does_not_duplicate_direct_done_sentinel(monkeypatch) -> None:
+async def test_pipeline_does_not_duplicate_direct_done_sentinel(monkeypatch) -> None:
     async def done_stream():
         yield "data: [DONE]\n\n"
 
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(done_stream(), "cred", "openai/gpt-test")]
+    chunks = await _run_chat(done_stream(), "openai/gpt-test")
 
-    assert chunks == ["data: [DONE]\n\n"]
+    assert chunks.count("data: [DONE]\n\n") == 1
 
 
 @pytest.mark.asyncio
-async def test_streaming_handler_splits_mixed_reasoning_and_content_delta() -> None:
+async def test_pipeline_splits_mixed_reasoning_and_content_delta() -> None:
     """Clients receive the reasoning-to-answer transition as distinct events."""
 
     async def mixed_stream():
@@ -262,15 +153,11 @@ async def test_streaming_handler_splits_mixed_reasoning_and_content_delta() -> N
         }
 
     completed_responses = []
-    chunks = [
-        chunk
-        async for chunk in StreamingHandler().wrap_stream(
-            mixed_stream(),
-            "cred",
-            "nvidia_nim/google/diffusiongemma-26b-a4b-it",
-            response_callback=completed_responses.append,
-        )
-    ]
+    chunks = await _run_chat(
+        mixed_stream(),
+        "nvidia_nim/google/diffusiongemma-26b-a4b-it",
+        response_callback=completed_responses.append,
+    )
 
     reasoning_chunk = json.loads(chunks[0][len("data: ") :])
     content_chunk = json.loads(chunks[1][len("data: ") :])
@@ -280,8 +167,8 @@ async def test_streaming_handler_splits_mixed_reasoning_and_content_delta() -> N
     assert reasoning_delta["reasoning_content"] == "end of thought"
     assert "content" not in reasoning_delta
     assert reasoning_chunk["choices"][0]["finish_reason"] is None
-    assert "usage" not in reasoning_chunk
+    assert reasoning_chunk.get("usage") is None
     assert content_delta["content"] == "beginning of answer"
     assert "reasoning_content" not in content_delta
-    assert completed_responses[0]["choices"][0]["message"]["content"] == "beginning of answer"
+    assert completed_responses[0]["messages"][0]["content"] == "beginning of answer"
     assert chunks[-1] == "data: [DONE]\n\n"

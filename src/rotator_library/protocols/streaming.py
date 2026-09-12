@@ -92,6 +92,11 @@ class StreamFormatState:
     stop_reason: str | None = None
     stop_sequence: str | None = None
     usage: Usage | None = None
+    # G4: the CLIENT's own stream_options.include_usage request. None keeps
+    # legacy behavior (emit the terminal usage frame whenever usage exists);
+    # False suppresses the extra usage-only chunk per the official chat
+    # streaming grammar (intermediate null-usage also drops with False).
+    include_usage: bool | None = None
     next_index: int = 0
     open_blocks: dict[str, int] = field(default_factory=dict)
     block_order: list[str] = field(default_factory=list)
@@ -293,7 +298,7 @@ def _format_openai(event: UnifiedStreamEvent, state: StreamFormatState) -> list[
         )))
         state.finished_choices.add(choice_index)
     if _is_terminal(event):
-        if state.usage is not None:
+        if state.usage is not None and state.include_usage is not False:
             frames.append(_data_frame(_openai_chunk(state, delta=None, finish_reason=None, usage=state.usage, empty_choices=True)))
         frames.append("data: [DONE]\n\n")
         state.terminal = True
@@ -905,9 +910,12 @@ def _openai_chunk(
         "model": state.model,
         # Documented include_usage grammar: intermediate chunks carry an
         # explicit null usage; the terminal usage chunk carries an EMPTY
-        # choices array.
+        # choices array. G4: when the client explicitly disabled usage
+        # frames the key drops entirely (the official no-usage shape).
         "usage": _openai_usage(usage) if usage is not None else None,
     }
+    if usage is None and state.include_usage is False:
+        payload.pop("usage", None)
     if empty_choices:
         payload["choices"] = []
     else:

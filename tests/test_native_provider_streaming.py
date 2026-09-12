@@ -19,6 +19,14 @@ from rotator_library.transaction_logger import TransactionLogger
 def _trace_level_2(monkeypatch):
     """Trace mechanics live at L2 (D15 tiers)."""
     monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
+async def _drain_native_events(agen):
+    """Unwrap RelayStreamItem frames from the native stream executor."""
+    events = []
+    async for frame in agen:
+        events.extend(frame.events if hasattr(frame, "events") else [frame])
+    return events
+
+
 class FakeStreamingClient:
     def __init__(self, chunks):
         self.chunks = chunks
@@ -65,7 +73,7 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     ]
     client = FakeStreamingClient(chunks)
 
-    events = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(client))]
+    events = await _drain_native_events(NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(client)))
 
     assert len(events) == 2
     first_event = events[0]
@@ -228,14 +236,11 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
         transaction_logger=logger,
     )
 
-    events = [
-        event
-        async for event in NativeProviderExecutor().stream(
-            {"model": "gpt-test", "messages": []},
-            context,
-            NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "before"}}]}, "[DONE]"])),
-        )
-    ]
+    events = await _drain_native_events(NativeProviderExecutor().stream(
+        {"model": "gpt-test", "messages": []},
+        context,
+        NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "before"}}]}, "[DONE]"])),
+    ))
 
     # The neutral-event edit landed after parse — the output carries it.
     assert events[0].delta.content[0].text == "adapted"
@@ -262,7 +267,7 @@ async def test_native_cross_protocol_stream_formats_openai_chat_sse() -> None:
         "[DONE]",
     ]
 
-    events = [event async for event in NativeProviderExecutor().stream({"model": "claude-sonnet-4-5", "messages": [], "max_tokens": 1}, context, NativeHTTPTransport(FakeStreamingClient(chunks)))]
+    events = await _drain_native_events(NativeProviderExecutor().stream({"model": "claude-sonnet-4-5", "messages": [], "max_tokens": 1}, context, NativeHTTPTransport(FakeStreamingClient(chunks))))
 
     async def event_source():
         for event in events:
@@ -308,23 +313,17 @@ async def test_native_provider_stream_extracts_unified_stream_events_for_later_r
     )
     executor = NativeProviderExecutor()
 
-    _ = [
-        event
-        async for event in executor.stream(
-            {"model": "gpt-test", "messages": []},
-            context,
-            NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "stream-state"}}]}, "[DONE]"])),
-        )
-    ]
+    await _drain_native_events(executor.stream(
+        {"model": "gpt-test", "messages": []},
+        context,
+        NativeHTTPTransport(FakeStreamingClient([{"choices": [{"delta": {"content": "stream-state"}}]}, "[DONE]"])),
+    ))
     second_client = FakeStreamingClient(["[DONE]"])
-    _ = [
-        event
-        async for event in executor.stream(
-            {"model": "gpt-test", "messages": []},
-            context,
-            NativeHTTPTransport(second_client),
-        )
-    ]
+    await _drain_native_events(executor.stream(
+        {"model": "gpt-test", "messages": []},
+        context,
+        NativeHTTPTransport(second_client),
+    ))
 
     assert second_client.calls[0]["json"]["metadata"]["cached_stream_text"] == "stream-state"
 
@@ -424,23 +423,17 @@ async def test_provider_stream_state_is_cached_for_followups_but_not_exposed(
     )
     executor = NativeProviderExecutor()
 
-    first_events = [
-        event
-        async for event in executor.stream(
-            request_payload,
-            context,
-            NativeHTTPTransport(FakeStreamingClient(chunks)),
-        )
-    ]
+    first_events = await _drain_native_events(executor.stream(
+        request_payload,
+        context,
+        NativeHTTPTransport(FakeStreamingClient(chunks)),
+    ))
     second_client = FakeStreamingClient(["[DONE]"])
-    _ = [
-        event
-        async for event in executor.stream(
-            request_payload,
-            context,
-            NativeHTTPTransport(second_client),
-        )
-    ]
+    await _drain_native_events(executor.stream(
+        request_payload,
+        context,
+        NativeHTTPTransport(second_client),
+    ))
 
     current = second_client.calls[0]["json"]
     for key in injected_path:

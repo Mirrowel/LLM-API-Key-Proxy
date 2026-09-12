@@ -86,6 +86,7 @@ from .types import RetryState, AvailabilityStats
 from .filters import CredentialFilter
 from .transforms import ProviderTransforms
 from .stream_ops import ChatWireStreamAdapter, NeutralStreamPipeline
+from ..streaming.relay import StreamRepairState
 from ..streaming.policy import can_retry_stream_after_error, is_stream_heartbeat_or_comment, is_visible_stream_output
 
 if TYPE_CHECKING:
@@ -1258,6 +1259,7 @@ class RequestExecutor:
         for index, target in enumerate(targets):
             attempt_started_at = time.monotonic()
             emitted_output = False
+            emitted_error_frame = False
             pending_chunks: List[str] = []
             terminal_error_type: Optional[str] = None
             target_context = clone_context_for_target(
@@ -1285,14 +1287,38 @@ class RequestExecutor:
                         terminal_error_type = chunk_error_type
                         pending_chunks.append(chunk)
                         continue
+                    if chunk_error_type and emitted_output:
+                        # G4: an error terminal AFTER visible output is a
+                        # real in-band failure the client must see (no
+                        # fallback is possible mid-output) — never parked,
+                        # never silently swallowed into a "succeeded" label.
+                        yield chunk
+                        emitted_error_frame = True
+                        continue
                     if _stream_chunk_is_visible_output(chunk):
                         for pending in pending_chunks:
+                            # Stale parked ERROR frames never flush ahead of
+                            # content — only genuine metadata frames do.
+                            if _stream_chunk_error_type(pending):
+                                lib_logger.warning(
+                                    "Dropping stale parked stream error frame before visible output: %s",
+                                    pending[:200],
+                                )
+                                continue
                             yield pending
                         pending_chunks.clear()
                         emitted_output = True
                         yield chunk
                         continue
-                    pending_chunks.append(chunk)
+                    if len(pending_chunks) < _STREAM_PENDING_CHUNK_CAP:
+                        pending_chunks.append(chunk)
+                    else:
+                        lib_logger.warning(
+                            "Stream pending-chunk cap reached (%d) — dropping oldest metadata frame",
+                            _STREAM_PENDING_CHUNK_CAP,
+                        )
+                        pending_chunks.pop(0)
+                        pending_chunks.append(chunk)
                 if terminal_error_type and not emitted_output:
                     error_type = terminal_error_type
                     self._log_routing_trace(
@@ -1317,6 +1343,8 @@ class RequestExecutor:
                         yield pending
                     return
                 for pending in pending_chunks:
+                    if _stream_chunk_error_type(pending):
+                        continue
                     yield pending
                 self._log_routing_trace(
                     context,
@@ -1324,7 +1352,7 @@ class RequestExecutor:
                     _target_trace(target),
                     metadata={"target_index": index, "emitted_output": emitted_output},
                 )
-                _append_routing_attempt_history(context, target, index, success=True, emitted_output=emitted_output, duration_ms=_elapsed_ms(attempt_started_at))
+                _append_routing_attempt_history(context, target, index, success=not emitted_error_frame, emitted_output=emitted_output, error_type=terminal_error_type if emitted_error_frame else None, duration_ms=_elapsed_ms(attempt_started_at))
                 return
             except Exception as exc:
                 if isinstance(exc, _FailDecision):
@@ -1799,7 +1827,7 @@ class RequestExecutor:
         provider = context.provider
         model = context.model
         deadline = context.deadline
-        client_protocol_context: Optional[ProtocolContext] = None
+        client_protocol_context: Optional[ProtocolContext] = None  # G4: rebuilt per attempt
 
         try:
             (
@@ -2044,23 +2072,36 @@ class RequestExecutor:
                                     # metrics on events and formats the client's
                                     # protocol exactly once at the tail. There is
                                     # no chat-shaped intermediate on any path.
-                                    if client_protocol_context is None:
-                                        client_protocol_context = ProtocolContext(
-                                            provider=provider,
-                                            model=model,
-                                            source_protocol="openai_chat",
-                                            target_protocol=context.input_protocol_name,
-                                            input_protocol=context.input_protocol_name,
-                                            provider_protocol=stream_provider_protocol,
-                                            client_protocol=context.input_protocol_name,
-                                            source_provider=provider,
-                                            target_provider=None,
-                                            provider_state_compatible=False,
-                                            request_id=getattr(context, "request_id", None),
-                                            session_id=context.session_id,
-                                            credential_stable_id=cred_context.stable_id,
-                                            transport="sse",
-                                        )
+                                    # G4: rebuilt PER ATTEMPT — credential
+                                    # identity and protocol identity refresh
+                                    # every rotation, while the METADATA dict
+                                    # (and thus the formatter state) carries
+                                    # over so destination-start frames are
+                                    # never duplicated across retries.
+                                    prior_stream_metadata = (
+                                        client_protocol_context.metadata
+                                        if client_protocol_context is not None
+                                        else {}
+                                    )
+                                    client_protocol_context = ProtocolContext(
+                                        provider=provider,
+                                        model=model,
+                                        source_protocol=stream_provider_protocol,
+                                        target_protocol=context.input_protocol_name,
+                                        input_protocol=context.input_protocol_name,
+                                        provider_protocol=stream_provider_protocol,
+                                        client_protocol=context.input_protocol_name,
+                                        source_provider=provider,
+                                        target_provider=None,
+                                        provider_state_compatible=False,
+                                        request_id=getattr(context, "request_id", None),
+                                        session_id=context.session_id,
+                                        credential_stable_id=cred_context.stable_id,
+                                        transport="sse",
+                                    )
+                                    client_protocol_context.metadata = prior_stream_metadata
+                                    stream_repair_state = StreamRepairState()
+                                    client_include_usage = _client_requested_include_usage(context.kwargs)
                                     pipeline = NeutralStreamPipeline(
                                         client_protocol_name=context.input_protocol_name,
                                         protocol_context=client_protocol_context,
@@ -2073,14 +2114,25 @@ class RequestExecutor:
                                         ),
                                         success_callback=lambda: self._clear_failure_history_on_success(provider, model),
                                         transaction_logger=context.transaction_logger,
+                                        repair_state=stream_repair_state,
+                                        client_include_usage=client_include_usage,
+                                        deadline=getattr(context, "deadline", None),
+                                        provider_plugin=plugin,
+                                        relay_eligible=(
+                                            native_stream_context is not None
+                                            and stream_provider_protocol == context.input_protocol_name
+                                            and context.input_protocol_name in ("openai_chat", "gemini")
+                                            and not getattr(native_stream_context, "adapter_names", ())
+                                        ),
                                     )
                                     if native_stream_context is not None:
+                                        native_stream_context.stream_repair_state = stream_repair_state
                                         event_source = stream
                                         usage_provider = lambda native_ctx=native_stream_context: getattr(
                                             native_ctx, "stream_usage_record", None
                                         )
                                     else:
-                                        chat_adapter = ChatWireStreamAdapter(model)
+                                        chat_adapter = ChatWireStreamAdapter(model, repair_state=stream_repair_state)
                                         event_source = chat_adapter.events(stream, pipeline.usage)
                                         usage_provider = None
                                     client_stream = pipeline.run(event_source, usage_provider=usage_provider)
@@ -2942,7 +2994,69 @@ class RequestExecutor:
         Yields:
             SSE-formatted strings unchanged
         """
-        chunks = []
+        chunks: list = []
+        frame_event: Optional[str] = None
+        frame_data: list[str] = []
+
+        def _flush_frame() -> None:
+            """Emit the buffered SSE frame (event name + joined data) to logs."""
+            nonlocal frame_event, frame_data
+            if not frame_data:
+                frame_event = None
+                return
+            payload_text = "\n".join(frame_data)
+            event_name = frame_event
+            frame_event = None
+            frame_data = []
+
+            if payload_text.strip() == "[DONE]":
+                transaction_logger.log_transform_pass(
+                    "stream_done_event",
+                    {"raw": payload_text},
+                    direction="stream",
+                    stage="final",
+                    transport="sse",
+                    snapshot=False,
+                )
+                return
+
+            try:
+                parsed = json.loads(payload_text)
+            except json.JSONDecodeError:
+                lib_logger.debug(
+                    f"Failed to parse chunk for logging: {payload_text[:100]}"
+                )
+                return
+
+            # Anthropic/responses frames name the event outside the JSON
+            # payload; fold it in so the name survives into chunks/L1.
+            if event_name:
+                if isinstance(parsed, dict):
+                    chunk_data = {"event": event_name}
+                    chunk_data.update(parsed)
+                else:
+                    chunk_data = {"event": event_name, "data": parsed}
+            else:
+                chunk_data = parsed
+
+            chunks.append(chunk_data)
+            trace_chunk_data = _redact_context_field_cache_paths(
+                chunk_data,
+                context,
+                "stream",
+                plugin,
+                config=getattr(self, "_experimental_config", None),
+            ) if context else chunk_data
+            transaction_logger.log_stream_chunk(trace_chunk_data)
+            if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
+                transaction_logger.log_transform_pass(
+                    "stream_error_event",
+                    trace_chunk_data,
+                    direction="stream",
+                    stage="client",
+                    transport="sse",
+                    snapshot=False,
+                )
 
         try:
             async for sse_line in stream:
@@ -2960,47 +3074,35 @@ class RequestExecutor:
                     transport="sse",
                     snapshot=False,
                 )
-                if sse_line.startswith("data: [DONE]"):
-                    transaction_logger.log_transform_pass(
-                        "stream_done_event",
-                        {"raw": trace_sse_line},
-                        direction="stream",
-                        stage="final",
-                        transport="sse",
-                        snapshot=False,
-                    )
                 yield sse_line
 
-                # Parse and accumulate for final logging
-                if sse_line.startswith("data: ") and not sse_line.startswith(
-                    "data: [DONE]"
-                ):
-                    try:
-                        content = sse_line[6:].strip()
-                        if content:
-                            chunk_data = json.loads(content)
-                            chunks.append(chunk_data)
-                            trace_chunk_data = _redact_context_field_cache_paths(
-                                chunk_data,
-                                context,
-                                "stream",
-                                plugin,
-                                config=getattr(self, "_experimental_config", None),
-                            ) if context else chunk_data
-                            transaction_logger.log_stream_chunk(trace_chunk_data)
-                            if isinstance(chunk_data, dict) and chunk_data.get("error") is not None:
-                                transaction_logger.log_transform_pass(
-                                    "stream_error_event",
-                                    trace_chunk_data,
-                                    direction="stream",
-                                    stage="client",
-                                    transport="sse",
-                                    snapshot=False,
-                                )
-                    except json.JSONDecodeError:
-                        lib_logger.debug(
-                            f"Failed to parse chunk for logging: {sse_line[:100]}"
-                        )
+                # Parse SSE frames line-by-line. One yielded item may be a
+                # single physical line, a whole "event:/data:" frame, or
+                # several lines joined by newlines; splitting makes every
+                # shape converge on the same parser. The trailing empty
+                # element left by a line terminator is an artifact, not a
+                # frame delimiter, so drop it before walking the lines.
+                # Comment lines (": ...") and non-data fields (id:, retry:)
+                # are skipped.
+                physical_lines = sse_line.split("\n")
+                if physical_lines and physical_lines[-1] == "":
+                    physical_lines.pop()
+                for physical_line in physical_lines:
+                    line = physical_line.rstrip("\r")
+                    if not line:
+                        _flush_frame()
+                    elif line.startswith(":"):
+                        continue
+                    elif line.startswith("event:"):
+                        frame_event = line[len("event:"):].strip()
+                    elif line.startswith("data:"):
+                        value = line[len("data:"):]
+                        if value.startswith(" "):
+                            value = value[1:]
+                        frame_data.append(value)
+
+            # Flush a frame that ended at EOF instead of a blank line.
+            _flush_frame()
         except BaseException as stream_error:
             # Failed streams still get their L1 summary BEFORE the error
             # propagates — except client disconnects (cancellation is not a
@@ -3655,8 +3757,11 @@ def _target_scope_value(target: RouteTarget, key: str, default: Any) -> Any:
 # Deterministic client-fault classes that reset the consecutive-quota
 # strike counter; transient classes deliberately keep it (see the reset
 # sites for the reasoning).
-_QUOTA_STRIKE_RESET_CLASSES = frozenset(
-    {
+# G4: bounded pre-output parking — runaway metadata accumulation (no visible
+# output ever) drops oldest frames with a warning instead of growing forever.
+_STREAM_PENDING_CHUNK_CAP = 512
+
+_QUOTA_STRIKE_RESET_CLASSES = frozenset(    {
         "invalid_request",
         "context_window_exceeded",
         "request_too_large",
@@ -3682,6 +3787,22 @@ class _FailDecision(Exception):
     def __init__(self, original: BaseException) -> None:
         super().__init__(str(original))
         self.original = original
+
+
+def _client_requested_include_usage(kwargs: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Read the client's own ``stream_options.include_usage`` request.
+
+    G4: the flag governs the CLIENT-facing usage frame (the official chat
+    grammar emits the extra usage-only chunk only when requested). Upstream
+    forcing for accounting is a separate, independent concern.
+    """
+
+    if not isinstance(kwargs, dict):
+        return None
+    stream_options = kwargs.get("stream_options")
+    if isinstance(stream_options, dict) and isinstance(stream_options.get("include_usage"), bool):
+        return stream_options["include_usage"]
+    return None
 
 
 def _route_error_type(error: BaseException, provider: Optional[str] = None) -> str:

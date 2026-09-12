@@ -23,16 +23,25 @@ import contextlib
 import json
 import logging
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any, AsyncGenerator, AsyncIterator, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from ..core.errors import StreamedAPIError, CredentialNeedsReauthError
 from ..protocols.streaming import format_canonical_stream_event, stream_format_state
-from ..protocols.types import ProtocolContext, UnifiedStreamEvent, serialize_value
+from ..protocols.types import ProtocolContext, UnifiedStreamEvent, Usage, serialize_value
 from ..streaming import StreamEvent, StreamMonitor
+from ..streaming.relay import RelayStreamItem, StreamRepairState
 from ..streaming.transport import SSEStreamFormatter
 from ..usage.accounting import UsageRecord, extract_usage_record
 from ..usage.costs import CostBreakdown, CostCalculator
+
+__all__ = [
+    "ChatWireStreamAdapter",
+    "NeutralStreamPipeline",
+    "StreamUsageTracker",
+    "RelayStreamItem",
+    "StreamRepairState",
+]
 
 if TYPE_CHECKING:
     from ..usage.manager import CredentialContext
@@ -139,17 +148,46 @@ class StreamUsageTracker:
 
     @staticmethod
     def _reduce(base: UsageRecord, candidate: UsageRecord) -> UsageRecord:
+        """Hybrid merge: a valueless late record never zeroes accumulation.
+
+        A provider's trailing ``{"usage": {}}`` decodes to an all-zero
+        record; REPLACE semantics would wipe everything accumulated from
+        earlier frames. Port of the native executor's token-value guard:
+        a candidate without token values keeps the base (cost carries
+        over); a candidate WITH values wins, with base cost preserved.
+        """
+
         if candidate is None:
             return base
-        merged = candidate
-        if base.provider_reported_cost is not None and merged.provider_reported_cost is None:
-            merged = replace(
-                merged,
-                provider_reported_cost=base.provider_reported_cost,
-                cost_currency=base.cost_currency,
-                cost_source=base.cost_source,
-            )
+        if not _record_has_token_values(candidate):
+            merged = base
+        else:
+            merged = candidate
+        if merged.provider_reported_cost is None:
+            for source in (base, candidate):
+                if source is not None and source.provider_reported_cost is not None:
+                    merged = replace(
+                        merged,
+                        provider_reported_cost=source.provider_reported_cost,
+                        cost_currency=source.cost_currency,
+                        cost_source=source.cost_source,
+                    )
+                    break
         return merged
+
+
+def _record_has_token_values(record: UsageRecord) -> bool:
+    for attr in (
+        "input_tokens",
+        "completion_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+    ):
+        value = getattr(record, attr, None)
+        if isinstance(value, (int, float)) and value > 0:
+            return True
+    return False
 
 
 class ChatWireStreamAdapter:
@@ -166,11 +204,12 @@ class ChatWireStreamAdapter:
     - DiffusionGemma-style deltas that mix reasoning and final text are split.
     """
 
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, repair_state: Optional[StreamRepairState] = None) -> None:
         self.model = model
         self._seen_tool_calls = False
         self._held_reason: Optional[str] = None
         self._held_reason_canonical: Optional[str] = None
+        self.repair_state = repair_state if repair_state is not None else StreamRepairState()
 
     async def events(
         self,
@@ -261,52 +300,65 @@ class ChatWireStreamAdapter:
         events: List[UnifiedStreamEvent] = list(chat.parse_stream_events(chunk_dict))
         if not events:
             return []
-        event = events[0]
-        delta_message = event.delta
         if any(
             item.delta is not None and getattr(item.delta, "tool_calls", None)
             for item in events
         ):
             self._seen_tool_calls = True
+            self.repair_state.tools_seen = True
 
-        if _is_terminal_event(event):
-            first = self._with_final_reason(event)
-            return [first, *events[1:]]
+        # Repair evidence: the provider's own reasons (per choice) are
+        # recorded for the pipeline tail even when held back.
+        for item in events:
+            if item.stop_reason:
+                self._held_reason_canonical = item.stop_reason
+                self.repair_state.last_provider_reason = item.stop_reason
+                output_index = getattr(item, "output_index", None)
+                try:
+                    choice_key = int(output_index) if output_index is not None else 0
+                except (TypeError, ValueError):
+                    choice_key = 0
+                self.repair_state.held_reasons[choice_key] = item.stop_reason
 
-        meaningful_usage = _event_has_meaningful_usage(event)
-        finish_seen = event.stop_reason is not None
-        if finish_seen:
-            self._held_reason_canonical = event.stop_reason
-            if not meaningful_usage:
-                # Intermediate finish frame: hold back the reason, keep every
-                # candidate's delta flowing (never drop sibling choices).
-                kept = [replace(item, stop_reason=None) for item in events if item.delta is not None]
-                return kept or []
+        if _is_terminal_event(events[0]):
+            return [self._with_final_reason(events[0]), *events[1:]]
+
+        first = events[0]
+        delta_message = first.delta
+        meaningful_usage = _event_has_meaningful_usage(first)
+        finish_seen = first.stop_reason is not None
+        if finish_seen and not meaningful_usage:
+            # Intermediate finish frame: hold back every choice's reason,
+            # keep every candidate's delta flowing (never drop siblings).
+            kept = [replace(item, stop_reason=None) for item in events if item.delta is not None]
+            return kept or []
 
         if meaningful_usage and (delta_message is None or finish_seen):
-            return [self._with_final_reason(event)]
+            # Usage-bearing final frame: every sibling survives, each with
+            # its own repaired reason (provider's own reason wins).
+            return [self._with_final_reason(item) for item in events]
 
-        if delta_message is None and event.message is None and not meaningful_usage:
+        if delta_message is None and first.message is None and not meaningful_usage:
             return []
 
-        if event.stop_reason is not None and not meaningful_usage and delta_message is not None:
-            return [replace(event, stop_reason=None)]
+        if first.stop_reason is not None and not meaningful_usage and delta_message is not None:
+            return [replace(item, stop_reason=None) for item in events]
 
-        return [event]
+        return events
 
     def _with_final_reason(self, event: UnifiedStreamEvent) -> UnifiedStreamEvent:
-        if self._seen_tool_calls:
-            return replace(event, stop_reason="tool_calls")
-        # The final frame's own reason wins over accumulated intermediate ones;
-        # accumulated only fills in when the final frame carries none.
+        # Provider's own final-frame reason wins; tools-seen only fills in
+        # when the provider never stated one (G4 ruling killed the override).
         if event.stop_reason:
             return event
         if self._held_reason_canonical:
             return replace(event, stop_reason=self._held_reason_canonical)
+        if self._seen_tool_calls:
+            return replace(event, stop_reason="tool_calls")
         return event
 
     def _terminal_event(self) -> UnifiedStreamEvent:
-        reason = "tool_calls" if self._seen_tool_calls else (self._held_reason_canonical or "stop")
+        reason = self.repair_state.repaired_reason(None) or "stop"
         return UnifiedStreamEvent(
             type="done",
             source_protocol="openai_chat",
@@ -360,7 +412,16 @@ class ChatWireStreamAdapter:
 
 
 class NeutralStreamPipeline:
-    """Operational stream layer over neutral events with client formatting tail."""
+    """Operational stream layer over neutral events with client formatting tail.
+
+    G4 conditional re-serialization: when ``relay_eligible`` is set and a
+    transport frame arrives with raw wire text (``RelayStreamItem``), the
+    provider's bytes are forwarded to the client untouched while the
+    observation side (usage, anchors, metrics, repair evidence) runs on the
+    parsed copy. Any edit signal (hook/adapter modification, error frames,
+    repair needs) permanently disengages the relay for the stream — the
+    formatter path takes over. Protocol equality alone never implies relay.
+    """
 
     def __init__(
         self,
@@ -374,6 +435,11 @@ class NeutralStreamPipeline:
         response_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         success_callback: Optional[Callable[[], None]] = None,
         transaction_logger: Optional[Any] = None,
+        repair_state: Optional[StreamRepairState] = None,
+        client_include_usage: Optional[bool] = None,
+        relay_eligible: bool = False,
+        deadline: Optional[float] = None,
+        provider_plugin: Any = None,
     ) -> None:
         self.client_protocol_name = client_protocol_name
         self.protocol_context = protocol_context
@@ -384,6 +450,11 @@ class NeutralStreamPipeline:
         self.response_callback = response_callback
         self.success_callback = success_callback
         self.transaction_logger = transaction_logger
+        self.repair_state = repair_state if repair_state is not None else StreamRepairState()
+        self.client_include_usage = client_include_usage
+        self.relay_eligible = relay_eligible
+        self.deadline = deadline
+        self.provider_plugin = provider_plugin
         self.usage = StreamUsageTracker(model, provider=protocol_context.provider)
 
     async def run(
@@ -399,13 +470,34 @@ class NeutralStreamPipeline:
         formatter = SSEStreamFormatter()
         monitor = StreamMonitor(clock=time.monotonic)
         state = stream_format_state(self.protocol_context, self.client_protocol_name)
+        # G4: the client's own usage-frame preference reaches the formatter
+        # state (None preserves legacy always-emit behavior).
+        state.include_usage = self.client_include_usage
 
         stream_completed = False
         completion_signaled = False
         upstream_closed = False
         stream_cancelled = False
+        relay_active = self.relay_eligible
         last_heartbeat_at = monitor.metrics.started_at
         error_buffer = StreamBuffer()
+        # G4: yield-suspend accounting — time spent blocked delivering to a
+        # slow client must not charge the upstream stall/TTFB clocks.
+        paused_at: Optional[float] = None
+        paused_since_first_byte = 0.0
+        paused_since_last_chunk = 0.0
+
+        def _note_yield_suspension() -> None:
+            nonlocal paused_at
+            paused_at = time.monotonic()
+
+        def _note_yield_resumed() -> None:
+            nonlocal paused_at, paused_since_first_byte, paused_since_last_chunk
+            if paused_at is not None:
+                delta = time.monotonic() - paused_at
+                paused_since_first_byte += delta
+                paused_since_last_chunk += delta
+                paused_at = None
 
         assistant_parts: List[str] = []
         tool_call_ids: List[str] = []
@@ -440,6 +532,7 @@ class NeutralStreamPipeline:
         try:
             while True:
                 try:
+                    _note_yield_resumed()
                     if self.request and await self.request.is_disconnected():
                         lib_logger.info(
                             "Client disconnected. Aborting stream for model %s.", self.model
@@ -449,7 +542,7 @@ class NeutralStreamPipeline:
                     next_task = asyncio.create_task(stream_iterator.__anext__())
                     try:
                         while True:
-                            wait_seconds = _next_stream_wait_seconds(monitor, stream_settings, last_heartbeat_at)
+                            wait_seconds = _next_stream_wait_seconds(monitor, stream_settings, last_heartbeat_at, deadline=self.deadline)
                             wait_tasks = {next_task}
                             disconnect_task = None
                             if self.request is not None:
@@ -472,7 +565,13 @@ class NeutralStreamPipeline:
                                 event = next_task.result()
                                 break
 
-                            timeout_error = _stream_timeout_error(monitor, stream_settings)
+                            timeout_error = _stream_timeout_error(
+                                monitor,
+                                stream_settings,
+                                paused_since_first_byte=paused_since_first_byte,
+                                paused_since_last_chunk=paused_since_last_chunk,
+                                deadline=self.deadline,
+                            )
                             if timeout_error:
                                 next_task.cancel()
                                 with contextlib.suppress(asyncio.CancelledError, StopAsyncIteration):
@@ -485,6 +584,7 @@ class NeutralStreamPipeline:
                                 heartbeat = formatter.format_heartbeat()
                                 last_heartbeat_at = time.monotonic()
                                 self._log_lifecycle("stream_heartbeat", monitor, "heartbeat")
+                                _note_yield_suspension()
                                 yield heartbeat
                     except Exception:
                         if not next_task.done():
@@ -496,17 +596,48 @@ class NeutralStreamPipeline:
                     if monitor.metrics.first_byte_at is None:
                         self._log_lifecycle("stream_first_byte", monitor, "raw_chunk")
 
+                    # Upstream progress resets the per-chunk pause discount —
+                    # only client-side suspension since the last event counts.
+                    paused_since_last_chunk = 0.0
+                    if monitor.metrics.first_byte_at is None:
+                        paused_since_first_byte = 0.0
                     error_buffer.reset()
 
-                    self.usage.merge_event(event)
-                    self._collect_anchors(event, assistant_parts, tool_call_ids, tool_call_events)
-                    if _completion_signal(event):
-                        completion_signaled = True
+                    # G4: sources may deliver transport frames (raw + parsed)
+                    # or bare events.
+                    if isinstance(event, RelayStreamItem):
+                        if event.is_comment:
+                            # Provider heartbeat evidence relays verbatim and
+                            # counts as liveness for the stall detector.
+                            monitor.record_event(
+                                StreamEvent("metadata", protocol=self.client_protocol_name, data={"comment": True})
+                            )
+                            if relay_active and event.raw is not None:
+                                _note_yield_suspension()
+                                yield event.raw + "\n\n"
+                            continue
+                        frame_events = event.events
+                        frame_raw = event.raw
+                    else:
+                        frame_events = [event]
+                        frame_raw = None
+
+                    terminal_seen = False
+                    error_in_frame = False
+                    for item_event in frame_events:
+                        self.usage.merge_event(item_event)
+                        self._collect_anchors(item_event, assistant_parts, tool_call_ids, tool_call_events)
+                        if _completion_signal(item_event):
+                            completion_signaled = True
+                        if item_event.type == "error":
+                            error_in_frame = True
+                        if _is_terminal_event(item_event):
+                            terminal_seen = True
 
                     wire_event = StreamEvent(
-                        "message" if self._event_visible(event) else "metadata",
+                        "message" if any(self._event_visible(e) for e in frame_events) else "metadata",
                         protocol=self.client_protocol_name,
-                        visible_output=self._event_visible(event),
+                        visible_output=any(self._event_visible(e) for e in frame_events),
                     )
                     first_visible = (
                         wire_event.visible_output
@@ -516,16 +647,49 @@ class NeutralStreamPipeline:
                     if first_visible:
                         self._log_lifecycle("stream_first_visible_output", monitor, "message")
 
-                    for frame in format_canonical_stream_event(
-                        event,
-                        self.client_protocol_name,
-                        self.protocol_context,
-                        state=state,
+                    # Relay decision (per frame, sticky disengage): raw bytes
+                    # exist, no edit signal, no error, no repair need on the
+                    # frame itself. Hook edits flip repair_state.edited_by_hook.
+                    if (
+                        relay_active
+                        and frame_raw is not None
+                        and not error_in_frame
+                        and not self.repair_state.edited_by_hook
                     ):
-                        self._trace_frame(frame)
-                        yield frame
+                        self._trace_frame(frame_raw)
+                        _note_yield_suspension()
+                        yield frame_raw + "\n\n"
+                        if terminal_seen:
+                            # The provider's own terminal bytes were relayed —
+                            # the tail must not synthesize a second one.
+                            state.terminal = True
+                            stream_completed = True
+                            break
+                        continue
 
-                    if _is_terminal_event(event):
+                    if error_in_frame or self.repair_state.edited_by_hook:
+                        # Disengage relay permanently: edits/errors require the
+                        # formatter path for the rest of the stream.
+                        relay_active = False
+
+                    for item_event in frame_events:
+                        if item_event.type == "error":
+                            error = item_event.error if isinstance(item_event.error, dict) else {"message": str(item_event.error)}
+                            raise StreamedAPIError(
+                                str(error.get("message") or error.get("type") or "Provider stream failed"),
+                                data={"error": dict(error)},
+                            )
+                        for frame in format_canonical_stream_event(
+                            item_event,
+                            self.client_protocol_name,
+                            self.protocol_context,
+                            state=state,
+                        ):
+                            self._trace_frame(frame)
+                            _note_yield_suspension()
+                            yield frame
+
+                    if terminal_seen:
                         stream_completed = True
                         break
 
@@ -580,12 +744,18 @@ class NeutralStreamPipeline:
         finally:
             if stream_completed:
                 if state.terminal is False:
+                    # G4 repair tail: missing finish/usage is recoverable,
+                    # never fatal. Reason ladder: provider's own final-frame
+                    # reason > held intermediate > tools-seen > stop. Usage is
+                    # always present (zeros when unknown) so downstream
+                    # parsers never meet a missing field.
+                    repaired_reason = self.repair_state.repaired_reason(state.stop_reason)
                     terminal_event = UnifiedStreamEvent(
                         type="done",
                         source_protocol=self.client_protocol_name,
                         native_type="done",
-                        stop_reason=state.stop_reason or None,
-                        usage=state.usage,
+                        stop_reason=repaired_reason,
+                        usage=state.usage if state.usage is not None else Usage(),
                     )
                     for frame in format_canonical_stream_event(
                         terminal_event,
@@ -673,6 +843,13 @@ class NeutralStreamPipeline:
 
     @staticmethod
     def _event_visible(event: UnifiedStreamEvent) -> bool:
+        """Read the REAL neutral attributes (G4): text lives in content
+        blocks, reasoning is a list of ReasoningBlock — the old
+        ``delta.text``/``delta.reasoning.text`` reads never existed, so
+        TTFT/visible metrics only ever fired for tool calls. Reasoning-only
+        deltas count as visible output (operator ruling: they lock the
+        fallback route exactly like text)."""
+
         if _is_terminal_event(event):
             return False
         if event.type == "error":
@@ -680,12 +857,14 @@ class NeutralStreamPipeline:
         delta = event.delta or event.message
         if delta is None:
             return False
-        text = getattr(delta, "text", None)
-        if isinstance(text, str) and text:
-            return True
-        reasoning = getattr(delta, "reasoning", None)
-        if reasoning is not None and getattr(reasoning, "text", None):
-            return True
+        for block in getattr(delta, "content", None) or []:
+            text = getattr(block, "text", None)
+            if isinstance(text, str) and text:
+                return True
+        for reasoning_block in getattr(delta, "reasoning", None) or []:
+            text = getattr(reasoning_block, "text", None)
+            if isinstance(text, str) and text:
+                return True
         tool_calls = getattr(delta, "tool_calls", None)
         return bool(tool_calls)
 
@@ -699,6 +878,12 @@ class NeutralStreamPipeline:
         delta = event.delta or event.message
         if delta is None:
             return
+        choice_key = 0
+        output_index = getattr(event, "output_index", None)
+        try:
+            choice_key = int(output_index) if output_index is not None else 0
+        except (TypeError, ValueError):
+            choice_key = 0
         for block in getattr(delta, "content", None) or []:
             text = getattr(block, "text", None)
             if isinstance(text, str) and text:
@@ -712,14 +897,15 @@ class NeutralStreamPipeline:
                 event_index = int(index) if index is not None else position
             except (TypeError, ValueError):
                 event_index = position
-            entry = tool_call_events.setdefault((0, event_index), {})
+            entry = tool_call_events.setdefault((choice_key, event_index), {})
             if call_id:
                 entry["id"] = str(call_id)
             name = getattr(call, "name", None)
-            function = getattr(call, "function", None)
             if name:
                 entry["name"] = str(name)
-            arguments = getattr(function, "arguments", None) if function is not None else None
+            # ToolCall carries .arguments directly (the old .function read
+            # never existed — streamed tool arguments were erased).
+            arguments = getattr(call, "arguments", None)
             if isinstance(arguments, str) and arguments:
                 entry["arguments"] = _merge_streamed_tool_arguments(
                     entry.get("arguments", ""),
@@ -729,7 +915,11 @@ class NeutralStreamPipeline:
     def _cost_breakdown(self, usage_record: UsageRecord) -> CostBreakdown:
         if self.skip_cost_calculation:
             return CostBreakdown(pricing_source="skipped")
-        return CostCalculator().calculate(usage_record, model=self.model)
+        # G4: provider plugin pricing applies on streams exactly like the
+        # non-streaming path (the bare calculator skipped it entirely).
+        return CostCalculator(provider_plugin=self.provider_plugin).calculate(
+            usage_record, model=self.model, provider=self.protocol_context.provider
+        )
 
     def _log_usage_accounting(self, usage_record: UsageRecord, cost_breakdown: CostBreakdown) -> None:
         if not self.transaction_logger:
@@ -795,9 +985,12 @@ def _next_stream_wait_seconds(
     monitor: StreamMonitor,
     settings: Any,
     last_heartbeat_at: float,
+    deadline: Optional[float] = None,
 ) -> Optional[float]:
     candidates: List[float] = []
     now = time.monotonic()
+    if deadline is not None:
+        candidates.append(max(0.0, deadline - now))
     if settings.heartbeat_seconds:
         candidates.append(max(0.0, last_heartbeat_at + settings.heartbeat_seconds - now))
     if settings.ttfb_timeout_seconds and monitor.metrics.first_byte_at is None:
@@ -814,10 +1007,29 @@ def _heartbeat_due(monitor: StreamMonitor, settings: Any, last_heartbeat_at: flo
     return time.monotonic() - last_heartbeat_at >= settings.heartbeat_seconds
 
 
-def _stream_timeout_error(monitor: StreamMonitor, settings: Any) -> Optional[Tuple[str, Dict[str, Any], str]]:
+def _stream_timeout_error(
+    monitor: StreamMonitor,
+    settings: Any,
+    *,
+    paused_since_first_byte: float = 0.0,
+    paused_since_last_chunk: float = 0.0,
+    deadline: Optional[float] = None,
+) -> Optional[Tuple[str, Dict[str, Any], str]]:
     now = time.monotonic()
+    if deadline is not None:
+        remaining = deadline - now
+        if remaining <= 0:
+            return (
+                "deadline_exceeded",
+                {
+                    "message": "Request deadline exceeded while streaming",
+                    "type": "api_connection",
+                    "details": {"timeout_type": "deadline"},
+                },
+                "stream_deadline_exceeded",
+            )
     if settings.ttfb_timeout_seconds and monitor.metrics.first_byte_at is None:
-        if now - monitor.metrics.started_at >= settings.ttfb_timeout_seconds:
+        if now - monitor.metrics.started_at - paused_since_first_byte >= settings.ttfb_timeout_seconds:
             return (
                 "ttfb_timeout",
                 {
@@ -829,7 +1041,7 @@ def _stream_timeout_error(monitor: StreamMonitor, settings: Any) -> Optional[Tup
             )
     if settings.stall_timeout_seconds and monitor.metrics.first_byte_at is not None:
         last_chunk_at = monitor.metrics.last_chunk_at or monitor.metrics.first_byte_at
-        if now - last_chunk_at >= settings.stall_timeout_seconds:
+        if last_chunk_at is not None and now - last_chunk_at - paused_since_last_chunk >= settings.stall_timeout_seconds:
             return (
                 "stall_timeout",
                 {
@@ -904,15 +1116,6 @@ def _usage_from_sse_string(chunk: str) -> Optional[Dict[str, Any]]:
         if key in data and key not in merged:
             merged[key] = data[key]
     return {"usage": merged}
-
-
-def _sse_has_done_payload(chunk: str) -> bool:
-    for line in chunk.strip().splitlines():
-        stripped = line.strip()
-        if stripped.startswith("data:"):
-            if stripped[5:].strip() == "[DONE]":
-                return True
-    return False
 
 
 def _merge_streamed_tool_arguments(current: str, incoming: str) -> str:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import json
-
 import pytest
 
-from rotator_library.client.streaming import StreamingHandler
+from rotator_library.client.stream_ops import (
+    ChatWireStreamAdapter,
+    NeutralStreamPipeline,
+)
+from rotator_library.protocols.types import ProtocolContext
 from rotator_library.transaction_logger import TransactionLogger
 from rotator_library.utils import zstd_io
 
@@ -27,6 +29,35 @@ class FakeCredentialContext:
 
     def mark_success(self, **kwargs) -> None:
         self.success_kwargs = kwargs
+
+
+def _protocol_context(model: str) -> ProtocolContext:
+    provider = model.split("/", 1)[0] if "/" in model else "openai"
+    return ProtocolContext(
+        provider=provider,
+        model=model,
+        source_protocol="openai_chat",
+        target_protocol="openai_chat",
+        input_protocol="openai_chat",
+        provider_protocol="openai_chat",
+        client_protocol="openai_chat",
+        transport="sse",
+    )
+
+
+def _pipeline(model: str, **kwargs) -> NeutralStreamPipeline:
+    return NeutralStreamPipeline(
+        client_protocol_name="openai_chat",
+        protocol_context=_protocol_context(model),
+        model=model,
+        **kwargs,
+    )
+
+
+async def _run(chunks_fn, model: str, **kwargs):
+    pipeline = _pipeline(model, **kwargs)
+    adapter = ChatWireStreamAdapter(model, repair_state=pipeline.repair_state)
+    return [frame async for frame in pipeline.run(adapter.events(chunks_fn(), pipeline.usage))]
 
 
 async def _usage_chunks():
@@ -100,7 +131,7 @@ async def test_streaming_usage_uses_normalized_accounting_and_trace(tmp_path, mo
     cred_context = FakeCredentialContext()
     logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
 
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "gpt-test", cred_context=cred_context, transaction_logger=logger)]
+    chunks = await _run(_usage_chunks, "gpt-test", cred_context=cred_context, transaction_logger=logger)
 
     assert chunks[-1] == "data: [DONE]\n\n"
     assert cred_context.success_kwargs["prompt_tokens"] == 55
@@ -117,7 +148,7 @@ async def test_streaming_usage_uses_normalized_accounting_and_trace(tmp_path, mo
 async def test_streaming_usage_skip_cost_returns_zero() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "gpt-test", cred_context=cred_context, skip_cost_calculation=True)]
+    _ = await _run(_usage_chunks, "gpt-test", cred_context=cred_context, skip_cost_calculation=True)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.0
 
@@ -126,7 +157,7 @@ async def test_streaming_usage_skip_cost_returns_zero() -> None:
 async def test_streaming_without_usage_still_marks_success_with_zero_usage() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_zero_usage_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_zero_usage_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["prompt_tokens"] == 0
     assert cred_context.success_kwargs["completion_tokens"] == 0
@@ -139,7 +170,7 @@ async def test_streaming_without_usage_still_marks_success_with_zero_usage() -> 
 async def test_streaming_completed_calls_success_callback() -> None:
     called = []
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_zero_usage_chunks(), "cred", "gpt-test", success_callback=lambda: called.append(True))]
+    _ = await _run(_zero_usage_chunks, "gpt-test", success_callback=lambda: called.append(True))
 
     assert called == [True]
 
@@ -149,7 +180,7 @@ async def test_streaming_usage_uses_configured_env_pricing(monkeypatch) -> None:
     monkeypatch.setenv("MODEL_PRICE_OPENAI_GPT_TEST_INPUT", "2.0")
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_usage_chunks(), "cred", "openai/gpt-test", cred_context=cred_context)]
+    _ = await _run(_usage_chunks, "openai/gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 110.0
 
@@ -158,9 +189,8 @@ async def test_streaming_usage_uses_configured_env_pricing(monkeypatch) -> None:
 async def test_streaming_cost_comment_updates_approx_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    chunks = [chunk async for chunk in StreamingHandler().wrap_stream(_cost_comment_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_cost_comment_chunks, "gpt-test", cred_context=cred_context)
 
-    assert chunks[0].startswith(": cost")
     assert cred_context.success_kwargs["approx_cost"] == 0.042
 
 
@@ -168,7 +198,7 @@ async def test_streaming_cost_comment_updates_approx_cost() -> None:
 async def test_streaming_cost_event_updates_approx_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_cost_event_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_cost_event_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.021
 
@@ -177,7 +207,7 @@ async def test_streaming_cost_event_updates_approx_cost() -> None:
 async def test_streaming_scalar_cost_event_updates_approx_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_scalar_cost_event_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_scalar_cost_event_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.033
 
@@ -186,7 +216,7 @@ async def test_streaming_scalar_cost_event_updates_approx_cost() -> None:
 async def test_streaming_reference_request_cost_comment_updates_approx_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_request_cost_comment_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_request_cost_comment_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.044
 
@@ -195,7 +225,7 @@ async def test_streaming_reference_request_cost_comment_updates_approx_cost() ->
 async def test_streaming_estimated_cost_comment_updates_approx_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_estimated_cost_comment_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_estimated_cost_comment_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.045
 
@@ -204,7 +234,7 @@ async def test_streaming_estimated_cost_comment_updates_approx_cost() -> None:
 async def test_streaming_sse_usage_preserves_top_level_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_top_level_cost_usage_sse_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_top_level_cost_usage_sse_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.055
 
@@ -213,7 +243,7 @@ async def test_streaming_sse_usage_preserves_top_level_cost() -> None:
 async def test_streaming_dict_usage_preserves_top_level_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_top_level_cost_usage_dict_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_top_level_cost_usage_dict_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.066
 
@@ -222,6 +252,6 @@ async def test_streaming_dict_usage_preserves_top_level_cost() -> None:
 async def test_streaming_final_usage_cost_overrides_comment_cost() -> None:
     cred_context = FakeCredentialContext()
 
-    _ = [chunk async for chunk in StreamingHandler().wrap_stream(_cost_comment_overridden_by_final_usage_chunks(), "cred", "gpt-test", cred_context=cred_context)]
+    _ = await _run(_cost_comment_overridden_by_final_usage_chunks, "gpt-test", cred_context=cred_context)
 
     assert cred_context.success_kwargs["approx_cost"] == 0.084

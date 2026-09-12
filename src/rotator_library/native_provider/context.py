@@ -40,6 +40,10 @@ class NativeProviderContext:
     # AND raw provider chunks (including provider-reported cost frames). The
     # operational stream layer adopts this record on completion.
     stream_usage_record: Any = None
+    # G4 shared stream-repair evidence (tools seen, provider's own reasons).
+    # Created by the client executor, fed by the native executor, consulted
+    # by the pipeline tail so bare-EOF streams still get repaired finishes.
+    stream_repair_state: Any = None
     headers: dict[str, str] = field(default_factory=dict)
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
