@@ -5,6 +5,7 @@ import time
 
 # Phase 1: Minimal imports for arg parsing and TUI
 import asyncio
+import math
 import os
 from pathlib import Path
 import sys
@@ -972,7 +973,9 @@ async def responses_websocket(websocket: WebSocket):
         return
     try:
         max_seconds = float(os.getenv("RESPONSES_WEBSOCKET_MAX_CONNECTION_SECONDS") or DEFAULT_MAX_CONNECTION_SECONDS)
-        if max_seconds <= 0:
+        # A NaN/inf env value passes a bare `<= 0` guard and starves the WS
+        # loop; require a finite, positive lifetime.
+        if not math.isfinite(max_seconds) or max_seconds <= 0:
             max_seconds = DEFAULT_MAX_CONNECTION_SECONDS
     except (TypeError, ValueError):
         max_seconds = DEFAULT_MAX_CONNECTION_SECONDS

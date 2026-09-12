@@ -10,8 +10,6 @@ from rotator_library.responses import InMemoryResponsesStore, ResponsesService, 
 from rotator_library.responses.streaming import ResponsesStreamEvent
 from rotator_library.responses.types import StoredResponse
 from rotator_library.responses.websocket import (
-    DEFAULT_MAX_CONNECTION_SECONDS,
-    LaneState,
     ResponsesWebSocketFormatter,
     ResponsesWebSocketSession,
     error_frame,
@@ -291,7 +289,7 @@ async def test_full_turn_yields_event_objects_with_terminal_discipline() -> None
 
 
 @pytest.mark.asyncio
-async def test_previous_response_not_found_maps_to_spec_frame_with_param_and_eviction() -> None:
+async def test_previous_response_not_found_maps_to_spec_frame_with_param_and_no_eviction() -> None:
     service = FakeService(error=ResponsesServiceError("Previous response not found: resp_missing", status_code=404, error_type="not_found_error"))
     session = ResponsesWebSocketSession(service=service, client=object())
     session.local_cache["resp_missing"] = StoredResponse(id="resp_missing", model="m", status="completed", response={})
@@ -306,8 +304,9 @@ async def test_previous_response_not_found_maps_to_spec_frame_with_param_and_evi
     assert frame["error"]["code"] == "previous_response_not_found"
     assert frame["error"]["param"] == "previous_response_id"
     assert frame["stream_id"] == "lane-x"
-    # Referenced parent evicted from the connection-local cache.
-    assert "resp_missing" not in session.local_cache
+    # Operator ruling: a failure NEVER deletes conversation memory — even a
+    # continuation miss leaves the referenced parent cached.
+    assert "resp_missing" in session.local_cache
 
 
 @pytest.mark.asyncio
@@ -376,7 +375,7 @@ async def test_store_failed_policy_covers_all_four_cells() -> None:
 
 
 @pytest.mark.asyncio
-async def test_failed_turn_evicts_referenced_parent() -> None:
+async def test_failed_turn_keeps_referenced_parent() -> None:
     service = FakeService(
         events=[
             _event("response.created", {"response": {"id": "resp_f", "status": "in_progress"}}),
@@ -389,7 +388,9 @@ async def test_failed_turn_evicts_referenced_parent() -> None:
         session.handle_frame(json.dumps({"type": "response.create", "model": "m", "previous_response_id": "resp_parent"}))
     )
     assert frames[-1]["type"] == "response.failed"
-    assert "resp_parent" not in session.local_cache
+    # The operator ruling REJECTS the official same-lane-failure eviction:
+    # the parent survives a failed child so the chain can be retried.
+    assert "resp_parent" in session.local_cache
 
 
 @pytest.mark.asyncio

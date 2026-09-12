@@ -667,8 +667,14 @@ class ResponsesService:
         *,
         request_scope: Optional[ResponsesRequestScope] = None,
         previous_response_access_token: Optional[str] = None,
+        local_cache: Optional[MutableMapping[str, StoredResponse]] = None,
     ) -> None:
-        """Validate stream-only preconditions before an HTTP response starts."""
+        """Validate stream-only preconditions before an HTTP response starts.
+
+        ``local_cache`` is the WebSocket connection-local continuation cache;
+        passing it lets warmup validate a chain exactly like a real turn
+        (local-first resolution) instead of 404ing on a store=false parent.
+        """
 
         if not raw_request.get("model"):
             raise ResponsesServiceError("'model' is required", status_code=400)
@@ -681,6 +687,7 @@ class ResponsesService:
                 None,
                 expected_scope_key=resolved_scope.key,
                 access_token=previous_response_access_token,
+                local_cache=local_cache,
                 provider_passthrough=_provider_continuation_eligible(raw_request),
                 raw_request_dict=raw_request,
             )
