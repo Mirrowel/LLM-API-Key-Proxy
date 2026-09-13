@@ -503,7 +503,8 @@ class LauncherTUI:
         )
         self.console.print("   6. :arrows_counterclockwise: Reload Configuration")
         self.console.print("   7. :information_source:  About")
-        self.console.print("   8. :door: Exit")
+        self.console.print("   8. :mag:  Transaction Explorer")
+        self.console.print("   9. :door: Exit")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -511,7 +512,7 @@ class LauncherTUI:
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
             show_choices=False,
         )
 
@@ -534,6 +535,8 @@ class LauncherTUI:
         elif choice == "7":
             self.show_about()
         elif choice == "8":
+            self.launch_transaction_explorer()
+        elif choice == "9":
             self.running = False
             sys.exit(0)
 
@@ -1026,6 +1029,17 @@ class LauncherTUI:
         from proxy_app.quota_viewer import run_quota_viewer
 
         run_quota_viewer()
+
+    def launch_transaction_explorer(self):
+        """Launch the transaction archive explorer (list / inspect / reconstruct)."""
+        clear_screen()
+
+        # Lazy import: the explorer pulls the library (archive reader +
+        # protocol registry) only when actually launched — the launcher
+        # fast path stays stdlib-only.
+        from proxy_app.transaction_explorer import run_explorer
+
+        run_explorer()
 
     def show_about(self):
         """Display About page with project information"""

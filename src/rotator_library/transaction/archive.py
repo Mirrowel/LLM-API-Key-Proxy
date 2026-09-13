@@ -30,8 +30,16 @@ _WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", "COM1", "LPT1"}
 
 
 def transactions_dir() -> Path:
-    root = get_default_root()
-    base = Path(root) / "logs" / "transactions"
+    """The archive directory — TRANSACTION_LOG_DIR relocates it (tests,
+    operators with custom layouts); default is <root>/logs/transactions."""
+
+    import os
+
+    override = os.environ.get("TRANSACTION_LOG_DIR")
+    if override:
+        base = Path(override)
+    else:
+        base = Path(get_default_root()) / "logs" / "transactions"
     base.mkdir(parents=True, exist_ok=True)
     return base
 
