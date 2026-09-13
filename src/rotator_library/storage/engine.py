@@ -453,7 +453,9 @@ def get_engine(family: str, *, directory: Optional[Path] = None) -> StorageEngin
                 from ..utils.paths import get_default_root
 
                 base = Path(get_default_root()) / "store"
-            idle_defaults = {"cache": 7 * 86400.0, "usage": 30 * 86400.0, "session": None}
+            # usage is accounting, not cache: no idle pruning, no TTL —
+            # rows live until their credential is structurally removed.
+            idle_defaults = {"cache": 7 * 86400.0, "session": None}
             engine = StorageEngine(
                 base / f"{family}.db",
                 idle_prune_seconds=idle_defaults.get(family),
