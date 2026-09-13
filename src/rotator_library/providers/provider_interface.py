@@ -458,9 +458,24 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         Config is intentionally a plain dict so custom providers can define it in
         env/JSON later without importing adapter classes. Phase 10 will add formal
         config loading and validation.
+
+        The generic ``param_rules`` adapter (when declared) receives the
+        merged provider/model parameter-rule declarations so strip/clamp/
+        map/rename tables declared anywhere (class, JSON, per-model) take
+        effect without provider code.
         """
 
-        return dict(self._get_runtime_config(model).adapter_config)
+        config = dict(self._get_runtime_config(model).adapter_config)
+        adapter_names = self.get_adapter_names(model)
+        if "param_rules" in adapter_names and "param_rules" not in config:
+            from ..adapters.param_rules import declared_param_rules
+
+            rules = declared_param_rules(self, model)
+            if rules:
+                # Resolved tables (provider+model merged) — the adapter's
+                # own resolution pass is idempotent over them.
+                config["param_rules"] = rules
+        return config
 
     def get_hooks(self, model: str = "") -> Tuple[Any, ...]:
         """Return ordered hook declarations for this provider/model.
