@@ -28,11 +28,10 @@ class ChutesAdapter(PayloadAdapter):
     supported_stages = ("request", "response", "stream_event")
 
     _UNSUPPORTED = (
-        "frequency_penalty",
-        "presence_penalty",
         "logit_bias",
         "logprobs",
         "top_logprobs",
+        "best_of",
     )
 
     async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
@@ -41,15 +40,17 @@ class ChutesAdapter(PayloadAdapter):
         updated = deepcopy(payload)
         for key in self._UNSUPPORTED:
             updated.pop(key, None)
+        if updated.get("n") not in (None, 1):
+            updated["n"] = 1
         if "max_completion_tokens" in updated and "max_tokens" not in updated:
             updated["max_tokens"] = updated.pop("max_completion_tokens")
         return updated
 
     async def transform_response(self, payload: Any, context: AdapterContext) -> Any:
-        return _rename_reasoning(payload)
+        return _normalize(payload)
 
     async def transform_stream_event(self, payload: Any, context: AdapterContext) -> Any:
-        return _rename_reasoning(payload)
+        return _normalize(payload)
 
 
 class NanoGPTAdapter(PayloadAdapter):
@@ -73,10 +74,26 @@ class NanoGPTAdapter(PayloadAdapter):
         return updated
 
     async def transform_response(self, payload: Any, context: AdapterContext) -> Any:
-        return _rename_reasoning(payload)
+        return _normalize(payload)
 
     async def transform_stream_event(self, payload: Any, context: AdapterContext) -> Any:
-        return _rename_reasoning(payload)
+        return _normalize(payload)
+
+
+def _normalize(payload: Any) -> Any:
+    payload = _rename_reasoning(payload)
+    if not isinstance(payload, dict):
+        return payload
+    usage = payload.get("usage")
+    if isinstance(usage, dict) and isinstance(usage.get("reasoning_tokens"), (int, float)):
+        details = usage.get("completion_tokens_details")
+        if not isinstance(details, dict) or "reasoning_tokens" not in details:
+            payload = deepcopy(payload)
+            usage = payload["usage"]
+            details = dict(details or {})
+            details["reasoning_tokens"] = usage.pop("reasoning_tokens")
+            usage["completion_tokens_details"] = details
+    return payload
 
 
 def _rename_reasoning(payload: Any) -> Any:

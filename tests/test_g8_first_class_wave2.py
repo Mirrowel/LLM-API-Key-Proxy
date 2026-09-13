@@ -80,10 +80,15 @@ def test_chutes_nanogpt_adapters():
         "max_completion_tokens": 512,
         "frequency_penalty": 0.3,
         "logprobs": True,
+        "best_of": 2,
+        "n": 3,
     }
     fixed = asyncio.run(chutes.transform_request(payload, context))
     assert fixed["max_tokens"] == 512 and "max_completion_tokens" not in fixed
-    assert "frequency_penalty" not in fixed and "logprobs" not in fixed
+    # Penalties stay: the live sampling whitelist advertises them per model.
+    assert "frequency_penalty" in fixed
+    assert "logprobs" not in fixed and "best_of" not in fixed
+    assert fixed["n"] == 1
     mapped = asyncio.run(nanogpt.transform_request({"max_completion_tokens": 9}, context))
     assert mapped["max_tokens"] == 9
 

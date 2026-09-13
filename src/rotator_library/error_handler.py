@@ -1473,6 +1473,9 @@ _QUOTA_MESSAGE_TOKENS = (
     # and subscription-balance exhaustion wording.
     "insufficient balance",
     "account balance",
+    # NanoGPT-style subscription exhaustion: 429 until daily/weekly reset.
+    "daily_rpd_limit_exceeded",
+    "daily_usd_limit_exceeded",
 )
 
 
