@@ -598,6 +598,25 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         )
         return _resolved_speaks_profiles(normalized)
 
+    def get_declared_profiles(self) -> Tuple[Dict[str, Dict[str, Any]], Optional[str]]:
+        """Unified profile view for routing: ``(profiles, default_name)``.
+
+        ``speaks`` translates into the transport-profiles shape (name →
+        protocol) with the first entry as the default; legacy
+        ``transport_profiles``/``default_profile`` remain the fallback
+        while providers migrate.
+        """
+
+        speaks_profiles = self._speaks_profiles()
+        if speaks_profiles:
+            names = [name for name in speaks_profiles if not name.startswith("__")]
+            view = {
+                name: {"protocol": speaks_profiles[name]["protocol"], **({"endpoint_paths": speaks_profiles[name]["endpoint_paths"]} if speaks_profiles[name].get("endpoint_paths") else {})}
+                for name in names
+            }
+            return view, (names[0] if names else None)
+        return self.transport_profiles, self.default_profile
+
     def _model_rules_rows(self, model: str = "") -> Tuple[Dict[str, Any], ...]:
         """Capability-table rows for a model: class declaration + JSON config."""
 

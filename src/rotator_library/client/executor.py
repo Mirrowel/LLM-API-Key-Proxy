@@ -922,7 +922,11 @@ class RequestExecutor:
         if not plugin:
             raise RoutingExecutionError(f"Provider {provider} has no plugin for native execution")
         profile = getattr(context, "execution_profile", None)
-        declared_profiles = getattr(plugin, "transport_profiles", None)
+        declared_profiles, declared_default = (
+            plugin.get_declared_profiles() if hasattr(plugin, "get_declared_profiles") else (None, None)
+        )
+        if declared_profiles is None:
+            declared_profiles = getattr(plugin, "transport_profiles", None)
         # Profile validation (D13): explicit profiles must exist — on
         # multi-profile AND single-protocol providers (fail-fast, never a
         # silent protocol mismatch); bare names resolve fast-path-or-error.
@@ -931,7 +935,7 @@ class RequestExecutor:
         try:
             profile = resolve_profile(
                 declared_profiles=declared_profiles,
-                default_profile=getattr(plugin, "default_profile", None),
+                default_profile=declared_default or getattr(plugin, "default_profile", None),
                 protocol_name=getattr(plugin, "protocol_name", None),
                 client_protocol=context.input_protocol_name,
                 requested_profile=profile,
@@ -3541,7 +3545,11 @@ def _target_profile_protocol(plugin: Any, target: RouteTarget, profile: str) -> 
 
 
 def _declared_profile_protocol(plugin: Any, profile: str) -> Optional[str]:
-    declared_profiles = getattr(plugin, "transport_profiles", None) if plugin else None
+    declared_profiles = None
+    if plugin is not None and hasattr(plugin, "get_declared_profiles"):
+        declared_profiles, _default = plugin.get_declared_profiles()
+    if not isinstance(declared_profiles, dict):
+        declared_profiles = getattr(plugin, "transport_profiles", None) if plugin else None
     if not isinstance(declared_profiles, dict):
         return None
     entry = declared_profiles.get(profile)

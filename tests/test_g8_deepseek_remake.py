@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""G8 deepseek remake pins.
+"""G8 deepseek remake pins (final envelope).
 
-The provider is a pure declaration: three transport faces, param_rules +
-model_param_rules parameter hygiene, and reasoning-content preservation
-through the real field-cache engine (response + stream siblings sharing
-one store). No custom execution path exists anymore.
+The provider is a pure declaration: three ``speaks`` faces, the
+``model_rules`` capability cascade for parameter hygiene, and
+reasoning-content preservation through ONE field-addressed cache rule
+(response + stream twins expanded by the engine, paths resolved from the
+protocol registry). No custom execution path exists anymore.
 """
 
 from __future__ import annotations
@@ -24,14 +25,28 @@ from rotator_library.field_cache import (
     build_cache_key,
 )
 from rotator_library.providers import PROVIDER_PLUGINS
-from rotator_library.providers.deepseek_provider import HARDCODED_MODELS
 
 
 def _plugin():
     return PROVIDER_PLUGINS["deepseek"]()
 
 
-# --- three-face profile resolution ------------------------------------------
+def _rule():
+    """The one field-addressed rule (engine expands it to the twins)."""
+
+    (rule,) = _plugin().field_cache_rules
+    assert rule.field == "reasoning"
+    assert rule.cache_key == "deepseek_reasoning"
+    return rule
+
+
+def _response_twin(rule):
+    """The response sibling the engine itself expands from ``sources``."""
+
+    return replace(rule, source="response", sources=None)
+
+
+# --- three-face speaks resolution ----------------------------------------------
 
 
 def test_default_face_is_chat_completions() -> None:
@@ -54,18 +69,40 @@ def test_responses_profile_resolves_responses_face() -> None:
 
 def test_anthropic_profile_resolves_anthropic_face() -> None:
     plugin = _plugin()
-    assert plugin.get_protocol_name("m", profile="anthropic") == "anthropic_messages"
-    assert plugin.get_native_operation("m", None, stream=False, profile="anthropic") == "messages"
+    assert plugin.get_protocol_name("m", profile="anthropic_messages") == "anthropic_messages"
     assert (
-        plugin.get_native_endpoint(model="m", operation="messages", profile="anthropic")
+        plugin.get_native_operation("m", None, stream=False, profile="anthropic_messages")
+        == "messages"
+    )
+    assert (
+        plugin.get_native_endpoint(model="m", operation="messages", profile="anthropic_messages")
         == "https://api.deepseek.com/anthropic/v1/messages"
     )
     assert (
-        plugin.get_native_endpoint(model="m", operation="count_tokens", profile="anthropic")
+        plugin.get_native_endpoint(
+            model="m", operation="count_tokens", profile="anthropic_messages"
+        )
         == "https://api.deepseek.com/anthropic/v1/messages/count_tokens"
     )
-    assert plugin.supports_native_operation("m", "messages", profile="anthropic") is True
-    assert plugin.supports_native_operation("m", "chat", profile="anthropic") is False
+    assert plugin.supports_native_operation("m", "messages", profile="anthropic_messages") is True
+    assert plugin.supports_native_operation("m", "chat", profile="anthropic_messages") is False
+
+
+def test_speaks_is_the_transport_declaration() -> None:
+    """The envelope replaces the legacy wiring: speaks resolves three faces,
+    the hand-rolled tables are gone, and the anthropic-compatibility face
+    inherits the protocol's conventional x-api-key auth."""
+    plugin = _plugin()
+    assert plugin.transport_profiles is None
+    assert plugin.protocol_name is None
+    assert plugin.default_profile is None
+    profiles = plugin._speaks_profiles()
+    assert set(profiles) - {"__default__"} == {"openai_chat", "responses", "anthropic_messages"}
+    assert profiles["__default__"] is profiles["openai_chat"]
+    assert plugin.get_native_headers("sk-test", profile="anthropic_messages") == {
+        "x-api-key": "sk-test"
+    }
+    assert plugin.get_native_headers("sk-test") == {"Authorization": "Bearer sk-test"}
 
 
 def test_transport_base_has_no_v1_suffix_and_env_overrides(monkeypatch) -> None:
@@ -80,14 +117,18 @@ def test_transport_base_has_no_v1_suffix_and_env_overrides(monkeypatch) -> None:
 
 
 def test_retired_custom_path_is_gone() -> None:
+    from rotator_library.providers.deepseek_provider import DeepseekProvider
+
     plugin = _plugin()
     assert plugin.has_custom_logic() is False
     assert plugin.adapter_names == ("param_rules",)
     assert not hasattr(plugin, "_get_reasoning_cache")
+    # Listing is the inherited shared implementation, not provider code.
+    assert "get_models" not in vars(DeepseekProvider)
     assert plugin.native_streaming_supported is True
 
 
-# --- declared parameter hygiene (param_rules + model_param_rules) -------------
+# --- declared parameter hygiene (model_rules cascade) ---------------------------
 
 
 async def _adapt(payload: dict, model: str) -> dict:
@@ -133,10 +174,32 @@ async def test_per_model_effort_mapping(effort: str, expected: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unknown_model_effort_is_unmapped() -> None:
+async def test_dated_snapshot_ids_match_the_wildcard() -> None:
+    """``deepseek-v4*`` covers the dated snapshot ids the exact-id table
+    could not — the intentional wildcard improvement."""
+    result = await _adapt(
+        {"model": "deepseek-v4-pro-0813", "messages": [], "reasoning_effort": "medium"},
+        "deepseek-v4-pro-0813",
+    )
+    assert result["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_flash_alias_gets_the_v4_effort_map() -> None:
+    """deepseek-flash is a v4 alias: the envelope maps its effort too (the
+    exact-id remake left it unmapped)."""
     result = await _adapt(
         {"model": "deepseek-flash", "messages": [], "reasoning_effort": "medium"},
         "deepseek-flash",
+    )
+    assert result["reasoning_effort"] == "high"
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_effort_is_unmapped() -> None:
+    result = await _adapt(
+        {"model": "deepseek-chat", "messages": [], "reasoning_effort": "medium"},
+        "deepseek-chat",
     )
     assert result["reasoning_effort"] == "medium"
 
@@ -154,18 +217,13 @@ async def test_nothing_sent_nothing_injected() -> None:
 # --- reasoning cache through the real field-cache engine ----------------------
 
 
-def _rules():
-    response_rule, stream_rule = _plugin().field_cache_rules
-    assert response_rule.cache_key == stream_rule.cache_key == "deepseek_reasoning"
-    return response_rule, stream_rule
-
-
 def _context(**overrides) -> FieldCacheContext:
     base = dict(
         provider="deepseek",
         model="deepseek-v4-pro",
         credential_id="cred-1",
         session_id="session-1",
+        protocol_family="openai_chat",
     )
     base.update(overrides)
     return FieldCacheContext(**base)
@@ -198,22 +256,30 @@ def _response(content: str, call_id: str, reasoning: str) -> dict:
     }
 
 
-def test_sibling_rules_share_one_cache_key_and_construct() -> None:
-    response_rule, stream_rule = _rules()
+def test_field_addressed_rule_shape_and_twin_expansion() -> None:
+    rule = _rule()
     context = _context()
-    assert build_cache_key(response_rule, context) == build_cache_key(stream_rule, context)
-    assert response_rule.placeholder == stream_rule.placeholder == "Reasoning content unavailable."
-    assert response_rule.ttl_seconds == stream_rule.ttl_seconds == 604800
-    assert response_rule.metadata["tool_call_id_path"] == "tool_calls.*.id"
-    # The shared-signature contract must hold for the real engine.
-    FieldCacheEngine([response_rule, stream_rule])
+    assert rule.sources == ("response", "stream_event")
+    assert rule.mode == "all"
+    assert rule.placeholder == "Reasoning content unavailable."
+    assert rule.ttl_seconds == 604800
+    assert rule.inject.when_missing_only is True
+    assert build_cache_key(rule, context) is not None
+    # The shared-signature contract must hold for the expanded twins.
+    FieldCacheEngine([rule])
+    # Correlation (tool_call_id_path) and paths derive from the registry.
+    from rotator_library.protocols.defaults import field_locations
+
+    slots = field_locations("reasoning", "openai_chat")
+    assert slots["tool_call_id_path"] == "tool_calls.*.id"
+    assert slots["inject_path"] == "messages.*.reasoning_content"
 
 
 @pytest.mark.asyncio
 async def test_reasoning_round_trip_all_history_default() -> None:
-    response_rule, stream_rule = _rules()
+    rule = _rule()
     store = InMemoryFieldCacheStore()
-    engine = FieldCacheEngine([response_rule, stream_rule], store=store)
+    engine = FieldCacheEngine([rule], store=store)
     context = _context()
 
     await engine.extract("response", _response("turn one", "call_1", "reasoning one"), context)
@@ -231,7 +297,7 @@ async def test_reasoning_round_trip_all_history_default() -> None:
     }
     updated, operations = await engine.inject("request", request, context)
 
-    reasoning_operation = next(op for op in operations if op.rule_name == "reasoning")
+    reasoning_operation = next(op for op in operations if op.rule_name.startswith("reasoning"))
     assert reasoning_operation.hit is True
     assert reasoning_operation.changed is True
     assert updated["messages"][1]["reasoning_content"] == "reasoning one"
@@ -243,8 +309,8 @@ async def test_reasoning_round_trip_all_history_default() -> None:
 
 @pytest.mark.asyncio
 async def test_reasoning_correlates_by_tool_call_id() -> None:
-    response_rule, stream_rule = _rules()
-    engine = FieldCacheEngine([response_rule, stream_rule])
+    rule = _rule()
+    engine = FieldCacheEngine([rule])
     context = _context()
 
     # Identical content: only the tool-call id can distinguish the values.
@@ -264,14 +330,14 @@ async def test_reasoning_correlates_by_tool_call_id() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_sibling_writes_the_same_store() -> None:
-    response_rule, stream_rule = _rules()
+async def test_stream_twin_writes_the_same_store() -> None:
+    rule = _rule()
     store = InMemoryFieldCacheStore()
     context = _context()
-    engine = FieldCacheEngine([response_rule, stream_rule], store=store)
+    engine = FieldCacheEngine([rule], store=store)
 
     # One streamed reasoning fragment: the serialized neutral event carries
-    # the provider chunk under ``raw``.
+    # the provider chunk under ``raw`` (the registry stream slot).
     event = {
         "type": "message_delta",
         "raw": {"choices": [{"index": 0, "delta": {"reasoning_content": "streamed thought"}}]},
@@ -279,7 +345,11 @@ async def test_stream_sibling_writes_the_same_store() -> None:
     operations = await engine.extract("stream_event", event, context)
     assert operations[0].changed is True
 
-    # The response sibling reads the same store: an occurrence whose content
+    # Both twins share ONE store entry map under ONE cache key.
+    stored = await store.get(build_cache_key(rule, context))
+    assert isinstance(stored, dict) and "streamed thought" in str(stored.values())
+
+    # The response twin reads the same store: an occurrence whose content
     # matches the fragment sha restores it.
     request = {
         "messages": [
@@ -287,7 +357,7 @@ async def test_stream_sibling_writes_the_same_store() -> None:
             {"role": "assistant", "content": "streamed thought"},
         ]
     }
-    response_only_engine = FieldCacheEngine([response_rule], store=store)
+    response_only_engine = FieldCacheEngine([_response_twin(rule)], store=store)
     updated, operations = await response_only_engine.inject("request", request, context)
     assert operations[0].hit is True
     assert updated["messages"][1]["reasoning_content"] == "streamed thought"
@@ -295,10 +365,10 @@ async def test_stream_sibling_writes_the_same_store() -> None:
 
 @pytest.mark.asyncio
 async def test_turn_scope_override_injects_only_latest_region() -> None:
-    response_rule, stream_rule = _rules()
+    rule = _rule()
     store = InMemoryFieldCacheStore()
     context = _context()
-    engine = FieldCacheEngine([response_rule, stream_rule], store=store)
+    engine = FieldCacheEngine([rule], store=store)
 
     await engine.extract("response", _response("turn one", "call_1", "reasoning one"), context)
     await engine.extract("response", _response("turn two", "call_2", "reasoning two"), context)
@@ -314,7 +384,7 @@ async def test_turn_scope_override_injects_only_latest_region() -> None:
 
     # A config-style override rebuilding the rule with mode="turn" narrows
     # injection to the latest region only; the store is untouched.
-    turned = replace(response_rule, mode="turn")
+    turned = replace(rule, mode="turn")
     assert turned.mode == "turn"
     updated, operations = await FieldCacheEngine([turned], store=store).inject(
         "request", request, context
@@ -326,8 +396,8 @@ async def test_turn_scope_override_injects_only_latest_region() -> None:
 
 @pytest.mark.asyncio
 async def test_placeholder_when_occurrence_does_not_correlate() -> None:
-    response_rule, _ = _rules()
-    engine = FieldCacheEngine([response_rule])
+    rule = _response_twin(_rule())
+    engine = FieldCacheEngine([rule])
     context = _context()
     # The store holds reasoning for one conversation turn; the request also
     # carries an assistant message the cache has never seen.
@@ -361,14 +431,16 @@ async def test_placeholder_when_occurrence_does_not_correlate() -> None:
         for record in records
         if record.levelno == logging.WARNING and "placeholder" in record.getMessage()
     ]
+    # Exactly one warning: the stream twin sees the placeholder already
+    # present (when_missing_only) and never re-warns.
     assert len(warnings) == 1
     assert operations[0].skipped is False
 
 
 @pytest.mark.asyncio
 async def test_existing_client_reasoning_is_preserved() -> None:
-    response_rule, stream_rule = _rules()
-    engine = FieldCacheEngine([response_rule, stream_rule])
+    rule = _rule()
+    engine = FieldCacheEngine([rule])
     context = _context()
     await engine.extract("response", _response("same", "call_1", "cached"), context)
 
@@ -387,7 +459,7 @@ async def test_existing_client_reasoning_is_preserved() -> None:
     assert updated["messages"][1]["reasoning_content"] == "client-provided"
 
 
-# --- model listing -------------------------------------------------------------
+# --- model listing (shared interface implementation) ----------------------------
 
 
 class _FakeResponse:
@@ -417,25 +489,21 @@ class _FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_model_listing_parses_provider_ids() -> None:
+async def test_model_listing_via_shared_implementation() -> None:
     plugin = _plugin()
     client = _FakeClient(
         body={"data": [{"id": "deepseek-v4-pro"}, {"id": "deepseek-v4-flash"}, {"object": "model"}]}
     )
     models = await plugin.get_models("sk-test", client)
     assert models == ["deepseek/deepseek-v4-pro", "deepseek/deepseek-v4-flash"]
+    # Listing face resolves from speaks (openai_chat, first in priority).
     assert client.calls[0] == "https://api.deepseek.com/models"
 
 
 @pytest.mark.asyncio
-async def test_model_listing_falls_back_to_hardcoded_list() -> None:
+async def test_failed_listing_is_an_honest_empty() -> None:
     plugin = _plugin()
     client = _FakeClient(error=RuntimeError("network down"))
     models = await plugin.get_models("sk-test", client)
-    assert models == [f"deepseek/{model}" for model in HARDCODED_MODELS]
-    assert HARDCODED_MODELS == [
-        "deepseek-v4-pro",
-        "deepseek-v4-flash",
-        "deepseek-v4-flash-vision-exp",
-        "deepseek-flash",
-    ]
+    # No hardcoded fallback anymore: a failed listing is an honest empty.
+    assert models == []

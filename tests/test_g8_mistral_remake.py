@@ -1,21 +1,23 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""G8 mistral remake pins.
+"""G8 mistral remake pins (final envelope).
 
 The provider is a declaration plus one adapter that EXTENDS the generic
-param_rules engine: provider/model parameter tables (strip_override
-re-admitting reasoning_effort on the four reasoning models), think-chunk
+param_rules engine: the ``model_rules`` capability cascade (strip_override
+re-admitting reasoning_effort on the reasoning families), think-chunk
 folding for response and stream, history-reasoning stripping, and the
-nested seed rename. Reasoning-content preservation runs through the real
-field-cache engine (response + stream siblings sharing one store, mode
-left at the global ``turn`` default, no placeholder).
+nested seed rename. Reasoning-content preservation runs through ONE
+field-addressed cache rule (response + stream twins sharing one store,
+mode left at the global ``turn`` default, no placeholder, paths resolved
+from the protocol registry).
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from dataclasses import replace
 
 import pytest
 
@@ -28,7 +30,6 @@ from rotator_library.field_cache import (
     build_cache_key,
 )
 from rotator_library.providers import PROVIDER_PLUGINS
-from rotator_library.providers.mistral_provider import MISTRAL_REASONING_MODELS
 
 
 def _plugin():
@@ -38,6 +39,15 @@ def _plugin():
 NON_REASONING_MODEL = "mistral-large-latest"
 REASONING_MODEL = "mistral-medium-3-5"
 
+# The current reasoning-capable upstream ids (covered by the
+# ``mistral-small*``/``mistral-medium*`` wildcards).
+REASONING_MODELS = (
+    "mistral-small-latest",
+    "mistral-small-2603",
+    "mistral-medium-3-5",
+    "mistral-medium-2604",
+)
+
 
 # --- declaration identity --------------------------------------------------------
 
@@ -45,7 +55,10 @@ REASONING_MODEL = "mistral-medium-3-5"
 def test_mistral_declaration_identity() -> None:
     plugin = _plugin()
     assert plugin.provider_env_name == "mistral"
-    assert plugin.protocol_name == "openai_chat"
+    assert plugin.speaks == ("openai_chat",)
+    assert plugin.transport_profiles is None
+    assert plugin.protocol_name is None
+    assert plugin.get_protocol_name("m") == "openai_chat"
     assert plugin.native_streaming_supported is True
     assert plugin.default_api_base == "https://api.mistral.ai/v1"
     assert plugin.get_native_endpoint(model="m", operation="chat") == "https://api.mistral.ai/v1/chat/completions"
@@ -53,16 +66,22 @@ def test_mistral_declaration_identity() -> None:
     assert get_adapter("mistral").name == "mistral"
 
 
-def test_reasoning_models_constant_and_rule_keys_agree() -> None:
-    assert MISTRAL_REASONING_MODELS == (
-        "mistral-small-latest",
-        "mistral-small-2603",
-        "mistral-medium-3-5",
-        "mistral-medium-2604",
-    )
+def test_capability_cascade_covers_the_reasoning_families() -> None:
+    """The wildcards replace the exact-id constant: every current reasoning
+    id (and any dated variant) resolves the strip_override + effort map."""
     plugin = _plugin()
-    assert plugin.MISTRAL_REASONING_MODELS == MISTRAL_REASONING_MODELS
-    assert set(plugin.model_param_rules) == set(MISTRAL_REASONING_MODELS)
+    assert tuple(row["match"] for row in plugin.model_rules) == (
+        "*",
+        "mistral-small*",
+        "mistral-medium*",
+    )
+    # the legacy per-model tables are gone; the cascade replaces them
+    assert not hasattr(plugin, "model_param_rules")
+    assert not hasattr(plugin, "param_rules")
+    for model in REASONING_MODELS + ("mistral-small-2411", "mistral-medium-2710"):
+        rules = plugin.get_adapter_config(model)["mistral"]
+        assert "reasoning_effort" not in rules["strip"], model
+        assert rules["map"]["reasoning_effort"]["medium"] == "high", model
 
 
 def test_retired_handler_and_patterns_are_gone() -> None:
@@ -71,6 +90,7 @@ def test_retired_handler_and_patterns_are_gone() -> None:
     assert not hasattr(plugin, "_is_mistral_reasoning")
     assert not hasattr(plugin, "MISTRAL_MODEL_PATTERNS")
     assert not hasattr(plugin, "DISABLE_VALUES")
+    assert not hasattr(plugin, "MISTRAL_REASONING_MODELS")
 
 
 def test_retired_client_transform_entry_is_gone() -> None:
@@ -90,7 +110,7 @@ def test_adapter_config_exposes_resolved_tables_under_own_key() -> None:
     assert "strip_override" not in rules
 
 
-# --- declared parameter hygiene (param_rules via the mistral adapter) ------------
+# --- declared parameter hygiene (model_rules via the mistral adapter) ------------
 
 
 async def _adapt(payload: dict, model: str) -> dict:
@@ -131,8 +151,8 @@ async def test_provider_level_strip_clamp_rename_on_plain_model() -> None:
 
 async def test_non_reasoning_model_strips_reasoning_effort() -> None:
     result = await _adapt(
-        {"model": "mistral-small-2410", "messages": [], "reasoning_effort": "high"},
-        "mistral-small-2410",
+        {"model": "mistral-ocr-latest", "messages": [], "reasoning_effort": "high"},
+        "mistral-ocr-latest",
     )
     assert "reasoning_effort" not in result
 
@@ -149,7 +169,7 @@ async def test_non_reasoning_model_strips_reasoning_effort() -> None:
     ],
 )
 async def test_reasoning_model_effort_table(effort: str, expected: str) -> None:
-    for model in MISTRAL_REASONING_MODELS:
+    for model in REASONING_MODELS:
         result = await _adapt(
             {"model": model, "messages": [], "reasoning_effort": effort},
             model,
@@ -373,7 +393,6 @@ async def test_stream_neutral_event_text_only_identity() -> None:
 
 # --- adapter: request specifics ---------------------------------------------------
 
-
 async def test_history_reasoning_fields_stripped_from_request() -> None:
     payload = {
         "model": REASONING_MODEL,
@@ -409,10 +428,19 @@ async def test_seed_moves_into_extra_body_random_seed() -> None:
 # --- reasoning cache through the real field-cache engine --------------------------
 
 
-def _rules():
-    response_rule, stream_rule = _plugin().field_cache_rules
-    assert response_rule.cache_key == stream_rule.cache_key == "mistral_reasoning"
-    return response_rule, stream_rule
+def _rule():
+    """The one field-addressed rule (engine expands it to the twins)."""
+
+    (rule,) = _plugin().field_cache_rules
+    assert rule.field == "reasoning"
+    assert rule.cache_key == "mistral_reasoning"
+    return rule
+
+
+def _response_twin(rule):
+    """The response sibling the engine itself expands from ``sources``."""
+
+    return replace(rule, source="response", sources=None)
 
 
 def _cache_context(**overrides) -> FieldCacheContext:
@@ -421,6 +449,7 @@ def _cache_context(**overrides) -> FieldCacheContext:
         model=REASONING_MODEL,
         credential_id="cred-1",
         session_id="session-1",
+        protocol_family="openai_chat",
     )
     base.update(overrides)
     return FieldCacheContext(**base)
@@ -445,24 +474,29 @@ def _response(content: str, reasoning: str) -> dict:
     }
 
 
-def test_sibling_rules_share_store_and_default_turn_mode() -> None:
-    response_rule, stream_rule = _rules()
+def test_field_addressed_rule_shape_and_default_turn_mode() -> None:
+    rule = _rule()
     context = _cache_context()
-    assert build_cache_key(response_rule, context) == build_cache_key(stream_rule, context)
-    # mode UNDECLATED: the global default ("turn") is the declaration
-    assert response_rule.mode == stream_rule.mode == "turn"
+    assert rule.sources == ("response", "stream_event")
+    # mode UNDECLARED: the global default ("turn") is the declaration
+    assert rule.mode == "turn"
     # no placeholder: no 400-on-missing contract to satisfy
-    assert response_rule.placeholder is None
-    assert stream_rule.placeholder is None
-    assert response_rule.inject.when_missing_only is True
-    assert stream_rule.inject.path == "messages.*.reasoning_content"
-    # the shared-signature contract must hold for the real engine
-    FieldCacheEngine([response_rule, stream_rule])
+    assert rule.placeholder is None
+    assert rule.inject.when_missing_only is True
+    assert build_cache_key(rule, context) is not None
+    # the shared-signature contract must hold for the expanded twins
+    FieldCacheEngine([rule])
+    # injection + correlation paths derive from the protocol registry
+    from rotator_library.protocols.defaults import field_locations
+
+    slots = field_locations("reasoning", "openai_chat")
+    assert slots["inject_path"] == "messages.*.reasoning_content"
+    assert slots["response_path"] == "choices.*.message.reasoning_content"
 
 
 async def test_reasoning_round_trip_current_turn_only() -> None:
-    response_rule, stream_rule = _rules()
-    engine = FieldCacheEngine([response_rule, stream_rule])
+    rule = _rule()
+    engine = FieldCacheEngine([rule])
     context = _cache_context()
 
     await engine.extract("response", _response("turn one", "reasoning one"), context)
@@ -479,7 +513,7 @@ async def test_reasoning_round_trip_current_turn_only() -> None:
     }
     updated, operations = await engine.inject("request", request, context)
 
-    reasoning_operation = next(op for op in operations if op.rule_name == "reasoning")
+    reasoning_operation = next(op for op in operations if op.rule_name.startswith("reasoning"))
     assert reasoning_operation.hit is True
     assert reasoning_operation.changed is True
     # mode=turn: only the latest region's assistant message is touched
@@ -491,8 +525,8 @@ async def test_reasoning_round_trip_current_turn_only() -> None:
 
 
 async def test_client_carried_reasoning_survives_when_missing_only() -> None:
-    response_rule, stream_rule = _rules()
-    engine = FieldCacheEngine([response_rule, stream_rule])
+    rule = _rule()
+    engine = FieldCacheEngine([rule])
     context = _cache_context()
     await engine.extract("response", _response("same", "cached"), context)
 
@@ -507,8 +541,8 @@ async def test_client_carried_reasoning_survives_when_missing_only() -> None:
 
 
 async def test_miss_leaves_message_clean_no_placeholder() -> None:
-    response_rule, _ = _rules()
-    engine = FieldCacheEngine([response_rule])
+    rule = _rule()
+    engine = FieldCacheEngine([_response_twin(rule)])
     context = _cache_context()
     await engine.extract("response", _response("known", "cached"), context)
 
@@ -524,29 +558,32 @@ async def test_miss_leaves_message_clean_no_placeholder() -> None:
     assert operations[0].skipped is True
 
 
-async def test_stream_sibling_writes_the_same_store() -> None:
+async def test_stream_twin_writes_the_same_store() -> None:
     from rotator_library.adapters.mistral import MistralAdapter as Adapter
-    from rotator_library.protocols.openai_chat import OpenAIChatProtocol
 
-    response_rule, stream_rule = _rules()
+    rule = _rule()
     store = InMemoryFieldCacheStore()
     context = _cache_context()
-    engine = FieldCacheEngine([response_rule, stream_rule], store=store)
+    engine = FieldCacheEngine([rule], store=store)
 
-    # One streamed reasoning fragment: the neutral event after the mistral
-    # adapter folded the think-chunk (extraction sees the serialized form).
-    protocol = OpenAIChatProtocol()
+    # One streamed reasoning fragment: the adapter folds the raw provider
+    # chunk (its dict path), and the serialized neutral event carries that
+    # chunk under ``raw`` — the registry's stream slot.
     chunk = {
         "choices": [
             {"index": 0, "delta": {"content": [_think_chunk("streamed thought")]}}
         ]
     }
-    event = protocol.parse_stream_events(chunk)[0]
-    adapted = await Adapter().transform_stream_event(event, _ctx())
-    operations = await engine.extract("stream_event", adapted.to_dict(), context)
+    folded = await Adapter().transform_stream_event(chunk, _ctx())
+    event = {"type": "message_delta", "raw": folded}
+    operations = await engine.extract("stream_event", event, context)
     assert operations[0].changed is True
 
-    # The response sibling reads the same store: an occurrence whose content
+    # Both twins share ONE store entry map under ONE cache key.
+    stored = await store.get(build_cache_key(rule, context))
+    assert isinstance(stored, dict) and "streamed thought" in str(stored.values())
+
+    # The response twin reads the same store: an occurrence whose content
     # matches the fragment sha restores it.
     request = {
         "messages": [
@@ -554,13 +591,13 @@ async def test_stream_sibling_writes_the_same_store() -> None:
             {"role": "assistant", "content": "streamed thought"},
         ]
     }
-    response_only_engine = FieldCacheEngine([response_rule], store=store)
+    response_only_engine = FieldCacheEngine([_response_twin(rule)], store=store)
     updated, operations = await response_only_engine.inject("request", request, context)
     assert operations[0].hit is True
     assert updated["messages"][1]["reasoning_content"] == "streamed thought"
 
 
-# --- model listing -------------------------------------------------------------
+# --- model listing (shared interface implementation) ------------------------------
 
 
 class _FakeResponse:
@@ -589,7 +626,7 @@ class _FakeClient:
         return _FakeResponse(self._body)
 
 
-async def test_model_listing_parses_provider_ids() -> None:
+async def test_model_listing_via_shared_implementation() -> None:
     plugin = _plugin()
     client = _FakeClient(
         body={"data": [{"id": "mistral-medium-3-5"}, {"id": "mistral-small-latest"}, {"object": "model"}]}
@@ -597,3 +634,10 @@ async def test_model_listing_parses_provider_ids() -> None:
     models = await plugin.get_models("sk-test", client)
     assert models == ["mistral/mistral-medium-3-5", "mistral/mistral-small-latest"]
     assert client.calls[0] == "https://api.mistral.ai/v1/models"
+
+
+async def test_failed_listing_is_an_honest_empty() -> None:
+    plugin = _plugin()
+    client = _FakeClient(error=RuntimeError("network down"))
+    models = await plugin.get_models("sk-test", client)
+    assert models == []
