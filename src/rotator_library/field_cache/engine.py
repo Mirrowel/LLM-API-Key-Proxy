@@ -6,7 +6,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import re
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Optional
@@ -15,7 +17,6 @@ from .paths import FieldCachePathError, extract_path, inject_path, parse_path
 from .store import (
     FieldCacheStore,
     InMemoryFieldCacheStore,
-    _bounded_append_values,
     _bounded_set_value,
 )
 from .types import FieldCacheContext, FieldCacheRule
@@ -170,8 +171,6 @@ class FieldCacheEngine:
             parse_path(rule.path)
             if rule.inject:
                 parse_path(rule.inject.path)
-            if rule.mode == "per_tool_call" and not rule.metadata.get("tool_call_id_path"):
-                raise ValueError("per_tool_call field-cache mode requires metadata.tool_call_id_path")
             if rule.cache_key:
                 signature = _shared_cache_signature(rule)
                 previous = shared_keys.get(rule.cache_key)
@@ -211,7 +210,7 @@ class FieldCacheEngine:
                 values = extract_path(payload, rule.path)
                 operation.matched = len(values)
                 operation.sample_values = _sample_values(values)
-                if values or rule.mode in {"last_user_turn", "last_assistant_turn", "per_tool_call"}:
+                if values or rule.metadata.get("turn_value_path") or rule.metadata.get("turn_container_path"):
                     operation.changed = await self._store_values(rule, operation.cache_key, values, payload, operation)
             except Exception as exc:
                 self._log_error(transaction_logger, "field_cache_extract", exc, payload, rule)
@@ -284,43 +283,56 @@ class FieldCacheEngine:
                 ]
                 if none_dimensions:
                     provenance_note["none_dimensions"] = none_dimensions
-                value = self._injection_value(rule, cached, updated, context, operation)
-                if operation.skipped:
-                    operations.append(operation)
-                    self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
-                    continue
-                transform_name = rule.metadata.get("transform")
-                if transform_name:
-                    from ..protocols.transforms import apply_transform
-
-                    if isinstance(value, list):
-                        value = [apply_transform(str(transform_name), item) for item in value]
-                        value = [item for item in value if item is not None]
-                    else:
-                        value = apply_transform(str(transform_name), value)
-                        if value is None:
-                            operation.reason = "transform_produced_nothing"
-                            operations.append(operation)
-                            self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
-                            continue
-                if provenance_note and provenance_note.get("inherited_from"):
-                    inherited = "inherited_from_compatible_model"
-                    none_dimensions = provenance_note.get("none_dimensions")
-                    operation.reason = (
-                        inherited + ";optional_scope_none:" + "+".join(none_dimensions)
-                        if none_dimensions
-                        else inherited
+                occurrence_plan = _occurrence_injection_plan(rule, updated)
+                if occurrence_plan is not None:
+                    changed, samples = self._apply_occurrence_injection(
+                        rule,
+                        cached,
+                        updated,
+                        context,
+                        operation,
+                        *occurrence_plan,
                     )
-                elif provenance_note and provenance_note.get("none_dimensions"):
-                    operation.reason = "optional_scope_none:" + "+".join(provenance_note["none_dimensions"])
-                operation.changed = inject_path(
-                    updated,
-                    rule.inject.path,
-                    value,
-                    when_missing_only=rule.inject.when_missing_only,
-                    insert=rule.inject.insert,
-                )
-                operation.sample_values = _sample_values(value if isinstance(value, list) else [value])
+                    operation.changed = changed
+                    operation.sample_values = samples
+                else:
+                    value = self._injection_value(rule, cached, updated, context, operation)
+                    if operation.skipped:
+                        operations.append(operation)
+                        self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
+                        continue
+                    transform_name = rule.metadata.get("transform")
+                    if transform_name:
+                        from ..protocols.transforms import apply_transform
+
+                        if isinstance(value, list):
+                            value = [apply_transform(str(transform_name), item) for item in value]
+                            value = [item for item in value if item is not None]
+                        else:
+                            value = apply_transform(str(transform_name), value)
+                            if value is None:
+                                operation.reason = "transform_produced_nothing"
+                                operations.append(operation)
+                                self._trace(transaction_logger, "after_field_cache_injection", updated, rule, operation, target=target)
+                                continue
+                    if provenance_note and provenance_note.get("inherited_from"):
+                        inherited = "inherited_from_compatible_model"
+                        none_dimensions = provenance_note.get("none_dimensions")
+                        operation.reason = (
+                            inherited + ";optional_scope_none:" + "+".join(none_dimensions)
+                            if none_dimensions
+                            else inherited
+                        )
+                    elif provenance_note and provenance_note.get("none_dimensions"):
+                        operation.reason = "optional_scope_none:" + "+".join(provenance_note["none_dimensions"])
+                    operation.changed = inject_path(
+                        updated,
+                        rule.inject.path,
+                        value,
+                        when_missing_only=rule.inject.when_missing_only,
+                        insert=rule.inject.insert,
+                    )
+                    operation.sample_values = _sample_values(value if isinstance(value, list) else [value])
             except Exception as exc:
                 self._log_error(transaction_logger, "field_cache_inject", exc, updated, rule)
                 if rule.critical:
@@ -379,61 +391,36 @@ class FieldCacheEngine:
         return [rule for rule in self.rules if rule.enabled and rule.inject and rule.inject.target == target]
 
     async def _store_values(self, rule: FieldCacheRule, cache_key: str, values: list[Any], payload: Any, operation: FieldCacheOperation) -> bool:
-        if rule.mode == "all":
-            await self._store_append(
-                cache_key,
-                values,
-                ttl_seconds=rule.ttl_seconds,
-                max_values=rule.max_values,
-                max_bytes=rule.max_bytes,
-            )
-            return True
-        if rule.mode == "last":
-            await self._store_set(
-                cache_key,
-                _wrap_cached_value(values[-1]),
-                ttl_seconds=rule.ttl_seconds,
-                max_values=None,
-                max_bytes=rule.max_bytes,
-                trim_collections=False,
-            )
-            return True
-        if rule.mode in {"last_user_turn", "last_assistant_turn"}:
-            role = "user" if rule.mode == "last_user_turn" else "assistant"
-            turn_values = _turn_values(rule, payload, role)
-            if not turn_values:
+        """Store every extracted occurrence under its correlation keys.
+
+        Correlation keys: the occurrence's tool-call ids (primary) and the
+        sha256 of its exact content bytes (secondary). Entries merge with the
+        existing map; recently written keys move to the end so dict order is
+        recency order (the mode selects values at injection time, never here).
+        """
+
+        entries = _extraction_entries(rule, payload, values)
+        if not entries:
+            if rule.metadata.get("turn_container_path") or rule.metadata.get("turn_value_path"):
                 operation.skipped = True
                 operation.reason = "turn_context_not_found"
-                return False
-            operation.matched = len(turn_values)
-            operation.sample_values = _sample_values(turn_values)
-            await self._store_set(
-                cache_key,
-                _wrap_cached_value(turn_values[-1]),
-                ttl_seconds=rule.ttl_seconds,
-                max_values=None,
-                max_bytes=rule.max_bytes,
-                trim_collections=False,
-            )
-            return True
-        if rule.mode == "per_tool_call":
-            stored = _tool_call_values(rule, payload, values)
-            if not stored:
-                operation.skipped = True
-                operation.reason = "tool_call_id_not_found"
-                return False
-            operation.matched = len(stored)
-            operation.sample_values = _sample_values(list(stored.values()))
-            await self._store_set(
-                cache_key,
-                stored,
-                ttl_seconds=rule.ttl_seconds,
-                max_values=rule.max_values,
-                max_bytes=rule.max_bytes,
-                trim_collections=True,
-            )
-            return True
-        raise ValueError(f"Unsupported field-cache mode: {rule.mode}")
+            return False
+        operation.matched = len(entries)
+        current = await self.store.get(cache_key)
+        merged: dict[str, Any] = dict(current) if isinstance(current, dict) else {}
+        for key, wrapped in entries:
+            merged.pop(key, None)
+            merged[key] = wrapped
+        operation.sample_values = _sample_values([_unwrap_cached_value(value) for value in merged.values()])
+        await self._store_set(
+            cache_key,
+            merged,
+            ttl_seconds=rule.ttl_seconds,
+            max_values=rule.max_values,
+            max_bytes=rule.max_bytes,
+            trim_collections=True,
+        )
+        return True
 
     async def _store_set(
         self,
@@ -460,81 +447,160 @@ class FieldCacheEngine:
             # the original set(key, value) shape. TTL is best-effort there.
             await self.store.set(cache_key, bounded)
 
-    async def _store_append(
+    def _apply_occurrence_injection(
         self,
-        cache_key: str,
-        values: list[Any],
-        *,
-        ttl_seconds: Optional[int],
-        max_values: Optional[int],
-        max_bytes: Optional[int],
-    ) -> None:
-        try:
-            await self.store.append(
-                cache_key,
-                values,
-                ttl_seconds=ttl_seconds,
-                max_values=max_values,
-                max_bytes=max_bytes,
-            )
-        except TypeError as exc:
-            if not _unsupported_store_keyword(exc):
-                raise
-            current = await self.store.get(cache_key)
-            if not isinstance(current, list):
-                current = []
-            bounded = _bounded_append_values(
-                current,
-                values,
-                max_values=max_values,
-                max_bytes=max_bytes,
-            )
-            try:
-                await self.store.set(
-                    cache_key,
-                    bounded,
-                    ttl_seconds=ttl_seconds,
-                )
-            except TypeError as set_exc:
-                if not _unsupported_store_keyword(set_exc):
-                    raise
-                await self.store.set(cache_key, bounded)
+        rule: FieldCacheRule,
+        cached: Any,
+        payload: Any,
+        context: FieldCacheContext,
+        operation: FieldCacheOperation,
+        container_path: str,
+        role_path: str,
+        content_path: str,
+        relative_path: str,
+    ) -> tuple[bool, list[Any]]:
+        """Inject one correlated value per in-scope occurrence.
 
-    def _injection_value(self, rule: FieldCacheRule, cached: Any, payload: Any, context: FieldCacheContext, operation: FieldCacheOperation) -> Any:
-        """Select the cached value to inject for the rule's mode.
-
-        Per-tool-call maps require a current tool-call ID so the engine never
-        injects an arbitrary provider signature into the wrong tool result.
+        Occurrences are assistant (or role-less) messages inside the mode's
+        scoped turn regions. Each occurrence correlates by its tool-call ids
+        first, then its content sha, else the rule's placeholder (with a loud
+        warning); unresolvable occurrences are skipped with a traced reason
+        and never raise.
         """
 
-        if rule.mode == "per_tool_call":
+        entries = cached if isinstance(cached, dict) else {}
+        items = _container_items(payload, container_path)
+        regions = _turn_region_indexes(items, role_path, content_path)
+        scoped = _scoped_region_ids(regions, rule)
+        if scoped is None:
+            operation.skipped = True
+            operation.reason = "turn_context_not_found"
+            return False, []
+        tool_id_path = rule.metadata.get("tool_call_id_path")
+        transform_name = rule.metadata.get("transform")
+        changed = False
+        samples: list[Any] = []
+        warned = False
+        matched = 0
+        skipped_occurrences = 0
+        for index, item in enumerate(items):
+            if regions[index] not in scoped or not isinstance(item, dict):
+                continue
+            if _message_role(item, role_path) not in ("", "assistant"):
+                continue
+            message_obj = _message_object(item, role_path) or item
+            keys = [str(value) for value in extract_path(message_obj, str(tool_id_path))] if tool_id_path else []
+            content_sha = _message_content_sha(message_obj, content_path)
+            matches = [_unwrap_cached_value(entries[key]) for key in keys if key in entries]
+            value: Any = _MISSING
+            if matches:
+                if rule.inject and rule.inject.as_list:
+                    value = matches
+                elif len(matches) == 1:
+                    value = matches[0]
+                else:
+                    skipped_occurrences += 1
+                    operation.reason = "occurrence_skipped:ambiguous_tool_call_values"
+                    continue
+            elif content_sha in entries:
+                value = _unwrap_cached_value(entries[content_sha])
+            if value is _MISSING:
+                if rule.placeholder is None:
+                    skipped_occurrences += 1
+                    operation.reason = "occurrence_skipped:no_correlated_value"
+                    continue
+                value = rule.placeholder
+                if not warned:
+                    _LOGGER.warning(
+                        "Field-cache rule %r for %s/%s injected placeholder at occurrence %d: no correlated cached value",
+                        rule.name,
+                        context.provider,
+                        context.model,
+                        matched,
+                    )
+                    warned = True
+            if transform_name:
+                from ..protocols.transforms import apply_transform
+
+                value = apply_transform(str(transform_name), value)
+                if value is None:
+                    skipped_occurrences += 1
+                    operation.reason = "occurrence_skipped:transform_produced_nothing"
+                    continue
+            occurrence_path = f"{container_path}.{index}.{relative_path}"
+            try:
+                occurrence_changed = inject_path(
+                    payload,
+                    occurrence_path,
+                    deepcopy(value),
+                    when_missing_only=rule.inject.when_missing_only if rule.inject else False,
+                    insert=False,
+                )
+            except FieldCachePathError:
+                skipped_occurrences += 1
+                operation.reason = "occurrence_skipped:path_unresolvable"
+                continue
+            matched += 1
+            changed = changed or occurrence_changed
+            samples.append(value)
+        operation.matched = matched
+        if matched == 0 and skipped_occurrences:
+            operation.skipped = True
+            operation.reason = "occurrence_skipped:no_correlated_value" if rule.placeholder is None else operation.reason
+        return changed, _sample_values(samples)
+
+    def _injection_value(self, rule: FieldCacheRule, cached: Any, payload: Any, context: FieldCacheContext, operation: FieldCacheOperation) -> Any:
+        """Select the scalar cached value for a non-occurrence injection path.
+
+        Tool-id driven lookups (context tool_call_id or inject_tool_call_id_path)
+        keep the per-occurrence contract: an arbitrary provider signature never
+        lands on the wrong tool result. Without ids, dict recency order drives
+        the mode: turn = latest value, turns = last turn_count values, all =
+        every value (as a list, mirroring append semantics).
+        """
+
+        injection = rule.inject
+        ids = _injection_tool_ids(rule, payload, context)
+        if ids:
             if not isinstance(cached, dict):
                 operation.skipped = True
                 operation.reason = "invalid_tool_call_cache"
-                return None
-            ids = _injection_tool_ids(rule, payload, context)
-            if not ids:
-                operation.skipped = True
-                operation.reason = "tool_call_id_not_found"
                 return None
             matches = [_unwrap_cached_value(cached[str(tool_id)]) for tool_id in ids if str(tool_id) in cached]
             if not matches:
                 operation.skipped = True
                 operation.reason = "tool_call_cache_miss"
                 return None
-            if rule.inject and rule.inject.as_list:
+            if injection and injection.as_list:
                 return matches
             if len(matches) == 1:
                 return matches[0]
             operation.skipped = True
             operation.reason = "ambiguous_tool_call_values"
             return None
-        if rule.mode == "all":
-            return cached if isinstance(cached, list) else [cached]
-        if rule.inject and rule.inject.as_list:
-            unwrapped = _unwrap_cached_value(cached)
-            return unwrapped if isinstance(unwrapped, list) else [unwrapped]
-        return _unwrap_cached_value(cached)
+        if rule.metadata.get("tool_call_id_path") or rule.metadata.get("inject_tool_call_id_path"):
+            operation.skipped = True
+            operation.reason = "tool_call_id_not_found"
+            return None
+        if not isinstance(cached, dict):
+            if rule.mode == "all":
+                return cached if isinstance(cached, list) else [cached]
+            if injection and injection.as_list:
+                unwrapped = _unwrap_cached_value(cached)
+                return unwrapped if isinstance(unwrapped, list) else [unwrapped]
+            return _unwrap_cached_value(cached)
+        values = list(cached.values())
+        if not values:
+            operation.skipped = True
+            operation.reason = "tool_call_cache_miss"
+            return None
+        if rule.mode == "turn":
+            unwrapped = _unwrap_cached_value(values[-1])
+            if injection and injection.as_list:
+                return unwrapped if isinstance(unwrapped, list) else [unwrapped]
+            return unwrapped
+        count = len(values) if rule.mode == "all" else max(1, min(rule.turn_count, len(values)))
+        return [_unwrap_cached_value(value) for value in values[-count:]]
 
     def _trace(
         self,
@@ -653,30 +719,215 @@ def _unwrap_cached_value(value: Any) -> Any:
     return _last_value(value)
 
 
-def _turn_values(rule: FieldCacheRule, payload: Any, role: str) -> list[Any]:
-    """Return values from the latest turn matching `role`.
+_MISSING = object()
 
-    Rules can provide explicit turn paths for provider-specific payloads. The
-    default handles the common `messages[*]` shape used by OpenAI-compatible and
-    Responses-like requests.
+_AUTO_TURN_SHAPES: tuple[tuple[str, str, str], ...] = (
+    ("messages", "role", "content"),
+    ("contents", "role", "parts"),
+    ("input", "role", "content"),
+    ("choices", "message.role", "content"),
+)
+
+
+def _resolve_turn_shape(rule: FieldCacheRule, payload: Any) -> Optional[tuple[str, str, str]]:
+    """Return (container_path, role_path, content_path) for the payload shape.
+
+    Declared metadata wins; otherwise the common conversational containers are
+    auto-detected so the openai_chat, anthropic, gemini, and responses shapes
+    work without per-rule boilerplate.
     """
 
-    container_path = rule.metadata.get("turn_container_path", "messages")
-    role_path = rule.metadata.get("turn_role_path", "role")
-    value_path = rule.metadata.get("turn_value_path") or _message_relative_path(rule.path, container_path)
-    if not value_path:
-        return []
-    turns = extract_path(payload, str(container_path))
-    if len(turns) == 1 and isinstance(turns[0], list):
-        turns = turns[0]
-    latest: list[Any] = []
-    for turn in turns:
-        roles = extract_path(turn, str(role_path))
-        if roles and str(roles[0]) == role:
-            values = extract_path(turn, str(value_path))
-            if values:
-                latest = values
-    return latest
+    declared = rule.metadata.get("turn_container_path")
+    if declared:
+        return (
+            str(declared),
+            str(rule.metadata.get("turn_role_path", "role")),
+            str(rule.metadata.get("turn_content_path", "content")),
+        )
+    if isinstance(payload, dict):
+        for container, role_path, content_path in _AUTO_TURN_SHAPES:
+            if isinstance(payload.get(container), list):
+                return (container, role_path, content_path)
+    return None
+
+
+def _container_items(payload: Any, container_path: str) -> list[Any]:
+    items = extract_path(payload, container_path)
+    if len(items) == 1 and isinstance(items[0], list):
+        return items[0]
+    return items
+
+
+def _message_role(item: Any, role_path: str) -> str:
+    roles = extract_path(item, role_path)
+    if not roles:
+        return ""
+    return str(roles[0]).strip().lower()
+
+
+def _message_object(item: Any, role_path: str) -> Optional[dict[str, Any]]:
+    segments = role_path.split(".")
+    if len(segments) == 1:
+        return item if isinstance(item, dict) else None
+    current: Any = item
+    for segment in segments[:-1]:
+        if not isinstance(current, dict) or segment not in current:
+            return None
+        current = current[segment]
+    return current if isinstance(current, dict) else None
+
+
+def _is_tool_result_block(block: Any) -> bool:
+    if not isinstance(block, dict):
+        return False
+    block_type = str(block.get("type") or "")
+    if block_type in {"tool_result", "function_call_output"}:
+        return True
+    return "tool_result" in block or "functionResponse" in block
+
+
+def _message_starts_turn(item: dict[str, Any], role_path: str, content_path: str, message_obj: Optional[dict[str, Any]]) -> bool:
+    """A turn region starts at a user message with real user-authored content.
+
+    Tool-result-only user messages (anthropic tool_result blocks, gemini
+    functionResponse parts, responses function_call_output items) stay in the
+    current region; openai_chat tool results ride separate role="tool"
+    messages and never match the user check.
+    """
+
+    if _message_role(item, role_path) != "user":
+        return False
+    if str(item.get("type") or "") == "function_call_output":
+        return False
+    content = message_obj.get(content_path) if isinstance(message_obj, dict) else None
+    if isinstance(content, list) and content and all(_is_tool_result_block(block) for block in content):
+        return False
+    return True
+
+
+def _turn_region_indexes(items: list[Any], role_path: str, content_path: str) -> list[int]:
+    regions: list[int] = []
+    current = 0
+    for index, item in enumerate(items):
+        message_obj = _message_object(item, role_path) if isinstance(item, dict) else None
+        if index > 0 and isinstance(item, dict) and _message_starts_turn(item, role_path, content_path, message_obj):
+            current += 1
+        regions.append(current)
+    return regions
+
+
+def _scoped_region_ids(regions: list[int], rule: FieldCacheRule) -> Optional[set[int]]:
+    if not regions:
+        return None
+    distinct = sorted(set(regions))
+    if rule.mode == "turn":
+        return {distinct[-1]}
+    if rule.mode == "turns":
+        return set(distinct[-max(1, rule.turn_count) :])
+    return set(distinct)
+
+
+def _content_sha(content: Any) -> str:
+    dumped = json.dumps(content, sort_keys=True, ensure_ascii=False, default=str)
+    return "sha256:" + hashlib.sha256(dumped.encode("utf-8")).hexdigest()
+
+
+def _normalized_content(content: Any) -> Any:
+    """Reduce block-list content to its text so shas correlate across shapes.
+
+    The same completion is a plain string on the chat wire and a list of text
+    blocks in serialized unified payloads; both reduce to the joined text.
+    """
+
+    if isinstance(content, list):
+        parts = [block["text"] for block in content if isinstance(block, dict) and isinstance(block.get("text"), str)]
+        if parts:
+            return "".join(parts)
+    return content
+
+
+def _message_content_sha(message_obj: Any, content_path: str) -> str:
+    content = message_obj.get(content_path) if isinstance(message_obj, dict) else None
+    return _content_sha(_normalized_content(content))
+
+
+def _occurrence_keys(rule: FieldCacheRule, message_obj: Any, content_path: str) -> list[str]:
+    keys: list[str] = []
+    tool_id_path = rule.metadata.get("tool_call_id_path")
+    if tool_id_path and isinstance(message_obj, dict):
+        keys = [str(value) for value in extract_path(message_obj, str(tool_id_path))]
+    keys.append(_message_content_sha(message_obj, content_path))
+    return keys
+
+
+def _extraction_entries(rule: FieldCacheRule, payload: Any, values: list[Any]) -> list[tuple[str, dict[str, Any]]]:
+    """Correlation entries for every occurrence in the extraction payload.
+
+    With a resolvable turn shape, occurrences are container items carrying the
+    watched value path (the message object supplies tool-call ids and the
+    content bytes for the sha). Otherwise plain path matches correlate by
+    value-local tool-call ids or their own content sha.
+    """
+
+    entries: list[tuple[str, dict[str, Any]]] = []
+    shape = _resolve_turn_shape(rule, payload)
+    declared = bool(rule.metadata.get("turn_container_path") or rule.metadata.get("turn_value_path"))
+    if shape is not None:
+        container_path, role_path, content_path = shape
+        value_path = rule.metadata.get("turn_value_path") or _extraction_value_path(rule.path, container_path)
+        if value_path:
+            for item in _container_items(payload, container_path):
+                if not isinstance(item, dict):
+                    continue
+                message_obj = _message_object(item, role_path) or item
+                item_values = extract_path(item, str(value_path))
+                if not item_values:
+                    continue
+                keys = _occurrence_keys(rule, message_obj, content_path)
+                for position, value in enumerate(item_values):
+                    if position == len(item_values) - 1:
+                        for key in keys:
+                            entries.append((key, _wrap_cached_value(value)))
+                    else:
+                        entries.append((_content_sha(value), _wrap_cached_value(value)))
+            if entries or declared:
+                return entries
+    tool_id_path = rule.metadata.get("tool_call_id_path")
+    tool_container_path = rule.metadata.get("tool_container_path")
+    tool_value_path = rule.metadata.get("tool_value_path")
+    if tool_container_path and tool_value_path:
+        for container in _container_items(payload, str(tool_container_path)):
+            if not isinstance(container, dict):
+                continue
+            container_ids = extract_path(container, str(tool_id_path)) if tool_id_path else []
+            container_values = extract_path(container, str(tool_value_path))
+            if container_ids and container_values:
+                for container_id in container_ids:
+                    entries.append((str(container_id), _wrap_cached_value(container_values[-1])))
+        if entries:
+            return entries
+    for value in values:
+        keys = [str(tool_id) for tool_id in extract_path(value, str(tool_id_path))] if tool_id_path else []
+        if not keys:
+            keys = [_content_sha(value)]
+        for key in keys:
+            entries.append((key, _wrap_cached_value(value)))
+    return entries
+
+
+def _occurrence_injection_plan(rule: FieldCacheRule, payload: Any) -> Optional[tuple[str, str, str, str]]:
+    """Per-occurrence injection plan when the inject path is turn-relative."""
+
+    if not rule.inject:
+        return None
+    shape = _resolve_turn_shape(rule, payload)
+    if shape is None:
+        return None
+    container_path, role_path, content_path = shape
+    relative = _message_relative_path(rule.inject.path, container_path)
+    if relative is None:
+        return None
+    return (container_path, role_path, content_path, relative)
 
 
 def _message_relative_path(path: str, container_path: str) -> Optional[str]:
@@ -687,28 +938,21 @@ def _message_relative_path(path: str, container_path: str) -> Optional[str]:
     return None
 
 
-def _tool_call_values(rule: FieldCacheRule, payload: Any, values: list[Any]) -> dict[str, Any]:
-    """Correlate cached values to provider tool-call IDs."""
+def _extraction_value_path(rule_path: str, container_path: str) -> Optional[str]:
+    """Container-relative value path for extraction, accepting item indexes.
 
-    container_path = rule.metadata.get("tool_container_path")
-    tool_id_path = rule.metadata.get("tool_call_id_path")
-    tool_value_path = rule.metadata.get("tool_value_path")
-    stored: dict[str, Any] = {}
-    if container_path and tool_value_path:
-        containers = extract_path(payload, str(container_path))
-        if len(containers) == 1 and isinstance(containers[0], list):
-            containers = containers[0]
-        for container in containers:
-            tool_ids = extract_path(container, str(tool_id_path)) if tool_id_path else []
-            tool_values = extract_path(container, str(tool_value_path))
-            if tool_ids and tool_values:
-                stored[str(tool_ids[0])] = _wrap_cached_value(tool_values[-1])
-        return stored
-    for value in values:
-        tool_ids = extract_path(value, str(tool_id_path)) if tool_id_path else []
-        if tool_ids:
-            stored[str(tool_ids[0])] = _wrap_cached_value(value)
-    return stored
+    Injection keeps the strict wildcard/tail forms only (a declared
+    ``messages.0.x`` targets message 0 exactly); extraction derives the
+    watched field from any item addressing form, including ``choices[0]``.
+    """
+
+    relative = _message_relative_path(rule_path, container_path)
+    if relative is not None:
+        return relative
+    match = re.match(re.escape(container_path) + r"\.(?:\*|\[-?\d+\]|\d+)\.(.+)$", rule_path)
+    if match:
+        return match.group(1)
+    return None
 
 
 def _injection_tool_ids(rule: FieldCacheRule, payload: Any, context: FieldCacheContext) -> list[str]:

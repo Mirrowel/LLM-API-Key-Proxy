@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from dataclasses import replace
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from ..adapters import get_adapter, run_adapter_chain
+from ..config import DEFAULT_FIELD_CACHE_REQUEST_EXTRACTION
 from ..field_cache import FieldCacheEngine, InMemoryFieldCacheStore
 from ..field_cache.types import is_provider_continuation_path
 from ..core.errors import StreamedAPIError, StructuredAPIResponseError, structured_api_response_error
@@ -66,6 +68,15 @@ class _HookBlock(Exception):
         super().__init__(message or "blocked by hook")
         self.message = message or "blocked by hook"
         self.error_type = error_type
+
+
+def _field_cache_request_extraction_enabled() -> bool:
+    """Request-source extraction is a backfill/recovery mechanic, off by default."""
+
+    value = os.environ.get("FIELD_CACHE_REQUEST_EXTRACTION")
+    if value is None:
+        return DEFAULT_FIELD_CACHE_REQUEST_EXTRACTION
+    return value.strip().lower() in {"1", "true"}
 
 
 class NativeProviderExecutor:
@@ -177,8 +188,9 @@ class NativeProviderExecutor:
             if outcome.modified:
                 unified_request = outcome.payload
                 self._trace(context, "after_parsed_canonical_hooks", unified_request, direction="request", stage="adapter")
-            await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
-            self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
+            if _field_cache_request_extraction_enabled():
+                await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
+                self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
             request_before_injection = unified_request
             # G2 R6A: slot before canonical state injection.
             outcome = await self._fire(context, "canonical_state_inject_a", unified_request, direction="request")
@@ -307,8 +319,9 @@ class NativeProviderExecutor:
             outcome = await self._fire(context, "state_inject_b", provider_request, direction="request")
             if outcome.modified:
                 provider_request = outcome.payload
-            await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
-            self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
+            if _field_cache_request_extraction_enabled():
+                await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
+                self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
             # G2 stage correction: the provider finalizer is the LAST
             # pre-send payload edit — after adapters and cache injection
             # (audit R5: finalizer-before-adapters killed envelopes and let
@@ -557,8 +570,9 @@ class NativeProviderExecutor:
             outcome = await self._fire(context, "parsed_canonical", unified_request, direction="request")
             if outcome.modified:
                 unified_request = outcome.payload
-            await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
-            self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
+            if _field_cache_request_extraction_enabled():
+                await cache_engine.extract("unified_request", serialize_value(unified_request), context.field_cache_context(), transaction_logger=logger)
+                self._trace(context, "after_unified_request_field_cache_extraction", {"source": "unified_request"}, direction="request", stage="adapter", snapshot=False)
             request_before_injection = unified_request
             # G2 R6A/B around canonical state injection (stream path).
             outcome = await self._fire(context, "canonical_state_inject_a", unified_request, direction="request")
@@ -651,8 +665,9 @@ class NativeProviderExecutor:
             outcome = await self._fire(context, "state_inject_b", provider_request, direction="request")
             if outcome.modified:
                 provider_request = outcome.payload
-            await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
-            self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
+            if _field_cache_request_extraction_enabled():
+                await cache_engine.extract("request", provider_request, context.field_cache_context(), transaction_logger=logger)
+                self._trace(context, "after_request_field_cache_extraction", {"source": "request"}, direction="request", stage="adapter", snapshot=False)
             provider_request = self._request_stream_usage(context, provider_request)
             # G2 stage correction (stream path): finalizer LAST pre-send.
             provider_request = self._prepare_provider_request(provider_request, context)

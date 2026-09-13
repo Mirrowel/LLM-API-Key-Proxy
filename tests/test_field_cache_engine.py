@@ -30,7 +30,7 @@ def _trace_text(logger):
 
 
 
-def _reasoning_rule(mode: str = "last", scope=("provider", "model", "credential", "session")) -> FieldCacheRule:
+def _reasoning_rule(mode: str = "turn", scope=("provider", "model", "credential", "session")) -> FieldCacheRule:
     return FieldCacheRule(
         name="reasoning_content",
         source="response",
@@ -51,7 +51,7 @@ def _context(**overrides) -> FieldCacheContext:
 async def test_extract_response_value_and_inject_into_next_request() -> None:
     engine = FieldCacheEngine([_reasoning_rule()])
     response = {"choices": [{"message": {"reasoning_content": "hidden"}}]}
-    request = {"messages": [{"role": "user", "content": "hi"}]}
+    request = {"messages": [{"role": "user", "content": "hi"}, {"role": "assistant"}]}
 
     operations = await engine.extract("response", response, _context())
     updated, injection_operations = await engine.inject("request", request, _context())
@@ -63,7 +63,7 @@ async def test_extract_response_value_and_inject_into_next_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_last_mode_overwrites_prior_value() -> None:
+async def test_turn_mode_overwrites_prior_value() -> None:
     engine = FieldCacheEngine([_reasoning_rule()])
 
     await engine.extract("response", {"choices": [{"message": {"reasoning_content": "first"}}]}, _context())
@@ -75,13 +75,21 @@ async def test_last_mode_overwrites_prior_value() -> None:
 
 @pytest.mark.asyncio
 async def test_all_mode_appends_values() -> None:
-    engine = FieldCacheEngine([_reasoning_rule(mode="all")])
+    rule = FieldCacheRule(
+        name="reasoning_content",
+        source="response",
+        path="choices.*.message.reasoning_content",
+        mode="all",
+        scope=("provider", "model", "credential", "session"),
+        inject=FieldCacheInjection(target="request", path="metadata.values", as_list=True),
+    )
+    engine = FieldCacheEngine([rule])
 
-    await engine.extract("response", {"choices": [{"message": {"reasoning_content": "first"}}]}, _context())
-    await engine.extract("response", {"choices": [{"message": {"reasoning_content": "second"}}]}, _context())
+    await engine.extract("response", {"choices": [{"message": {"content": "a", "reasoning_content": "first"}}]}, _context())
+    await engine.extract("response", {"choices": [{"message": {"content": "b", "reasoning_content": "second"}}]}, _context())
     updated, _ = await engine.inject("request", {"messages": [{}]}, _context())
 
-    assert updated["messages"][-1]["reasoning_content"] == ["first", "second"]
+    assert updated["metadata"]["values"] == ["first", "second"]
 
 
 @pytest.mark.asyncio
@@ -122,7 +130,7 @@ def test_shared_cache_key_rejects_incompatible_counterparts() -> None:
         cache_key="provider_signature",
         source="response",
         path="signature",
-        mode="last",
+        mode="turn",
     )
     stream_rule = FieldCacheRule(
         name="stream_signature",
@@ -385,7 +393,7 @@ async def test_field_cache_traces_start_and_complete_even_without_matching_rules
     assert all(entry["data"] is not None for entry in entries)
 
 
-def test_per_tool_call_requires_tool_call_id_path() -> None:
+def test_retired_mode_is_rejected_at_construction() -> None:
     with pytest.raises(ValueError):
         FieldCacheEngine([
             FieldCacheRule(name="tool_state", source="response", path="tool_calls.*", mode="per_tool_call")
@@ -492,7 +500,7 @@ async def test_all_mode_enforces_value_count_and_byte_bounds() -> None:
         path="value",
         mode="all",
         max_values=2,
-        max_bytes=32,
+        max_bytes=300,
         inject=FieldCacheInjection(target="request", path="metadata.values", as_list=True),
     )
     engine = FieldCacheEngine([rule])
@@ -501,7 +509,7 @@ async def test_all_mode_enforces_value_count_and_byte_bounds() -> None:
     updated, _ = await engine.inject("request", {"metadata": {}}, _context())
 
     assert updated["metadata"]["values"] == ["two", "three"]
-    operations = await engine.extract("response", {"value": "x" * 64}, _context())
+    operations = await engine.extract("response", {"value": "x" * 300}, _context())
     # G2 containment: the byte-bound violation skips the rule (loud warning +
     # trace) instead of failing the request; the prior values survive.
     assert operations[0].skipped is True
@@ -536,12 +544,12 @@ async def test_last_mode_contains_oversized_opaque_state() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_tool_call_mode_bounds_correlated_entries() -> None:
+async def test_correlated_entries_are_bounded_by_max_values() -> None:
     rule = FieldCacheRule(
         name="tool_state",
         source="response",
         path="tool_calls.*",
-        mode="per_tool_call",
+        mode="turn",
         max_values=2,
         max_bytes=256,
         inject=FieldCacheInjection(target="request", path="metadata.state"),
@@ -624,7 +632,7 @@ async def test_legacy_append_fallback_remains_bounded() -> None:
         path="value",
         mode="all",
         max_values=2,
-        max_bytes=64,
+        max_bytes=300,
         inject=FieldCacheInjection(target="request", path="metadata.values", as_list=True),
     )
     engine = FieldCacheEngine([rule], store=LegacyStore())
@@ -666,12 +674,12 @@ async def test_store_internal_type_error_is_contained_not_treated_as_legacy_sign
 
 
 @pytest.mark.asyncio
-async def test_last_user_turn_uses_latest_user_message() -> None:
+async def test_turn_mode_injects_latest_user_region_value() -> None:
     rule = FieldCacheRule(
         name="user_signature",
         source="request",
         path="messages.*.metadata.signature",
-        mode="last_user_turn",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signature"),
         allow_missing_session=True,
     )
@@ -681,9 +689,9 @@ async def test_last_user_turn_uses_latest_user_message() -> None:
         "request",
         {
             "messages": [
-                {"role": "user", "metadata": {"signature": "first-user"}},
+                {"role": "user", "content": "one", "metadata": {"signature": "first-user"}},
                 {"role": "assistant", "metadata": {"signature": "assistant"}},
-                {"role": "user", "metadata": {"signature": "last-user"}},
+                {"role": "user", "content": "two", "metadata": {"signature": "last-user"}},
             ]
         },
         _context(session_id=None),
@@ -729,14 +737,15 @@ async def test_as_list_unwraps_last_mode_value_envelope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_last_assistant_turn_skips_without_turn_context() -> None:
+async def test_declared_turn_context_missing_skips_extraction() -> None:
     rule = FieldCacheRule(
         name="assistant_signature",
         source="response",
         path="choices.*.message.signature",
-        mode="last_assistant_turn",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signature"),
         allow_missing_session=True,
+        metadata={"turn_container_path": "messages", "turn_value_path": "reasoning_content"},
     )
     engine = FieldCacheEngine([rule])
 
@@ -752,7 +761,7 @@ async def test_turn_mode_uses_metadata_configured_relative_paths() -> None:
         name="assistant_signature",
         source="response",
         path="unused.global.path",
-        mode="last_assistant_turn",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signature"),
         allow_missing_session=True,
         metadata={"turn_container_path": "messages", "turn_role_path": "kind", "turn_value_path": "parts.*.signature"},
@@ -761,7 +770,7 @@ async def test_turn_mode_uses_metadata_configured_relative_paths() -> None:
 
     await engine.extract(
         "response",
-        {"messages": [{"kind": "assistant", "parts": [{"signature": "first"}]}, {"kind": "assistant", "parts": [{"signature": "second"}]}]},
+        {"messages": [{"kind": "assistant", "content": "one", "parts": [{"signature": "first"}]}, {"kind": "assistant", "content": "two", "parts": [{"signature": "second"}]}]},
         _context(session_id=None),
     )
     updated, _ = await engine.inject("request", {"metadata": {}}, _context(session_id=None))
@@ -770,12 +779,12 @@ async def test_turn_mode_uses_metadata_configured_relative_paths() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_tool_call_correlates_sibling_id_and_value_for_injection() -> None:
+async def test_tool_call_id_correlates_sibling_id_and_value_for_injection() -> None:
     rule = FieldCacheRule(
         name="tool_signature",
         source="response",
         path="tool_calls.*.signature",
-        mode="per_tool_call",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signature"),
         allow_missing_session=True,
         metadata={
@@ -794,12 +803,12 @@ async def test_per_tool_call_correlates_sibling_id_and_value_for_injection() -> 
 
 
 @pytest.mark.asyncio
-async def test_per_tool_call_as_list_injects_matching_values() -> None:
+async def test_tool_call_id_as_list_injects_matching_values() -> None:
     rule = FieldCacheRule(
         name="tool_signature",
         source="response",
         path="tool_calls.*",
-        mode="per_tool_call",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signatures", as_list=True),
         allow_missing_session=True,
         metadata={"tool_call_id_path": "id", "inject_tool_call_id_path": "tool_ids.*"},
@@ -813,12 +822,12 @@ async def test_per_tool_call_as_list_injects_matching_values() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_tool_call_preserves_list_valued_match() -> None:
+async def test_tool_call_id_preserves_list_valued_match() -> None:
     rule = FieldCacheRule(
         name="tool_signatures",
         source="response",
         path="tool_calls.*.signatures",
-        mode="per_tool_call",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signatures"),
         allow_missing_session=True,
         metadata={"tool_container_path": "tool_calls", "tool_call_id_path": "id", "tool_value_path": "signatures"},
@@ -859,12 +868,12 @@ async def test_engine_supports_legacy_store_without_ttl_keyword() -> None:
 
 
 @pytest.mark.asyncio
-async def test_per_tool_call_skips_when_current_tool_id_is_ambiguous() -> None:
+async def test_tool_call_id_skips_when_current_tool_id_is_missing() -> None:
     rule = FieldCacheRule(
         name="tool_signature",
         source="response",
         path="tool_calls.*",
-        mode="per_tool_call",
+        mode="turn",
         inject=FieldCacheInjection(target="request", path="metadata.signature"),
         allow_missing_session=True,
         metadata={"tool_call_id_path": "id"},

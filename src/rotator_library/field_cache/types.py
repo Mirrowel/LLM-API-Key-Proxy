@@ -23,7 +23,7 @@ FieldCacheTarget = Literal[
     "response",
     "unified_response",
 ]
-FieldCacheMode = Literal["last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"]
+FieldCacheMode = Literal["turn", "turns", "all"]
 FieldCacheScope = Literal["provider", "model", "credential", "session", "classifier"]
 
 DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
@@ -61,10 +61,12 @@ class FieldCacheRule:
     name: str
     source: FieldCacheSource
     path: str
-    mode: FieldCacheMode = "last"
+    mode: FieldCacheMode = "turn"
+    turn_count: int = 1
     scope: tuple[FieldCacheScope, ...] = DEFAULT_SCOPE
     inject: Optional[FieldCacheInjection] = None
     enabled: bool = True
+    placeholder: Optional[str] = None
     # Rule-level escape hatch (G2 containment): by default a rule error is
     # contained (warning + trace + skip this rule, request proceeds). Setting
     # ``critical=True`` restores the old fail-closed behavior for rules whose
@@ -84,8 +86,10 @@ class FieldCacheRule:
             not self.cache_key or any(char in self.cache_key for char in "/\\:")
         ):
             raise ValueError("FieldCacheRule.cache_key must be non-empty and filesystem-safe")
-        if self.mode not in {"last", "all", "last_user_turn", "last_assistant_turn", "per_tool_call"}:
+        if self.mode not in {"turn", "turns", "all"}:
             raise ValueError(f"Unsupported field-cache mode: {self.mode}")
+        if not isinstance(self.turn_count, int) or isinstance(self.turn_count, bool) or self.turn_count <= 0:
+            raise ValueError("FieldCacheRule.turn_count must be a positive integer")
         if self.source not in _VALID_SOURCES:
             raise ValueError(f"Unsupported field-cache source: {self.source}")
         if self.inject and self.inject.target not in _VALID_TARGETS:
@@ -124,8 +128,6 @@ class FieldCacheRule:
                 get_transform(transform)
             except KeyError as exc:
                 raise ValueError(f"Unknown transform {transform!r}") from exc
-        if self.mode == "per_tool_call" and not self.metadata.get("tool_call_id_path"):
-            raise ValueError("per_tool_call rules require metadata.tool_call_id_path")
         # Constructor-owned dict: callers never share the passed mapping,
         # and stdlib copy/pickle/asdict keep working (the rule is shared
         # across requests via compiled caches — mutating a rule's metadata

@@ -315,7 +315,10 @@ async def test_native_provider_executor_rejects_unsupported_operation_before_tra
 
 
 @pytest.mark.asyncio
-async def test_native_runtime_executes_unified_request_source_and_target() -> None:
+async def test_native_runtime_executes_unified_request_source_and_target(monkeypatch) -> None:
+    # Request/unified_request extraction is the backfill mechanic: gated
+    # behind FIELD_CACHE_REQUEST_EXTRACTION, off by default.
+    monkeypatch.setenv("FIELD_CACHE_REQUEST_EXTRACTION", "1")
     rule = FieldCacheRule(
         name="unified_request_state",
         source="unified_request",
@@ -481,7 +484,10 @@ async def test_native_adapter_generic_traces_are_suppressed_for_field_cache_safe
 
 
 @pytest.mark.asyncio
-async def test_native_runtime_executes_request_source() -> None:
+async def test_native_runtime_executes_request_source(monkeypatch) -> None:
+    # Request-source extraction is the backfill mechanic: gated behind
+    # FIELD_CACHE_REQUEST_EXTRACTION, off by default.
+    monkeypatch.setenv("FIELD_CACHE_REQUEST_EXTRACTION", "1")
     rule = FieldCacheRule(
         name="request_state",
         source="request",

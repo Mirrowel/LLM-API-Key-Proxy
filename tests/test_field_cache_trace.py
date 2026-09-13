@@ -52,7 +52,7 @@ async def test_field_cache_extract_and_inject_emit_before_after_trace_entries(tm
     context = FieldCacheContext(provider="openai", model="gpt-test", credential_id="credential_1", session_id="session_1", classifier="global")
 
     await engine.extract("response", {"choices": [{"message": {"reasoning_content": "hidden"}}]}, context, transaction_logger=logger)
-    updated, _ = await engine.inject("request", {"messages": [{"role": "user"}]}, context, transaction_logger=logger)
+    updated, _ = await engine.inject("request", {"messages": [{"role": "user"}, {"role": "assistant"}]}, context, transaction_logger=logger)
 
     entries = _trace_entries(logger)
     pass_names = [entry["pass_name"] for entry in entries]
@@ -100,7 +100,7 @@ async def test_field_cache_errors_emit_transform_log_error(tmp_path) -> None:
         name="bad_injection",
         source="response",
         path="choices.*.message.reasoning_content",
-        inject=FieldCacheInjection(target="request", path="messages.*.reasoning_content"),
+        inject=FieldCacheInjection(target="request", path="metadata.*.cached"),
     )
     engine = FieldCacheEngine([rule])
     context = FieldCacheContext(provider="openai", model="gpt-test", credential_id="credential_1", session_id="session_1", classifier="global")

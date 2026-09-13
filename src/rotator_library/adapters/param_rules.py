@@ -38,31 +38,50 @@ from .base import AdapterContext, PayloadAdapter
 logger = logging.getLogger("rotator_library.adapters")
 
 
-def _deep_merge(base: Any, override: Any) -> Any:
-    """Merge override into base, recursing through dict values so a
-    model-level table extends (not replaces) the provider's."""
+def _deep_merge(base: Any, override: Any, kind: str = "") -> Any:
+    """Merge override into base by rule kind.
+
+    Mappings recurse (scoped tables extend, model overrides win per key).
+    Strip lists union (a scoped list adds knobs, never narrows). Clamp
+    bounds replace per parameter — a range is indivisible, and the scoped
+    face narrows it. Maps and renames merge per key with override winning.
+    """
 
     if isinstance(base, Mapping) and isinstance(override, Mapping):
         merged = dict(base)
         for key, value in override.items():
-            merged[key] = _deep_merge(merged.get(key), value) if key in merged else value
+            merged[key] = _deep_merge(merged.get(key), value, kind) if key in merged else value
         return merged
+    if isinstance(base, list) and isinstance(override, list) and kind == "strip":
+        return list(base) + [item for item in override if item not in base]
     return override
 
 
-def _resolve_rules(provider: str, model: str, config: Mapping[str, Any]) -> Dict[str, Any]:
-    """Merge provider-level rules with model-level overrides (model wins)."""
+def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, protocol: Optional[str] = None, profile: Optional[str] = None) -> Dict[str, Any]:
+    """Merge provider-level rules with model-level overrides (model wins).
+
+    Protocol- and profile-scoped tables overlay the flat base when their
+    key matches the executing transport (``by_protocol``/``by_profile``) —
+    the same strip/clamp/map/rename vocabulary, applied only on that face.
+    """
 
     resolved: Dict[str, Any] = {}
     provider_rules = config.get("param_rules")
     if isinstance(provider_rules, Mapping):
         resolved.update(provider_rules)
+    for scope_key, scope_value in (("by_protocol", protocol), ("by_profile", profile)):
+        scoped = config.get(scope_key)
+        if scope_value and isinstance(scoped, Mapping):
+            section = scoped.get(scope_value)
+            if isinstance(section, Mapping):
+                for key, value in section.items():
+                    resolved[key] = _deep_merge(resolved.get(key), value, key) if key in resolved else value
     model_rules = config.get("model_param_rules")
     if isinstance(model_rules, Mapping):
         per_model = model_rules.get(model)
         if isinstance(per_model, Mapping):
             for key, value in per_model.items():
-                resolved[key] = _deep_merge(resolved.get(key), value) if key in resolved else value
+                resolved[key] = _deep_merge(resolved.get(key), value, key) if key in resolved else value
     return resolved
 
 
@@ -78,7 +97,13 @@ class ParamRulesAdapter(PayloadAdapter):
         config: Mapping[str, Any] = {}
         if context is not None:
             config = context.config_for(self.name) or context.metadata.get("param_rules_config") or {}
-        rules = _resolve_rules(context.provider if context else "", context.model if context else "", config)
+        rules = _resolve_rules(
+            context.provider if context else "",
+            context.model if context else "",
+            config,
+            protocol=getattr(context, "protocol", None) if context else None,
+            profile=getattr(context, "profile", None) if context else None,
+        )
         if not rules:
             return payload
         updated = deepcopy(payload)

@@ -256,7 +256,7 @@ def test_field_cache_rule_parses_ttl_metadata_and_insert_injection() -> None:
                             "cache_key": "shared_tool_state",
                             "source": "stream_event",
                             "path": "raw.tool.state",
-                            "mode": "per_tool_call",
+                            "mode": "turn",
                             "ttl_seconds": 120,
                             "metadata": {
                                 "tool_container_path": "tools",

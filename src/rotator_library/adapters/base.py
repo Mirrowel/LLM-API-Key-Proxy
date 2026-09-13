@@ -23,6 +23,7 @@ class AdapterContext:
     provider: Optional[str] = None
     model: Optional[str] = None
     protocol: Optional[str] = None
+    profile: Optional[str] = None
     credential_id: Optional[str] = None
     session_id: Optional[str] = None
     scope_key: Optional[str] = None

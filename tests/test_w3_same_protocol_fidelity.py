@@ -136,7 +136,7 @@ async def test_unified_state_injection_forces_traced_rebuild() -> None:
                 name="continuation",
                 source="response",
                 path="id",
-                mode="last",
+                mode="turn",
                 inject=FieldCacheInjection(target="unified_request", path="previous_response_id"),
                 allow_missing_session=True,
                 scope=("provider", "model", "credential", "session"),

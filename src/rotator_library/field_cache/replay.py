@@ -20,7 +20,11 @@ Declaration schema (list of entries):
 ``source``         request | response | stream_event | unified_*  (default
                    response — a "watch the response and cache this" rule)
 ``path``           extraction path
-``keep``           last | all | turn | turns:N | per_tool_call  (mode mapping)
+``keep``           turn | turns | turns:N | all  (mode mapping; default turn)
+``turn_count``     region count for keep=turns (used by ``turns`` and
+                   ``turns:N`` alike; the explicit N form wins)
+``placeholder``    value injected when no correlation key matches an
+                   in-scope occurrence (loud warning, never silent)
 ``inject.path``    restore path
 ``inject.if``      auto (default — add only when absent) | always (overwrite;
                    an operator choice, honored for every field class)
@@ -54,10 +58,9 @@ from .types import (
 )
 
 _MODE_MAP: dict[str, FieldCacheMode] = {
-    "last": "last",
+    "turn": "turn",
+    "turns": "turns",
     "all": "all",
-    "turn": "last_user_turn",
-    "per_tool_call": "per_tool_call",
 }
 
 _VALID_REPLAY_SOURCES = {
@@ -73,12 +76,13 @@ _VALID_REPLAY_SOURCES = {
 def _parse_keep(keep: Any) -> tuple[FieldCacheMode, Optional[int]]:
     """Map the keep vocabulary to engine modes.
 
-    ``turns:N`` compiles to ``all`` with bounded history (the last N kept
-    values restore together); ``turn`` is the last user-turn value.
+    ``turns:N`` compiles to the ``turns`` mode with ``turn_count=N`` (the last
+    N turn regions restore together); ``turn`` scopes injection to the latest
+    region only; ``all`` covers every region.
     """
 
     if keep is None:
-        return "last", None
+        return "turn", None
     text = str(keep).strip().lower()
     if text.startswith("turns:"):
         try:
@@ -87,10 +91,10 @@ def _parse_keep(keep: Any) -> tuple[FieldCacheMode, Optional[int]]:
             raise ValueError(f"cache_replay keep 'turns:N' needs an integer N, got {keep!r}") from exc
         if count <= 0:
             raise ValueError(f"cache_replay keep 'turns:N' needs a positive N, got {keep!r}")
-        return "all", count
+        return "turns", count
     if text not in _MODE_MAP:
         raise ValueError(
-            f"cache_replay keep must be one of last | all | turn | turns:N | per_tool_call, got {keep!r}"
+            f"cache_replay keep must be one of turn | turns | turns:N | all, got {keep!r}"
         )
     return _MODE_MAP[text], None
 
@@ -116,6 +120,10 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
         if not path:
             raise ValueError(f"cache_replay rule {name!r} needs a path")
         mode, turns_cap = _parse_keep(entry.get("keep"))
+        turn_count = turns_cap if turns_cap is not None else max(1, int(entry.get("turn_count", 1) or 1))
+        placeholder = entry.get("placeholder")
+        if placeholder is not None and not isinstance(placeholder, str):
+            raise ValueError(f"cache_replay rule {name!r} placeholder must be a string")
         inject_entry = entry.get("inject")
         injection: Optional[FieldCacheInjection] = None
         if isinstance(inject_entry, dict) and inject_entry.get("path"):
@@ -157,29 +165,37 @@ def compile_cache_replay(entries: Iterable[Any], *, provider: str) -> tuple[Fiel
             metadata["compatibility"] = str(compatibility)
         if transform:
             metadata["transform"] = str(transform)
-        if entry.get("tool_call_id_path"):
-            metadata["tool_call_id_path"] = str(entry["tool_call_id_path"])
+        for metadata_key in (
+            "tool_call_id_path",
+            "tool_container_path",
+            "tool_value_path",
+            "inject_tool_call_id_path",
+            "turn_container_path",
+            "turn_role_path",
+            "turn_content_path",
+            "turn_value_path",
+        ):
+            if entry.get(metadata_key):
+                metadata[metadata_key] = str(entry[metadata_key])
         rules.append(
             FieldCacheRule(
                 name=name,
                 source=source,  # type: ignore[arg-type]
                 path=str(path),
                 mode=mode,
+                turn_count=turn_count,
                 scope=scope,
                 inject=injection,
                 enabled=bool(entry.get("enabled", True)),
                 critical=bool(entry.get("critical", False)),
+                placeholder=placeholder,
                 ttl_seconds=int(entry["ttl_seconds"]) if entry.get("ttl_seconds") is not None else None,
                 metadata=metadata,
                 # Matches the raw/JSON-configured rule default so the
                 # same-name weakening guard compares like with like across
                 # declaration layers.
                 allow_missing_session=bool(entry.get("allow_missing_session", False)),
-                # FieldCacheRule's uniform value bound applies when no
-                # turns cap is declared, keeping replay rules identical in
-                # shape to raw/JSON-configured rules (the weakening guard
-                # compares this field).
-                max_values=turns_cap if turns_cap is not None else 1024,
+                max_values=int(entry.get("max_values") or 1024),
             )
         )
     return tuple(rules)

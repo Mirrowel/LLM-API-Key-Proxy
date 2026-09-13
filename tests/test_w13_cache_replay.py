@@ -118,7 +118,7 @@ def test_engine_portable_inheritance_on_miss() -> None:
             name="reasoning",
             source="response",
             path="reasoning_content",
-            mode="last",
+            mode="turn",
             inject=None,
             metadata={"compatibility": "portable"},
         )
@@ -127,14 +127,14 @@ def test_engine_portable_inheritance_on_miss() -> None:
         engine = FieldCacheEngine([rule], store)
         import asyncio
 
-        asyncio.run(store.set(m1_key, {"v": "plaintext reasoning"}))
+        asyncio.run(store.set(m1_key, {"correlation": {"v": "plaintext reasoning"}}))
         # Inject into m2 (same session dimension) — sibling walk hits m1.
         target_payload = {"messages": [{"role": "user", "content": "hi"}]}
         rule_inject = FieldCacheRule(
             name="reasoning",
             source="response",
             path="reasoning_content",
-            mode="last",
+            mode="turn",
             inject=type(
                 "Inj",
                 (),
@@ -195,15 +195,15 @@ def test_cache_replay_compiles_modes_and_inject_options() -> None:
         provider="prov",
     )
     (rule,) = rules
-    assert rule.mode == "all"
-    assert rule.max_values == 2
+    assert rule.mode == "turns"
+    assert rule.turn_count == 2
     assert rule.metadata["compatibility"] == "portable"
     assert rule.inject.when_missing_only is True
 
 
 def test_cache_replay_always_means_overwrite_operator_choice() -> None:
     rules = compile_cache_replay(
-        [{"name": "sig", "source": "response", "path": "signature", "keep": "last", "inject": {"path": "sig", "if": "always"}}],
+        [{"name": "sig", "source": "response", "path": "signature", "keep": "turn", "inject": {"path": "sig", "if": "always"}}],
         provider="prov",
     )
     assert rules[0].inject.when_missing_only is False
@@ -394,10 +394,10 @@ def test_replay_scope_strengthens_to_d11_floor() -> None:
     assert set(rules[0].scope) == {"provider", "model"}
 
 
-def test_per_tool_call_requires_tool_call_id_path_at_compile() -> None:
-    with pytest.raises(ValueError, match="tool_call_id_path"):
+def test_retired_modes_are_rejected_at_compile() -> None:
+    with pytest.raises(ValueError, match="Unsupported field-cache mode"):
         FieldCacheRule(name="sig", source="response", path="sig", mode="per_tool_call")
-    with pytest.raises(ValueError, match="tool_call_id_path"):
+    with pytest.raises(ValueError, match="keep"):
         compile_cache_replay(
             [{"name": "sig", "source": "response", "path": "sig", "keep": "per_tool_call"}],
             provider="prov",
@@ -490,7 +490,7 @@ def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> 
             # Same behavioral shape as the env replacement (the guard
             # allows identical-behavior swaps; only weakening rejects).
             return parse_cache_replay_config(
-                '[{"name": "sig", "source": "response", "path": "signature", "keep": "last",'
+                '[{"name": "sig", "source": "response", "path": "signature", "keep": "turn",'
                 ' "inject": {"path": "sig", "if": "auto"}}]',
                 provider="shadowprov",
             )
@@ -499,7 +499,7 @@ def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> 
 
     # Identical-scope env rule replaces cleanly (no crash, no weakening).
     os.environ["SHADOWPROV_CACHE_REPLAY"] = (
-        '[{"name": "sig", "source": "response", "path": "signature", "keep": "last",'
+        '[{"name": "sig", "source": "response", "path": "signature", "keep": "turn",'
         ' "inject": {"path": "sig", "if": "auto"}}]'
     )
     try:
@@ -507,7 +507,7 @@ def test_env_shadowing_a_plugin_rule_passes_the_weakening_guard_or_rejects() -> 
         assert len([r for r in rules if r.name == "sig"]) == 1
         # Weakened scope (dropping model isolation) is rejected loudly.
         os.environ["SHADOWPROV_CACHE_REPLAY"] = (
-            '[{"name": "sig", "source": "response", "path": "signature", "keep": "last",'
+            '[{"name": "sig", "source": "response", "path": "signature", "keep": "turn",'
             ' "scope": ["provider"], "inject": {"path": "sig", "if": "auto"}}]'
         )
         from rotator_library.client.executor import _env_cache_replay_cached

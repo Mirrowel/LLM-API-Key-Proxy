@@ -104,3 +104,36 @@ def test_declared_resolution_from_plugin_class():
     assert reasoner["strip"] == ["logprobs"]
     extended = declared_param_rules(FakePlugin(), "fake-base", {"param_rules": {"strip": ["n"]}})
     assert extended["strip"] == ["n"]
+
+
+def test_protocol_and_profile_scoped_tables():
+    """by_protocol / by_profile sections overlay the flat base only on
+    their face (the extensibility ruling: same param, different rules
+    per protocol/profile)."""
+
+    from rotator_library.adapters.base import AdapterContext
+
+    adapter = _adapter()
+    rules_config = {
+        "param_rules": {"strip": ["logprobs"], "clamp": {"temperature": [0.0, 2.0]}},
+        "by_protocol": {
+            "anthropic_messages": {"strip": ["logit_bias"], "clamp": {"temperature": [0.0, 1.0]}},
+        },
+        "by_profile": {
+            "openai": {"map": {"reasoning_effort": {"medium": "high"}}},
+        },
+    }
+    # anthropic face: strip extends, clamp narrows
+    ctx = AdapterContext(provider="gemini", model="m", protocol="anthropic_messages", adapter_config={"param_rules": rules_config}, metadata={})
+    result = asyncio.run(adapter.transform_request({"logprobs": True, "logit_bias": {}, "temperature": 1.5}, ctx))
+    assert "logprobs" not in result and "logit_bias" not in result
+    assert result["temperature"] == 1.0
+    # openai face (profile): the map applies, the base clamp stays 0..2
+    ctx = AdapterContext(provider="gemini", model="m", protocol="openai_chat", profile="openai", adapter_config={"param_rules": rules_config}, metadata={})
+    result = asyncio.run(adapter.transform_request({"temperature": 1.5, "reasoning_effort": "medium"}, ctx))
+    assert result["temperature"] == 1.5
+    assert result["reasoning_effort"] == "high"
+    # unrelated face: neither scoped section applies
+    ctx = AdapterContext(provider="other", model="m", protocol="openai_chat", adapter_config={"param_rules": rules_config}, metadata={})
+    result = asyncio.run(adapter.transform_request({"reasoning_effort": "medium"}, ctx))
+    assert result["reasoning_effort"] == "medium"

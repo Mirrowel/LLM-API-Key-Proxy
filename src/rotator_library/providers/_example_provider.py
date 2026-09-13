@@ -494,7 +494,10 @@ class ExampleProvider(ProviderInterface):
     #   source         request | response | stream_event | unified_request |
     #                  unified_response | unified_stream_event (default response)
     #   path           extraction path (dotted, ``[n]`` indexes, ``*`` wildcard)
-    #   keep           last | all | turn | turns:N | per_tool_call
+    #   keep           turn | turns | turns:N | all
+    #   turn_count     region count when keep=turns (explicit ``turns:N`` wins)
+    #   placeholder    value injected when no correlation key matches an
+    #                  in-scope occurrence (loud warning, never silent)
     #   inject.path    restore path
     #   inject.if      auto (only when absent, default) | always (overwrite)
     #   inject.target  request | unified_request | metadata | response |
@@ -505,7 +508,9 @@ class ExampleProvider(ProviderInterface):
     #   scope          scope dimensions; provider+model are always required
     #   critical       fail-closed escape hatch (default False: log+skip)
     #   ttl_seconds    retention window
-    #   tool_call_id_path   required for ``keep: per_tool_call``
+    #   tool_call_id_path   occurrence correlation: message-relative path to
+    #                  tool-call ids (primary correlation key; content sha is
+    #                  the automatic fallback)
     #
     # Precedence per rule name:
     #   JSON ``field_cache`` > env ``<NAME>_CACHE_REPLAY`` >
@@ -519,11 +524,11 @@ class ExampleProvider(ProviderInterface):
     cache_replay: List[Dict[str, Any]] = [
         {
             # Cache the upstream response id and replay it as the next
-            # request's prompt-cache key.
+            # request's prompt-cache key (latest region).
             "name": "prompt_cache_key",
             "source": "response",
             "path": "id",
-            "keep": "last",
+            "keep": "turn",
             "inject": {
                 "target": "request",
                 "path": "prompt_cache_key",
@@ -533,13 +538,16 @@ class ExampleProvider(ProviderInterface):
             "ttl_seconds": 3600,
         },
         {
-            # Preserve reasoning text across a tool-call round trip, keyed by
-            # the tool-call id.
+            # Preserve reasoning across every region of the conversation:
+            # occurrences correlate by tool-call id first, then content sha.
             "name": "reasoning_state",
             "source": "stream_event",
             "path": "choices[0].delta.reasoning_content",
-            "keep": "per_tool_call",
-            "tool_call_id_path": "choices[0].delta.tool_calls[0].id",
+            "keep": "all",
+            "tool_call_id_path": "delta.tool_calls.*.id",
+            "metadata": {
+                "turn_value_path": "delta.reasoning_content",
+            },
             "inject": {
                 "target": "request",
                 "path": "messages[-1].reasoning_content",

@@ -27,6 +27,9 @@ class NativeProviderContext:
     protocol_name: str
     endpoint: str
     operation: str = "chat"
+    # Resolved transport profile (steers param-rule tables and per-profile
+    # adapter config; None for single-face providers).
+    profile: Optional[str] = None
     input_protocol_name: Optional[str] = None
     client_protocol_name: Optional[str] = None
     # Pristine same-protocol client wire payload (D4 raw fast path). When the
@@ -105,6 +108,7 @@ class NativeProviderContext:
             provider=self.provider,
             model=self.model,
             protocol=self.protocol_name,
+            profile=getattr(self, "profile", None),
             credential_id=self.credential_id,
             session_id=self.session_id,
             scope_key=self.scope_key,

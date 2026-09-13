@@ -400,7 +400,7 @@ async def test_provider_stream_state_is_cached_for_followups_but_not_exposed(
                 name="responses_continuation",
                 source="stream_event",
                 path="raw.response.id",
-                mode="last",
+                mode="turn",
                 inject=FieldCacheInjection(target="request", path="previous_response_id"),
                 allow_missing_session=True,
                 scope=("provider", "model", "credential", "session"),

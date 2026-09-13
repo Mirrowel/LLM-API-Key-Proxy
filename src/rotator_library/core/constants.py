@@ -49,6 +49,7 @@ from ..config import (
     DEFAULT_TRANSIENT_RETRY_DELAY,
     DEFAULT_TRANSIENT_RETRY_JITTER,
     DEFAULT_STREAM_RETRY_ON_REASONING_ONLY,
+    DEFAULT_FIELD_CACHE_REQUEST_EXTRACTION,
 )
 
 # =============================================================================
@@ -122,6 +123,7 @@ __all__ = [
     "DEFAULT_TRANSIENT_RETRY_DELAY",
     "DEFAULT_TRANSIENT_RETRY_JITTER",
     "DEFAULT_STREAM_RETRY_ON_REASONING_ONLY",
+    "DEFAULT_FIELD_CACHE_REQUEST_EXTRACTION",
     # Environment variable prefixes
     "ENV_PREFIX_ROTATION_MODE",
     "ENV_PREFIX_FAIR_CYCLE",

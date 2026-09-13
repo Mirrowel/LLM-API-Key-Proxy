@@ -180,3 +180,8 @@ DEFAULT_TRANSIENT_RETRY_JITTER: float = 0.5
 # duplicate or diverge for consumers that already received content.
 # Override: STREAM_RETRY_ON_REASONING_ONLY=true
 DEFAULT_STREAM_RETRY_ON_REASONING_ONLY: bool = False
+
+# Field-cache request-source extraction (request/unified_request passes).
+# Backfill/recovery mechanic only: normal extraction always comes from
+# response/stream sources. Override: FIELD_CACHE_REQUEST_EXTRACTION=1/true
+DEFAULT_FIELD_CACHE_REQUEST_EXTRACTION: bool = False
