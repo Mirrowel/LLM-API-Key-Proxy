@@ -4,8 +4,9 @@
 """W4 acceptance fixtures: cross-protocol conversion (D7/D9).
 
 Every D7 semantic class has a defined behavior per protocol pair, and every
-deliberate omission/approximation/merge is recorded in a client-visible
-``x-proxy-conversion`` summary — content-asserted, never just structural.
+deliberate omission/approximation/merge is recorded on the unified request or
+response object (G10 Phase B: record-only disclosure, never a client-visible
+``x-proxy-conversion`` key) — content-asserted, never just structural.
 """
 
 from __future__ import annotations
@@ -41,11 +42,6 @@ def _build(protocol_name: str, payload: dict, *, source: str) -> tuple[dict, obj
 
 def _warnings_of(unified) -> list[str]:
     return [w.code for w in unified.warnings]
-
-
-def _summary_codes(payload: dict) -> list[str]:
-    summary = payload.get("x-proxy-conversion") or {}
-    return [entry["code"] for entry in summary.get("warnings", [])]
 
 
 # ---------------------------------------------------------------------------
@@ -100,9 +96,10 @@ def test_unsupported_control_surfaces_in_response_summary() -> None:
     for warning in unified.warnings:
         response.warnings.append(warning)
     chat_payload = get_protocol("openai_chat").format_response(response, _ctx("anthropic_messages", "openai_chat"))
-    assert "unsupported_optional_control" in _summary_codes(chat_payload)
-    entry = next(e for e in chat_payload["x-proxy-conversion"]["warnings"] if e["code"] == "unsupported_optional_control")
-    assert entry["field"] == "seed"
+    assert "x-proxy-conversion" not in chat_payload
+    assert "unsupported_optional_control" in _warnings_of(response)
+    entry = next(w for w in response.warnings if w.code == "unsupported_optional_control")
+    assert entry.field == "seed"
 
 
 def test_clean_conversion_has_no_summary_block() -> None:
@@ -354,7 +351,8 @@ def _audio_response() -> UnifiedResponse:
 def test_audio_drop_recorded_at_unsupported_targets(target: str) -> None:
     response = _audio_response()
     payload = get_protocol(target).format_response(response, _ctx("gemini", target))
-    assert "media_dropped" in _summary_codes(payload)
+    assert "x-proxy-conversion" not in payload
+    assert "media_dropped" in _warnings_of(response)
 
 
 def test_image_maps_chat_to_anthropic_request() -> None:
@@ -721,7 +719,8 @@ def test_url_only_audio_and_video_at_chat_record_drops() -> None:
     )
     chat = get_protocol("openai_chat")
     formatted = chat.format_response(unified, _ctx("gemini", "openai_chat"))
-    assert "media_dropped" in {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
+    assert "x-proxy-conversion" not in formatted
+    assert "media_dropped" in _warnings_of(unified)
 
 
 # ---------------------------------------------------------------------------
@@ -779,7 +778,8 @@ def test_refusal_with_annotations_at_responses_no_crash_and_recorded() -> None:
         for item in formatted["output"]
         if item.get("type") == "message"
     )
-    assert "annotations_dropped" in {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
+    assert "x-proxy-conversion" not in formatted
+    assert "annotations_dropped" in _warnings_of(unified)
 
 
 def test_effort_and_budget_both_disclosure_of_discarded_budget() -> None:
@@ -933,8 +933,8 @@ def test_assistant_image_output_drops_recorded_not_fabricated() -> None:
         formatted = get_protocol(target).format_response(unified, _ctx("gemini", target))
         payload_str = str(formatted)
         assert "aW1hZ2U=" not in payload_str, target  # actually dropped, not just warned
-        warnings = {w["code"] for w in formatted.get("x-proxy-conversion", {}).get("warnings", [])}
-        assert "media_dropped" in warnings, target
+        assert "x-proxy-conversion" not in formatted, target
+        assert "media_dropped" in _warnings_of(unified), target
 
 
 def test_chat_field_plus_interleaved_system_keeps_positions() -> None:

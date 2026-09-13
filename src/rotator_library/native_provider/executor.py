@@ -277,10 +277,10 @@ class NativeProviderExecutor:
                 provider_request = outcome.payload
                 context.request_transport_overlays.append({"kind": "hook_edit", "stage": "provider_built"})
                 self._trace(context, "after_provider_built_hooks", provider_request, direction="request", stage="adapter")
-            # D7 recorded summaries: request-side warnings (deliberate
-            # omissions, merges, approximations recorded during build) ride
-            # along and surface on the client response via
-            # attach_conversion_summary.
+            # G10 Phase B: every transport overlay (foreign-state strip,
+            # canonical rebuild, hook edit, transport rewrite) is value-level
+            # in the change log — the overlay list has no other consumer.
+            self._record_transport_overlays(context, logger)
             request_warnings = list(unified_request.warnings)
             adapters = [get_adapter(name) for name in context.adapter_names]
             adapter_context = context.adapter_context()
@@ -433,6 +433,19 @@ class NativeProviderExecutor:
             else:
                 client_response = client_protocol.format_response(unified_response, response_context)
                 self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
+            # G10 Phase B: conversion notes live in the change log — never
+            # on the client payload, never on the console. This fires on
+            # BOTH branches: same-protocol raw passthrough keeps its
+            # request-side warnings too (they were silently dropped here
+            # before). The count-token private channel is the exception: the
+            # facade owns the logger and drains it after the response
+            # returns, so logging here would duplicate the records.
+            if (
+                logger is not None
+                and unified_response.warnings
+                and not (isinstance(client_response, dict) and "_proxy_warnings" in client_response)
+            ):
+                logger.log_conversion_warnings(unified_response.warnings)
             # G2 P4 (response_formatted): the ONLY seam that sees the client
             # payload before it leaves the proxy.
             outcome = await self._fire(context, "response_formatted", client_response, direction="response")
@@ -563,14 +576,51 @@ class NativeProviderExecutor:
                 ),
             )
             provider_request = protocol.build_request(unified_request, provider_context)
+            # G3 stream-strip parity: opaque per-provider state echoed by the
+            # client is foreign to a switched executing provider. The stream
+            # path has no raw basis, so the strip runs on the built provider
+            # payload — a disclosed edit with the same discipline as the
+            # non-stream raw path.
+            overlays: list[dict[str, Any]] = list(context.request_transport_overlays or [])
+            input_provider = context.metadata.get("input_provider")
+            if input_provider and input_provider != context.provider:
+                from ..protocols.opaque_strip import strip_foreign_opaque_state
+
+                stripped_fields = strip_foreign_opaque_state(provider_request, input_protocol.name)
+                if stripped_fields:
+                    overlays.append({
+                        "kind": "foreign_bound_state_stripped",
+                        "from_provider": input_provider,
+                        "fields": stripped_fields,
+                    })
+                    overlays.append({"kind": "canonical_rebuild", "reason": "foreign_opaque_state_stripped"})
+            context.request_transport_overlays = overlays
+            self._trace(
+                context,
+                "request_transport_overlays",
+                {"basis": "rebuild", "overlays": overlays},
+                direction="metadata",
+                stage="protocol",
+                snapshot=False,
+            )
             self._trace(context, "built_native_provider_request", provider_request, direction="request", stage="protocol")
             # G2 R7/R8 (stream path).
             outcome = await self._fire(context, "transport_basis_selected", provider_request, direction="request")
             if outcome.modified:
                 provider_request = outcome.payload
+                context.request_transport_overlays.append({"kind": "hook_edit", "stage": "transport_basis_selected"})
             outcome = await self._fire(context, "provider_built", provider_request, direction="request")
             if outcome.modified:
                 provider_request = outcome.payload
+                context.request_transport_overlays.append({"kind": "hook_edit", "stage": "provider_built"})
+                self._trace(context, "after_provider_built_hooks", provider_request, direction="request", stage="adapter")
+            self._record_transport_overlays(context, logger)
+            # G10 Phase B: stream request-side warnings are recorded too —
+            # the non-stream path snapshots them at build; the stream path
+            # used to drop them entirely.
+            request_warnings = list(unified_request.warnings)
+            if logger is not None and request_warnings:
+                logger.log_conversion_warnings(request_warnings, stage="stream_request")
             adapters = [get_adapter(name) for name in context.adapter_names]
             adapter_context = context.adapter_context()
             adapter_context.transaction_logger = None
@@ -918,6 +968,15 @@ class NativeProviderExecutor:
                 protocol=context.protocol_name,
                 pass_name="provider_validation",
             )
+
+    @staticmethod
+    def _record_transport_overlays(context: NativeProviderContext, logger: Any) -> None:
+        """Sink each transport overlay into the change log (G10 Phase B)."""
+
+        if logger is None:
+            return
+        for overlay in context.request_transport_overlays or []:
+            logger.log_runtime_event("protocol", "overlay", "transport overlay", overlay)
 
     @staticmethod
     def _trace(

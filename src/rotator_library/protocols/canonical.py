@@ -352,6 +352,41 @@ def add_conversion_warning(
     )
 
 
+def record_conversion_warning(
+    warnings: list,
+    *,
+    code: str,
+    message: str,
+    field: Optional[str],
+    source_protocol: Optional[str],
+    target_protocol: Optional[str],
+) -> None:
+    """THE one list-sink writer (G10 Phase B): every per-module warning
+    helper delegates here. One dedup key — (code, message, field, source,
+    target) — so same-code-different-field warnings never collapse and
+    the key no longer depends on which module noticed the drop."""
+
+    key = (code, message, field or "", source_protocol or "", target_protocol or "")
+    for warning in warnings:
+        if (
+            warning.code == code
+            and warning.message == message
+            and (warning.field or "") == key[2]
+            and (warning.source_protocol or "") == key[3]
+            and (warning.target_protocol or "") == key[4]
+        ):
+            return
+    warnings.append(
+        ConversionWarning(
+            code=code,
+            message=message,
+            field=field,
+            source_protocol=source_protocol,
+            target_protocol=target_protocol,
+        )
+    )
+
+
 # Deterministic reasoning-effort <-> budget-tokens approximation table (D7
 # level 3: deterministic inference). Chosen once, documented, warned on use.
 _EFFORT_TO_BUDGET_TOKENS = {
@@ -841,18 +876,9 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
 
 
 def attach_conversion_summary(payload: dict[str, Any], unified_response: Any) -> dict[str, Any]:
-    """Attach the recorded conversion summary to a client response payload.
+    """Retired shim (G10 Phase B): conversion summaries live in the change
+    log, never on the client payload. Returns the payload untouched."""
 
-    The summary renders recorded warnings (deliberate omissions, merges,
-    approximations) under the ``x-proxy-conversion`` extension key — present
-    only when warnings exist. Raw-passthrough responses never carry it (they
-    produce no warnings); D7's "recorded summary" becomes client-visible
-    instead of internal-only.
-    """
-
-    summary = conversion_summary(getattr(unified_response, "warnings", None) or [])
-    if summary is not None:
-        payload["x-proxy-conversion"] = summary
     return payload
 
 
@@ -1238,12 +1264,19 @@ def message_tool_results(message: UnifiedMessage) -> list[ToolResult]:
     return [block.tool_result for block in message.content if block.tool_result is not None]
 
 
-def resolve_tool_result_names(messages: Iterable[UnifiedMessage]) -> list[UnifiedMessage]:
+def resolve_tool_result_names(
+    messages: Iterable[UnifiedMessage],
+    warnings: Optional[list] = None,
+) -> list[UnifiedMessage]:
     """Enrich result records with function names from preceding calls.
 
     Chat and Anthropic identify results by call ID, while Gemini requires the
     function name on its response part. Keeping both in the canonical record
     allows either direction without provider-specific history lookups.
+
+    Synthesized correlation ids (a call without an id, or a result matched to
+    a call by name) are disclosed on ``warnings`` with the total count — a
+    minted identifier is never silent.
     """
 
     message_list = list(messages)
@@ -1251,11 +1284,13 @@ def resolve_tool_result_names(messages: Iterable[UnifiedMessage]) -> list[Unifie
     ids_by_name: dict[str, list[str]] = {}
     result_index_by_name: dict[str, int] = {}
     call_index = 0
+    synthesized = 0
     for message in message_list:
         for call in message_tool_calls(message):
             if not call.id:
                 call.id = f"call_{call_index}"
                 call.extra["synthetic_id"] = True
+                synthesized += 1
             call_index += 1
             if call.id and call.name:
                 names[call.id] = call.name
@@ -1270,6 +1305,16 @@ def resolve_tool_result_names(messages: Iterable[UnifiedMessage]) -> list[Unifie
                     result.tool_call_id = candidates[result_index]
                     result.extra["synthetic_tool_call_id"] = True
                     result_index_by_name[result.name] = result_index + 1
+                    synthesized += 1
+    if synthesized and warnings is not None:
+        record_conversion_warning(
+            warnings,
+            code="tool_result_id_synthesized",
+            message=f"{synthesized} tool correlation id(s) synthesized to link calls and results",
+            field="tool_call_id",
+            source_protocol=None,
+            target_protocol=None,
+        )
     return message_list
 
 

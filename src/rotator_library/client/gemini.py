@@ -70,16 +70,24 @@ class GeminiHandler:
 
         request_payload = dict(payload)
         request_payload["model"] = self._routable_model(model)
+        captured: dict[str, Any] = {}
+
+        def _capture_context(ctx: Any) -> None:
+            captured["logger"] = getattr(ctx, "transaction_logger", None)
+
         try:
-            return await self._client.agenerate(
+            result = await self._client.agenerate(
                 request_payload,
                 input_protocol="gemini",
                 _requested_operation=OPERATION_COUNT_TOKENS,
+                _request_context_callback=_capture_context,
             )
         except RoutingExecutionError as error:
             if getattr(error, "error_type", "") != "operation_unsupported" or not _local_estimate_enabled():
                 raise
             return self._local_count_estimate(request_payload)
+        _drain_proxy_warnings(result, captured.get("logger"))
+        return result
 
     def _local_count_estimate(self, request_payload: dict[str, Any]) -> dict[str, Any]:
         """Legacy local estimate: canonical Chat projection token counting."""
@@ -135,3 +143,18 @@ def _local_estimate_enabled() -> bool:
     import os
 
     return str(os.environ.get("COUNT_TOKENS_LOCAL_ESTIMATE", "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _drain_proxy_warnings(payload: Any, logger: Any) -> None:
+    """Pop the private count-token warning channel and sink it to the record.
+
+    G10 Phase B: the count-tokens adapters return ``_proxy_warnings`` because
+    they have no logger; the facade owns the logger handle, pops the key so
+    it never reaches the client, and records the warnings in the change log.
+    """
+
+    if not isinstance(payload, dict):
+        return
+    warnings = payload.pop("_proxy_warnings", None)
+    if warnings and logger is not None:
+        logger.log_conversion_warnings(warnings, stage="count_tokens")

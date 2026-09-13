@@ -21,7 +21,6 @@ from .canonical import (
     add_conversion_warning,
     disclose_response_drops,
     format_reasoning_controls,
-    attach_conversion_summary,
     STOP_REASON_CONTENT_FILTER,
     canonical_stop_reason,
     canonical_structured_output,
@@ -169,8 +168,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
         # (effort -> reasoning, format -> structured output); the canonical
         # structured view derives from that split.
         structured_output = generation_params.get("structured_output")
+        warnings_list: list[ConversionWarning] = []
         messages = resolve_tool_result_names(
-            normalize_tool_result_messages([self._parse_message(message) for message in request.get("messages") or []])
+            normalize_tool_result_messages([self._parse_message(message) for message in request.get("messages") or []]),
+            warnings_list,
         )
         return UnifiedRequest(
             operation=_operation_from_context(context, OPERATION_MESSAGES),
@@ -185,6 +186,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             metadata=deepcopy(request.get("metadata") or {}),
             source_protocol=self.name,
             extensions={self.name: {"generation_params": source_generation}},
+            warnings=warnings_list,
             raw=deepcopy(raw_request),
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
@@ -275,7 +277,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             extra={"type": response.get("type")},
         )
         self._promote_message_blocks(message)
-        return UnifiedResponse(
+        unified_response = UnifiedResponse(
             operation=operation,
             logical_operation=OPERATION_GENERATE if operation != OPERATION_COUNT_TOKENS else OPERATION_UNKNOWN,
             id=response.get("id"),
@@ -289,6 +291,20 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             raw=deepcopy(response),
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"id", "type", "role", "content", "model", "stop_reason", "stop_sequence", "usage"}},
         )
+        if native_stop == "model_context_window_exceeded":
+            # The console WARNING above is kept; the mapping also lands in
+            # the change log as a conversion warning (G10 Phase B).
+            from .canonical import record_conversion_warning
+
+            record_conversion_warning(
+                unified_response.warnings,
+                code="stop_reason_approximated",
+                message="model_context_window_exceeded mapped to max_tokens (the only cross-protocol reading)",
+                field="stop_reason",
+                source_protocol=self.name,
+                target_protocol=None,
+            )
+        return unified_response
 
     def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
         disclose_response_drops(unified_response, self.name)
@@ -298,6 +314,10 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             # Normalized usage wins over raw preserved fields so later adapters
             # can correct counts without stale provider keys shadowing them.
             payload["input_tokens"] = usage.input_tokens if usage else 0
+            # Private transport key: the facade/finalizer pops this and sinks
+            # it into the change log; it is never sent to the client.
+            if unified_response.warnings:
+                payload["_proxy_warnings"] = list(unified_response.warnings)
             return payload
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
@@ -390,7 +410,7 @@ class AnthropicMessagesProtocol(ProtocolAdapter):
             "usage": self._format_usage(unified_response.usage),
         }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -1112,24 +1132,34 @@ def _anthropic_output_modalities(blocks: list[ContentBlock]) -> list[str]:
 
 
 def _warn_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning to a plain list sink."""
+    """Canonical delegation (G10): full dedup key, source always stamped."""
+
+    from .canonical import record_conversion_warning
 
     if warnings is None:
         return
-    for warning in warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="anthropic_messages"))
+    record_conversion_warning(
+        warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol="anthropic_messages",
+        target_protocol="anthropic_messages",
+    )
 
 
 def _warn_once(unified_response: UnifiedResponse, *, code: str, message: str, target_protocol: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+    """Canonical delegation (G10): response sink, full key, real source."""
 
-    for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol=target_protocol)
+    from .canonical import record_conversion_warning
+
+    record_conversion_warning(
+        unified_response.warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=unified_response.source_protocol,
+        target_protocol=target_protocol,
     )
 
 

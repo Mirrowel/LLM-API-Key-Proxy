@@ -624,9 +624,8 @@ def test_unknown_native_stop_reason_never_leaks_as_invalid_chat_value() -> None:
     # value never leaks into the wire enum.
     assert payload["choices"][0]["finish_reason"] == "stop"
     assert response.metadata["native_stop_reason"] == "OTHER"
-    summary = payload.get("x-proxy-conversion") or {}
-    rendered = summary.get("warnings") or summary.get("entries") or []
-    assert any(entry.get("code") == "stop_reason_approximated" for entry in rendered) or summary.get("count")
+    assert "x-proxy-conversion" not in payload
+    assert any(w.code == "stop_reason_approximated" for w in response.warnings)
 
 
 @pytest.mark.parametrize(

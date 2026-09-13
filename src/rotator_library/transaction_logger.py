@@ -471,6 +471,71 @@ class TransactionLogger:
                 self._record.maybe_enable_spill(self._spill_dir)
             self._record.add_stream_chunk(sanitize_for_trace(_make_json_safe(chunk)))
 
+    def log_conversion_warnings(self, warnings: Any, *, stage: str = "conversion") -> None:
+        """Emit conversion warnings into the change log (G10 Phase B).
+
+        The disclosure contract: notes go to the record — never the client
+        payload, never the console (substitution/fallback/repair events
+        keep their WARNING console lines; these do not).
+        """
+
+        if self._record is None:
+            return
+        for warning in warnings or []:
+            if isinstance(warning, dict):
+                code = str(warning.get("code") or "")
+                message = str(warning.get("message") or "")
+                field = warning.get("field")
+                source_protocol = warning.get("source_protocol")
+                target_protocol = warning.get("target_protocol")
+            elif hasattr(warning, "code"):
+                code = str(getattr(warning, "code", ""))
+                message = str(getattr(warning, "message", ""))
+                field = getattr(warning, "field", None)
+                source_protocol = getattr(warning, "source_protocol", None)
+                target_protocol = getattr(warning, "target_protocol", None)
+            else:
+                continue
+            self._record.record_change(
+                stage,
+                "conversion_warning",
+                detail=message[:400],
+                code=code,
+                value={
+                    "field": field,
+                    "source_protocol": source_protocol,
+                    "target_protocol": target_protocol,
+                },
+            )
+
+    def log_runtime_event(
+        self,
+        stage: str,
+        kind: str,
+        detail: str = "",
+        value: Any = None,
+        *,
+        code: Optional[str] = None,
+    ) -> None:
+        """Record one value-level runtime event (G10 Phase B).
+
+        Thin delegation to :meth:`TransactionRecord.record_change` for the
+        mutation families that are not conversion warnings: overlay,
+        repair, relay_disengage, routing_substitution, fallback. The
+        ``code`` defaults to ``kind`` so every event is queryable by its
+        family (the change log stays replayable, never console-only).
+        """
+
+        if self._record is None:
+            return
+        self._record.record_change(
+            stage,
+            kind,
+            detail=str(detail)[:400],
+            code=str(code or kind),
+            value=_make_json_safe(value) if value is not None else None,
+        )
+
     def log_provider_response(self, response_data: Dict[str, Any]) -> None:
         """Record the provider's final response as a boundary (native path)."""
 

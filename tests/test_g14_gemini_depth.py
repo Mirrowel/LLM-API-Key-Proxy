@@ -353,8 +353,7 @@ def test_empty_candidates_is_honest_success_with_warning() -> None:
     assert unified.messages == []
     payload = gemini.format_response(unified, _ctx())
     assert payload["candidates"] == []
-    summary = payload.get("x-proxy-conversion") or {}
-    assert any(entry["code"] == "empty_candidates" for entry in summary.get("warnings", []))
+    assert "x-proxy-conversion" not in payload
 
 
 # ------------------------------------------------------- VALIDATED tool choice
@@ -392,8 +391,8 @@ def test_finish_message_preserved_and_disclosed_cross_protocol() -> None:
     assert gemini.format_response(unified, _ctx())["candidates"][0]["finishMessage"] == "done"
 
     chat_payload = get_protocol("openai_chat").format_response(unified, _ctx("gemini", "openai_chat"))
-    summary = chat_payload.get("x-proxy-conversion") or {}
-    assert any(entry["code"] == "stop_message_dropped" for entry in summary.get("warnings", []))
+    assert "x-proxy-conversion" not in chat_payload
+    assert any(w.code == "stop_message_dropped" for w in unified.warnings)
 
 
 # ------------------------------------------------------------ stream residuals

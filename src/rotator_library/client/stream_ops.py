@@ -686,6 +686,13 @@ class NeutralStreamPipeline:
                         # Disengage relay permanently: edits/errors require the
                         # formatter path for the rest of the stream.
                         relay_active = False
+                        if self.transaction_logger is not None:
+                            self.transaction_logger.log_runtime_event(
+                                "stream",
+                                "relay_disengage",
+                                "byte-relay disengaged",
+                                {"cause": "error_frame" if error_in_frame else "hook_edit"},
+                            )
 
                     for item_event in frame_events:
                         if item_event.type == "error":
@@ -765,6 +772,20 @@ class NeutralStreamPipeline:
                     # always present (zeros when unknown) so downstream
                     # parsers never meet a missing field.
                     repaired_reason = self.repair_state.repaired_reason(state.stop_reason)
+                    if self.transaction_logger is not None:
+                        self.transaction_logger.log_runtime_event(
+                            "stream",
+                            "repair",
+                            "synthesized finish reason",
+                            {"reason": repaired_reason},
+                        )
+                        if state.usage is None:
+                            self.transaction_logger.log_runtime_event(
+                                "stream",
+                                "repair",
+                                "usage synthesized zero",
+                                {},
+                            )
                     terminal_event = UnifiedStreamEvent(
                         type="done",
                         source_protocol=self.client_protocol_name,
@@ -786,17 +807,12 @@ class NeutralStreamPipeline:
 
                 # Stream-side conversion drops (foreign builtins omitted,
                 # refusal degradations, media drops) accumulate on the
-                # formatter state — traced once at the tail (streams carry
-                # no in-band summary header by construction).
+                # formatter state. G10 Phase B: they land in the change log
+                # via log_conversion_warnings (never the console, never the
+                # client payload) — the lifecycle trace entry remains.
                 if state.warnings:
-                    for warning in state.warnings:
-                        lib_logger.info(
-                            "stream conversion warning: [%s] %s (field=%s, target=%s)",
-                            warning.code,
-                            warning.message,
-                            warning.field,
-                            warning.target_protocol,
-                        )
+                    if self.transaction_logger is not None:
+                        self.transaction_logger.log_conversion_warnings(state.warnings, stage="stream")
                     self._log_lifecycle(
                         "stream_conversion_warnings",
                         monitor,

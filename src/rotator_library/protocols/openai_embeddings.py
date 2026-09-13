@@ -22,6 +22,15 @@ class OpenAIEmbeddingsProtocol(ProtocolAdapter):
     The adapter intentionally treats embedding vectors as opaque data entries.
     That keeps it usable for OpenAI-compatible providers with additional index,
     metadata, or sparse-vector fields without narrowing the schema too early.
+
+    G10 Phase B disclosure: unknown option keys are passed through verbatim
+    (round-trip fidelity) but recorded as ``unsupported_optional_control``
+    request warnings; :meth:`format_response` carries them under the private
+    ``_proxy_warnings`` transport key for the finalizer to drain and strip.
+    NOTE: the live embeddings route currently bypasses this adapter (G9
+    first-class embeddings is pending), so the disclosure fires whenever the
+    adapter is engaged (native/embedding transports) rather than on the
+    legacy passthrough.
     """
 
     name: ClassVar[str] = "openai_embeddings"
@@ -31,12 +40,32 @@ class OpenAIEmbeddingsProtocol(ProtocolAdapter):
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
+        warnings: list = []
+        unknown_options = sorted(key for key in request if key not in _REQUEST_CORE_FIELDS)
+        if unknown_options:
+            # Unknown option keys are passed through verbatim (same-protocol
+            # round-trip fidelity), but provider support is not guaranteed —
+            # disclosed rather than silent.
+            from .canonical import record_conversion_warning
+
+            record_conversion_warning(
+                warnings,
+                code="unsupported_optional_control",
+                message=(
+                    "embeddings option key(s) outside the canonical surface pass through "
+                    f"verbatim (provider support not guaranteed): {', '.join(unknown_options)}"
+                ),
+                field="options",
+                source_protocol=self.name,
+                target_protocol=self.name,
+            )
         return UnifiedRequest(
             operation=OPERATION_EMBEDDINGS,
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             input=deepcopy(request.get("input")),
             generation_params={k: deepcopy(request[k]) for k in _REQUEST_OPTION_FIELDS if k in request},
             raw=deepcopy(raw_request),
+            warnings=warnings,
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
@@ -64,6 +93,11 @@ class OpenAIEmbeddingsProtocol(ProtocolAdapter):
         if unified_response.usage:
             payload["usage"] = unified_response.usage.raw or unified_response.usage.to_dict()
         payload.update(deepcopy(unified_response.extra))
+        # Private transport key (G10 Phase B): request option-drop warnings
+        # ride the response to the finalizer, which sinks them into the
+        # change log and strips the key before the client sees it.
+        if unified_response.warnings:
+            payload["_proxy_warnings"] = list(unified_response.warnings)
         return payload
 
     def extract_usage(self, raw_or_unified: Any, context: ProtocolContext | None = None) -> Usage | None:

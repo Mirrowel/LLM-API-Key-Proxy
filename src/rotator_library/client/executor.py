@@ -728,6 +728,19 @@ class RequestExecutor:
                     native_endpoint=None,
                     fast_path=None,
                 )
+                # G10 Phase B: the fallback identity also lands value-level in
+                # the change log (the console WARNING below is kept).
+                logger.log_runtime_event(
+                    "routing",
+                    "fallback",
+                    "litellm_fallback",
+                    {
+                        "provider": provider,
+                        "model": model,
+                        "native_protocol_available": protocol,
+                        "stream": bool(stream),
+                    },
+                )
             except Exception:
                 lib_logger.debug("litellm fallback identity recording failed", exc_info=True)
         if not getattr(context, "_litellm_fallback_warned", False):
@@ -861,13 +874,25 @@ class RequestExecutor:
         )
         unified_response = source_protocol.parse_response(payload, protocol_context)
         unified_response.model = context.model
-        # D7 recorded summaries: request-side warnings ride along to the
-        # client response (x-proxy-conversion block).
+        # D7 recorded summaries ride the unified object; G10 Phase B sinks
+        # them into the change log (never the client payload).
         source_warnings = getattr(context.unified_request, "warnings", None) or []
         for warning in source_warnings:
             if warning not in unified_response.warnings:
                 unified_response.warnings.append(warning)
-        return client_protocol.format_response(unified_response, protocol_context)
+        formatted = client_protocol.format_response(unified_response, protocol_context)
+        # The sink runs AFTER formatting: format_response may append
+        # response-side drop warnings that would otherwise be discarded. The
+        # count-token private channel is drained by the facade (it owns the
+        # logger handle), so it is never double-recorded here.
+        logger = getattr(context, "transaction_logger", None)
+        if (
+            logger is not None
+            and unified_response.warnings
+            and not (isinstance(formatted, dict) and "_proxy_warnings" in formatted)
+        ):
+            logger.log_conversion_warnings(unified_response.warnings)
+        return formatted
 
     def _build_native_provider_context(
         self,
@@ -928,6 +953,19 @@ class RequestExecutor:
             and client_protocol != protocol_name
             and getattr(plugin, "transport_profiles", None) is None
         ):
+            # G10 Phase B: the substitution is a value-level runtime event
+            # (recorded every pass, the console warning stays once-per-key).
+            if context.transaction_logger is not None:
+                context.transaction_logger.log_runtime_event(
+                    "routing",
+                    "routing_substitution",
+                    "single-protocol conversion per default protocol priority",
+                    {
+                        "provider": provider,
+                        "client_protocol": client_protocol,
+                        "protocol": protocol_name,
+                    },
+                )
             from ..routing.profiles import _warned_substitutions, lib_logger as _profiles_logger
 
             _warn_key = (provider, client_protocol, protocol_name, "single-protocol")

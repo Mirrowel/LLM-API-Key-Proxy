@@ -124,11 +124,17 @@ class AnthropicHandler:
         payload = dict(request)
         payload.setdefault("model", "")
         model = str(payload.get("model") or "")
+        captured: Dict[str, Any] = {}
+
+        def _capture_context(ctx: Any) -> None:
+            captured["logger"] = getattr(ctx, "transaction_logger", None)
+
         try:
-            return await self._client.agenerate(
+            result = await self._client.agenerate(
                 payload,
                 input_protocol="anthropic_messages",
                 _requested_operation=OPERATION_COUNT_TOKENS,
+                _request_context_callback=_capture_context,
             )
         except Exception as error:
             from ..client.executor import RoutingExecutionError
@@ -139,7 +145,9 @@ class AnthropicHandler:
                 and _local_estimate_enabled()
             ):
                 raise
-        return self._local_count_estimate(payload, model)
+            return self._local_count_estimate(payload, model)
+        _drain_proxy_warnings(result, captured.get("logger"))
+        return result
 
     def _local_count_estimate(self, payload: Dict[str, Any], model: str) -> Dict[str, Any]:
         """Legacy local estimate via the canonical Chat projection."""
@@ -196,3 +204,18 @@ def _local_estimate_enabled() -> bool:
     import os
 
     return str(os.environ.get("COUNT_TOKENS_LOCAL_ESTIMATE", "") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _drain_proxy_warnings(payload: Any, logger: Optional[TransactionLogger]) -> None:
+    """Pop the private count-token warning channel and sink it to the record.
+
+    G10 Phase B: the count-tokens adapters return ``_proxy_warnings`` because
+    they have no logger; the facade owns the logger handle, pops the key so
+    it never reaches the client, and records the warnings in the change log.
+    """
+
+    if not isinstance(payload, dict):
+        return
+    warnings = payload.pop("_proxy_warnings", None)
+    if warnings and logger is not None:
+        logger.log_conversion_warnings(warnings, stage="count_tokens")

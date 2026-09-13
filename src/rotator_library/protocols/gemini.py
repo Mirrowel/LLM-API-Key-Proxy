@@ -18,7 +18,6 @@ from .base import ProtocolAdapter
 from .canonical import (
     disclose_response_drops,
     format_reasoning_controls,
-    attach_conversion_summary,
     add_conversion_warning,
     canonical_stop_reason,
     canonical_structured_output,
@@ -82,25 +81,35 @@ _REQUEST_CORE_FIELDS = {
 
 
 def _warn_gemini_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+    """Canonical delegation (G10)."""
 
-    for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="gemini")
+    from .canonical import record_conversion_warning
+
+    record_conversion_warning(
+        unified_response.warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=unified_response.source_protocol,
+        target_protocol="gemini",
     )
 
 
 def _warn_gemini_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning to a plain list sink."""
+    """Canonical delegation (G10)."""
+
+    from .canonical import record_conversion_warning
 
     if warnings is None:
         return
-    for warning in warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="gemini"))
+    record_conversion_warning(
+        warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol="gemini",
+        target_protocol="gemini",
+    )
 
 
 def _drop_gemini_signatures(payload: dict[str, Any]) -> bool:
@@ -150,12 +159,14 @@ class GeminiProtocol(ProtocolAdapter):
         generation_params = _parse_gemini_generation_params(generation_config, tool_config)
         if safety_settings:
             generation_params["safety_settings"] = safety_settings
+        warnings_list: list[ConversionWarning] = []
         return UnifiedRequest(
             operation=_operation_from_context(context, OPERATION_CHAT),
             logical_operation=OPERATION_GENERATE,
             model=str(request.get("model") or getattr(context, "model", None) or ""),
             messages=resolve_tool_result_names(
-                normalize_tool_result_messages([self._parse_content(content, default_role="user") for content in request.get("contents") or []])
+                normalize_tool_result_messages([self._parse_content(content, default_role="user") for content in request.get("contents") or []]),
+                warnings_list,
             ),
             system=self._parse_system(request.get("systemInstruction") or request.get("system_instruction")),
             tools=self._parse_tools(request.get("tools") or []),
@@ -165,6 +176,7 @@ class GeminiProtocol(ProtocolAdapter):
             response_format=deepcopy(generation_params.get("structured_output")),
             source_protocol=self.name,
             extensions={self.name: {"generationConfig": generation_config, "safetySettings": safety_settings, "toolConfig": tool_config}},
+            warnings=warnings_list,
             raw=deepcopy(raw_request),
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
@@ -178,7 +190,7 @@ class GeminiProtocol(ProtocolAdapter):
                 formatted
                 for formatted in (
                     self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_request.warnings)
-                    for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)))
+                    for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)), unified_request.warnings)
                 )
                 if formatted is not None
             ],
@@ -406,10 +418,11 @@ class GeminiProtocol(ProtocolAdapter):
             raw=deepcopy(response),
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"responseId", "id", "modelVersion", "candidates", "usageMetadata", "promptFeedback"}},
         )
-        if not messages and metadata_block_reason is None:
+        if not messages and metadata_block_reason is None and unified_response.operation != OPERATION_COUNT_TOKENS:
             # No candidates and no blockReason: the provider returned an empty
             # success. Surface it honestly (with a recorded disclosure) rather
             # than fabricating a candidate or silently emitting an empty 200.
+            # Count-token responses legitimately carry no candidates.
             unified_response.warnings.append(
                 ConversionWarning(
                     code="empty_candidates",
@@ -429,6 +442,10 @@ class GeminiProtocol(ProtocolAdapter):
             # Normalized usage wins over raw preserved fields so later adapters
             # can correct counts without stale provider keys shadowing them.
             payload["totalTokens"] = usage.total_tokens if usage else 0
+            # Private transport key: the facade/finalizer pops this and sinks
+            # it into the change log; it is never sent to the client.
+            if unified_response.warnings:
+                payload["_proxy_warnings"] = list(unified_response.warnings)
             return payload
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
@@ -501,7 +518,7 @@ class GeminiProtocol(ProtocolAdapter):
             "promptFeedback": deepcopy(unified_response.metadata.get("promptFeedback")),
         }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_events(self, raw_event: Any, context: ProtocolContext | None = None) -> list[UnifiedStreamEvent]:
         """One canonical event per candidate — candidateCount>1 streams carry

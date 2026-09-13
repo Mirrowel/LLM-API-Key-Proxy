@@ -320,20 +320,18 @@ def format_canonical_stream_event(
 
 
 def _stream_warn(state: "StreamFormatState", code: str, message: str, field: str) -> None:
-    """Record a stream-side conversion drop (traced at the pipeline tail)."""
+    """Canonical delegation (G10): field is part of the dedup key."""
 
-    if state.warnings is None:
-        state.warnings = []
-    if not any(w.code == code and w.message == message for w in state.warnings):
-        state.warnings.append(
-            ConversionWarning(
-                code=code,
-                message=message,
-                field=field,
-                source_protocol=state.source_protocol,
-                target_protocol=state.protocol,
-            )
-        )
+    from .canonical import record_conversion_warning
+
+    record_conversion_warning(
+        state.warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=state.source_protocol,
+        target_protocol=state.protocol,
+    )
 
 
 def _stream_disclose_unrepresentable(state: "StreamFormatState", kind: str, detail: str) -> None:

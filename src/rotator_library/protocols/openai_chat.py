@@ -22,7 +22,6 @@ from .base import ProtocolAdapter
 from .canonical import (
     add_conversion_warning,
     disclose_response_drops,
-    attach_conversion_summary,
     canonical_stop_reason,
     canonical_structured_output,
     canonical_tool_arguments,
@@ -130,7 +129,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
         warnings_list: list[ConversionWarning] = []
-        messages = resolve_tool_result_names([self._parse_message(message) for message in request.get("messages") or []])
+        messages = resolve_tool_result_names([self._parse_message(message) for message in request.get("messages") or []], warnings_list)
         tools = [self._parse_tool_definition(tool) for tool in request.get("tools") or []]
         source_generation_params = {k: deepcopy(request[k]) for k in _GENERATION_PARAMS if k in request}
         generation_params = _parse_openai_generation_params(source_generation_params)
@@ -390,7 +389,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
         if service_tier is not None:
             payload["service_tier"] = service_tier
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_events(self, raw_event: Any, context: ProtocolContext | None = None) -> list[UnifiedStreamEvent]:
         """One canonical event per choice — ``n>1`` frames carry several
@@ -693,6 +692,18 @@ class OpenAIChatProtocol(ProtocolAdapter):
                     )
             content = _tool_result_text({"error": result.content} if result.is_error else result.content)
         else:
+            if warnings is not None and not preserve_source and message.role in {"system", "developer"}:
+                # Cross-protocol merge: Chat carries one content field per
+                # message, so multiple instruction text blocks concatenate
+                # into a single string. A single block stays silent.
+                text_blocks = [block for block in message.content if block.type == "text"]
+                if len(text_blocks) > 1 and all(block.type == "text" for block in message.content):
+                    _warn_once(
+                        warnings,
+                        code="instructions_merged",
+                        message=f"{len(text_blocks)} instruction text blocks merged into one Chat system content field",
+                        field="content",
+                    )
             content = self._format_content(message.content, preserve_source=preserve_source, warnings=warnings)
         if isinstance(content, list) and not content:
             if any(block.type == "refusal" and block.refusal for block in message.content):
@@ -1439,20 +1450,22 @@ def _warn_once(
     code: str,
     message: str,
     field: Optional[str] = None,
+    source_protocol: Optional[str] = None,
 ) -> None:
-    """Append a deduplicated ConversionWarning to a plain list sink.
+    """Canonical delegation (G10): full key; source defaults to this wire."""
 
-    Retry/rotation rebuild the same request more than once — direct appends
-    clone identical warnings on every pass (the rendered summary dedupes,
-    the internal list must too).
-    """
+    from .canonical import record_conversion_warning
 
     if warnings is None:
         return
-    for warning in warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="openai_chat"))
+    record_conversion_warning(
+        warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=source_protocol or "openai_chat",
+        target_protocol="openai_chat",
+    )
 
 
 def _drop_chat_signature_entries(container: dict[str, Any]) -> bool:
@@ -1480,13 +1493,17 @@ def _drop_chat_signature_entries(container: dict[str, Any]) -> bool:
 
 
 def _warn_chat_once(unified_response: UnifiedResponse, *, code: str, message: str, field: Optional[str] = None) -> None:
-    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+    """Canonical delegation (G10): response sink, full key, real source."""
 
-    for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="openai_chat")
+    from .canonical import record_conversion_warning
+
+    record_conversion_warning(
+        unified_response.warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=unified_response.source_protocol,
+        target_protocol="openai_chat",
     )
 
 

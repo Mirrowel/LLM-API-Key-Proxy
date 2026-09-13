@@ -246,6 +246,11 @@ def resolve_profile(
         key = (provider, client_protocol, chosen, candidate_protocol)
         if key not in _warned_substitutions:
             _warned_substitutions.add(key)
+            # G10 Phase B: profile resolution has no transaction logger
+            # reachable (it runs before the executor context exists), so the
+            # substitution disclosure stays console-only here. The executor's
+            # single-protocol substitution site records the value-level
+            # change-log entry where a logger IS reachable.
             lib_logger.warning(
                 "Provider %s has no endpoint for client protocol %r — serving "
                 "converted via profile %r (%s) per the default protocol "

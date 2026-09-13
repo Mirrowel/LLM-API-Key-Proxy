@@ -21,7 +21,6 @@ from .canonical import (
     STOP_REASON_CONTENT_FILTER,
     format_reasoning_controls,
     normalize_reasoning_controls,
-    attach_conversion_summary,
     add_conversion_warning,
     canonical_stop_reason,
     canonical_structured_output,
@@ -135,11 +134,12 @@ class ResponsesWireAdapter(ProtocolAdapter):
         generation_params = _parse_responses_generation_params(source_generation)
         if "tool_choice" in generation_params:
             generation_params["tool_choice"] = canonical_tool_choice(generation_params["tool_choice"], self.name)
+        warnings_list: list[ConversionWarning] = []
         return UnifiedRequest(
             operation=OPERATION_RESPONSES,
             logical_operation=OPERATION_GENERATE,
             model=str(request.get("model") or getattr(context, "model", None) or ""),
-            messages=resolve_tool_result_names(self._parse_input(request.get("input"))),
+            messages=resolve_tool_result_names(self._parse_input(request.get("input")), warnings_list),
             system=text_blocks(request.get("instructions")) if request.get("instructions") is not None else [],
             tools=[self._parse_tool(tool) for tool in request.get("tools") or []],
             stream=bool(request.get("stream", False)),
@@ -150,6 +150,7 @@ class ResponsesWireAdapter(ProtocolAdapter):
             metadata=deepcopy(request.get("metadata") or {}),
             source_protocol=self.name,
             extensions={self.name: {"generation_params": source_generation}},
+            warnings=warnings_list,
             raw=deepcopy(raw_request),
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
@@ -335,7 +336,7 @@ class ResponsesWireAdapter(ProtocolAdapter):
                 "reason": "content_filter" if unified_response.stop_reason == STOP_REASON_CONTENT_FILTER else "max_output_tokens"
             }
         payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
-        return attach_conversion_summary({k: v for k, v in payload.items() if v is not None}, unified_response)
+        return {k: v for k, v in payload.items() if v is not None}
 
     def parse_stream_event(self, raw_event: Any, context: ProtocolContext | None = None) -> UnifiedStreamEvent:
         event = _decode_sse_data(raw_event)
@@ -1118,25 +1119,18 @@ def _responses_output_modalities(messages: list[UnifiedMessage]) -> list[str]:
 
 
 def _warn_responses_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning (formatting may run twice)."""
+    """Canonical delegation (G10)."""
 
-    for warning in unified_response.warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    unified_response.warnings.append(
-        ConversionWarning(code=code, message=message, field=field, source_protocol=unified_response.source_protocol, target_protocol="responses")
+    from .canonical import record_conversion_warning
+
+    record_conversion_warning(
+        unified_response.warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=unified_response.source_protocol,
+        target_protocol="responses",
     )
-
-
-def _warn_responses_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
-    """Append a deduplicated ConversionWarning to a plain list sink."""
-
-    if warnings is None:
-        return
-    for warning in warnings:
-        if warning.code == code and warning.message == message and warning.field == field:
-            return
-    warnings.append(ConversionWarning(code=code, message=message, field=field, source_protocol=None, target_protocol="responses"))
 
 
 _BUILTIN_TOOL_ITEM_TYPES = {
@@ -1148,6 +1142,23 @@ _BUILTIN_TOOL_ITEM_TYPES = {
     "mcp_call",
     "local_shell_call",
 }
+
+
+def _warn_responses_list_once(warnings: list | None, *, code: str, message: str, field: str | None = None) -> None:
+    """Canonical delegation (G10)."""
+
+    from .canonical import record_conversion_warning
+
+    if warnings is None:
+        return
+    record_conversion_warning(
+        warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol="responses",
+        target_protocol="responses",
+    )
 
 
 def _parse_responses_annotations(payload: Any) -> list[Annotation]:
