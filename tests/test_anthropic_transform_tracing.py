@@ -9,19 +9,7 @@ import pytest
 import rotator_library.client.anthropic as anthropic_client_module
 from rotator_library.client.anthropic import AnthropicHandler
 from rotator_library.transaction_logger import TransactionLogger
-
-
-
-
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
-
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+from tests.txn_helpers import boundaries, pass_names as change_pass_names
 
 
 
@@ -130,10 +118,11 @@ async def test_anthropic_handler_traces_boundary_when_logging_enabled(tmp_path, 
     response = await AnthropicHandler(client).messages(payload)
 
     assert response["content"][0]["text"] == "native answer"
-    pass_names = [entry["pass_name"] for entry in _trace_entries(created[0].log_dir)]
+    pass_names = change_pass_names(created[0])
     assert "anthropic_raw_request" in pass_names
     assert "anthropic_native_protocol_response" in pass_names
-    assert "final_client_response" in pass_names
+    # The final client response is captured as the client-egress boundary.
+    assert "client_egress" in boundaries(created[0])
 
 
 @pytest.mark.asyncio

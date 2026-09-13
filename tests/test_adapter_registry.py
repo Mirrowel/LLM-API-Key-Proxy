@@ -17,19 +17,13 @@ from rotator_library.adapters import (
     run_adapter_chain,
 )
 from rotator_library.transaction_logger import TransactionLogger
+from tests.txn_helpers import changes
 
 
 
 
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
-
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+def _trace_entries(logger):
+    return changes(logger)
 
 
 
@@ -179,8 +173,10 @@ async def test_adapter_chain_traces_final_summary(tmp_path) -> None:
     result = await run_adapter_chain([get_adapter("model_override")], payload, context, stage="request")
 
     assert result["model"] == "native"
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     pass_names = [entry["pass_name"] for entry in entries]
     assert pass_names == ["before_adapter_chain", "after_adapter", "after_adapter_chain"]
-    assert entries[-1]["metadata"]["adapter_count"] == 1
-    assert entries[-1]["metadata"]["changed"] is True
+    assert entries[1]["data"]["model"] == "native"
+    assert entries[-1]["data"]["model"] == "native"
+    assert entries[-1]["stage"] == "adapter"
+    assert entries[-1]["detail"] == "after_adapter_chain/request/adapter"

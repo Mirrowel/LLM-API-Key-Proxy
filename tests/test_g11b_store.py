@@ -19,19 +19,6 @@ from rotator_library.responses import (
 from rotator_library.transaction_logger import TransactionLogger
 
 
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-
-
-def _trace_text(log_dir) -> str:
-    from rotator_library.utils import zstd_io
-
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
-
-
 class _FakeCache:
     """Minimal key-value cache mirroring the ProviderCache async surface."""
 
@@ -169,10 +156,12 @@ async def test_create_response_survives_failing_store(tmp_path) -> None:
     )
 
     assert response["id"] == "resp_create"
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
-    errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
-    assert any(entry["data"]["failed_pass_name"] == "responses_store_response" for entry in errors)
+    from tests.txn_helpers import error_records, record_errors
+
+    errors = error_records(logger)
+    assert any(entry["failed_pass_name"] == "responses_store_response" for entry in errors)
     assert "secret-token" not in json.dumps(errors)
+    assert "secret-token" not in json.dumps(record_errors(logger), default=str)
 
 
 @pytest.mark.asyncio

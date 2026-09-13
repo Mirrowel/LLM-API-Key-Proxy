@@ -25,6 +25,7 @@ from rotator_library.responses import (
     ResponsesWebSocketFormatter,
 )
 from rotator_library.transaction_logger import TransactionLogger
+from tests.txn_helpers import error_records
 
 
 _REQUIRED_RESPONSE_FIELDS = (
@@ -55,19 +56,6 @@ def _assert_sdk_response_object(obj: dict) -> None:
     assert isinstance(obj["tool_choice"], (str, dict))
     assert isinstance(obj["tools"], list)
     assert isinstance(obj["metadata"], dict)
-
-
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-
-
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
-
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
 
 
 def _event_names(events: list[str]) -> list[str]:
@@ -352,10 +340,9 @@ async def test_stream_response_store_failures_emit_store_specific_trace(tmp_path
     # A failing store must never cost the client its terminal frames.
     assert any("response.completed" in event for event in events)
 
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
-    errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
-    assert any(entry["data"]["failed_pass_name"] == "responses_store_stream_response" for entry in errors)
-    assert "secret-token" not in json.dumps(errors)
+    records = error_records(logger)
+    assert any(entry["failed_pass_name"] == "responses_store_stream_response" for entry in records)
+    assert "secret-token" not in json.dumps(records)
 
 
 @pytest.mark.asyncio
@@ -388,10 +375,9 @@ async def test_stream_current_state_store_failures_emit_store_specific_trace(tmp
     # In-progress snapshots are best-effort: the stream still completes.
     assert any(event.event_name == "response.completed" for event in events)
 
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
-    errors = [entry for entry in entries if entry["pass_name"] == "transform_log_error"]
-    assert any(entry["data"]["failed_pass_name"] == "responses_store_stream_current_state" for entry in errors)
-    assert "secret-token" not in json.dumps(errors)
+    records = error_records(logger)
+    assert any(entry["failed_pass_name"] == "responses_store_stream_current_state" for entry in records)
+    assert "secret-token" not in json.dumps(records)
 
 
 @pytest.mark.asyncio

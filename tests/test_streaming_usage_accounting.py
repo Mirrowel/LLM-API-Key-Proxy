@@ -17,10 +17,10 @@ def _trace_level_2(monkeypatch):
     monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 
 
-def _trace_entries(log_dir):
-    from pathlib import Path
+def _trace_entries(logger):
+    from tests.txn_helpers import changes
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return changes(logger)
 
 
 class FakeCredentialContext:
@@ -140,7 +140,7 @@ async def test_streaming_usage_uses_normalized_accounting_and_trace(tmp_path, mo
     assert cred_context.success_kwargs["completion_tokens"] == 20
     assert cred_context.success_kwargs["thinking_tokens"] == 10
     assert cred_context.success_kwargs["approx_cost"] > 0
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     assert any(entry["pass_name"] == "usage_accounting_summary" for entry in entries)
 
 

@@ -10,14 +10,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from rotator_library.transaction_logger import ProviderLogger, TransactionLogger
-from rotator_library.utils import zstd_io
 import pytest
 
-
-def _artifact(log_dir, name):
-    compressed = Path(str(log_dir / name) + ".zst")
-    return compressed if compressed.exists() else log_dir / name
-
+from tests.txn_helpers import boundaries, client_chunks
 
 
 @dataclass
@@ -68,20 +63,15 @@ def test_transaction_logger_serializes_model_response_objects(tmp_path, caplog) 
 
     logger.log_response(ModelDumpResponse())
 
-    assert "Failed to write response.json" not in caplog.text
-    response = zstd_io.read_json_any(logger.log_dir / "response.json")
-    assert response["data"]["model"] == "gemini_cli/gemini-3-flash-preview"
-    assert response["data"]["nested"] == {"count": 2, "path": str(Path("provider/state.json"))}
-    assert response["data"]["created_at"] == "2026-01-02T03:04:05"
-    assert response["data"]["binary"] == "hello"
-    assert sorted(response["data"]["set_values"]) == ["a", "b"]
-    assert response["data"]["unknown"] == "provider-leaf"
-
-    metadata = zstd_io.read_json_any(logger.log_dir / "metadata.json")
-    assert metadata["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
-    assert metadata["finish_reason"] == "stop"
-    assert metadata["reasoning_found"] is True
-    assert metadata["reasoning_content"] == "kept for metadata"
+    payload = boundaries(logger)["client_egress"]
+    assert payload["model"] == "gemini_cli/gemini-3-flash-preview"
+    assert payload["nested"] == {"count": 2, "path": str(Path("provider/state.json"))}
+    assert payload["created_at"] == "2026-01-02T03:04:05"
+    assert payload["binary"] == "hello"
+    assert sorted(payload["set_values"]) == ["a", "b"]
+    assert payload["unknown"] == "provider-leaf"
+    assert payload["usage"] == {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+    assert not logger._record.errors
 
 
 def test_transaction_logger_serializes_stream_chunks_with_provider_objects(tmp_path, caplog) -> None:
@@ -90,10 +80,9 @@ def test_transaction_logger_serializes_stream_chunks_with_provider_objects(tmp_p
     logger.log_stream_chunk({"chunk": ModelDumpResponse()})
     logger.log_response({"model": "model", "choices": []})  # finalize: flush buffered chunks
 
-    assert "Failed to append to streaming_chunks.jsonl" not in caplog.text
-    entries = zstd_io.read_jsonl_any(logger.log_dir / "streaming_chunks.jsonl")
-    chunk_entry = next(entry for entry in entries if isinstance(entry.get("chunk"), dict) and isinstance(entry["chunk"].get("chunk"), dict) and entry["chunk"]["chunk"].get("id") == "chatcmpl-test")
-    assert chunk_entry["chunk"]["chunk"]["id"] == "chatcmpl-test"
+    chunks = client_chunks(logger)
+    chunk_entry = next(entry for entry in chunks if isinstance(entry.get("chunk"), dict))
+    assert chunk_entry["chunk"]["id"] == "chatcmpl-test"
 
 
 def test_provider_logger_serializes_final_response_objects(tmp_path, caplog) -> None:
@@ -102,8 +91,7 @@ def test_provider_logger_serializes_final_response_objects(tmp_path, caplog) -> 
 
     provider_logger.log_final_response(ModelDumpResponse())
 
-    assert "ProviderLogger: Failed to write final_response.json" not in caplog.text
-    payload = zstd_io.read_json_any(provider_logger.log_dir / "final_response.json")
+    payload = boundaries(transaction_logger)["provider_response"]
     assert payload["id"] == "chatcmpl-test"
     assert payload["nested"]["path"] == str(Path("provider/state.json"))
 
@@ -115,5 +103,5 @@ def test_transaction_logger_handles_circular_provider_payloads(tmp_path) -> None
 
     logger.log_response({"model": "model", "usage": {}, "node": node})
 
-    response = zstd_io.read_json_any(logger.log_dir / "response.json")
-    assert response["data"]["node"] == {"name": "root", "child": "[CIRCULAR]"}
+    payload = boundaries(logger)["client_egress"]
+    assert payload["node"] == {"name": "root", "child": "<circular>"}

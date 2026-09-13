@@ -37,6 +37,33 @@ def compression_available() -> bool:
     return _COMPRESSION_AVAILABLE
 
 
+# ---------------------------------------------------------------------------
+# Byte-level one-shot compression (G10 transaction archives)
+# ---------------------------------------------------------------------------
+
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def compress_bytes(payload: bytes) -> bytes:
+    """One-shot zstd frame (level 3, shared context); raw passthrough when
+    zstandard is unavailable."""
+
+    if not _COMPRESSION_AVAILABLE:
+        return payload
+    with _LOCK:
+        return _COMPRESSOR.compress(payload)
+
+
+def decompress_bytes(blob: bytes) -> bytes:
+    """Decompress a one-shot zstd frame; passthrough when zstandard is
+    unavailable or the blob is not a zstd frame (plain-JSON degradation)."""
+
+    if not _COMPRESSION_AVAILABLE or len(blob) < 4 or blob[:4] != _ZSTD_MAGIC:
+        return blob
+    with _LOCK:
+        return _DECOMPRESSOR.decompress(blob)
+
+
 def _write_bytes(path: Path, payload: bytes, *, compressed: bool) -> None:
     if compressed and _COMPRESSION_AVAILABLE:
         with _LOCK:

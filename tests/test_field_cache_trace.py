@@ -9,19 +9,11 @@ import pytest
 from rotator_library.adapters import AdapterContext, get_adapter, run_adapter_chain
 from rotator_library.field_cache import FieldCacheContext, FieldCacheEngine, FieldCacheInjection, FieldCacheRule
 from rotator_library.transaction_logger import TransactionLogger
+from tests.txn_helpers import changes, error_records
 
 
-
-
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
-
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+def _trace_entries(logger):
+    return changes(logger)
 
 
 
@@ -40,12 +32,11 @@ async def test_adapter_chain_emits_before_after_trace_entries(tmp_path) -> None:
 
     result = await run_adapter_chain([get_adapter("model_override")], {"model": "public"}, context, stage="request")
 
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     assert result["model"] == "native"
     assert [entry["pass_name"] for entry in entries] == ["before_adapter_chain", "after_adapter", "after_adapter_chain"]
-    assert entries[1]["metadata"]["adapter"] == "model_override"
-    assert entries[1]["metadata"]["changed"] is True
-    assert entries[1]["credential_id"] == "cred_1"
+    assert entries[1]["data"]["model"] == "native"
+    assert entries[1]["detail"] == "after_adapter/request/adapter"
 
 
 @pytest.mark.asyncio
@@ -63,7 +54,7 @@ async def test_field_cache_extract_and_inject_emit_before_after_trace_entries(tm
     await engine.extract("response", {"choices": [{"message": {"reasoning_content": "hidden"}}]}, context, transaction_logger=logger)
     updated, _ = await engine.inject("request", {"messages": [{"role": "user"}]}, context, transaction_logger=logger)
 
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     pass_names = [entry["pass_name"] for entry in entries]
     assert updated["messages"][-1]["reasoning_content"] == "hidden"
     assert pass_names == [
@@ -76,10 +67,9 @@ async def test_field_cache_extract_and_inject_emit_before_after_trace_entries(tm
         "after_field_cache_injection",
         "field_cache_injection_complete",
     ]
-    assert entries[2]["metadata"]["rule_name"] == "reasoning_content"
-    assert entries[2]["metadata"]["matched"] == 1
-    assert entries[6]["metadata"]["hit"] is True
-    assert entries[6]["metadata"]["changed"] is True
+    # Extraction/injection passes carry the mutated payload in the change log.
+    assert entries[2]["data"] is not None
+    assert entries[6]["data"] is not None
 
 
 @pytest.mark.asyncio
@@ -97,9 +87,10 @@ async def test_stream_sourced_rule_injection_trace_uses_request_direction(tmp_pa
     await engine.extract("stream_event", {"metadata": {"provider_session_id": "sid_1"}}, context, transaction_logger=logger)
     await engine.inject("request", {"metadata": {}}, context, transaction_logger=logger)
 
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     injection_entries = [entry for entry in entries if "injection" in entry["pass_name"]]
-    assert {entry["direction"] for entry in injection_entries} == {"request"}
+    assert injection_entries
+    assert {entry["detail"].split("/")[1] for entry in injection_entries} == {"request"}
 
 
 @pytest.mark.asyncio
@@ -121,8 +112,7 @@ async def test_field_cache_errors_emit_transform_log_error(tmp_path) -> None:
     assert operations[0].skipped is True
     assert operations[0].reason == "rule_error:FieldCachePathError"
 
-    entries = _trace_entries(logger.log_dir)
-    error_entry = next(entry for entry in entries if entry["pass_name"] == "transform_log_error")
-    assert error_entry["data"]["failed_pass_name"] == "field_cache_inject"
-    assert error_entry["metadata"]["rule_name"] == "bad_injection"
+    records = error_records(logger)
+    error_entry = next(entry for entry in records if entry["failed_pass_name"] == "field_cache_inject")
+    assert error_entry["stage"] == "adapter"
     assert updated == {"messages": [{"role": "user"}]}

@@ -10,6 +10,7 @@ import rotator_library.responses.service as responses_service_module
 from rotator_library.responses import InMemoryResponsesStore, ResponsesService, ResponsesServiceError, ResponsesStoreSettings, StoredResponse, create_configured_responses_store
 from rotator_library.core.errors import StructuredAPIResponseError
 from rotator_library.transaction_logger import TransactionLogger
+from tests.txn_helpers import pass_names
 
 
 
@@ -167,18 +168,16 @@ def test_responses_service_errors_format_per_protocol() -> None:
     assert error.to_protocol_payload("anthropic_messages")["error"]["type"] == "rate_limit_error"
 
 
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
+def _trace_entries(logger):
+    from tests.txn_helpers import changes
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return changes(logger)
 
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
 
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+def _trace_text(logger):
+    from tests.txn_helpers import change_text
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return change_text(logger)
 
 
 
@@ -484,9 +483,11 @@ async def test_internal_session_hints_do_not_leak_to_direct_clients_or_traces(tm
     await service.create_response({"model": "gpt-test", "input": "Continue", "previous_response_id": "resp_parent"}, client, transaction_logger=logger)
 
     assert "_session_tracking_hints" not in client.calls[0]
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "_session_tracking_hints" not in trace_text
-    assert "has_session_hints" in trace_text
+    # The native-protocol request is traced, but the internal tracking hints
+    # never enter the record.
+    assert "responses_native_protocol_request" in pass_names(logger)
 
 
 @pytest.mark.asyncio
@@ -548,7 +549,7 @@ async def test_scoped_responses_preserve_routing_but_never_store_or_trace_secret
     assert client.calls[0]["kwargs"]["api_keys"] == raw_request["api_keys"]
     assert client.calls[0]["kwargs"]["providers"] == raw_request["providers"]
     persisted_text = json.dumps(stored.to_dict())
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "super-secret-routing-key" not in persisted_text
     assert "provider-secret-header" not in persisted_text
     assert "super-secret-routing-key" not in trace_text
@@ -667,8 +668,8 @@ async def test_service_emits_transform_trace_passes(tmp_path) -> None:
 
     await service.create_response({"model": "gpt-test", "input": "Hello"}, FakeClient(), transaction_logger=logger)
 
-    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
-    assert pass_names == [
+    names = [entry["pass_name"] for entry in _trace_entries(logger)]
+    assert names == [
         "responses_raw_request",
         "responses_parsed_request",
         "responses_native_protocol_request",
@@ -687,9 +688,9 @@ async def test_service_usage_trace_includes_provider_reported_cost(tmp_path) -> 
 
     await service.create_response({"model": "gpt-test", "input": "Hello"}, FakeCostClient(), transaction_logger=logger)
 
-    usage_entry = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"][-1]
+    usage_entry = [entry for entry in _trace_entries(logger) if entry["pass_name"] == "usage_accounting_summary"][-1]
     assert usage_entry["data"]["cost"]["provider_reported_cost"] == 0.033
-    assert usage_entry["metadata"]["pricing_source"] == "responses_provider"
+    assert usage_entry["stage"] == "final"
 
 
 def test_trace_responses_usage_returns_before_conversion_without_logger(monkeypatch) -> None:

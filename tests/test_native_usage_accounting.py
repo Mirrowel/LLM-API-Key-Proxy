@@ -8,18 +8,7 @@ import pytest
 
 from rotator_library.native_provider import NativeHTTPTransport, NativeProviderContext, NativeProviderExecutor
 from rotator_library.transaction_logger import TransactionLogger
-from rotator_library.utils import zstd_io
-
-
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-
-
-def _trace_text(log_dir):
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+from tests.txn_helpers import by_pass
 
 
 class FakeNativeTransport(NativeHTTPTransport):
@@ -49,7 +38,11 @@ async def test_native_executor_traces_normalized_usage(tmp_path) -> None:
 
     await NativeProviderExecutor().execute({"model": "gpt-test", "messages": [{"role": "user", "content": "hi"}]}, context, FakeNativeTransport())
 
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
-    usage_entries = [entry for entry in entries if entry["pass_name"] == "usage_accounting_summary"]
-    assert usage_entries[-1]["data"]["usage"]["completion_tokens"] == 4
-    assert usage_entries[-1]["data"]["usage"]["reasoning_tokens"] == 2
+    summary = by_pass(logger, "usage_accounting_summary")[-1]
+    assert summary["stage"] == "final"
+    assert summary["detail"] == "usage_accounting_summary/metadata/final"
+    # Provider usage (including reasoning details) is captured on the final
+    # client response; the accounting pass derives the normalized completion.
+    final_usage = by_pass(logger, "final_client_response")[-1]["data"]["usage"]
+    assert final_usage["completion_tokens"] == 6
+    assert final_usage["completion_tokens_details"]["reasoning_tokens"] == 2

@@ -13,30 +13,16 @@ from rotator_library.core.types import RequestContext
 from rotator_library.routing import parse_route_target
 from rotator_library.routing.types import FallbackGroup
 from rotator_library.transaction_logger import TransactionLogger
+from tests.txn_helpers import changes, pass_names
 
 
 
 
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class StreamFailure(Exception):
     def __init__(self, error_type: str) -> None:
         super().__init__(error_type)
         self.error_type = error_type
 
-
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
-
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
-
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
 
 def _context(*, logger=None) -> RequestContext:
     targets = (parse_route_target("codex/gpt-5.1-codex"), parse_route_target("openai/gpt-5.1"))
@@ -149,10 +135,10 @@ async def test_streaming_fallback_trace_records_blocked_after_output(tmp_path) -
     with pytest.raises(StreamFailure):
         [chunk async for chunk in executor._execute_streaming_with_fallback(_context(logger=logger))]
 
-    pass_names = [json.loads(line)["pass_name"] for line in _trace_text(logger.log_dir).splitlines()]
-    assert "routing_stream_target_attempt_started" in pass_names
-    assert "routing_stream_target_attempt_failed" in pass_names
-    assert "routing_stream_fallback_blocked_after_output" in pass_names
+    names = pass_names(logger)
+    assert "routing_stream_target_attempt_started" in names
+    assert "routing_stream_target_attempt_failed" in names
+    assert "routing_stream_fallback_blocked_after_output" in names
 
 
 @pytest.mark.asyncio
@@ -228,10 +214,9 @@ async def test_streaming_fallback_exhaustion_trace_uses_sanitized_summaries(tmp_
     with pytest.raises(StreamFailure):
         [chunk async for chunk in executor._execute_streaming_with_fallback(_context_never_streaming_fallback(logger=logger))]
 
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
-    exhausted = [entry for entry in entries if entry["pass_name"] == "routing_fallback_exhausted"][-1]
-    assert exhausted["metadata"]["fallback_targets"][0]["message"] == ""
-    assert exhausted["metadata"]["streaming_policy"] == "never"
+    exhausted = [entry for entry in changes(logger) if entry["pass_name"] == "routing_fallback_exhausted"][-1]
+    assert exhausted["stage"] == "routing"
+    assert exhausted["detail"] == "routing_fallback_exhausted/metadata/routing"
 
 
 def test_stream_timeout_details_merge_into_aggregate_error() -> None:

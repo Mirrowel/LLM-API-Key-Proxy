@@ -67,8 +67,10 @@ def _trace_text_exists(log_dir):
     return (Path(log_dir) / "transform_trace.jsonl").exists() or (Path(log_dir) / "transform_trace.jsonl.zst").exists()
 
 
-def _trace_passes(log_dir):
-    return [entry["pass_name"] for entry in zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")]
+def _trace_passes(logger):
+    from tests.txn_helpers import pass_names
+
+    return pass_names(logger)
 
 
 @pytest.mark.asyncio
@@ -79,12 +81,12 @@ async def test_streaming_handler_emits_lifecycle_metrics_without_changing_output
 
     assert chunks[0].startswith("data: ")
     assert chunks[-1] == "data: [DONE]\n\n"
-    pass_names = _trace_passes(logger.log_dir)
-    assert "stream_started" in pass_names
-    assert "stream_first_byte" in pass_names
-    assert "stream_first_visible_output" in pass_names
-    assert "stream_completed" in pass_names
-    assert "stream_metrics_final" in pass_names
+    names = _trace_passes(logger)
+    assert "stream_started" in names
+    assert "stream_first_byte" in names
+    assert "stream_first_visible_output" in names
+    assert "stream_completed" in names
+    assert "stream_metrics_final" in names
 
 
 @pytest.mark.asyncio
@@ -97,9 +99,9 @@ async def test_stream_trace_metrics_can_be_disabled_without_changing_output(tmp_
     assert chunks[0].startswith("data: ")
     assert chunks[-1] == "data: [DONE]\n\n"
     if _trace_text_exists(logger.log_dir):
-        pass_names = _trace_passes(logger.log_dir)
-        assert "stream_started" in pass_names
-        assert "stream_metrics_final" in pass_names
+        names = _trace_passes(logger)
+        assert "stream_started" in names
+        assert "stream_metrics_final" in names
 
 
 @pytest.mark.asyncio

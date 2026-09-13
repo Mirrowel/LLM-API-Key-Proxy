@@ -13,8 +13,9 @@ from pathlib import Path
 import pytest
 
 from proxy_app.detailed_logger import RawIOLogger
-from rotator_library.transaction_logger import ProviderLogger, TransactionContext
+from rotator_library.transaction_logger import ProviderLogger, TransactionLogger
 from rotator_library.transform_trace import scrub_sensitive_text
+from tests.txn_helpers import changes, record_errors
 from rotator_library.usage import UsageManager
 from rotator_library.usage.identity.registry import derive_accessor_id
 from rotator_library.usage.persistence.storage import UsageStorage
@@ -165,43 +166,39 @@ async def test_quota_stats_never_returns_key_material(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _provider_logger(tmp_path: Path) -> ProviderLogger:
-    context = TransactionContext(
-        log_dir=tmp_path / "txn",
-        request_id="req-1",
-        enabled=True,
-        provider="openai",
-        model="gpt-test",
-    )
-    return ProviderLogger(context)
+def _provider_logger(tmp_path: Path):
+    transaction_logger = TransactionLogger("openai", "gpt-test", parent_dir=tmp_path)
+    return ProviderLogger(transaction_logger.get_context()), transaction_logger
 
 
-def test_provider_logger_rejects_path_traversal(tmp_path: Path) -> None:
-    logger = _provider_logger(tmp_path)
+def test_provider_logger_contains_extra_payloads_in_change_log(tmp_path: Path) -> None:
+    logger, transaction_logger = _provider_logger(tmp_path)
 
+    # The record model never writes arbitrary filenames to disk, so there is
+    # no directory to traverse out of; the filename/value land in the change
+    # log instead (detail=filename, value=payload).
     logger.log_extra("../../escaped.log", "boom")
-    assert not (tmp_path / "escaped.log").exists()
-    assert not (tmp_path / "txn" / "escaped.log").exists()
-
     logger.log_extra(str(tmp_path / "absolute.log"), "boom")
+    logger.log_extra("safe.log", "ok")
+
+    assert not (tmp_path / "escaped.log").exists()
     assert not (tmp_path / "absolute.log").exists()
 
-    logger.log_extra("safe.log", "ok")
-    assert (tmp_path / "txn" / "provider" / "safe.log").read_text(
-        encoding="utf-8"
-    ) == "ok"
+    extras = [entry for entry in changes(transaction_logger) if entry["kind"] == "provider_extra"]
+    details = [entry["detail"] for entry in extras]
+    assert details == ["../../escaped.log", str(tmp_path / "absolute.log"), "safe.log"]
+    assert extras[-1]["data"] == "ok"
+    assert not list(tmp_path.rglob("*.log"))
 
 
 def test_provider_logger_error_log_scrubs_url_keys(tmp_path: Path) -> None:
-    logger = _provider_logger(tmp_path)
+    logger, transaction_logger = _provider_logger(tmp_path)
 
     logger.log_error("upstream failed https://api.example/v1?key=REALKEY&alt=sse")
 
-    content = (tmp_path / "txn" / "provider" / "error.log").read_text(
-        encoding="utf-8"
-    )
-    assert "REALKEY" not in content
-    assert "[REDACTED]" in content
+    message = record_errors(transaction_logger)[0]["message"]
+    assert "REALKEY" not in message
+    assert "[REDACTED]" in message
 
 
 # ---------------------------------------------------------------------------

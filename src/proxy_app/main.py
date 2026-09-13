@@ -502,6 +502,15 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Drain the background transaction writer so sealed records land on
+    # disk before the process exits.
+    try:
+        from rotator_library.transaction import TransactionWriter
+
+        TransactionWriter.instance().stop()
+    except Exception:
+        pass
+
     await client.background_refresher.stop()  # Stop the background task on shutdown
     if app.state.embedding_batcher:
         await app.state.embedding_batcher.stop()

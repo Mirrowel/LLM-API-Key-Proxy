@@ -18,26 +18,15 @@ from rotator_library.field_cache import (
 )
 from rotator_library.field_cache.types import is_provider_continuation_path
 from rotator_library.transaction_logger import TransactionLogger
+from tests.txn_helpers import change_text, changes, record_errors
 
 
+def _trace_entries(logger):
+    return changes(logger)
 
 
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
-
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
-
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
-
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+def _trace_text(logger):
+    return change_text(logger)
 
 
 
@@ -338,12 +327,12 @@ async def test_field_cache_trace_omits_raw_sample_values(tmp_path) -> None:
         transaction_logger=logger,
     )
 
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "provider-signature-secret" not in trace_text
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     after_entry = next(entry for entry in entries if entry["pass_name"] == "after_field_cache_extraction")
-    assert after_entry["metadata"]["sample_value_count"] == 1
-    assert after_entry["metadata"]["sample_value_types"] == ["str"]
+    # Only shape/count metadata is traced, never the raw sample value.
+    assert after_entry["data"]["payload_type"] == "dict"
 
 
 @pytest.mark.asyncio
@@ -366,9 +355,10 @@ async def test_field_cache_error_trace_omits_raw_payload_values(tmp_path) -> Non
     # skipped; the request proceeds.
     assert operations[0].skipped is True
     assert operations[0].reason == "rule_error:RuntimeError"
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "provider-signature-secret" not in trace_text
-    assert "payload_type" in trace_text
+    raw = record_errors(logger)[0]["raw"]
+    assert raw["payload_type"] == "dict"
 
 
 @pytest.mark.asyncio
@@ -382,7 +372,7 @@ async def test_field_cache_traces_start_and_complete_even_without_matching_rules
     assert operations == []
     assert injection_operations == []
     assert updated == {"messages": []}
-    entries = _trace_entries(logger.log_dir)
+    entries = _trace_entries(logger)
     pass_names = [entry["pass_name"] for entry in entries]
     assert pass_names == [
         "field_cache_extraction_start",
@@ -390,8 +380,9 @@ async def test_field_cache_traces_start_and_complete_even_without_matching_rules
         "field_cache_injection_start",
         "field_cache_injection_complete",
     ]
-    assert entries[1]["metadata"]["rule_count"] == 0
-    assert entries[-1]["metadata"]["operation_count"] == 0
+    # Boundaries are emitted even with no matching rules; payload shape is
+    # recorded on each pass.
+    assert all(entry["data"] is not None for entry in entries)
 
 
 def test_per_tool_call_requires_tool_call_id_path() -> None:

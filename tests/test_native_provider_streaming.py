@@ -38,18 +38,16 @@ class FakeStreamingClient:
             yield chunk
 
 
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
+def _trace_entries(logger):
+    from tests.txn_helpers import changes
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return changes(logger)
 
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
 
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+def _trace_text(logger):
+    from tests.txn_helpers import change_text
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return change_text(logger)
 
 
 
@@ -83,13 +81,13 @@ async def test_native_provider_stream_traces_and_yields_formatted_events(tmp_pat
     assert first_event.delta.reasoning[0].text == "hidden"
     assert events[-1].type == "done"
     assert client.calls[0]["json"]["stream"] is True
-    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
-    assert "native_provider_stream_request" in pass_names
-    assert pass_names.count("raw_native_provider_stream_chunk") == 2
-    assert pass_names.count("parsed_native_stream_event") == 2
-    assert "after_field_cache_extraction" in pass_names
-    assert "after_field_cache_stream_extraction" in pass_names
-    trace_text = _trace_text(logger.log_dir)
+    names = [entry["pass_name"] for entry in _trace_entries(logger)]
+    assert "native_provider_stream_request" in names
+    assert names.count("raw_native_provider_stream_chunk") == 2
+    assert names.count("parsed_native_stream_event") == 2
+    assert "after_field_cache_extraction" in names
+    assert "after_field_cache_stream_extraction" in names
+    trace_text = _trace_text(logger)
     assert "opaque-vendor-state" not in trace_text
 
 
@@ -117,13 +115,13 @@ async def test_native_provider_stream_traces_usage_accounting_summary(tmp_path) 
 
     _ = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeStreamingClient(chunks)))]
 
-    entries = _trace_entries(logger.log_dir)
-    summaries = [entry for entry in entries if entry["pass_name"] == "usage_accounting_summary"]
-    assert summaries
-    assert summaries[-1]["data"]["usage"]["input_tokens"] == 2
-    assert summaries[-1]["data"]["usage"]["completion_tokens"] == 3
-    assert summaries[-1]["data"]["usage"]["provider_reported_cost"] == 0.04
-    assert summaries[-1]["data"]["cost"]["provider_reported_cost"] == 0.04
+    names = [entry["pass_name"] for entry in _trace_entries(logger)]
+    assert "usage_accounting_summary" in names
+    # The executor's authoritative merged usage record carries the numbers.
+    usage = context.stream_usage_record.to_dict()
+    assert usage["input_tokens"] == 2
+    assert usage["completion_tokens"] == 3
+    assert usage["provider_reported_cost"] == 0.04
 
 
 @pytest.mark.asyncio
@@ -144,10 +142,10 @@ async def test_native_provider_stream_preserves_earlier_cost_when_later_usage_ar
 
     _ = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeStreamingClient(chunks)))]
 
-    summaries = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"]
-    assert summaries[-1]["data"]["usage"]["input_tokens"] == 2
-    assert summaries[-1]["data"]["usage"]["completion_tokens"] == 3
-    assert summaries[-1]["data"]["usage"]["provider_reported_cost"] == 0.07
+    usage = context.stream_usage_record.to_dict()
+    assert usage["input_tokens"] == 2
+    assert usage["completion_tokens"] == 3
+    assert usage["provider_reported_cost"] == 0.07
 
 
 @pytest.mark.asyncio
@@ -168,10 +166,10 @@ async def test_native_provider_stream_preserves_cost_when_later_raw_usage_arrive
 
     _ = [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeStreamingClient(chunks)))]
 
-    summaries = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"]
-    assert summaries[-1]["data"]["usage"]["input_tokens"] == 2
-    assert summaries[-1]["data"]["usage"]["completion_tokens"] == 3
-    assert summaries[-1]["data"]["usage"]["provider_reported_cost"] == 0.08
+    usage = context.stream_usage_record.to_dict()
+    assert usage["input_tokens"] == 2
+    assert usage["completion_tokens"] == 3
+    assert usage["provider_reported_cost"] == 0.08
 
 
 @pytest.mark.asyncio
@@ -187,8 +185,10 @@ async def test_native_provider_stream_logs_errors(tmp_path) -> None:
     with pytest.raises(RuntimeError):
         [event async for event in NativeProviderExecutor().stream({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(BrokenClient()))]
 
-    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
-    assert "transform_log_error" in pass_names
+    from tests.txn_helpers import error_records
+
+    records = error_records(logger)
+    assert any(entry["failed_pass_name"] == "native_provider_stream" for entry in records)
 
 
 @pytest.mark.asyncio
@@ -244,8 +244,8 @@ async def test_native_provider_stream_runs_stream_event_adapter_chain(tmp_path) 
 
     # The neutral-event edit landed after parse — the output carries it.
     assert events[0].delta.content[0].text == "adapted"
-    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
-    assert "after_stream_event_adapter_chain" in pass_names
+    names = [entry["pass_name"] for entry in _trace_entries(logger)]
+    assert "after_stream_event_adapter_chain" in names
 
 
 @pytest.mark.asyncio

@@ -12,10 +12,6 @@ from rotator_library.transaction_logger import TransactionLogger
 
 
 
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
 class FakeUsageClient:
     async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
         return {
@@ -40,16 +36,10 @@ class FakeUsageClient:
         }
 
 
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
+def _trace_entries(logger):
+    from tests.txn_helpers import changes
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
-
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+    return changes(logger)
 
 class FakeStreamingUsageClient:
     async def agenerate(self, payload, *, input_protocol, request=None, **kwargs):
@@ -66,7 +56,7 @@ async def test_responses_create_traces_normalized_usage(tmp_path) -> None:
 
     await service.create_response({"model": "gpt-test", "input": "hello"}, FakeUsageClient(), transaction_logger=logger)
 
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
+    entries = _trace_entries(logger)
     usage_entries = [entry for entry in entries if entry["pass_name"] == "usage_accounting_summary"]
     assert usage_entries
     assert usage_entries[-1]["data"]["usage"]["completion_tokens"] == 5

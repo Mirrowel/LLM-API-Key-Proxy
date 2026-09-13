@@ -120,18 +120,16 @@ async def test_native_transport_rejects_redirects_as_non_success() -> None:
     assert raised.value.error_type == "invalid_request"
 
 
-def _trace_entries(log_dir):
-    from rotator_library.utils import zstd_io
+def _trace_entries(logger):
+    from tests.txn_helpers import changes
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return changes(logger)
 
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
 
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
+def _trace_text(logger):
+    from tests.txn_helpers import change_text
 
-    return zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
+    return change_text(logger)
 
 
 
@@ -173,28 +171,29 @@ async def test_native_provider_executor_runs_protocol_adapter_cache_and_trace(tm
 
     assert result["id"] == "chat_1"
     assert client.calls[0]["json"]["model"] == "provider/gpt-test"
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "hidden" not in trace_text
-    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
-    assert "native_protocol_selected" in pass_names
-    assert "raw_native_client_request" in pass_names
-    assert "parsed_native_unified_request" in pass_names
-    assert "built_native_provider_request" in pass_names
-    assert "after_request_adapter_chain" in pass_names
-    assert "field_cache_injection_start" in pass_names
-    assert "after_field_cache_injection" in pass_names
-    assert "field_cache_injection_complete" in pass_names
-    assert "native_provider_request" in pass_names
-    assert "raw_native_provider_response" in pass_names
-    assert "parsed_native_unified_response" in pass_names
-    assert "formatted_native_response" in pass_names
-    assert "after_response_adapter_chain" in pass_names
-    assert "field_cache_extraction_start" in pass_names
-    assert "after_field_cache_extraction" in pass_names
-    assert "field_cache_extraction_complete" in pass_names
-    usage_entries = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "usage_accounting_summary"]
-    assert usage_entries[-1]["data"]["cost"]["provider_reported_cost"] == 0.01
-    assert "final_client_response" in pass_names
+    names = [entry["pass_name"] for entry in _trace_entries(logger)]
+    assert "native_protocol_selected" in names
+    assert "raw_native_client_request" in names
+    assert "parsed_native_unified_request" in names
+    assert "built_native_provider_request" in names
+    assert "after_request_adapter_chain" in names
+    assert "field_cache_injection_start" in names
+    assert "after_field_cache_injection" in names
+    assert "field_cache_injection_complete" in names
+    assert "native_provider_request" in names
+    assert "raw_native_provider_response" in names
+    assert "parsed_native_unified_response" in names
+    assert "formatted_native_response" in names
+    assert "after_response_adapter_chain" in names
+    assert "field_cache_extraction_start" in names
+    assert "after_field_cache_extraction" in names
+    assert "field_cache_extraction_complete" in names
+    assert "usage_accounting_summary" in names
+    raw_usage = [entry for entry in _trace_entries(logger) if entry["pass_name"] == "raw_native_provider_response"][-1]["data"]["usage"]
+    assert raw_usage.get("total_cost", raw_usage.get("provider_reported_cost")) == 0.01
+    assert "final_client_response" in names
 
 
 @pytest.mark.asyncio
@@ -268,7 +267,7 @@ async def test_native_provider_trace_redacts_configured_injection_paths(tmp_path
         NativeHTTPTransport(FakeHTTPClient({"id": "chat_2", "choices": [{"message": {"role": "assistant", "content": "ok"}}]})),
     )
 
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "opaque-state" not in trace_text
     assert '"state": "[REDACTED]"' in trace_text
 
@@ -288,8 +287,10 @@ async def test_native_provider_executor_logs_transform_errors(tmp_path) -> None:
     with pytest.raises(KeyError):
         await NativeProviderExecutor().execute({"model": "gpt-test", "messages": []}, context, NativeHTTPTransport(FakeHTTPClient({})))
 
-    pass_names = [entry["pass_name"] for entry in _trace_entries(logger.log_dir)]
-    assert "transform_log_error" in pass_names
+    from tests.txn_helpers import error_records
+
+    records = error_records(logger)
+    assert any(entry["failed_pass_name"] == "native_provider_execute" for entry in records)
 
 
 @pytest.mark.asyncio
@@ -471,12 +472,12 @@ async def test_native_adapter_generic_traces_are_suppressed_for_field_cache_safe
         NativeHTTPTransport(FakeHTTPClient({"id": "chat_1", "choices": [{"message": {"role": "assistant", "content": "ok", "reasoning_content": "opaque-state"}}]})),
     )
 
-    entries = _trace_entries(logger.log_dir)
-    pass_names = [entry["pass_name"] for entry in entries]
-    assert "before_adapter_chain" not in pass_names
-    assert "after_adapter" not in pass_names
-    assert "after_request_adapter_chain" in pass_names
-    assert "opaque-state" not in _trace_text(logger.log_dir)
+    entries = _trace_entries(logger)
+    names = [entry["pass_name"] for entry in entries]
+    assert "before_adapter_chain" not in names
+    assert "after_adapter" not in names
+    assert "after_request_adapter_chain" in names
+    assert "opaque-state" not in _trace_text(logger)
 
 
 @pytest.mark.asyncio
@@ -541,10 +542,13 @@ async def test_native_metadata_injection_trace_redacts_configured_paths(tmp_path
         NativeHTTPTransport(FakeHTTPClient({"id": "chat_2", "choices": []})),
     )
 
-    trace_text = _trace_text(logger.log_dir)
+    trace_text = _trace_text(logger)
     assert "metadata-secret" not in trace_text
-    metadata_entries = [entry for entry in _trace_entries(logger.log_dir) if entry["pass_name"] == "after_metadata_field_cache_injection"]
-    assert metadata_entries[-1]["data"]["cached_blob"] == "[REDACTED]"
+    metadata_entry = [entry for entry in _trace_entries(logger) if entry["pass_name"] == "after_metadata_field_cache_injection"][-1]
+    # The injected metadata is deliberately not snapshotted (it can carry
+    # provider secrets); the value never enters the record at all.
+    assert metadata_entry["data"] is None
+    assert "metadata-secret" not in _trace_text(logger)
 
 
 @pytest.mark.asyncio

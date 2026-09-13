@@ -3,45 +3,39 @@
 
 # src/rotator_library/transaction_logger.py
 """
-Unified transaction logging for the rotator library.
+Unified transaction logging for the rotator library (G10 record model).
 
-Provides correlated logging between the OpenAI-compatible client layer and
-provider-specific implementations. Each API transaction gets a unique directory
-containing both client-level I/O and provider-level details.
+Each API transaction accumulates in memory as one :class:`TransactionRecord`
+(four wire boundaries, value-level change log, recipe, metadata) and is
+sealed at request end into exactly ONE compressed archive file:
 
-Directory structure:
-    logs/transactions/MMDD_HHMMSS_{provider}_{model}_{request_id}/
-        request.json              # OpenAI-compatible input to client
-        response.json             # OpenAI-compatible output from client
-        streaming_chunks.jsonl    # If streaming mode
-        metadata.json             # Timing, usage, model, provider, etc.
-        provider/                 # Provider-specific subdirectory (optional)
-            request_payload.json  # Transformed request to provider API
-            response_stream.log   # Raw streaming chunks from provider
-            final_response.json   # Raw provider response
-            error.log             # If any errors occurred
+    logs/transactions/MMDD_HHMMSS_{protocol}[_{profile}]_{provider}_{model}_{request_id}.transaction.zst
+
+All disk I/O funnels through the single background
+:class:`~rotator_library.transaction.TransactionWriter` (group flush, atomic
+tmp+rename, newest-N retention). The old multi-file directory layout, the
+quadratic append-jsonl rewrites, and the capture/ side-directory are
+retired: the record IS the buffer, so error capture is simply "seal with
+everything in it".
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import os
-import shutil
+import re
 import time
 import uuid
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, field, is_dataclass
 from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
+from .transaction import TransactionRecord, TransactionWriter, archive as _archive
 from .transform_trace import (
-    TransformTraceWriter,
-    provider_snapshot_namespace,
     sanitize_for_trace,
     scrub_sensitive_text,
 )
-from .utils import zstd_io
 from .utils.paths import get_logs_dir
 
 lib_logger = logging.getLogger("rotator_library")
@@ -54,285 +48,136 @@ FRAMEWORK_KEYS = frozenset({
     "credential_identifier",
 })
 
+_API_FORMAT_PROTOCOLS = {
+    "oai": "openai_chat",
+    "ant": "anthropic_messages",
+    "gem": "gemini",
+    "responses": "responses",
+}
+
 
 def _strip_framework_keys(data: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in data.items() if k not in FRAMEWORK_KEYS}
+    if isinstance(data, dict):
+        return {k: v for k, v in data.items() if k not in FRAMEWORK_KEYS}
+    return data
 
 
 def _make_json_safe(value: Any, _seen: Optional[set[int]] = None) -> Any:
-    """Return a JSON-serializable copy of provider/client logging payloads.
+    """Recursively convert non-JSON-native values (dataclasses, Paths,
+    datetimes, sets) into plain JSON structures; circular-safe."""
 
-    Provider implementations may hand transaction logging LiteLLM/Pydantic
-    models, dataclasses, paths, timestamps, bytes, or provider-specific helper
-    objects. Logging must never fail the request path, so this function converts
-    common structured objects to their dictionary form and falls back to strings
-    only at unknown leaves.
-    """
-
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if _seen is None:
+        _seen = set()
+    marker = id(value)
+    if marker in _seen:
+        return "<circular>"
+    if isinstance(value, (str, int, float, bool)) or value is None:
         return value
-
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "replace")
     if isinstance(value, Path):
         return str(value)
-    if isinstance(value, bytes):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        _seen.add(marker)
         try:
-            return value.decode("utf-8")
-        except UnicodeDecodeError:
-            return value.hex()
-
-    seen = _seen if _seen is not None else set()
-    object_id = id(value)
-    if object_id in seen:
-        return "[CIRCULAR]"
-
-    if isinstance(value, dict):
-        seen.add(object_id)
-        try:
-            return {str(k): _make_json_safe(v, seen) for k, v in value.items()}
-        finally:
-            seen.discard(object_id)
-
-    if isinstance(value, (list, tuple, set, frozenset)):
-        seen.add(object_id)
-        try:
-            return [_make_json_safe(item, seen) for item in value]
-        finally:
-            seen.discard(object_id)
-
-    if is_dataclass(value) and not isinstance(value, type):
-        seen.add(object_id)
-        try:
-            return {
-                field.name: _make_json_safe(getattr(value, field.name), seen)
-                for field in fields(value)
-            }
-        finally:
-            seen.discard(object_id)
-
-    for method_name in ("model_dump", "dict", "to_dict"):
-        method = getattr(value, method_name, None)
-        if not callable(method):
-            continue
-        seen.add(object_id)
-        try:
-            try:
-                converted = method()
-            except TypeError:
-                converted = method(exclude_none=False)
-            return _make_json_safe(converted, seen)
+            return _make_json_safe(model_dump(), _seen)
         except Exception:
-            continue
+            pass
         finally:
-            seen.discard(object_id)
-
+            _seen.discard(marker)
+    as_dict = getattr(value, "to_dict", None)
+    if callable(as_dict):
+        _seen.add(marker)
+        try:
+            return _make_json_safe(as_dict(), _seen)
+        except Exception:
+            pass
+        finally:
+            _seen.discard(marker)
+    if is_dataclass(value) and not isinstance(value, type):
+        _seen.add(marker)
+        try:
+            return _make_json_safe(value.__dict__, _seen)
+        finally:
+            _seen.discard(marker)
+    if isinstance(value, dict):
+        _seen.add(marker)
+        try:
+            return {str(k): _make_json_safe(v, _seen) for k, v in value.items()}
+        finally:
+            _seen.discard(marker)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        _seen.add(marker)
+        try:
+            return [_make_json_safe(item, _seen) for item in value]
+        finally:
+            _seen.discard(marker)
     return str(value)
 
 
 def _get_transactions_dir() -> Path:
-    """Get the transactions log directory, creating it if needed."""
-    logs_dir = get_logs_dir()
-    transactions_dir = logs_dir / "transactions"
-    transactions_dir.mkdir(parents=True, exist_ok=True)
-    return transactions_dir
+    base = Path(get_logs_dir()) / "transactions"
+    base.mkdir(parents=True, exist_ok=True)
+    return base
 
 
 def _utc_timestamp() -> str:
-    """Return an ISO-8601 UTC timestamp for log records."""
-
     return datetime.now(UTC).isoformat()
 
 
-def _resolve_trace_level() -> int:
-    """TRANSACTION_LOG_LEVEL: 1 = boundaries + metadata (default),
-    2 = + intermediates, 3 = + verbose per-frame tracing."""
-
-    raw = os.getenv("TRANSACTION_LOG_LEVEL", "1")
-    try:
-        return max(1, min(3, int(raw)))
-    except (TypeError, ValueError):
-        return 1
-
-
-# Rotation-class failures: expected under load, carry no request evidence
-# worth archiving (the enumerated capture-on-error exclusion set — the
-# classifier vocabulary in error_handler.py is the single source; the
-# alias-coverage test pins this set against classify_error outputs).
-_ROTATION_ERROR_TYPES = {
-    "rate_limit",
+# Rotation-class failures never trigger error capture (rate limit, quota,
+# auth, transport) — the record still seals, just without the escalation.
+_ROTATION_ERROR_TYPES = frozenset({
     "rate_limit_error",
+    "rate_limit",
     "quota_exceeded",
-    "quota_exceeded_error",
-    "proxy_all_credentials_exhausted",
-    "authentication",
     "authentication_error",
-    "auth",
-    "invalid_auth",
-    "reauth",
-    "credential_reauth",
-    "credential_reauth_needed",
+    "authentication",
     "permission_error",
     "forbidden",
-    "proxy_timeout",
-    "timeout",
-    "request_timeout",
-}
+    "timeout_error",
+    "api_connection_error",
+    "api_connection",
+})
 
 
 def _normalize_error_type(value: Any) -> str:
-    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_").replace(".", "_")
-
-
-def _is_rotation_error_type(value: Any) -> bool:
-    normalized = _normalize_error_type(value)
-    if normalized in _ROTATION_ERROR_TYPES:
-        return True
-    # Native provider spellings ("rate_limit_error") reduce to the
-    # classifier stem ("rate_limit").
-    for suffix in ("_error", "_exception"):
-        if normalized.endswith(suffix) and normalized[: -len(suffix)] in _ROTATION_ERROR_TYPES:
-            return True
-    return False
+    text = str(value or "").strip().lower()
+    return re.sub(r"[^a-z0-9_]", "_", text)
 
 
 def _error_qualifies_for_capture(error: BaseException) -> bool:
-    """Request-related failures archive buffered intermediates (400-class
-    payload/protocol problems, unexpected crashes); rotation-class
-    failures (429s, quota, credential refresh, transport timeouts) do
-    not. Status codes win over type strings: a structured 429-class
-    response is rotation regardless of its type label."""
-
-    structured_status = getattr(error, "status_code", None)
-    if isinstance(structured_status, int) and structured_status in (429, 401, 403, 408, 504):
-        return False
-    explicit = getattr(error, "error_type", None)
-    if isinstance(explicit, str) and explicit and _is_rotation_error_type(explicit):
-        return False
-    # Mid-stream errors: their payload may carry a provider error type.
-    data = getattr(error, "data", None)
-    if isinstance(data, dict):
-        inner = data.get("error")
-        if isinstance(inner, dict):
-            for key in ("type", "code"):
-                if _is_rotation_error_type(inner.get(key)):
-                    return False
-    # 400-class, 5xx crashes, and unexpected exception types qualify.
-    return True
-
-
-def _prune_old_transactions() -> None:
-    """Bound L1 disk usage: keep only the newest TRANSACTION_LOG_RETENTION
-    transaction directories (default 1000). Never raises."""
-
-    try:
-        raw = os.getenv("TRANSACTION_LOG_RETENTION", "1000")
-        keep = int(raw)
-        if keep <= 0:
-            return  # 0 or negative = unlimited retention
-    except (TypeError, ValueError):
-        keep = 1000
-    try:
-        transactions_root = _get_transactions_dir()
-        if not transactions_root.exists():
-            return
-        dirs = [entry for entry in transactions_root.iterdir() if entry.is_dir()]
-        # (mtime, name) breaks same-second ties deterministically.
-        dirs.sort(key=lambda entry: (entry.stat().st_mtime, entry.name), reverse=True)
-        for stale in dirs[keep:]:
-            shutil.rmtree(stale, ignore_errors=True)
-    except Exception:
-        lib_logger.debug("transaction retention prune failed", exc_info=True)
-
-
-def _sanitize_name(name: str) -> str:
-    """Sanitize a name for use in directory/file names."""
-    # Replace problematic characters with underscores
-    for char in '/\\:*?"<>|':
-        name = name.replace(char, "_")
-    return name
-
-
-_SAFE_LOG_FILENAME_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
-)
-
-
-def _safe_log_path(base: Path, filename: str) -> Optional[Path]:
-    """Resolve a log filename inside ``base`` or return None when unsafe.
-
-    Provider-supplied filenames must not escape the transaction log directory:
-    reject empty names, absolute paths, path separators, ``..`` and any
-    character outside a conservative filename allowlist.
-    """
-
-    name = str(filename).strip()
-    if not name or name in {".", ".."}:
-        return None
-    if "/" in name or "\\" in name or ".." in name:
-        return None
-    if Path(name).is_absolute() or name.startswith("~"):
-        return None
-    if any(char not in _SAFE_LOG_FILENAME_CHARS for char in name):
-        return None
-    return base / name
+    error_type = _normalize_error_type(getattr(error, "error_type", None) or type(error).__name__)
+    return error_type not in _ROTATION_ERROR_TYPES
 
 
 @dataclass
 class TransactionContext:
-    """
-    Lightweight context passed to providers for correlated logging.
+    """Lightweight correlation handle passed to providers."""
 
-    Providers receive this context and can use it to create their own
-    loggers that write to the transaction's directory structure.
-    """
-
-    log_dir: Path
-    """Root directory for this transaction's logs."""
-
+    log_dir: Optional[Path]
     request_id: str
-    """Unique 8-character correlation ID for this transaction."""
-
     enabled: bool
-    """Whether logging is enabled."""
-
     provider: str
-    """Provider name (e.g., 'openai', 'anthropic')."""
-
     model: str
-    """Model name (sanitized for filesystem use)."""
-
-    trace_model: Optional[str] = None
-    """Exact model name used in transform trace entries."""
-
+    trace_model: str
     session_id: Optional[str] = None
-    """Inferred session id for trace correlation, when available."""
-
     scope_key: Optional[str] = None
-    """Usage scope key for trace correlation, when available."""
-
     classifier: Optional[str] = None
-    """Classifier/private routing label for trace correlation, when available."""
-
     trace_enabled: bool = False
-    """Whether provider loggers should append transform trace entries."""
-
     trace_level: int = 1
-    """W12 tier for trace writers (1 boundaries, 2 intermediates, 3 verbose)."""
+    record: Optional[TransactionRecord] = None
 
 
 class TransactionLogger:
-    """
-    Logs complete API transactions at the client.py layer.
+    """Facade over the G10 transaction record for one client request.
 
-    Creates a unique directory for each transaction and logs:
-    - OpenAI-compatible request (what client.py receives)
-    - OpenAI-compatible response (what client.py returns)
-    - Streaming chunks (if streaming mode)
-    - Metadata (timing, usage, model info)
-
-    Also provides a TransactionContext that can be passed to providers
-    for correlated provider-level logging.
+    The public surface is unchanged from the directory-layout era; the
+    internals accumulate into a :class:`TransactionRecord` and seal into
+    one archive via the background writer at request end.
     """
 
     __slots__ = (
@@ -348,17 +193,15 @@ class TransactionLogger:
         "classifier",
         "streaming",
         "api_format",
-        "_dir_available",
+        "protocol_name",
+        "profile_name",
+        "_record",
         "_context",
-        "_trace_writer",
-        "trace_level",
-        "compressed",
-        "_attempt_records",
-        "_routing_records",
-        "_extra_metadata",
+        "_sealed",
         "_error_records",
-        "_chunk_buffer",
+        "_extra_metadata",
         "_capture_flushed",
+        "sealed_envelope",
     )
 
     def __init__(
@@ -368,93 +211,59 @@ class TransactionLogger:
         enabled: bool = True,
         api_format: str = "oai",
         parent_dir: Optional[Path] = None,
+        *,
+        protocol: Optional[str] = None,
+        profile: Optional[str] = None,
+        operation: str = "",
+        execution_mode: str = "",
     ):
-        """
-        Initialize transaction logger.
-
-        Args:
-            provider: Provider name (e.g., 'openai', 'anthropic')
-            model: Model name (will be sanitized for filesystem)
-            enabled: Whether logging is enabled
-            api_format: API format prefix ('oai' for OpenAI, 'ant' for Anthropic)
-            parent_dir: Optional parent directory for nested logging
-        """
         self.enabled = enabled
         self.start_time = time.time()
-        self.request_id = str(uuid.uuid4())[:8]  # 8-char short ID
+        self.request_id = str(uuid.uuid4())[:8]
         self.provider = provider
         self.trace_model = model
         self.session_id: Optional[str] = None
         self.scope_key: Optional[str] = None
         self.classifier: Optional[str] = None
         self.api_format = api_format
-        # W12 (D15): 1 = L1 boundaries + metadata (default); 2 = + intermediates
-        # (transform trace + snapshots); 3 = reserved for verbose per-frame
-        # (currently behaves as 2).
-        self.trace_level = _resolve_trace_level()
-        self.compressed = zstd_io.compression_available()
-        self._attempt_records: list[Dict[str, Any]] = []
-        self._routing_records: list[Dict[str, Any]] = []
-        self._extra_metadata: Dict[str, Any] = {}
+        self.protocol_name = protocol or _API_FORMAT_PROTOCOLS.get(api_format, api_format)
+        self.profile_name = profile
+        self.streaming = False
+        self.log_dir: Optional[Path] = None
+        self._context: Optional[TransactionContext] = None
+        self._sealed = False
         self._error_records: list[Dict[str, Any]] = []
-        self._chunk_buffer = zstd_io.JsonlBuffer(max_entries=8192)
+        self._extra_metadata: Dict[str, Any] = {}
         self._capture_flushed = False
+        self.sealed_envelope: Optional[Dict[str, Any]] = None
 
-        # Strip provider prefix from model if present
-        # e.g., "openai/gpt-4.1" -> "gpt-4.1"
         model_name = model
         if "/" in model_name and model_name.split("/")[0] == provider:
             model_name = model_name.split("/", 1)[1]
 
-        self.model = _sanitize_name(model_name)
-        self.streaming = False
-        self.log_dir: Optional[Path] = None
-        self._dir_available = False
-        self._context: Optional[TransactionContext] = None
-        self._trace_writer: Optional[TransformTraceWriter] = None
+        self.model = model_name
 
+        self._record: Optional[TransactionRecord] = None
         if not enabled:
             return
-
-        # Create directory based on whether we have a parent directory
-        timestamp = datetime.now().strftime("%m%d_%H%M%S")
-        safe_provider = _sanitize_name(provider)
-
-        if parent_dir:
-            # Nested logging: create subdirectory inside parent
-            # e.g., parent_dir/openai/ for OpenAI translation layer
-            subdir_name = "openai" if api_format == "oai" else api_format
-            self.log_dir = parent_dir / subdir_name
-        else:
-            # Root-level logging: MMDD_HHMMSS_{api_format}_{provider}_{model}_{request_id}
-            dir_name = f"{timestamp}_{api_format}_{safe_provider}_{self.model}_{self.request_id}"
-            self.log_dir = _get_transactions_dir() / dir_name
-
         try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            self._dir_available = True
-            self._trace_writer = TransformTraceWriter(
-                self.log_dir,
-                component="client",
-                provider=provider,
-                model=self.trace_model,
+            self._record = TransactionRecord(
                 request_id=self.request_id,
-                enabled=True,
-                level=self.trace_level,
+                protocol=self.protocol_name,
+                provider=provider,
+                model=model_name,
+                profile=profile,
+                operation=operation,
+                execution_mode=execution_mode,
             )
-            if parent_dir is None:
-                _prune_old_transactions()
-        except Exception as e:
-            lib_logger.error(f"TransactionLogger: Failed to create directory: {e}")
+            self.log_dir = _get_transactions_dir()
+        except Exception as exc:
+            lib_logger.error("TransactionLogger: record init failed: %s", exc)
             self.enabled = False
 
-    def get_context(self) -> TransactionContext:
-        """
-        Get the transaction context for passing to providers.
+    # -- context ---------------------------------------------------------
 
-        Returns a lightweight dataclass that providers can use to create
-        their own loggers with correlated directory structure.
-        """
+    def get_context(self) -> TransactionContext:
         if self._context is None:
             self._context = TransactionContext(
                 log_dir=self.log_dir if self.log_dir else Path("."),
@@ -466,8 +275,9 @@ class TransactionLogger:
                 session_id=self.session_id,
                 scope_key=self.scope_key,
                 classifier=self.classifier,
-                trace_enabled=bool(self._trace_writer),
-                trace_level=self.trace_level,
+                trace_enabled=self.enabled,
+                trace_level=1,
+                record=self._record,
             )
         return self._context
 
@@ -478,16 +288,14 @@ class TransactionLogger:
         scope_key: Optional[str] = None,
         classifier: Optional[str] = None,
     ) -> None:
-        """Attach routing/session metadata discovered after logger creation."""
-
         if session_id is not None:
             self.session_id = session_id
         if scope_key is not None:
             self.scope_key = scope_key
         if classifier is not None:
             self.classifier = classifier
-        if self._trace_writer:
-            self._trace_writer.update_context(
+        if self._record is not None:
+            self._record.update_metadata(
                 session_id=self.session_id,
                 scope_key=self.scope_key,
                 classifier=self.classifier,
@@ -496,6 +304,8 @@ class TransactionLogger:
             self._context.session_id = self.session_id
             self._context.scope_key = self.scope_key
             self._context.classifier = self.classifier
+
+    # -- change log ------------------------------------------------------
 
     def log_transform_pass(
         self,
@@ -512,22 +322,19 @@ class TransactionLogger:
         scrub_strings: bool = False,
         snapshot: bool = True,
     ) -> None:
-        """Record an additive transform trace entry if tracing is available."""
+        """Record one transform-pipeline observation into the change log."""
 
-        if not self.enabled or not self._dir_available or not self._trace_writer:
+        if not self.enabled or self._record is None:
             return
-        self._trace_writer.record(
-            pass_name,
-            data,
-            direction=direction,
-            stage=stage,
-            protocol=protocol,
-            credential_id=credential_id,
-            transport=transport,
-            changed_from_previous=changed_from_previous,
-            metadata=metadata,
-            scrub_strings=scrub_strings,
-            snapshot=snapshot,
+        payload = data
+        if scrub_strings and isinstance(data, (str, bytes)):
+            payload = scrub_sensitive_text(str(data))
+        self._record.record_change(
+            stage,
+            "trace_pass",
+            detail="/".join(str(part) for part in (pass_name, direction, stage) if part),
+            value=sanitize_for_trace(_make_json_safe(payload)) if (snapshot or changed_from_previous) else None,
+            code=pass_name,
         )
 
     def log_transform_error(
@@ -541,79 +348,49 @@ class TransactionLogger:
         transport: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Record a standardized transform/logging failure without raising."""
-
-        error_data = {
-            "failed_pass_name": failed_pass_name,
-            "error_type": type(error).__name__,
-            "message": str(error),
-            "payload": payload,
-        }
-        self.log_transform_pass(
-            "transform_log_error",
-            error_data,
-            direction="error",
-            stage=stage,
-            protocol=protocol,
-            transport=transport,
-            metadata=metadata,
-            scrub_strings=True,
-            snapshot=False,
-        )
-        self._error_records.append(
-            {
-                "failed_pass_name": failed_pass_name,
-                "error_type": type(error).__name__,
-                "message": scrub_sensitive_text(str(error))[:2000],
-                "stage": stage,
-            }
-        )
-        # Capture-on-error (D15): request-relevant failures archive the
-        # in-memory trace ring even when L2 disk tracing is off.
+        if self._record is not None:
+            self._record.record_error(
+                _normalize_error_type(getattr(error, "error_type", None) or type(error).__name__),
+                scrub_sensitive_text(str(error)),
+                raw=payload,
+            )
+            self._error_records.append(
+                {
+                    "failed_pass_name": failed_pass_name,
+                    "error_type": type(error).__name__,
+                    "message": scrub_sensitive_text(str(error))[:2000],
+                    "stage": stage,
+                }
+            )
         self.flush_capture_on_error(error)
 
     def flush_capture_on_error(self, error: Optional[BaseException] = None) -> bool:
-        """Archive the buffered intermediates when the error looks
-        request-related (bad payload, protocol violation, unexpected
-        crash). Rotation-class failures (rate limit, quota, auth refresh)
-        do not trigger capture."""
+        """Mark the record error-escalated (the sealed archive IS the capture)."""
 
-        if not self.enabled or not self._dir_available or self._capture_flushed:
+        if not self.enabled or self._capture_flushed:
             return False
         if error is not None and not _error_qualifies_for_capture(error):
             return False
-        if self._trace_writer is None or self.log_dir is None:
+        if self._record is None:
             return False
-        drained = self._trace_writer.drain_ring()
-        if not drained:
-            return False
-        try:
-            capture_dir = self.log_dir / "capture"
-            capture_dir.mkdir(parents=True, exist_ok=True)
-            entries = [json.loads(line) for line in drained]
-            zstd_io.write_json(capture_dir / "captured_trace.json", entries, indent=None)
-            self._capture_flushed = True
-            return True
-        except Exception as e:
-            lib_logger.error(f"TransactionLogger: capture flush failed: {e}")
-            return False
+        self._capture_flushed = True
+        self._record.mark_escalation("error_capture")
+        return True
+
+    # -- metadata ----------------------------------------------------------
 
     def record_attempt(self, record: Dict[str, Any]) -> None:
-        """Record a per-attempt routing/execution summary row (metadata v2)."""
-
-        if isinstance(record, dict):
-            self._attempt_records.append(_make_json_safe(record))
+        if self._record is not None and isinstance(record, dict):
+            self._record.record_attempt(_make_json_safe(record))
 
     def record_routing(self, record: Dict[str, Any]) -> None:
-        """Record a routing decision (fallback groups, target selection)."""
-
-        if isinstance(record, dict):
-            self._routing_records.append(_make_json_safe(record))
+        if self._record is not None and isinstance(record, dict):
+            self._record.record_routing(_make_json_safe(record))
 
     def update_metadata(self, **fields: Any) -> None:
-        """Attach extra metadata fields (execution mode, protocols, overlays)."""
-
         self._extra_metadata.update(_make_json_safe(dict(fields)))
+        if self._record is not None:
+            self._record.update_metadata(**_make_json_safe(dict(fields)))
 
     def finalize_metadata(
         self,
@@ -621,61 +398,31 @@ class TransactionLogger:
         status_code: int = 200,
         error: Optional[BaseException] = None,
     ) -> None:
-        """Write metadata.json without a response body (stream + responses
-        routes) — the L1 summary is always produced."""
+        """Seal the record (stream + responses routes; no response body)."""
 
-        if error is not None:
-            # Ensure the failure that triggered this finalize is recorded
-            # even when no log_transform_error ran first.
+        if error is not None and self._record is not None:
             record = {
                 "failed_pass_name": "finalize",
                 "error_type": type(error).__name__,
                 "message": scrub_sensitive_text(str(error))[:2000],
                 "stage": "final",
             }
-            if not any(entry.get("error_type") == type(error).__name__ and entry.get("message") == record["message"] for entry in self._error_records):
-                self._error_records.append(record)
-        self._flush_chunk_buffer()
-        self._finalize_trace_writer()
-        self._log_metadata({}, status_code, (time.time() - self.start_time) * 1000)
+            if not any(
+                entry.get("error_type") == record["error_type"] and entry.get("message") == record["message"]
+                for entry in self._error_records
+            ):
+                self._record.record_error(record["error_type"], record["message"])
+        self._seal_and_submit(status_code)
 
-    def _finalize_trace_writer(self) -> None:
-        if self._trace_writer is not None:
-            try:
-                self._trace_writer.flush_pending()
-            except Exception:
-                lib_logger.debug("trace writer finalize flush failed", exc_info=True)
+    # -- boundaries --------------------------------------------------------
 
     def log_request(
         self, request_data: Dict[str, Any], filename: str = "request.json"
     ) -> None:
-        """
-        Log the request received by client.py.
-
-        Args:
-            request_data: The request data dict (messages, model, etc.)
-            filename: Custom filename for the log file (default: request.json)
-        """
-        if not self.enabled or not self._dir_available:
+        if not self.enabled or self._record is None:
             return
-
-        self.streaming = request_data.get("stream", False)
-
-        data = {
-            "request_id": self.request_id,
-            "timestamp_utc": _utc_timestamp(),
-            # L1 boundary redaction: key-based secret scrubbing incl.
-            # camelCase normalization (invariant: boundaries never log secrets).
-            "data": sanitize_for_trace(request_data),
-        }
-        self.log_transform_pass(
-            "raw_client_request",
-            request_data,
-            direction="request",
-            stage="client",
-            transport="sse" if self.streaming else "http",
-        )
-        self._write_json(filename, data)
+        self.streaming = bool(request_data.get("stream", False))
+        self._record.set_boundary("client_request", sanitize_for_trace(_make_json_safe(request_data)))
 
     def log_transformed_request(
         self,
@@ -685,77 +432,27 @@ class TransactionLogger:
         credential_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Log the transformed request if it differs from the original.
-
-        Compares the two payloads after stripping framework infrastructure
-        keys (api_key, api_base, custom_llm_provider, etc.).  If the
-        remaining content is identical, nothing is written.
-
-        Args:
-            transformed_data: The kwargs after all transforms/sanitization.
-            original_data: The original kwargs as received by the client.
-        """
-        if not self.enabled or not self._dir_available:
+        if not self.enabled or self._record is None:
             return
-
         stripped_transformed = _strip_framework_keys(transformed_data)
         stripped_original = _strip_framework_keys(original_data)
-
-        changed_from_previous: Optional[bool] = None
         try:
-            changed_from_previous = json.dumps(stripped_transformed, sort_keys=True, default=str) != json.dumps(
+            changed = json.dumps(stripped_transformed, sort_keys=True, default=str) != json.dumps(
                 stripped_original, sort_keys=True, default=str
             )
         except (TypeError, ValueError):
-            changed_from_previous = None
-
-        self.log_transform_pass(
-            "prepared_provider_request",
-            transformed_data,
-            direction="request",
-            stage="client",
-            credential_id=credential_id,
-            transport="sse" if transformed_data.get("stream") else "http",
-            changed_from_previous=changed_from_previous,
-            metadata=metadata,
-        )
-
-        if changed_from_previous is False:
+            changed = True
+        if changed is False:
             return
-
-        logged = _strip_framework_keys(sanitize_for_trace(transformed_data))
-        data = {
-            "request_id": self.request_id,
-            "timestamp_utc": _utc_timestamp(),
-            "data": logged,
-        }
-        self._write_json("request_transformed.json", data)
+        self._record.set_boundary(
+            "provider_request",
+            _strip_framework_keys(sanitize_for_trace(_make_json_safe(transformed_data))),
+        )
 
     def log_stream_chunk(self, chunk: Dict[str, Any]) -> None:
-        """
-        Log an individual chunk from a streaming response.
-
-        Args:
-            chunk: The streaming chunk data
-        """
-        if not self.enabled or not self._dir_available:
+        if not self.enabled or self._record is None:
             return
-
-        log_entry = {
-            "timestamp_utc": _utc_timestamp(),
-            "chunk": _make_json_safe(chunk),
-        }
-        self.log_transform_pass(
-            "parsed_stream_chunk",
-            chunk,
-            direction="stream",
-            stage="client",
-            transport="sse",
-            snapshot=False,
-        )
-        # Memory-safe buffered chunks; flushed once at finalize (L1).
-        self._chunk_buffer.add(log_entry)
+        self._record.add_client_chunk(_make_json_safe(chunk))
 
     def log_response(
         self,
@@ -764,167 +461,39 @@ class TransactionLogger:
         headers: Optional[Dict[str, Any]] = None,
         filename: str = "response.json",
     ) -> None:
-        """
-        Log the response returned by client.py.
-
-        Args:
-            response_data: The response data dict
-            status_code: HTTP status code (default 200)
-            headers: Optional response headers
-            filename: Custom filename for the log file (default: response.json)
-        """
-        if not self.enabled or not self._dir_available:
+        if not self.enabled or self._record is None:
             return
-
-        end_time = time.time()
-        duration_ms = (end_time - self.start_time) * 1000
-
-        safe_response = _make_json_safe(response_data)
-        data = {
-            "request_id": self.request_id,
-            "timestamp_utc": _utc_timestamp(),
-            "status_code": status_code,
-            "duration_ms": round(duration_ms),
-            "headers": sanitize_for_trace(_make_json_safe(dict(headers)))
-            if headers
-            else None,
-            "data": sanitize_for_trace(safe_response),
-        }
-        self.log_transform_pass(
-            "final_client_response",
-            response_data,
-            direction="response",
-            stage="final",
-            transport="sse" if self.streaming else "http",
-            metadata={"status_code": status_code, "headers": dict(headers) if headers else None},
+        self._record.set_boundary(
+            "client_egress",
+            sanitize_for_trace(_make_json_safe(response_data)),
         )
-        self._write_json(filename, data)
-        self._flush_chunk_buffer()
-        self._finalize_trace_writer()
+        if headers:
+            self._record.update_metadata(response_headers=sanitize_for_trace(_make_json_safe(dict(headers))))
+        self._seal_and_submit(status_code)
 
-        # Also write metadata
-        self._log_metadata(safe_response, status_code, duration_ms)
+    # -- sealing -----------------------------------------------------------
 
-    def _flush_chunk_buffer(self) -> None:
-        """Persist the buffered stream chunks once (L1 boundary artifact)."""
-        if self._chunk_buffer and self.log_dir and self._dir_available:
-            try:
-                self._chunk_buffer.flush_to(self.log_dir / "streaming_chunks.jsonl")
-            except Exception as e:
-                lib_logger.error(f"TransactionLogger: chunk flush failed: {e}")
-
-    def _log_metadata(
-        self, response_data: Dict[str, Any], status_code: int, duration_ms: float
-    ) -> None:
-        """Log transaction metadata summary."""
-        if not isinstance(response_data, dict):
-            response_data = {"value": response_data}
-        usage = response_data.get("usage") or {}
-        if not isinstance(usage, dict):
-            usage = {}
-        model = response_data.get("model", self.model)
-        finish_reason = "N/A"
-
-        if "choices" in response_data and response_data["choices"]:
-            first_choice = response_data["choices"][0]
-            if isinstance(first_choice, dict):
-                finish_reason = first_choice.get("finish_reason", "N/A")
-
-        # Check for provider subdirectory
-        has_provider_logs = False
-        if self.log_dir:
-            provider_dir = self.log_dir / "provider"
-            try:
-                has_provider_logs = provider_dir.exists() and any(
-                    provider_dir.iterdir()
-                )
-            except OSError:
-                has_provider_logs = False
-
-        metadata = {
-            "request_id": self.request_id,
-            "timestamp_utc": _utc_timestamp(),
-            "duration_ms": round(duration_ms),
-            "status_code": status_code,
-            "provider": self.provider,
-            "model": model,
-            "streaming": self.streaming,
-            "usage": {
-                "prompt_tokens": usage.get("prompt_tokens"),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
-            },
-            "finish_reason": finish_reason,
-            "has_provider_logs": has_provider_logs,
-            "reasoning_found": False,
-            "reasoning_content": None,
-            # W12 metadata v2 (D15): correlation, tier, and reconstruction.
-            "schema": "2",
-            "trace_level": self.trace_level,
-            "compressed": self.compressed,
-            "session_id": self.session_id,
-            "scope_key": self.scope_key,
-            "classifier": self.classifier,
-            "attempts": self._attempt_records,
-            "routing": self._routing_records,
-            "errors": self._error_records,
-            "reconstruct": {
-                "script": "tools/reconstruct_traces.py",
-                "inputs": ["request.json", "metadata.json"],
-                "note": "regenerates L2 intermediates by replaying the deterministic pipeline; live-state decisions stay in metadata",
-            },
-        }
-        if self._extra_metadata:
-            metadata["extra"] = self._extra_metadata
-
-        # Extract reasoning if present
-        reasoning = self._extract_reasoning(response_data)
-        if reasoning:
-            metadata["reasoning_found"] = True
-            metadata["reasoning_content"] = reasoning
-
-        self._write_json("metadata.json", metadata)
-
-    def _extract_reasoning(self, response_data: Dict[str, Any]) -> Optional[str]:
-        """Recursively search for and extract 'reasoning' fields from response."""
-        if not isinstance(response_data, dict):
-            return None
-
-        if "reasoning" in response_data:
-            return response_data["reasoning"]
-
-        if "choices" in response_data and response_data["choices"]:
-            first_choice = response_data["choices"][0]
-            if not isinstance(first_choice, dict):
-                return None
-            message = first_choice.get("message", {})
-            if not isinstance(message, dict):
-                return None
-            if "reasoning" in message:
-                return message["reasoning"]
-            if "reasoning_content" in message:
-                return message["reasoning_content"]
-
-        return None
-
-    def _write_json(self, filename: str, data: Dict[str, Any]) -> None:
-        """Write JSON data to a file in the log directory (zstd when available)."""
-        if not self.log_dir:
+    def _seal_and_submit(self, status_code: int) -> None:
+        if not self.enabled or self._sealed or self._record is None:
             return
-        try:
-            zstd_io.write_json(self.log_dir / filename, _make_json_safe(data))
-        except Exception as e:
-            lib_logger.error(f"TransactionLogger: Failed to write {filename}: {e}")
-
-    def _append_text(self, filename: str, text: str) -> None:
-        """Append text to a file in the log directory."""
-        if not self.log_dir:
-            return
-        try:
-            with open(self.log_dir / filename, "a", encoding="utf-8") as f:
-                f.write(text)
-        except Exception as e:
-            lib_logger.error(f"TransactionLogger: Failed to append to {filename}: {e}")
+        self._sealed = True
+        duration_ms = (time.time() - self.start_time) * 1000
+        self._record.update_metadata(
+            duration_ms=round(duration_ms, 2),
+            api_format=self.api_format,
+            errors=list(self._error_records) or None,
+        )
+        envelope = self._record.seal(status_code=status_code)
+        self.sealed_envelope = envelope
+        filename = _archive.archive_filename(
+            protocol=self.protocol_name,
+            provider=self.provider,
+            model=self.model,
+            request_id=self.request_id,
+            profile=self.profile_name,
+            when=self.start_time,
+        )
+        TransactionWriter.instance().submit_sealed(envelope, filename=filename)
 
     @staticmethod
     def assemble_streaming_response(
@@ -946,11 +515,6 @@ class TransactionLogger:
         if not chunks:
             return {}
 
-        # Per-choice aggregation: a stream may carry n>1 siblings, each with
-        # its own content, tool calls, and finish reason. Choices are keyed by
-        # their provider-assigned index and re-emitted with that index intact.
-        # Lifecycle: an index is initialized on first sight and kept in
-        # `choice_order` so the final response preserves arrival order.
         choice_messages: Dict[int, Dict[str, Any]] = {}
         choice_tools: Dict[int, Dict[int, Dict[str, Any]]] = {}
         choice_finish: Dict[int, Optional[str]] = {}
@@ -977,7 +541,6 @@ class TransactionLogger:
                 if not isinstance(delta, dict):
                     delta = {}
 
-                # Dynamically aggregate all fields from the delta
                 for key, value in delta.items():
                     if value is None:
                         continue
@@ -1023,7 +586,7 @@ class TransactionLogger:
                                 "arguments"
                             ]
 
-                    else:  # Generic key handling for other data like 'reasoning'
+                    else:
                         if key == "role":
                             final_message[key] = value
                         elif key not in final_message:
@@ -1037,20 +600,14 @@ class TransactionLogger:
                         ):
                             final_message[key].extend(value)
                         else:
-                            # Provider-specific streamed fields can change type;
-                            # keep logging robust by taking the latest value.
                             final_message[key] = value
 
-                # Provider-stated finish wins. Last non-empty statement per
-                # choice is retained; the "tool_calls"/"stop" fallback applies
-                # only when the provider never stated a reason for that choice.
                 if choice.get("finish_reason"):
                     choice_finish[index] = choice["finish_reason"]
 
             if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
                 usage_data = chunk["usage"]
 
-        # Final Response Construction
         final_choices: list[Dict[str, Any]] = []
         for index in choice_order:
             final_message = choice_messages[index]
@@ -1059,14 +616,12 @@ class TransactionLogger:
             if aggregated_tool_calls:
                 final_message["tool_calls"] = list(aggregated_tool_calls.values())
 
-            # Ensure standard fields are present
-            for field in ["content", "tool_calls", "function_call"]:
-                if field not in final_message:
-                    final_message[field] = None
+            for missing in ["content", "tool_calls", "function_call"]:
+                if missing not in final_message:
+                    final_message[missing] = None
 
             finish_reason = choice_finish[index]
             if not finish_reason:
-                # Infer only when the provider stated nothing for this choice.
                 finish_reason = "tool_calls" if aggregated_tool_calls else "stop"
 
             final_choices.append(
@@ -1079,7 +634,7 @@ class TransactionLogger:
 
         first_chunk = chunks[0] if isinstance(chunks[0], dict) else {}
 
-        full_response = {
+        return {
             "id": first_chunk.get("id"),
             "object": "chat.completion",
             "created": first_chunk.get("created"),
@@ -1088,211 +643,50 @@ class TransactionLogger:
             "usage": usage_data,
         }
 
-        return full_response
-
 
 class ProviderLogger:
-    """
-    Base class for provider-specific logging.
+    """Provider-side boundary logging onto the shared transaction record."""
 
-    Logs provider-level request/response data to a subdirectory of the
-    transaction's log directory. Providers can extend this class to add
-    custom logging methods.
-
-    Default behavior:
-    - Creates a 'provider/' subdirectory in the transaction log
-    - Logs request payload, response chunks, final response, and errors
-
-    Providers can override __init__ to use a different directory structure,
-    or add custom methods for provider-specific logging needs.
-    """
-
-    __slots__ = ("enabled", "log_dir", "_trace_writer")
+    __slots__ = ("enabled", "log_dir", "_record")
 
     def __init__(self, context: Optional[TransactionContext]):
-        """
-        Initialize provider logger from transaction context.
-
-        Args:
-            context: TransactionContext from TransactionLogger, or None to disable
-        """
         self.enabled = False
         self.log_dir: Optional[Path] = None
-        self._trace_writer: Optional[TransformTraceWriter] = None
+        self._record: Optional[TransactionRecord] = None
 
         if context is None or not context.enabled:
             return
-
-        self.enabled = True
-        self.log_dir = context.log_dir / "provider"
-
-        try:
-            self.log_dir.mkdir(parents=True, exist_ok=True)
-            if getattr(context, "trace_enabled", False):
-                self._trace_writer = TransformTraceWriter(
-                    context.log_dir,
-                    component="provider",
-                    provider=context.provider,
-                    model=context.trace_model or context.model,
-                    request_id=context.request_id,
-                    session_id=context.session_id,
-                    scope_key=context.scope_key,
-                    classifier=context.classifier,
-                    snapshot_namespace=provider_snapshot_namespace(),
-                    enabled=True,
-                    level=getattr(context, "trace_level", 1),
-                )
-        except Exception as e:
-            lib_logger.error(f"ProviderLogger: Failed to create directory: {e}")
-            self.enabled = False
-
-    def _log_transform_pass(
-        self,
-        pass_name: str,
-        data: Any,
-        *,
-        direction: str,
-        stage: str = "provider",
-        transport: Optional[str] = None,
-        scrub_strings: bool = False,
-        snapshot: bool = True,
-    ) -> None:
-        if not self.enabled or not self._trace_writer:
+        record = getattr(context, "record", None)
+        if record is None:
             return
-        self._trace_writer.record(
-            pass_name,
-            data,
-            direction=direction,
-            stage=stage,
-            transport=transport,
-            scrub_strings=scrub_strings,
-            snapshot=snapshot,
-        )
+        self.enabled = True
+        self.log_dir = context.log_dir
+        self._record = record
 
     def finalize(self) -> None:
-        """Flush the provider-side trace writer's pending batch.
-
-        The provider writer shares the transaction's transform_trace.jsonl
-        with the client writer but batches independently; terminal points
-        (final response, error) flush so no entries are lost.
-        """
-
-        if self._trace_writer is not None:
-            try:
-                self._trace_writer.flush_pending()
-            except Exception:
-                lib_logger.debug("provider trace writer finalize failed", exc_info=True)
+        """No-op under the record model (the client logger seals)."""
 
     def log_request(self, payload: Dict[str, Any]) -> None:
-        """
-        Log the request payload sent to the provider API.
-
-        Args:
-            payload: The transformed request payload
-        """
-        self._log_transform_pass(
-            "provider_request_payload",
-            payload,
-            direction="request",
-            transport="http",
-        )
-        # L1 boundary redaction applies at the provider boundary too.
-        self._write_json("request_payload.json", sanitize_for_trace(payload))
+        if self._record is not None:
+            self._record.set_boundary("provider_request", sanitize_for_trace(_make_json_safe(payload)))
 
     def log_response_chunk(self, chunk: str) -> None:
-        """
-        Log a raw chunk from the provider's response stream.
-
-        Args:
-            chunk: Raw chunk string from the stream
-        """
-        self._log_transform_pass(
-            "provider_raw_stream_chunk",
-            chunk,
-            direction="stream",
-            transport="sse",
-            snapshot=False,
-        )
-        self._append_text("response_stream.log", chunk + "\n")
+        if self._record is not None:
+            self._record.add_stream_chunk(chunk)
 
     def log_final_response(self, response_data: Dict[str, Any]) -> None:
-        """
-        Log the final, reassembled response from the provider.
-
-        Args:
-            response_data: The complete response data
-        """
-        self._log_transform_pass(
-            "provider_final_response",
-            response_data,
-            direction="response",
-        )
-        self._write_json("final_response.json", sanitize_for_trace(response_data))
-        self.finalize()
+        if self._record is not None:
+            self._record.set_boundary("provider_response", sanitize_for_trace(_make_json_safe(response_data)))
 
     def log_error(self, error_message: str) -> None:
-        """
-        Log an error message with timestamp.
-
-        Args:
-            error_message: The error message to log
-        """
-        timestamp = _utc_timestamp()
-        scrubbed_message = scrub_sensitive_text(str(error_message))
-        self._log_transform_pass(
-            "provider_error",
-            {"timestamp_utc": timestamp, "message": error_message},
-            direction="error",
-            scrub_strings=True,
-            snapshot=False,
-        )
-        self._append_text("error.log", f"[{timestamp}] {scrubbed_message}\n")
-        self.finalize()
+        if self._record is not None:
+            self._record.record_error("provider_error", scrub_sensitive_text(str(error_message)))
 
     def log_extra(self, filename: str, data: Union[Dict[str, Any], str]) -> None:
-        """
-        Log arbitrary data to a custom file.
-
-        Allows providers to log additional files without subclassing.
-
-        Args:
-            filename: Name of the file to write
-            data: Either a dict (written as JSON) or string (written as text)
-        """
-        if isinstance(data, dict):
-            self._write_json(filename, data)
-        else:
-            self._append_text(filename, data)
-
-    def _write_json(self, filename: str, data: Dict[str, Any]) -> None:
-        """Write JSON data to a file in the log directory."""
-        if not self.enabled or not self.log_dir:
-            return
-        target = _safe_log_path(self.log_dir, filename)
-        if target is None:
-            lib_logger.warning(
-                f"ProviderLogger: refusing unsafe log filename {filename!r}"
+        if self._record is not None:
+            self._record.record_change(
+                "provider",
+                "provider_extra",
+                detail=str(filename),
+                value=_make_json_safe(data) if isinstance(data, dict) else str(data),
             )
-            return
-        try:
-            with open(target, "w", encoding="utf-8") as f:
-                json.dump(_make_json_safe(data), f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            lib_logger.error(f"ProviderLogger: Failed to write {filename}: {e}")
-
-    def _append_text(self, filename: str, text: str) -> None:
-        """Append text to a file in the log directory."""
-        if not self.enabled or not self.log_dir:
-            return
-        target = _safe_log_path(self.log_dir, filename)
-        if target is None:
-            lib_logger.warning(
-                f"ProviderLogger: refusing unsafe log filename {filename!r}"
-            )
-            return
-        try:
-            with open(target, "a", encoding="utf-8") as f:
-                f.write(text)
-        except Exception as e:
-            lib_logger.error(f"ProviderLogger: Failed to append to {filename}: {e}")
-

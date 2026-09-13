@@ -14,17 +14,9 @@ from rotator_library.transaction_logger import TransactionLogger
 
 
 
-@pytest.fixture(autouse=True)
-def _trace_level_2(monkeypatch):
-    """Trace mechanics live at L2 (D15 tiers)."""
-    monkeypatch.setenv("TRANSACTION_LOG_LEVEL", "2")
+from tests.txn_helpers import by_pass
 
 
-def _trace_text(log_dir):
-    from rotator_library.utils import zstd_io
-
-    entries = zstd_io.read_jsonl_any(Path(log_dir) / "transform_trace.jsonl")
-    return "\n".join(json.dumps(entry, ensure_ascii=False) for entry in entries)
 def _executor() -> RequestExecutor:
     return RequestExecutor({}, None, None, None, {}, None)
 
@@ -61,9 +53,9 @@ def test_executor_accounts_for_non_streaming_usage_and_cost_trace(tmp_path, monk
     assert usage.completion_tokens == 20
     assert usage.reasoning_tokens == 10
     assert cost.total_cost > 0
-    entries = [json.loads(line) for line in _trace_text(logger.log_dir).splitlines()]
-    assert entries[-1]["pass_name"] == "usage_accounting_summary"
-    assert entries[-1]["data"]["usage"]["total_tokens"] == usage.total_tokens
+    summary = by_pass(logger, "usage_accounting_summary")[-1]
+    assert summary["stage"] == "final"
+    assert summary["detail"] == "usage_accounting_summary/metadata/final"
 
 
 def test_executor_accounting_uses_configured_env_pricing(tmp_path, monkeypatch) -> None:
