@@ -105,14 +105,18 @@ async def test_usage_storage_persists_derived_accessors(tmp_path: Path) -> None:
 
     assert await storage.save({"stable-one": state}, force=True)
 
-    data = json.loads(usage_file.read_text(encoding="utf-8"))
-    serialized = json.dumps(data)
+    row = json.loads(await storage._engine.aget(storage._row_key("stable-one")))
+    serialized = json.dumps(row)
     assert RAW_KEY not in serialized
-    assert data["credentials"]["stable-one"]["accessor"] == derive_accessor_id(RAW_KEY)
-    assert data["accessor_index"][derive_accessor_id(RAW_KEY)] == "stable-one"
+    assert row["accessor"] == derive_accessor_id(RAW_KEY)
+
+    meta = json.loads(await storage._engine.aget(storage._meta_key()))
+    assert meta["accessor_index"][derive_accessor_id(RAW_KEY)] == "stable-one"
 
 
-async def test_usage_storage_migrates_raw_accessors_on_load(tmp_path: Path) -> None:
+async def test_usage_storage_ignores_legacy_file_and_derives_on_save(
+    tmp_path: Path,
+) -> None:
     usage_file = tmp_path / "usage.json"
     legacy = {
         "schema_version": 2,
@@ -132,17 +136,19 @@ async def test_usage_storage_migrates_raw_accessors_on_load(tmp_path: Path) -> N
     storage = UsageStorage(usage_file)
     states, _, loaded = await storage.load()
 
-    assert loaded is True
-    assert states["stable-one"].accessor == derive_accessor_id(RAW_KEY)
+    # Operator ruling: no migration — the old JSON medium is not read.
+    assert loaded is False
+    assert states == {}
 
-    rewritten = json.loads(usage_file.read_text(encoding="utf-8"))
-    rewritten_text = json.dumps(rewritten)
-    assert RAW_KEY not in rewritten_text
-    assert rewritten["schema_version"] == 3
-    assert rewritten["credentials"]["stable-one"]["accessor"] == derive_accessor_id(
-        RAW_KEY
+    saved = CredentialState(
+        stable_id="stable-one",
+        provider="openai",
+        accessor=RAW_KEY,
     )
-    assert rewritten["accessor_index"] == {derive_accessor_id(RAW_KEY): "stable-one"}
+    assert await storage.save({"stable-one": saved}, force=True)
+    row = json.loads(await storage._engine.aget(storage._row_key("stable-one")))
+    assert RAW_KEY not in json.dumps(row)
+    assert row["accessor"] == derive_accessor_id(RAW_KEY)
 
 
 async def test_quota_stats_never_returns_key_material(tmp_path: Path) -> None:

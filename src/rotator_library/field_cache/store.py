@@ -133,9 +133,11 @@ class InMemoryFieldCacheStore:
 class ProviderCacheFieldStore:
     """Field-cache store backed by an injected `ProviderCache` instance.
 
-    The wrapper does not create `ProviderCache` itself because that class starts
-    background async tasks during initialization. Providers or later config code
-    should own that lifecycle and pass an initialized cache here.
+    ``ProviderCache`` is engine-backed, so reads refresh the row's
+    ``last_access`` (idle pruning awareness) and the per-value TTL envelope's
+    ``expires_at`` is still honored on read. The wrapper does not create
+    ``ProviderCache`` itself; providers or later config code own that
+    lifecycle and pass an initialized cache here.
     """
 
     def __init__(self, provider_cache: Any) -> None:

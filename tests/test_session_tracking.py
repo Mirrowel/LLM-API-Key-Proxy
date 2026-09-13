@@ -35,6 +35,25 @@ from rotator_library.protocols.types import (
 )
 from rotator_library.client.rotating_client import _resolve_session_persistence_settings
 from rotator_library.client.request_builder import RequestContextBuilder
+from rotator_library.storage.engine import get_engine
+
+
+def _session_engine():
+    return get_engine("session")
+
+
+def _put_session_row(session_id: str, payload) -> None:
+    _session_engine().set(
+        f"session:{session_id}", json.dumps(payload).encode("utf-8")
+    )
+
+
+def _put_anchor_row(value: str, payload) -> None:
+    _session_engine().set(f"anchor:{value}", json.dumps(payload).encode("utf-8"))
+
+
+def _dump_session_rows():
+    return {key: json.loads(raw) for key, raw, _meta in _session_engine().iterate()}
 
 
 def _stream_protocol_context(model: str = "model") -> ProtocolContext:
@@ -3826,7 +3845,7 @@ class SessionTrackerTests(unittest.TestCase):
             )
             first = tracker.infer_session(request, provider="gemini", model="pro")
             tracker.flush()
-            persisted = json.loads(path.read_text(encoding="utf-8"))
+            persisted = _dump_session_rows()
             original_state = tracker._sessions[first.session_id]
             original_records = {
                 value: (record.strength, record.source, record.group)
@@ -3843,8 +3862,9 @@ class SessionTrackerTests(unittest.TestCase):
             second = restored.infer_session(request, provider="gemini", model="pro")
             restored_state = restored._sessions[first.session_id]
 
-        self.assertEqual(persisted["schema_version"], 3)
-        self.assertNotIn("anchors", persisted["sessions"][first.session_id])
+        session_row = persisted[f"session:{first.session_id}"]
+        self.assertNotIn("anchors", session_row)
+        self.assertNotIn("schema_version", session_row)
         self.assertEqual(first.session_id, second.session_id)
         self.assertEqual(first.affinity_key, second.affinity_key)
         self.assertEqual(original_state.history_signatures, restored_state.history_signatures)
@@ -3895,7 +3915,7 @@ class SessionTrackerTests(unittest.TestCase):
                 response={"id": secrets["response"], "object": "response"},
             )
             tracker.flush()
-            persisted_text = path.read_text(encoding="utf-8")
+            persisted_text = json.dumps(_dump_session_rows())
 
         for secret in secrets.values():
             self.assertNotIn(secret, persisted_text)
@@ -3913,11 +3933,14 @@ class SessionTrackerTests(unittest.TestCase):
             for index in range(3)
         }
         evil_anchor = f"{namespace}:evil:{'a' * 64}"
-        payload = {
-            "schema_version": 3,
-            "sessions": sessions,
-            "anchors": {
-                evil_anchor: {
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "session_stickiness.json"
+            for session_id, session_payload in sessions.items():
+                _put_session_row(session_id, session_payload)
+            _put_anchor_row(
+                evil_anchor,
+                {
                     "session_id": "session-2",
                     "namespace": namespace,
                     "strength": "strong",
@@ -3925,13 +3948,8 @@ class SessionTrackerTests(unittest.TestCase):
                     "group": "forged",
                     "expires_at": now + 3600,
                     "last_seen": now,
-                }
-            },
-        }
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            path = Path(temp_dir) / "session_stickiness.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
+                },
+            )
             with patch.object(SessionTracker, "_MAX_PERSISTED_SESSIONS", 2):
                 tracker = SessionTracker(
                     ttl_seconds=3600,
@@ -3945,7 +3963,7 @@ class SessionTrackerTests(unittest.TestCase):
     def test_schema_three_loader_rejects_oversized_state_before_json_parsing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
-            path.write_text("{" + ("x" * 128), encoding="utf-8")
+            _session_engine().set("session:big", ("{" + ("x" * 128)).encode("utf-8"))
             with patch.object(SessionTracker, "_MAX_PERSISTED_FILE_BYTES", 64):
                 tracker = SessionTracker(
                     ttl_seconds=3600,
@@ -4033,29 +4051,35 @@ class SessionTrackerTests(unittest.TestCase):
 
     def test_malformed_persistence_payloads_are_ignored_without_startup_failure(self):
         payloads = [
-            "{not-json",
-            json.dumps([]),
-            json.dumps({"schema_version": 1, "sessions": {}, "anchors": {}}),
-            json.dumps({"schema_version": 2, "sessions": {}, "anchors": {}}),
-            json.dumps({"schema_version": 3, "sessions": [], "anchors": {}}),
-            json.dumps(
-                {
-                    "schema_version": 3,
-                    "sessions": {
-                        "bad": {
-                            "namespace": "session-domain:x",
-                            "expires_at": "not-a-number",
-                        }
-                    },
-                    "anchors": {},
-                }
+            ("session:not-json", b"{not-json"),
+            ("session:list", json.dumps([]).encode("utf-8")),
+            (
+                "session:bad-schema",
+                json.dumps({"schema_version": 1, "sessions": {}, "anchors": {}}).encode("utf-8"),
+            ),
+            (
+                "session:sessionless",
+                json.dumps({"schema_version": 2, "sessions": {}, "anchors": {}}).encode("utf-8"),
+            ),
+            (
+                "session:empty-sessions",
+                json.dumps({"schema_version": 3, "sessions": [], "anchors": {}}).encode("utf-8"),
+            ),
+            (
+                "session:bad",
+                json.dumps(
+                    {
+                        "namespace": "session-domain:x",
+                        "expires_at": "not-a-number",
+                    }
+                ).encode("utf-8"),
             ),
         ]
 
-        for payload in payloads:
-            with self.subTest(payload=payload[:30]), tempfile.TemporaryDirectory() as temp_dir:
+        for key, raw in payloads:
+            with self.subTest(payload=key), tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "session_stickiness.json"
-                path.write_text(payload, encoding="utf-8")
+                _session_engine().set(key, raw)
                 tracker = SessionTracker(
                     ttl_seconds=3600,
                     persist_to_disk=True,
@@ -4127,7 +4151,10 @@ class SessionTrackerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            for session_id, session_payload in payload["sessions"].items():
+                _put_session_row(session_id, session_payload)
+            for value, anchor_payload in payload["anchors"].items():
+                _put_anchor_row(value, anchor_payload)
             tracker = SessionTracker(
                 ttl_seconds=3600,
                 persist_to_disk=True,
@@ -4173,7 +4200,10 @@ class SessionTrackerTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
-            path.write_text(json.dumps(payload), encoding="utf-8")
+            for session_id, session_payload in payload["sessions"].items():
+                _put_session_row(session_id, session_payload)
+            for value, anchor_payload in payload["anchors"].items():
+                _put_anchor_row(value, anchor_payload)
             tracker = SessionTracker(
                 ttl_seconds=3600,
                 persist_to_disk=True,
@@ -4194,20 +4224,13 @@ class SessionTrackerTests(unittest.TestCase):
     def test_unversioned_persistence_is_ignored(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
-            path.write_text(
-                json.dumps(
-                    {
-                        "sessions": {
-                            "old-session": {
-                                "namespace": "provider:gemini:model:pro",
-                                "expires_at": 9999999999,
-                                "anchors": [],
-                            }
-                        },
-                        "anchors": {},
-                    }
-                ),
-                encoding="utf-8",
+            _put_session_row(
+                "old-session",
+                {
+                    "namespace": "provider:gemini:model:pro",
+                    "expires_at": 9999999999,
+                    "anchors": [],
+                },
             )
             tracker = SessionTracker(
                 ttl_seconds=3600,

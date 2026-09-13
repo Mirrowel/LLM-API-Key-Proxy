@@ -175,15 +175,15 @@ class TestMaxRecordedPersistence:
             # Save
             await storage.save({"test-id": state}, force=True)
 
-            # Read raw JSON to verify structure
-            with open(temp_path) as f:
-                data = json.load(f)
-
-            cred_data = data["credentials"]["test-id"]
+            # Read the engine row to verify structure
+            raw = await storage._engine.aget(storage._row_key("test-id"))
+            cred_data = json.loads(raw)
             window_data = cred_data["model_usage"]["test-model"]["windows"]["5h"]
 
             assert window_data["max_recorded_requests"] == 100
             assert window_data["max_recorded_at"] is not None
+            # Display-only duplicates are stripped from the stored form.
+            assert "max_recorded_at_human" not in window_data
 
         finally:
             temp_path.unlink(missing_ok=True)

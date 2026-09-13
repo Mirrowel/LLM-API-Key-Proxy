@@ -519,6 +519,15 @@ async def lifespan(app: FastAPI):
     except Exception:
         pass
 
+    # Close storage engines LAST: they hold no request state, and any
+    # late-settling store writes have already drained above.
+    try:
+        from rotator_library.storage.engine import close_all_engines
+
+        close_all_engines()
+    except Exception:
+        pass
+
     # Stop model info service
     if hasattr(app.state, "model_info_service") and app.state.model_info_service:
         await app.state.model_info_service.stop()

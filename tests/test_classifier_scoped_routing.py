@@ -122,20 +122,20 @@ def test_stateless_private_completion_uses_only_scoped_secret_and_provider_overl
     assert captured["api_key"] != "irrelevant-openai-secret"
 
     safe_classifier = client._safe_scope_name("user/one")
-    usage_file = (
-        Path(tmp_path)
-        / "usage"
-        / "classifiers"
-        / safe_classifier
-        / "usage_logfare.json"
-    )
-    usage_data = json.loads(usage_file.read_text())
-    serialized = json.dumps(usage_data)
+    usage_key = f"classifier:{safe_classifier}:logfare"
+    storage = client.usage_managers[usage_key]._storage
+    meta = json.loads(storage._engine.get(storage._meta_key()))
+    rows = {
+        key: json.loads(raw)
+        for key, raw, _meta in storage._engine.iterate(prefix=storage._prefix())
+        if key != storage._meta_key()
+    }
+    serialized = json.dumps(rows) + json.dumps(meta)
     assert "scoped-logfare-secret" not in serialized
     assert "global-logfare-key" not in serialized
-    assert usage_data["accessor_index"] == {}
+    assert meta["accessor_index"] == {}
 
-    credential_state = next(iter(usage_data["credentials"].values()))
+    credential_state = next(iter(rows.values()))
     assert credential_state["accessor"].startswith("private:")
     assert credential_state["private"] is True
 

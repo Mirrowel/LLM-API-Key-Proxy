@@ -36,9 +36,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from .utils.resilient_io import ResilientStateWriter, safe_read_json
+from .storage.engine import get_engine
 
 lib_logger = logging.getLogger("rotator_library")
+
+_SESSION_ROW_PREFIX = "session:"
+_ANCHOR_ROW_PREFIX = "anchor:"
+
+
+class _EngineRowWriter:
+    """Persist session/anchor rows to the ``session`` storage engine.
+
+    Exposes the same ``write(payload) -> bool`` surface the tracker used for
+    its file writer, so the generation gate and throttle logic stay intact.
+    """
+
+    def __init__(self, engine: Any) -> None:
+        self._engine = engine
+
+    def write(self, payload: Dict[str, Dict[str, Any]]) -> bool:
+        now = time.time()
+        try:
+            for key, value in payload.items():
+                expires_at = value.get("expires_at") if isinstance(value, dict) else None
+                ttl = (
+                    max(1.0, float(expires_at) - now)
+                    if isinstance(expires_at, (int, float))
+                    else None
+                )
+                self._engine.set(key, json.dumps(value).encode("utf-8"), ttl_seconds=ttl)
+            return True
+        except Exception:
+            return False
 
 
 @dataclass(frozen=True)
@@ -233,17 +262,12 @@ class SessionTracker:
         self._dirty_generation = 0
         self._last_persisted_generation = 0
         self._last_save_attempt = 0.0
-        self._writer: Optional[ResilientStateWriter] = None
+        self._writer: Optional[Any] = None
+        self._engine = get_engine("session")
         self._lock = threading.RLock()
         self._save_io_lock = threading.Lock()
         if self.persist_to_disk:
             self._load()
-            if self.persistence_path:
-                self._writer = ResilientStateWriter(
-                    self.persistence_path,
-                    lib_logger,
-                    serializer=lambda data: json.dumps(data, indent=2, sort_keys=True),
-                )
 
     def infer_session_id(self, request_data: Dict[str, Any]) -> Optional[str]:
         """Compatibility wrapper for older callers/tests."""
@@ -1632,35 +1656,34 @@ class SessionTracker:
         if changed:
             self._mark_dirty()
 
-    def _load(self) -> None:
-        if not self.persistence_path:
-            return
+    @staticmethod
+    def _decode_row(raw: Any) -> Optional[Dict[str, Any]]:
         try:
-            if (
-                self.persistence_path.exists()
-                and self.persistence_path.stat().st_size > self._MAX_PERSISTED_FILE_BYTES
-            ):
-                lib_logger.warning("Ignoring oversized session_stickiness.json")
-                return
-        except OSError:
-            return
-        data = safe_read_json(self.persistence_path, lib_logger)
-        if not isinstance(data, dict):
-            return
+            payload = json.loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _load(self) -> None:
         now = time.time()
-        if data.get("schema_version") != self._PERSISTENCE_SCHEMA_VERSION:
-            lib_logger.info(
-                "Ignoring unsupported session_stickiness.json format; session persistence will rebuild in memory."
-            )
+        sessions: Dict[str, Any] = {}
+        anchors: Dict[str, Any] = {}
+        try:
+            rows = list(self._engine.iterate())
+        except Exception:
             return
-        sessions = data.get("sessions")
-        anchors = data.get("anchors")
-        if not isinstance(sessions, dict) or not isinstance(anchors, dict):
-            lib_logger.info(
-                "Ignoring malformed session_stickiness.json containers; "
-                "session persistence will rebuild in memory."
-            )
-            return
+        for key, raw, _meta in rows:
+            if len(raw) > self._MAX_PERSISTED_FILE_BYTES:
+                continue
+            if key.startswith(_SESSION_ROW_PREFIX):
+                payload = self._decode_row(raw)
+                if payload is not None:
+                    sessions[key[len(_SESSION_ROW_PREFIX):]] = payload
+            elif key.startswith(_ANCHOR_ROW_PREFIX):
+                payload = self._decode_row(raw)
+                if payload is not None:
+                    anchors[key[len(_ANCHOR_ROW_PREFIX):]] = payload
+
         def persisted_last_seen(item: tuple[Any, Any]) -> float:
             payload = item[1]
             if not isinstance(payload, dict):
@@ -1757,49 +1780,39 @@ class SessionTracker:
         self,
         *,
         force: bool = False,
-    ) -> Optional[tuple[ResilientStateWriter, Dict[str, Any], int]]:
-        if not self.persist_to_disk or not self.persistence_path or not self._dirty:
+    ) -> Optional[tuple[Any, Dict[str, Any], int]]:
+        if not self.persist_to_disk or not self._dirty:
             return None
         now = time.time()
         if not force and now - self._last_save_attempt < self.persistence_flush_interval_seconds:
             return None
         self._last_save_attempt = now
-        payload = {
-            "schema_version": self._PERSISTENCE_SCHEMA_VERSION,
-            "sessions": {
-                session_id: {
-                    "namespace": state.namespace,
-                    "expires_at": state.expires_at,
-                    "affinity_key": state.affinity_key,
-                    "last_seen": state.last_seen,
-                    "history_signatures": list(state.history_signatures),
-                }
-                for session_id, state in self._sessions.items()
-            },
-            "anchors": {
-                anchor: {
-                    "session_id": record.session_id,
-                    "namespace": record.namespace,
-                    "strength": record.strength,
-                    "source": record.source,
-                    "group": record.group,
-                    "expires_at": record.expires_at,
-                    "last_seen": record.last_seen,
-                }
-                for anchor, record in self._anchors.items()
-            },
-        }
+        payload: Dict[str, Any] = {}
+        for session_id, state in self._sessions.items():
+            payload[f"{_SESSION_ROW_PREFIX}{session_id}"] = {
+                "namespace": state.namespace,
+                "expires_at": state.expires_at,
+                "affinity_key": state.affinity_key,
+                "last_seen": state.last_seen,
+                "history_signatures": list(state.history_signatures),
+            }
+        for anchor, record in self._anchors.items():
+            payload[f"{_ANCHOR_ROW_PREFIX}{anchor}"] = {
+                "session_id": record.session_id,
+                "namespace": record.namespace,
+                "strength": record.strength,
+                "source": record.source,
+                "group": record.group,
+                "expires_at": record.expires_at,
+                "last_seen": record.last_seen,
+            }
         if self._writer is None:
-            self._writer = ResilientStateWriter(
-                self.persistence_path,
-                lib_logger,
-                serializer=lambda data: json.dumps(data, indent=2, sort_keys=True),
-            )
+            self._writer = _EngineRowWriter(self._engine)
         return self._writer, payload, self._dirty_generation
 
     def _write_save_job(
         self,
-        save_job: Optional[tuple[ResilientStateWriter, Dict[str, Any], int]],
+        save_job: Optional[tuple[Any, Dict[str, Any], int]],
     ) -> None:
         if save_job is None:
             return

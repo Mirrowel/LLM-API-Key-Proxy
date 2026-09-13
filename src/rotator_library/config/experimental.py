@@ -119,7 +119,7 @@ class RetryRuntimeSettings:
 class ResponsesStoreRuntimeSettings:
     """Runtime backend selection for Responses storage."""
 
-    backend: str = "provider_cache"
+    backend: str = "engine"
     cache_name: str = "responses"
     cache_prefix: str = "responses"
     cache_dir: Optional[str] = None
@@ -338,9 +338,9 @@ def get_responses_store_runtime_settings(
     active = config if config is not None else load_experimental_config(env=source)
     responses = active.responses if isinstance(active.responses, dict) else {}
     store = responses.get("store", {}) if isinstance(responses.get("store"), dict) else responses
-    backend = str(_env_or_json(source, "RESPONSES_STORE_BACKEND", store, "backend", default="provider_cache")).strip().lower()
-    if backend not in {"memory", "provider_cache"}:
-        raise ExperimentalConfigError("RESPONSES_STORE_BACKEND must be 'memory' or 'provider_cache'")
+    backend = str(_env_or_json(source, "RESPONSES_STORE_BACKEND", store, "backend", default="engine")).strip().lower()
+    if backend not in {"memory", "engine"}:
+        raise ExperimentalConfigError("RESPONSES_STORE_BACKEND must be 'memory' or 'engine'")
     return ResponsesStoreRuntimeSettings(
         backend=backend,
         cache_name=str(_env_or_json(source, "RESPONSES_STORE_CACHE_NAME", store, "cache_name", default="responses")),

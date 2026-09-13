@@ -4,16 +4,20 @@
 """
 Usage data storage.
 
-Handles loading and saving usage data to JSON files.
+Persists per-credential usage state to the shared ``usage`` storage engine:
+one row per credential plus one small metadata row for the accessor index and
+global fair-cycle state. The former whole-file ``usage_*.json`` medium is no
+longer read or written (operator ruling: fresh start, old files untouched).
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Union
 
 from ..types import (
     WindowStats,
@@ -23,10 +27,8 @@ from ..types import (
     CredentialState,
     CooldownInfo,
     FairCycleState,
-    GlobalFairCycleState,
-    StorageSchema,
 )
-from ...utils.resilient_io import ResilientStateWriter, safe_read_json
+from ...storage.engine import get_engine
 from ...error_handler import mask_credential
 from ..identity.registry import derive_accessor_id
 from ...core.constants import (
@@ -49,18 +51,51 @@ def _format_timestamp(ts: Optional[float]) -> Optional[str]:
         return None
 
 
+_TIMESTAMP_FIELDS = (
+    "started_at",
+    "reset_at",
+    "max_recorded_at",
+    "first_used_at",
+    "last_used_at",
+    "created_at",
+    "last_updated",
+    "until",
+    "exhausted_at",
+)
+
+
+def with_human_timestamps(value: Any) -> Any:
+    """Regenerate display-only ``*_human`` strings on a stored-shaped value.
+
+    Human-readable timestamps are derived view fields, so they are stripped
+    before storage and regenerated here when a display path needs them.
+    """
+
+    if isinstance(value, dict):
+        for key in list(value):
+            item = value[key]
+            if key in _TIMESTAMP_FIELDS and item is not None:
+                value.setdefault(f"{key}_human", _format_timestamp(item))
+            else:
+                with_human_timestamps(item)
+    elif isinstance(value, list):
+        for item in value:
+            with_human_timestamps(item)
+    return value
+
+
 class UsageStorage:
     """
-    Handles persistence of usage data to JSON files.
+    Handles persistence of usage data to the storage engine.
 
     Features:
-    - Async file I/O with aiofiles
-    - Atomic writes (write to temp, then rename)
-    - Automatic schema migration
+    - One engine row per credential (no whole-file rewrite)
     - Debounced saves to reduce I/O
+    - Derived accessors: raw upstream keys never reach storage
     """
 
     CURRENT_SCHEMA_VERSION = 3
+    _META_SUFFIX = "__meta__"
 
     def __init__(
         self,
@@ -71,68 +106,80 @@ class UsageStorage:
         Initialize storage.
 
         Args:
-            file_path: Path to the usage.json file
+            file_path: Legacy usage.json path; used only to namespace rows
             save_debounce_seconds: Minimum time between saves
         """
         self.file_path = Path(file_path)
         self.save_debounce_seconds = save_debounce_seconds
+        self._namespace = hashlib.sha256(
+            str(self.file_path).encode("utf-8")
+        ).hexdigest()[:16]
+        self._engine = get_engine("usage")
 
         self._last_save: float = 0
         self._pending_save: bool = False
         self._save_lock = asyncio.Lock()
         self._dirty: bool = False
-        self._writer = ResilientStateWriter(self.file_path, lib_logger)
+
+    def _row_key(self, stable_id: str) -> str:
+        return f"{self._namespace}:{stable_id}"
+
+    def _meta_key(self) -> str:
+        return f"{self._namespace}:{self._META_SUFFIX}"
+
+    def _prefix(self) -> str:
+        return f"{self._namespace}:"
 
     async def load(
         self,
     ) -> tuple[Dict[str, CredentialState], Dict[str, Dict[str, Any]], bool]:
         """
-        Load usage data from file.
+        Load usage data from the engine.
 
         Returns:
-            Tuple of (states dict, fair_cycle_global dict, loaded_from_file bool)
+            Tuple of (states dict, fair_cycle_global dict, loaded bool)
         """
-        if not self.file_path.exists():
-            return {}, {}, False
+        async with self._save_lock:
+            try:
+                meta = await self._engine.aget(self._meta_key())
+                fair_cycle_global: Dict[str, Dict[str, Any]] = {}
+                if meta:
+                    try:
+                        meta_data = json.loads(meta)
+                    except (ValueError, TypeError):
+                        meta_data = None
+                    if isinstance(meta_data, dict):
+                        fair_cycle_global = (
+                            meta_data.get("fair_cycle_global", {}) or {}
+                        )
 
-        try:
-            async with self._file_lock():
-                data = safe_read_json(self.file_path, lib_logger, parse_json=True)
-
-            if not data:
-                return {}, {}, True
-
-            # Check schema version
-            version = data.get("schema_version", 1)
-            migrated = False
-            if version < self.CURRENT_SCHEMA_VERSION:
-                lib_logger.info(
-                    f"Migrating usage data from v{version} to v{self.CURRENT_SCHEMA_VERSION}"
+                states: Dict[str, CredentialState] = {}
+                rows = await asyncio.to_thread(
+                    lambda: list(self._engine.iterate(prefix=self._prefix()))
                 )
-                data = self._migrate(data, version)
-                migrated = True
+                for key, raw, _meta in rows:
+                    if key == self._meta_key():
+                        continue
+                    stable_id = key[len(self._prefix()) :]
+                    try:
+                        cred_data = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if not isinstance(cred_data, dict):
+                        continue
+                    state = self._parse_credential_state(stable_id, cred_data)
+                    if state:
+                        states[stable_id] = state
 
-            # Parse credentials
-            states = {}
-            for stable_id, cred_data in data.get("credentials", {}).items():
-                state = self._parse_credential_state(stable_id, cred_data)
-                if state:
-                    states[stable_id] = state
-
-            if migrated:
-                # Rewrite immediately so old raw accessors do not survive on
-                # disk after the first load (defense in depth).
-                self._writer.write(data)
-
-            lib_logger.info(f"Loaded {len(states)} credentials from {self.file_path}")
-            return states, data.get("fair_cycle_global", {}), True
-
-        except json.JSONDecodeError as e:
-            lib_logger.error(f"Failed to parse usage file: {e}")
-            return {}, {}, True
-        except Exception as e:
-            lib_logger.error(f"Failed to load usage file: {e}")
-            return {}, {}, True
+                loaded = bool(states) or meta is not None
+                lib_logger.info(
+                    f"Loaded {len(states)} credentials from usage engine "
+                    f"namespace {self._namespace}"
+                )
+                return states, fair_cycle_global, loaded
+            except Exception as e:
+                lib_logger.error(f"Failed to load usage data: {e}")
+                return {}, {}, False
 
     async def save(
         self,
@@ -141,7 +188,7 @@ class UsageStorage:
         force: bool = False,
     ) -> bool:
         """
-        Save usage data to file.
+        Save usage data to the engine, one row per credential.
 
         Args:
             states: Dict of stable_id -> CredentialState
@@ -160,39 +207,49 @@ class UsageStorage:
 
         async with self._save_lock:
             try:
-                # Build storage data
-                data = {
-                    "schema_version": self.CURRENT_SCHEMA_VERSION,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                    "credentials": {},
-                    "accessor_index": {},
-                    "fair_cycle_global": fair_cycle_global or {},
-                }
-
+                accessor_index: Dict[str, str] = {}
+                keep: set[str] = set()
                 for stable_id, state in states.items():
-                    data["credentials"][stable_id] = self._serialize_credential_state(
-                        state
-                    )
+                    keep.add(self._row_key(stable_id))
+                    serialized = self._serialize_credential_state(state)
                     if not str(state.accessor).startswith("private:"):
-                        data["accessor_index"][
+                        accessor_index[
                             derive_accessor_id(state.accessor)
                         ] = stable_id
-
-                saved = self._writer.write(data)
-
-                if saved:
-                    self._last_save = now
-                    self._dirty = False
-                    lib_logger.debug(
-                        f"Saved {len(states)} credentials to {self.file_path}"
+                    await self._engine.aset(
+                        self._row_key(stable_id),
+                        json.dumps(serialized).encode("utf-8"),
                     )
-                    return True
 
-                self._dirty = True
-                return False
+                meta = {
+                    "schema_version": self.CURRENT_SCHEMA_VERSION,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "accessor_index": accessor_index,
+                    "fair_cycle_global": fair_cycle_global or {},
+                }
+                keep.add(self._meta_key())
+                await self._engine.aset(
+                    self._meta_key(), json.dumps(meta).encode("utf-8")
+                )
+
+                existing = await asyncio.to_thread(
+                    lambda: list(self._engine.keys(prefix=self._prefix()))
+                )
+                for key in existing:
+                    if key not in keep:
+                        await self._engine.adelete(key)
+
+                self._last_save = now
+                self._dirty = False
+                lib_logger.debug(
+                    f"Saved {len(states)} credentials to usage engine "
+                    f"namespace {self._namespace}"
+                )
+                return True
 
             except Exception as e:
-                lib_logger.error(f"Failed to save usage file: {e}")
+                lib_logger.error(f"Failed to save usage data: {e}")
+                self._dirty = True
                 return False
 
     async def save_if_dirty(
@@ -227,61 +284,6 @@ class UsageStorage:
     # PRIVATE METHODS
     # =========================================================================
 
-    def _file_lock(self):
-        """Get a lock for file operations."""
-        return self._save_lock
-
-    def _migrate(self, data: Dict[str, Any], from_version: int) -> Dict[str, Any]:
-        """Migrate data from older schema versions."""
-        if from_version == 1:
-            # v1 -> v2: Add accessor_index, restructure credentials
-            data["schema_version"] = 2
-            data.setdefault("accessor_index", {})
-            data.setdefault("fair_cycle_global", {})
-
-            # v1 used file paths as keys, v2 uses stable_ids
-            # For migration, treat paths as stable_ids
-            old_credentials = data.get("credentials", data.get("key_states", {}))
-            new_credentials = {}
-
-            for key, cred_data in old_credentials.items():
-                # Use path as temporary stable_id
-                stable_id = cred_data.get("stable_id", key)
-                new_credentials[stable_id] = cred_data
-                new_credentials[stable_id]["accessor"] = key
-
-            data["credentials"] = new_credentials
-            from_version = 2
-
-        if from_version == 2:
-            # v2 -> v3: raw accessors are replaced with derived identifiers so
-            # usage.json never contains upstream API keys.
-            data["credentials"] = self._derive_accessors(
-                data.get("credentials", {})
-            )
-            data["accessor_index"] = {
-                derive_accessor_id(accessor): stable_id
-                for accessor, stable_id in data.get("accessor_index", {}).items()
-                if not str(accessor).startswith("private:")
-            }
-            data["schema_version"] = self.CURRENT_SCHEMA_VERSION
-
-        return data
-
-    @staticmethod
-    def _derive_accessors(
-        credentials: Dict[str, Dict[str, Any]]
-    ) -> Dict[str, Dict[str, Any]]:
-        """Return credential rows with raw accessors replaced by derived ids."""
-        derived: Dict[str, Dict[str, Any]] = {}
-        for stable_id, cred_data in credentials.items():
-            if isinstance(cred_data, dict):
-                accessor = cred_data.get("accessor")
-                if isinstance(accessor, str):
-                    cred_data = {**cred_data, "accessor": derive_accessor_id(accessor)}
-            derived[stable_id] = cred_data
-        return derived
-
     def _parse_window_stats(self, name: str, data: Dict[str, Any]) -> WindowStats:
         """Parse window stats from storage data."""
         return WindowStats(
@@ -307,7 +309,7 @@ class UsageStorage:
         )
 
     def _serialize_window_stats(self, window: WindowStats) -> Dict[str, Any]:
-        """Serialize window stats for storage."""
+        """Serialize window stats for storage (display fields excluded)."""
         return {
             "request_count": window.request_count,
             "success_count": window.success_count,
@@ -321,17 +323,12 @@ class UsageStorage:
             "total_tokens": window.total_tokens,
             "approx_cost": window.approx_cost,
             "started_at": window.started_at,
-            "started_at_human": _format_timestamp(window.started_at),
             "reset_at": window.reset_at,
-            "reset_at_human": _format_timestamp(window.reset_at),
             "limit": window.limit,
             "max_recorded_requests": window.max_recorded_requests,
             "max_recorded_at": window.max_recorded_at,
-            "max_recorded_at_human": _format_timestamp(window.max_recorded_at),
             "first_used_at": window.first_used_at,
-            "first_used_at_human": _format_timestamp(window.first_used_at),
             "last_used_at": window.last_used_at,
-            "last_used_at_human": _format_timestamp(window.last_used_at),
         }
 
     def _parse_total_stats(self, data: Dict[str, Any]) -> TotalStats:
@@ -353,7 +350,7 @@ class UsageStorage:
         )
 
     def _serialize_total_stats(self, totals: TotalStats) -> Dict[str, Any]:
-        """Serialize total stats for storage."""
+        """Serialize total stats for storage (display fields excluded)."""
         return {
             "request_count": totals.request_count,
             "success_count": totals.success_count,
@@ -367,9 +364,7 @@ class UsageStorage:
             "total_tokens": totals.total_tokens,
             "approx_cost": totals.approx_cost,
             "first_used_at": totals.first_used_at,
-            "first_used_at_human": _format_timestamp(totals.first_used_at),
             "last_used_at": totals.last_used_at,
-            "last_used_at_human": _format_timestamp(totals.last_used_at),
         }
 
     def _parse_model_stats(self, data: Dict[str, Any]) -> ModelStats:
@@ -507,7 +502,7 @@ class UsageStorage:
             return None
 
     def _serialize_credential_state(self, state: CredentialState) -> Dict[str, Any]:
-        """Serialize a credential state for storage."""
+        """Serialize a credential state for storage (display fields excluded)."""
         # Serialize cooldowns (only active ones)
         now = time.time()
         cooldowns = {}
@@ -516,9 +511,7 @@ class UsageStorage:
                 cooldowns[key] = {
                     "reason": cd.reason,
                     "until": cd.until,
-                    "until_human": _format_timestamp(cd.until),
                     "started_at": cd.started_at,
-                    "started_at_human": _format_timestamp(cd.started_at),
                     "source": cd.source,
                     "model_or_group": cd.model_or_group,
                     "backoff_count": cd.backoff_count,
@@ -530,7 +523,6 @@ class UsageStorage:
             fair_cycle[key] = {
                 "exhausted": fc.exhausted,
                 "exhausted_at": fc.exhausted_at,
-                "exhausted_at_human": _format_timestamp(fc.exhausted_at),
                 "exhausted_reason": fc.exhausted_reason,
                 "cycle_request_count": fc.cycle_request_count,
             }
@@ -556,7 +548,5 @@ class UsageStorage:
             "optimal_concurrent": state.optimal_concurrent,
             "max_concurrent": state.max_concurrent,
             "created_at": state.created_at,
-            "created_at_human": _format_timestamp(state.created_at),
             "last_updated": state.last_updated,
-            "last_updated_human": _format_timestamp(state.last_updated),
         }

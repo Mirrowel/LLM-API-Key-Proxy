@@ -100,122 +100,40 @@ async def test_in_memory_store_prunes_oldest_when_max_items_exceeded() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_cache_store_serializes_json_and_does_not_clear_without_key_delete() -> None:
-    class FakeProviderCache:
-        def __init__(self) -> None:
-            self.values = {}
-
-        async def store_async(self, key: str, value: str) -> None:
-            json.loads(value)
-            self.values[key] = value
-
-        async def retrieve_async(self, key: str):
-            return self.values.get(key)
-
-    cache = FakeProviderCache()
-    store = ProviderCacheResponsesStore(cache)
-    stored = _stored("resp_provider_cache")
+async def test_engine_store_serializes_json_and_keeps_unrelated_rows() -> None:
+    store = ProviderCacheResponsesStore()
+    stored = _stored("resp_engine")
+    other = _stored("resp_other")
 
     await store.save(stored)
+    await store.save(other)
     loaded = await store.get(stored.id)
 
     assert loaded is not None
     assert loaded.id == stored.id
     assert await store.list_input_items(stored.id) == stored.input_items
-    assert await store.delete(stored.id) is False
-    assert cache.values
+    assert await store.delete(stored.id) is True
+    assert await store.get(stored.id) is None
+    assert await store.get(other.id) is not None
 
 
 @pytest.mark.asyncio
-async def test_provider_cache_response_ids_cannot_collide_after_encoding() -> None:
-    class FakeProviderCache:
-        def __init__(self) -> None:
-            self.values = {}
-
-        async def store_async(self, key: str, value: str) -> None:
-            self.values[key] = value
-
-        async def retrieve_async(self, key: str):
-            return self.values.get(key)
-
-    cache = FakeProviderCache()
-    store = ProviderCacheResponsesStore(cache)
+async def test_engine_response_ids_cannot_collide_after_encoding() -> None:
+    store = ProviderCacheResponsesStore()
     slash = _stored("resp/a")
     underscore = _stored("resp_a")
 
     await store.save(slash)
     await store.save(underscore)
 
-    assert len(cache.values) == 2
+    assert store._backend().size() == 2
     assert (await store.get("resp/a")).id == "resp/a"
     assert (await store.get("resp_a")).id == "resp_a"
 
 
 @pytest.mark.asyncio
-async def test_provider_cache_store_safely_migrates_matching_legacy_entry() -> None:
-    class FakeProviderCache:
-        def __init__(self) -> None:
-            self.values = {}
-
-        async def store_async(self, key: str, value: str) -> None:
-            self.values[key] = value
-
-        async def retrieve_async(self, key: str):
-            return self.values.get(key)
-
-        async def delete_async(self, key: str) -> bool:
-            return self.values.pop(key, None) is not None
-
-    cache = FakeProviderCache()
-    store = ProviderCacheResponsesStore(cache)
-    stored = _stored("resp_legacy")
-    cache.values["responses:resp_legacy"] = json.dumps(stored.to_dict())
-
-    loaded = await store.get(stored.id)
-
-    assert loaded is not None
-    assert loaded.id == stored.id
-    assert "responses:resp_legacy" not in cache.values
-    assert len(cache.values) == 1
-
-
-@pytest.mark.asyncio
-async def test_provider_cache_store_rejects_ambiguous_legacy_collision() -> None:
-    class FakeProviderCache:
-        def __init__(self) -> None:
-            self.values = {}
-
-        async def store_async(self, key: str, value: str) -> None:
-            self.values[key] = value
-
-        async def retrieve_async(self, key: str):
-            return self.values.get(key)
-
-    cache = FakeProviderCache()
-    store = ProviderCacheResponsesStore(cache)
-    collided = _stored("resp_a")
-    cache.values["responses:resp_a"] = json.dumps(collided.to_dict())
-
-    assert await store.get("resp/a") is None
-    assert cache.values["responses:resp_a"]
-
-
-@pytest.mark.asyncio
-async def test_provider_cache_store_uses_key_delete_when_available() -> None:
-    class FakeProviderCache:
-        def __init__(self) -> None:
-            self.values = {}
-
-        async def store_async(self, key: str, value: str) -> None:
-            self.values[key] = value
-
-        async def retrieve_async(self, key: str):
-            return self.values.get(key)
-
-        async def delete_async(self, key: str) -> bool:
-            return self.values.pop(key, None) is not None
-
-    store = ProviderCacheResponsesStore(FakeProviderCache())
+async def test_engine_store_uses_key_delete() -> None:
+    store = ProviderCacheResponsesStore()
     stored = _stored("resp_delete")
     await store.save(stored)
 
@@ -224,30 +142,21 @@ async def test_provider_cache_store_uses_key_delete_when_available() -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_cache_store_closes_owned_cache_tasks() -> None:
-    class FakeProviderCache:
-        def __init__(self) -> None:
-            self.closed = False
-
-        async def shutdown(self) -> None:
-            self.closed = True
-
-    cache = FakeProviderCache()
-    store = ProviderCacheResponsesStore(cache)
+async def test_engine_store_close_does_not_tear_down_shared_engine() -> None:
+    store = ProviderCacheResponsesStore()
+    stored = _stored("resp_close")
+    await store.save(stored)
 
     await store.close()
 
-    assert cache.closed is True
+    assert await store.get(stored.id) is not None
 
 
 @pytest.mark.asyncio
-async def test_configured_provider_cache_store_persists_between_instances(tmp_path) -> None:
+async def test_configured_engine_store_persists_between_instances(tmp_path) -> None:
     env = {
-        "RESPONSES_STORE_BACKEND": "provider_cache",
-        "RESPONSES_STORE_CACHE_NAME": "responses_test",
-        "RESPONSES_STORE_CACHE_PREFIX": "responses",
-        "RESPONSES_STORE_CACHE_DIR": str(tmp_path),
-        "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "60",
+        "RESPONSES_STORE_BACKEND": "engine",
+        "RESPONSES_STORE_CACHE_PREFIX": "responses_durable",
         "RESPONSES_STORE_CACHE_DISK_TTL_SECONDS": "60",
     }
     first_store = create_configured_responses_store(env=env)
@@ -262,13 +171,10 @@ async def test_configured_provider_cache_store_persists_between_instances(tmp_pa
 
 
 @pytest.mark.asyncio
-async def test_configured_provider_cache_store_deletes_durable_entry(tmp_path) -> None:
+async def test_configured_engine_store_deletes_durable_entry(tmp_path) -> None:
     env = {
-        "RESPONSES_STORE_BACKEND": "provider_cache",
-        "RESPONSES_STORE_CACHE_NAME": "responses_delete_test",
-        "RESPONSES_STORE_CACHE_PREFIX": "responses",
-        "RESPONSES_STORE_CACHE_DIR": str(tmp_path),
-        "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "60",
+        "RESPONSES_STORE_BACKEND": "engine",
+        "RESPONSES_STORE_CACHE_PREFIX": "responses_delete",
         "RESPONSES_STORE_CACHE_DISK_TTL_SECONDS": "60",
     }
     first_store = create_configured_responses_store(env=env)

@@ -124,10 +124,10 @@ def test_responses_store_runtime_settings_env_overrides_json(tmp_path) -> None:
 
     settings = get_responses_store_runtime_settings(
         config=config,
-        env={"RESPONSES_STORE_BACKEND": "provider_cache", "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "30"},
+        env={"RESPONSES_STORE_BACKEND": "engine", "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "30"},
     )
 
-    assert settings.backend == "provider_cache"
+    assert settings.backend == "engine"
     assert settings.cache_name == "json_responses"
     assert settings.cache_prefix == "json_prefix"
     assert settings.cache_dir == str(tmp_path / "json-cache")

@@ -299,11 +299,8 @@ async def test_scoped_response_requires_unforgeable_access_capability() -> None:
 @pytest.mark.asyncio
 async def test_scoped_access_capability_survives_durable_store_restart(tmp_path) -> None:
     env = {
-        "RESPONSES_STORE_BACKEND": "provider_cache",
-        "RESPONSES_STORE_CACHE_NAME": "responses_capability_test",
-        "RESPONSES_STORE_CACHE_PREFIX": "responses",
-        "RESPONSES_STORE_CACHE_DIR": str(tmp_path),
-        "RESPONSES_STORE_CACHE_MEMORY_TTL_SECONDS": "60",
+        "RESPONSES_STORE_BACKEND": "engine",
+        "RESPONSES_STORE_CACHE_PREFIX": "responses_capability_test",
         "RESPONSES_STORE_CACHE_DISK_TTL_SECONDS": "60",
     }
     request = {

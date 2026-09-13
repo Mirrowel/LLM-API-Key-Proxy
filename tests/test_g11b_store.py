@@ -19,23 +19,12 @@ from rotator_library.responses import (
 from rotator_library.transaction_logger import TransactionLogger
 
 
-class _FakeCache:
-    """Minimal key-value cache mirroring the ProviderCache async surface."""
+def _put_engine_row(store, response_id: str, scope_key: str, raw: str) -> None:
+    """Write a raw JSON row directly into the store's engine namespace."""
 
-    def __init__(self) -> None:
-        self.values: dict[str, str] = {}
-
-    async def store_async(self, key: str, value: str) -> None:
-        self.values[key] = value
-
-    async def retrieve_async(self, key: str):
-        return self.values.get(key)
-
-    async def delete_async(self, key: str) -> bool:
-        return self.values.pop(key, None) is not None
-
-    async def shutdown(self) -> None:
-        return None
+    store._backend().set(
+        store._key(response_id, scope_key), raw.encode("utf-8")
+    )
 
 
 class _FailingStore:
@@ -97,9 +86,8 @@ async def test_durable_poison_expiry_degrades_to_unexpired(poison) -> None:
     """Non-numeric and non-finite expiries are unusable, not fatal: they
     degrade to ``None`` so the row lives instead of raising on every read."""
 
-    cache = _FakeCache()
-    store = ProviderCacheResponsesStore(cache)
-    cache.values[store._key("resp_test", "public")] = _raw_row(poison)
+    store = ProviderCacheResponsesStore()
+    _put_engine_row(store, "resp_test", "public", _raw_row(poison))
 
     loaded = await store.get("resp_test")
 
@@ -109,9 +97,8 @@ async def test_durable_poison_expiry_degrades_to_unexpired(poison) -> None:
 
 @pytest.mark.asyncio
 async def test_durable_negative_expiry_is_a_miss() -> None:
-    cache = _FakeCache()
-    store = ProviderCacheResponsesStore(cache)
-    cache.values[store._key("resp_test", "public")] = _raw_row(time.time() - 1)
+    store = ProviderCacheResponsesStore()
+    _put_engine_row(store, "resp_test", "public", _raw_row(time.time() - 1))
 
     assert await store.get("resp_test") is None
 
@@ -203,18 +190,19 @@ class _NativeClient:
 
 
 @pytest.mark.asyncio
-async def test_configured_store_defaults_to_provider_cache(tmp_path) -> None:
+async def test_configured_store_defaults_to_engine(tmp_path) -> None:
     store = create_configured_responses_store(env={"RESPONSES_STORE_CACHE_DIR": str(tmp_path)})
     try:
         assert isinstance(store, ProviderCacheResponsesStore)
         assert store.max_items == 10000
+        assert store._ttl_seconds == 172800
     finally:
         await store.close()
 
 
 @pytest.mark.asyncio
 async def test_durable_store_enforces_max_items() -> None:
-    store = ProviderCacheResponsesStore(_FakeCache(), max_items=2)
+    store = ProviderCacheResponsesStore(max_items=2)
     for index in range(3):
         row = _stored(f"resp_{index}")
         row.created_at = float(index + 1)
