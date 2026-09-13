@@ -23,8 +23,15 @@ Declaration shape (dict)::
       "rename": {"max_completion_tokens": "max_tokens"}
     }
 
-``map`` values that are absent from the table pass through unchanged
-(declaring an exhaustive table is the provider's choice, not ours).
+    ``map`` values that are absent from the table pass through unchanged
+    (declaring an exhaustive table is the provider's choice, not ours).
+
+    ``model_param_rules`` entries may carry ``strip_override`` (a list):
+    when present on a model it REPLACES the provider strip list for that
+    model — the escape hatch for "provider strips X globally, this model
+    allows it". It is terminal: no deep-merge with any inherited strip
+    list (scoped or provider-level), and it resolves to the ordinary
+    ``strip`` table so already-resolved configurations never carry it.
 """
 
 from __future__ import annotations
@@ -90,6 +97,15 @@ def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, prot
         per_model = model_rules.get(model)
         if isinstance(per_model, Mapping):
             for key, value in per_model.items():
+                if key == "strip_override":
+                    # Terminal model-level escape hatch: the override list
+                    # REPLACES whatever strip list the provider/scoped tables
+                    # produced for this model. It never merges — a model that
+                    # allows X must not silently re-inherit a global strip
+                    # of X added later.
+                    if isinstance(value, (list, tuple)):
+                        resolved["strip"] = list(value)
+                    continue
                 resolved[key] = _deep_merge(resolved.get(key), value, key) if key in resolved else value
     return resolved
 
@@ -98,7 +114,7 @@ class ParamRulesAdapter(PayloadAdapter):
     """Apply declared strip/clamp/map/rename rules to a request payload."""
 
     name = "param_rules"
-    supported_stages = ("request",)
+    supported_stages: tuple[str, ...] = ("request",)
 
     async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
         if not isinstance(payload, dict):

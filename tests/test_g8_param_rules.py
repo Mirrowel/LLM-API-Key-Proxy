@@ -156,3 +156,80 @@ def test_protocol_and_profile_scoped_tables():
     ctx = AdapterContext(provider="other", model="m", protocol="openai_chat", adapter_config={"param_rules": rules_config}, metadata={})
     result = asyncio.run(adapter.transform_request({"reasoning_effort": "medium"}, ctx))
     assert result["reasoning_effort"] == "medium"
+
+
+def test_strip_override_replaces_provider_strip_list():
+    """A model-level strip_override REPLACES the provider strip list for
+    that model — the escape hatch for "provider strips X globally, this
+    model allows it". Terminal: no union with the inherited list."""
+
+    adapter = _adapter()
+    rules_config = {
+        "param_rules": {"strip": ["reasoning_effort", "logit_bias", "logprobs"]},
+        "model_param_rules": {
+            "reasoner": {"strip_override": ["logit_bias"]},
+        },
+    }
+    # plain model: the provider strip list applies in full
+    base = _ctx("p", "plain", rules_config)
+    result = asyncio.run(
+        adapter.transform_request({"reasoning_effort": "low", "logit_bias": {}, "logprobs": True}, base)
+    )
+    assert result == {}
+    # reasoner: only the override list strips — effort and logprobs survive
+    overridden = _ctx("p", "reasoner", rules_config)
+    result = asyncio.run(
+        adapter.transform_request({"reasoning_effort": "low", "logit_bias": {}, "logprobs": True}, overridden)
+    )
+    assert result["reasoning_effort"] == "low"
+    assert result["logprobs"] is True
+    assert "logit_bias" not in result
+
+
+def test_strip_override_empty_list_allows_everything():
+    adapter = _adapter()
+    rules_config = {
+        "param_rules": {"strip": ["logit_bias"]},
+        "model_param_rules": {"wide": {"strip_override": []}},
+    }
+    context = _ctx("p", "wide", rules_config)
+    result = asyncio.run(adapter.transform_request({"logit_bias": {}, "logprobs": True}, context))
+    assert result == {"logit_bias": {}, "logprobs": True}
+
+
+def test_strip_override_coexists_with_other_model_rules():
+    adapter = _adapter()
+    rules_config = {
+        "param_rules": {"strip": ["reasoning_effort"], "clamp": {"temperature": [0.0, 1.0]}},
+        "model_param_rules": {
+            "reasoner": {"strip_override": [], "map": {"reasoning_effort": {"medium": "high"}}},
+        },
+    }
+    context = _ctx("p", "reasoner", rules_config)
+    result = asyncio.run(
+        adapter.transform_request({"reasoning_effort": "medium", "temperature": 2.5}, context)
+    )
+    # strip_override re-admitted the effort knob; the map and the clamp
+    # (separate rule kinds) still apply.
+    assert result["reasoning_effort"] == "high"
+    assert result["temperature"] == 1.0
+
+
+def test_declared_resolution_consumes_strip_override():
+    """declared_param_rules resolves strip_override into the ordinary
+    ``strip`` table (what get_adapter_config stores for the adapter) —
+    the resolved form never carries the escape-hatch key, keeping the
+    resolution pass idempotent over stored flat tables."""
+
+    from rotator_library.adapters.param_rules import declared_param_rules
+
+    class FakePlugin:
+        provider_env_name = "fake"
+        param_rules = {"strip": ["a"]}
+        model_param_rules = {"m": {"strip_override": ["b"]}}
+
+    overridden = declared_param_rules(FakePlugin(), "m")
+    assert overridden["strip"] == ["b"]
+    assert "strip_override" not in overridden
+    plain = declared_param_rules(FakePlugin(), "other")
+    assert plain["strip"] == ["a"]
