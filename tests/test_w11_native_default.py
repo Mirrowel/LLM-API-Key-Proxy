@@ -82,7 +82,13 @@ def test_env_api_base_override_wins_over_class_default(monkeypatch) -> None:
     plugin = _plugin("openai")
     monkeypatch.setenv("OPENAI_API_BASE", "https://override.example.internal/v1")
     assert plugin.get_provider_api_base() == "https://override.example.internal/v1"
-    assert plugin.get_native_endpoint(model="gpt-test") == "https://override.example.internal/v1/chat/completions"
+    # Responses-first default profile: the bare endpoint resolves through
+    # it; the chat face is addressed explicitly (openai:chat/...).
+    assert plugin.get_native_endpoint(model="gpt-test") == "https://override.example.internal/v1/responses"
+    assert (
+        plugin.get_native_endpoint(model="gpt-test", profile="chat")
+        == "https://override.example.internal/v1/chat/completions"
+    )
 
 
 def test_bearer_auth_header_default() -> None:

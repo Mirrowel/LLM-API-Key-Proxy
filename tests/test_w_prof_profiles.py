@@ -289,13 +289,24 @@ def test_provider_derives_endpoint_per_profile() -> None:
 def test_single_protocol_providers_ignore_profiles() -> None:
     from rotator_library.providers import PROVIDER_PLUGINS
 
+    deepseek = PROVIDER_PLUGINS["deepseek"]()
+    assert deepseek.get_protocol_name("m") in ("openai_chat", "", None)
+
+
+def test_openai_declares_two_faces_with_matching_resolution() -> None:
+    from rotator_library.providers import PROVIDER_PLUGINS
+
     openai = PROVIDER_PLUGINS["openai"]()
-    assert openai.get_protocol_name("m") == "openai_chat"
+    assert openai.get_protocol_name("m", profile="chat") == "openai_chat"
+    assert openai.get_protocol_name("m") == "responses"
+    assert openai.get_native_endpoint(model="m", profile="chat").endswith("/chat/completions")
+    assert openai.get_native_endpoint(model="m").endswith("/responses")
 
 
 def test_executor_rejects_explicit_profile_on_single_protocol_provider() -> None:
-    """openai:responses/gpt-test must fail loudly (structured 400), not be
-    silently served as chat."""
+    """groq:responses/gpt-test must fail loudly (structured 400), not be
+    silently served as chat. (openai now legitimately declares a responses
+    face, so it no longer belongs in this pin.)"""
 
     from rotator_library.client.executor import RequestExecutor
     from rotator_library.core.errors import StructuredAPIResponseError
@@ -304,11 +315,11 @@ def test_executor_rejects_explicit_profile_on_single_protocol_provider() -> None
 
     executor = RequestExecutor.__new__(RequestExecutor)
     executor._experimental_config = None
-    plugin = PROVIDER_PLUGINS["openai"]()
+    plugin = PROVIDER_PLUGINS["groq"]()
     context = RequestContext(
-        model="openai/gpt-test",
-        provider="openai",
-        kwargs={"model": "openai/gpt-test", "messages": []},
+        model="groq/gpt-test",
+        provider="groq",
+        kwargs={"model": "groq/gpt-test", "messages": []},
         streaming=False,
         credentials=[],
         deadline=0,
@@ -317,7 +328,7 @@ def test_executor_rejects_explicit_profile_on_single_protocol_provider() -> None
     )
     with pytest.raises(StructuredAPIResponseError, match="has no profiles"):
         executor._build_native_provider_context(
-            "openai", "openai/gpt-test", plugin, "sk-test", "cred-1", context, None
+            "openai", "groq/gpt-test", plugin, "sk-test", "cred-1", context, None
         )
 
 

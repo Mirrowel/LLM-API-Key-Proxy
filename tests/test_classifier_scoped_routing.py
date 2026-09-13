@@ -50,6 +50,11 @@ def test_default_completion_keeps_backward_compatible_global_pool(tmp_path, monk
     from rotator_library.providers import PROVIDER_PLUGINS
 
     monkeypatch.setattr(PROVIDER_PLUGINS["openai"](), "protocol_name", None, raising=False)
+    # Responses-first default profile would resolve through the native
+    # responses face; this fixture pins the LiteLLM backward-compat path,
+    # so the profile surface is disabled alongside the protocol.
+    monkeypatch.setattr(PROVIDER_PLUGINS["openai"](), "transport_profiles", None, raising=False)
+    monkeypatch.setattr(PROVIDER_PLUGINS["openai"](), "default_profile", None, raising=False)
 
     async def fake_acompletion(**kwargs):
         captured.update(kwargs)

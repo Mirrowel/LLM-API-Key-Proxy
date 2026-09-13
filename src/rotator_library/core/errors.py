@@ -196,7 +196,7 @@ def structured_api_response_error(
     ``classify_error`` (docs/experimental/error-reference.md 5.9): quota
     markers at any status first, then structured wire vocabulary, then the
     status ladder. Free-text participates only in the two sanctioned narrow
-    checks (context spellings; quota tokens at 400/429) — never bare
+    checks (context spellings; quota tokens at 400/402/429) — never bare
     substring tokens like "rate".
     """
 

@@ -1469,6 +1469,10 @@ _QUOTA_MESSAGE_TOKENS = (
     "insufficient_quota",
     "spend limit",
     "billing",
+    # 402 bodies on aggregator gateways (chutes/nanogpt-style): wallet
+    # and subscription-balance exhaustion wording.
+    "insufficient balance",
+    "account balance",
 )
 
 
@@ -1526,9 +1530,10 @@ def _structured_quota_signal(
     if isinstance(body_code, int) and body_code == 429 and status_code != 429:
         return True
     # Sanctioned narrow message sniff: quota words only, and only where
-    # quota-vs-rate ambiguity exists (400 rescue + bare-text 429 bodies
-    # without structured fields).
-    if status_code in (400, 429):
+    # quota-vs-rate ambiguity exists (400 rescue, bare-text 429 bodies,
+    # and payment-required 402 — credit/balance exhaustion is quota by
+    # definition on aggregator gateways).
+    if status_code in (400, 402, 429):
         lowered = (message or "").lower()
         if any(token in lowered for token in _QUOTA_MESSAGE_TOKENS):
             return True
