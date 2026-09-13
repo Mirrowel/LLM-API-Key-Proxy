@@ -47,6 +47,10 @@ _PROVIDER_CONFIG_KEYS = {
     "profiles",
     "model_protocols",
     "cache_replay",
+    # G8 capability table: ordered per-model rule rows (the class
+    # ``model_rules`` declaration, configurable from JSON; rows append
+    # after the class rows so config overrides code).
+    "model_rules",
 }
 _HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 # Parsed-config cache keyed by (path, mtime) — the request path must never
@@ -147,6 +151,9 @@ class ProviderRuntimeConfig:
     # G2 hooks: JSON provider ``hooks`` entries (names/objects) that add to
     # the provider class declaration. None means "not configured".
     hooks: Optional[tuple[Any, ...]] = None
+    # G8 capability table: ordered per-model rule rows appending after the
+    # provider class ``model_rules`` declaration (config overrides code).
+    model_rules: tuple[dict[str, Any], ...] = ()
     # D13 transport profiles (fix-pass G7): multi-variant providers declare
     # profiles in JSON; dynamic providers bind them onto the instance.
     transport_profiles: Optional[dict[str, dict[str, Any]]] = None
@@ -380,6 +387,7 @@ def get_provider_runtime_config(
     field_cache_rules = _configured_provider_field_cache(provider, model, raw.get("field_cache"))
     model_quota_groups = _configured_quota_groups(raw.get("model_quota_groups")) if "model_quota_groups" in raw else None
     hooks = _configured_hooks(raw.get("hooks")) if "hooks" in raw else None
+    model_rules = _configured_model_rules(raw.get("model_rules")) if "model_rules" in raw else ()
     transport_profiles = _configured_transport_profiles(_profiles_raw(raw))
     default_profile = _configured_default_profile(raw.get("default_profile"), transport_profiles)
     return ProviderRuntimeConfig(
@@ -395,6 +403,7 @@ def get_provider_runtime_config(
         field_cache_rules=field_cache_rules,
         model_quota_groups=model_quota_groups,
         hooks=hooks,
+        model_rules=model_rules,
         transport_profiles=transport_profiles,
         default_profile=default_profile,
     )
@@ -535,6 +544,8 @@ def _validate_provider_sections(value: Any) -> None:
             as_bool(raw.get("native_streaming_supported"), name="providers.native_streaming_supported")
         if "model_quota_groups" in raw:
             _configured_quota_groups(raw.get("model_quota_groups"))
+        if "model_rules" in raw:
+            _configured_model_rules(raw.get("model_rules"))
         if "hooks" in raw:
             _configured_hooks(raw.get("hooks"))
 
@@ -945,6 +956,86 @@ def _configured_quota_groups(value: Any) -> dict[str, list[str]]:
     return result
 
 
+_MODEL_RULE_ROW_KEYS = frozenset(
+    {"match", "strip", "clamp", "map", "rename", "strip_override", "effort_map", "allow", "deny"}
+)
+
+
+def _configured_model_rules(value: Any) -> tuple[dict[str, Any], ...]:
+    """Validate the JSON ``model_rules`` capability table (G8).
+
+    Shape mirrors the class declaration: an ordered list of rows, each
+    with a non-empty ``match`` wildcard and the param-rule vocabulary
+    inline (plus ``effort_map`` sugar and ``allow``/``deny`` face lists).
+    """
+
+    if value in (None, [], ()):
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise ExperimentalConfigError("providers.model_rules must be a list of rule rows")
+    rows: list[dict[str, Any]] = []
+    for row in value:
+        if not isinstance(row, Mapping):
+            raise ExperimentalConfigError("providers.model_rules rows must be objects")
+        unsupported = set(str(key) for key in row) - _MODEL_RULE_ROW_KEYS
+        if unsupported:
+            raise ExperimentalConfigError(
+                f"providers.model_rules rows contain unsupported keys: {', '.join(sorted(unsupported))}"
+            )
+        match = row.get("match")
+        if not isinstance(match, str) or not match.strip():
+            raise ExperimentalConfigError("providers.model_rules rows require a non-empty 'match' wildcard")
+        _validate_model_rule_row(row)
+        rows.append({str(key): item for key, item in row.items()})
+    return tuple(rows)
+
+
+def _validate_model_rule_row(row: Mapping[str, Any]) -> None:
+    strip = row.get("strip")
+    if "strip" in row and (not isinstance(strip, list) or not all(isinstance(item, str) for item in strip)):
+        raise ExperimentalConfigError("providers.model_rules strip must be a string array")
+    strip_override = row.get("strip_override")
+    if "strip_override" in row and (
+        not isinstance(strip_override, list) or not all(isinstance(item, str) for item in strip_override)
+    ):
+        raise ExperimentalConfigError("providers.model_rules strip_override must be a string array")
+    clamp = row.get("clamp")
+    if "clamp" in row:
+        if not isinstance(clamp, Mapping) or not clamp:
+            raise ExperimentalConfigError("providers.model_rules clamp must be an object")
+        for parameter, bounds in clamp.items():
+            if (
+                not isinstance(bounds, (list, tuple))
+                or len(bounds) != 2
+                or not all(isinstance(bound, (int, float)) and not isinstance(bound, bool) for bound in bounds)
+            ):
+                raise ExperimentalConfigError(
+                    f"providers.model_rules clamp.{parameter} must be a [min, max] number pair"
+                )
+    maps = row.get("map")
+    if "map" in row and (not isinstance(maps, Mapping) or not all(isinstance(table, Mapping) for table in maps.values())):
+        raise ExperimentalConfigError("providers.model_rules map must map parameters to value tables")
+    effort = row.get("effort_map")
+    if "effort_map" in row and (not isinstance(effort, Mapping) or not all(isinstance(item, str) for item in effort.values())):
+        raise ExperimentalConfigError("providers.model_rules effort_map must map effort values to strings")
+    rename = row.get("rename")
+    if "rename" in row and (
+        not isinstance(rename, Mapping)
+        or not all(isinstance(old, str) and isinstance(new, str) for old, new in rename.items())
+    ):
+        raise ExperimentalConfigError("providers.model_rules rename must map old names to new names")
+    for face_key in ("allow", "deny"):
+        faces = row.get(face_key)
+        if face_key in row and (
+            not isinstance(faces, list)
+            or not faces
+            or not all(isinstance(face, str) and face.strip() for face in faces)
+        ):
+            raise ExperimentalConfigError(
+                f"providers.model_rules {face_key} must be a non-empty list of protocol names"
+            )
+
+
 def _pricing_from_env(provider: str, model: str, env: Mapping[str, str]) -> Optional[ModelPricing]:
     suffixes = {
         "input": "INPUT",
@@ -1059,8 +1150,10 @@ def _field_cache_rule_from_dict(data: Mapping[str, Any]) -> FieldCacheRule:
     try:
         return FieldCacheRule(
             name=str(data["name"]),
-            source=str(data["source"]),
-            path=str(data["path"]),
+            source=_optional_string(data.get("source")),
+            path=str(data.get("path", "")),
+            field=_optional_string(data.get("field")),
+            sources=tuple(str(item) for item in data["sources"]) if isinstance(data.get("sources"), list) else None,
             cache_key=_optional_string(data.get("cache_key")),
             mode=str(data.get("mode", "turn")),
             turn_count=max(1, int(data.get("turn_count", 1) or 1)),

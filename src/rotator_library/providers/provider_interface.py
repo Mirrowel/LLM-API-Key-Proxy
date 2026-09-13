@@ -383,6 +383,18 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     hooks: Tuple[Any, ...] = ()
     field_cache_rules: Tuple[Any, ...] = ()
     native_streaming_supported: bool = False
+    # G8 capability table: an ORDERED cascade of per-model rule rows
+    # (top-to-bottom like CSS — later rows override conflicting keys,
+    # non-conflicting keys inherit). Each row is
+    # ``{"match": <fnmatch wildcard on the model id, case-insensitive>, ...}``
+    # with the param_rules vocabulary inline (strip, clamp, map, rename,
+    # strip_override), ``effort_map`` (sugar compiling to a map on
+    # reasoning_effort), and ``allow``/``deny`` protocol lists (per-model
+    # face limiting — a face outside allow, or in deny, is refused with an
+    # error naming the row). ``*`` is the provider-default row. JSON
+    # runtime config ``model_rules`` rows append after these (config
+    # overrides code). Supersedes ``model_param_rules`` (kept as a bridge).
+    model_rules: Tuple[Dict[str, Any], ...] = ()
     # Default transport base for native execution; env ``{PROVIDER}_API_BASE``
     # overrides. Providers without a stable public base (dynamic/config
     # defined) leave this None.
@@ -519,8 +531,19 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         profile always decides the dialect — a runtime ``protocol_name``
         override applies only to profile-less requests (a silent override
         of an explicit ``provider:profile`` address is forbidden).
+
+        G8 model_rules face limiting: when the resolved model's
+        capability-table rows refuse the face (outside ``allow``, or in
+        ``deny``), resolution raises ``ModelRulesFaceError`` naming the
+        deciding row instead of returning a protocol the model rejects.
         """
 
+        protocol = self._declared_protocol_name(model, profile)
+        if protocol:
+            self._enforce_model_rules_faces(model, protocol)
+        return protocol
+
+    def _declared_protocol_name(self, model: str = "", profile: Optional[str] = None) -> Optional[str]:
         profiles = self._speaks_profiles()
         if profiles:
             from ..routing.profiles import ModelReferenceError
@@ -575,6 +598,25 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         )
         return _resolved_speaks_profiles(normalized)
 
+    def _model_rules_rows(self, model: str = "") -> Tuple[Dict[str, Any], ...]:
+        """Capability-table rows for a model: class declaration + JSON config."""
+
+        rows = tuple(self.model_rules or ())
+        configured = getattr(self._get_runtime_config(model), "model_rules", None) or ()
+        return rows + tuple(configured)
+
+    def _enforce_model_rules_faces(self, model: str, protocol: str) -> None:
+        """Refuse a face the model's capability-table rows limit away."""
+
+        if not model:
+            return
+        rows = self._model_rules_rows(model)
+        if not rows:
+            return
+        from ..adapters.param_rules import enforce_model_rules_faces
+
+        enforce_model_rules_faces(rows, model, protocol, provider=self._provider_config_key())
+
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
         """Return ordered adapter names for this provider/model.
 
@@ -604,7 +646,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         if "param_rules" in adapter_names and "param_rules" not in config:
             from ..adapters.param_rules import declared_param_rules
 
-            rules = declared_param_rules(self, model)
+            runtime_rows = getattr(self._get_runtime_config(model), "model_rules", None) or ()
+            rules = declared_param_rules(
+                self,
+                model,
+                {"model_rules": list(runtime_rows)} if runtime_rows else None,
+            )
             if rules:
                 # Resolved tables (provider+model merged) — the adapter's
                 # own resolution pass is idempotent over them.

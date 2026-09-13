@@ -1250,6 +1250,14 @@ def _redact_field_cache_paths(data: Any, context: NativeProviderContext, directi
     redacted = serialize_value(deepcopy(data))
     for rule in context.field_cache_rules:
         paths: list[str] = []
+        if rule.field:
+            # Field-addressed rules carry no literal paths at declaration;
+            # redact every registry location of the field (conservative
+            # across families until derivation narrows them per face).
+            from ..protocols.defaults import FIELD_LOCATIONS
+
+            for slots in FIELD_LOCATIONS.get(rule.field, {}).values():
+                paths.extend(str(value) for value in slots.values() if value)
         if direction == "request" and rule.inject:
             paths.append(rule.inject.path)
         if direction == "metadata" and rule.inject and rule.inject.target == "metadata":

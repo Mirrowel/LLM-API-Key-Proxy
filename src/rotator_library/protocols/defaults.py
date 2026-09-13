@@ -203,6 +203,21 @@ FIELD_LOCATIONS: Dict[str, Dict[str, Dict[str, str]]] = {
 }
 
 
+def protocol_family(protocol: str) -> str:
+    """Wire family of a protocol (variants resolve to their base family).
+
+    The same table lookup ``field_locations`` uses, exposed for callers
+    (native execution contexts) that must tag a payload with its family so
+    field-addressed cache rules can resolve registry locations.
+    """
+
+    text = str(protocol or "")
+    entry = PROTOCOL_DEFAULTS.get(text)
+    if entry and entry.get("family"):
+        return str(entry["family"])
+    return text
+
+
 def field_locations(field: str, protocol: str) -> Optional[Dict[str, str]]:
     family = PROTOCOL_DEFAULTS.get(str(protocol), {}).get("family", protocol)
     return FIELD_LOCATIONS.get(str(field), {}).get(family)

@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Iterable, Optional
 
 from .paths import FieldCachePathError, extract_path, inject_path, parse_path
@@ -19,10 +19,21 @@ from .store import (
     InMemoryFieldCacheStore,
     _bounded_set_value,
 )
-from .types import FieldCacheContext, FieldCacheRule
+from .types import FieldCacheContext, FieldCacheInjection, FieldCacheRule
 
 
 _LOGGER = logging.getLogger("rotator_library.field_cache")
+
+# Registry slot per extraction source (G8 field addressing). Unified
+# payloads mirror the provider wire shape of the executing face, so they
+# resolve through the same slots. Request-side sources have no registry
+# slot: a field rule watching requests declares its path explicitly.
+_SOURCE_LOCATION_SLOTS: dict[str, str] = {
+    "response": "response_path",
+    "unified_response": "response_path",
+    "stream_event": "stream_path",
+    "unified_stream_event": "stream_path",
+}
 
 
 @dataclass
@@ -159,18 +170,57 @@ class FieldCacheEngine:
     def __init__(self, rules: Iterable[FieldCacheRule], store: Optional[FieldCacheStore] = None) -> None:
         self.rules = tuple(rules)
         self.store = store or InMemoryFieldCacheStore()
+        # Multi-source convenience: one declared rule with sources=(a, b)
+        # becomes sibling rules sharing one cache key BEFORE validation, so
+        # name-uniqueness and the shared-key signature contract govern the
+        # rules the engine actually executes.
+        self._expanded_rules = self._expand_rule_sources(self.rules)
+        # Field-addressed rules derive per protocol family, once per
+        # (rule, family); the derivation cache lives on the engine.
+        self._derived_rules: dict[tuple[str, Optional[str]], FieldCacheRule] = {}
         self._validate_rules()
+
+    @staticmethod
+    def _expand_rule_sources(rules: tuple[FieldCacheRule, ...]) -> tuple[FieldCacheRule, ...]:
+        expanded: list[FieldCacheRule] = []
+        for rule in rules:
+            sources = rule.sources
+            if sources is None:
+                expanded.append(rule)
+                continue
+            unique = tuple(dict.fromkeys(sources))
+            for source in unique:
+                expanded.append(
+                    replace(
+                        rule,
+                        source=source,  # type: ignore[arg-type]
+                        sources=None,
+                        name=rule.name if len(unique) == 1 else f"{rule.name}.{source}",
+                        # Twins share one store entry: the shared cache key
+                        # is the declared key or the base rule name.
+                        cache_key=rule.cache_key or rule.name,
+                    )
+                )
+        return tuple(expanded)
 
     def _validate_rules(self) -> None:
         names: set[str] = set()
         shared_keys: dict[str, tuple[Any, ...]] = {}
-        for rule in self.rules:
+        for rule in self._expanded_rules:
             if rule.name in names:
                 raise ValueError(f"Duplicate field-cache rule name: {rule.name}")
             names.add(rule.name)
-            parse_path(rule.path)
+            if rule.field:
+                self._validate_field_rule(rule)
+            elif not rule.path:
+                raise ValueError(f"Field-cache rule {rule.name!r} requires a path")
+            else:
+                parse_path(rule.path)
             if rule.inject:
-                parse_path(rule.inject.path)
+                if rule.inject.path:
+                    parse_path(rule.inject.path)
+                elif not rule.field:
+                    raise ValueError(f"Field-cache rule {rule.name!r} injection requires a path")
             if rule.cache_key:
                 signature = _shared_cache_signature(rule)
                 previous = shared_keys.get(rule.cache_key)
@@ -179,6 +229,90 @@ class FieldCacheEngine:
                         f"Field-cache rules sharing cache_key {rule.cache_key!r} must use identical mode, scope, TTL, injection, and correlation behavior"
                     )
                 shared_keys[rule.cache_key] = signature
+
+    @staticmethod
+    def _validate_field_rule(rule: FieldCacheRule) -> None:
+        """Startup-style validation of a field-addressed rule.
+
+        The field must exist in the registry, and a rule without an explicit
+        extraction path must use a source the registry can resolve. Family-
+        specific gaps surface at derivation time with the same error style
+        (the family is only known once a payload executes).
+        """
+
+        from ..protocols.defaults import FIELD_LOCATIONS
+
+        if rule.field not in FIELD_LOCATIONS:
+            raise ValueError(
+                f"Unknown field {rule.field!r} addressed by field-cache rule {rule.name!r}; "
+                f"known fields: {', '.join(sorted(FIELD_LOCATIONS))}"
+            )
+        if not rule.path:
+            slot = _SOURCE_LOCATION_SLOTS.get(str(rule.source))
+            if slot is None:
+                raise ValueError(
+                    f"Field-addressed rule {rule.name!r} uses source {rule.source!r}, but the "
+                    f"field registry resolves no extraction slot for that source (declare an explicit path)"
+                )
+
+    def _derived_rule(self, rule: FieldCacheRule, family: Optional[str]) -> FieldCacheRule:
+        """Resolve a field-addressed rule against a protocol family.
+
+        Effective path/inject/metadata derive from
+        ``protocols.defaults.FIELD_LOCATIONS[field][family]`` — response and
+        stream slots follow the rule's source, the inject slot targets the
+        injection, and the tool-call-id slot feeds correlation metadata.
+        Explicit declarations override any single slot. Derived rules cache
+        on the engine per (rule, family).
+        """
+
+        if rule.field is None:
+            return rule
+        cache_key = (rule.name, family)
+        cached = self._derived_rules.get(cache_key)
+        if cached is not None:
+            return cached
+        from ..protocols.defaults import FIELD_LOCATIONS
+
+        locations = FIELD_LOCATIONS.get(rule.field) or {}
+        family_text = str(family).strip() if family else ""
+        if not family_text:
+            raise ValueError(
+                f"Field-addressed rule {rule.name!r} (field {rule.field!r}) requires a protocol "
+                "family on the field-cache context; none was provided"
+            )
+        slots = locations.get(family_text)
+        if not slots:
+            raise ValueError(
+                f"Field-addressed rule {rule.name!r} cannot serve field {rule.field!r}: protocol "
+                f"family {family_text!r} declares no field locations (known families: "
+                f"{', '.join(sorted(locations)) or 'none'})"
+            )
+
+        def location(slot_name: str, purpose: str) -> str:
+            value = slots.get(slot_name)
+            if not value:
+                raise ValueError(
+                    f"Field-addressed rule {rule.name!r} cannot serve field {rule.field!r} on "
+                    f"family {family_text!r}: the family declares no {slot_name} ({purpose}) location"
+                )
+            return str(value)
+
+        path = rule.path or location(_SOURCE_LOCATION_SLOTS[str(rule.source)], "extraction")
+        inject = rule.inject
+        if inject is None:
+            inject = FieldCacheInjection(target="request", path=location("inject_path", "injection"))
+        elif not inject.path:
+            inject = replace(inject, path=location("inject_path", "injection"))
+        metadata = dict(rule.metadata)
+        if "tool_call_id_path" not in metadata and slots.get("tool_call_id_path"):
+            metadata["tool_call_id_path"] = str(slots["tool_call_id_path"])
+        derived = replace(rule, path=path, inject=inject, metadata=metadata)
+        parse_path(derived.path)
+        if derived.inject:
+            parse_path(derived.inject.path)
+        self._derived_rules[cache_key] = derived
+        return derived
 
     async def extract(
         self,
@@ -189,7 +323,7 @@ class FieldCacheEngine:
         transaction_logger: Optional[Any] = None,
     ) -> list[FieldCacheOperation]:
         operations: list[FieldCacheOperation] = []
-        rules = self._rules_for_source(source)
+        rules = self._rules_for_source(source, getattr(context, "protocol_family", None))
         self._trace_summary(transaction_logger, "field_cache_extraction_start", payload, source=source, target=None, rules=rules, operations=operations)
         for rule in rules:
             operation = FieldCacheOperation(
@@ -236,7 +370,7 @@ class FieldCacheEngine:
     ) -> tuple[Any, list[FieldCacheOperation]]:
         updated = payload if mutate else deepcopy(payload)
         operations: list[FieldCacheOperation] = []
-        rules = self._rules_for_injection(target)
+        rules = self._rules_for_injection(target, getattr(context, "protocol_family", None))
         self._trace_summary(transaction_logger, "field_cache_injection_start", updated, source=None, target=target, rules=rules, operations=operations)
         for rule in rules:
             operation = FieldCacheOperation(
@@ -346,8 +480,12 @@ class FieldCacheEngine:
         self._trace_summary(transaction_logger, "field_cache_injection_complete", updated, source=None, target=target, rules=rules, operations=operations)
         return updated, operations
 
-    def _rules_for_source(self, source: str) -> list[FieldCacheRule]:
-        return [rule for rule in self.rules if rule.enabled and rule.source == source]
+    def _rules_for_source(self, source: str, family: Optional[str] = None) -> list[FieldCacheRule]:
+        return [
+            self._derived_rule(rule, family)
+            for rule in self._expanded_rules
+            if rule.enabled and rule.source == source
+        ]
 
     async def _lookup_compatible_sibling(
         self,
@@ -377,6 +515,7 @@ class FieldCacheEngine:
                 session_id=context.session_id,
                 conversation_id=context.conversation_id,
                 classifier=context.classifier,
+                protocol_family=getattr(context, "protocol_family", None),
                 metadata=dict(context.metadata),
             )
             sibling_key = build_cache_key(rule, sibling_context)
@@ -387,8 +526,15 @@ class FieldCacheEngine:
                 return cached, {"inherited_from": sibling.key}
         return None
 
-    def _rules_for_injection(self, target: str) -> list[FieldCacheRule]:
-        return [rule for rule in self.rules if rule.enabled and rule.inject and rule.inject.target == target]
+    def _rules_for_injection(self, target: str, family: Optional[str] = None) -> list[FieldCacheRule]:
+        rules: list[FieldCacheRule] = []
+        for rule in self._expanded_rules:
+            if not rule.enabled:
+                continue
+            derived = self._derived_rule(rule, family)
+            if derived.inject and derived.inject.target == target:
+                rules.append(derived)
+        return rules
 
     async def _store_values(self, rule: FieldCacheRule, cache_key: str, values: list[Any], payload: Any, operation: FieldCacheOperation) -> bool:
         """Store every extracted occurrence under its correlation keys.

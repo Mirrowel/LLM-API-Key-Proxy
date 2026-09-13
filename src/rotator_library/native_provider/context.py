@@ -120,7 +120,14 @@ class NativeProviderContext:
         )
 
     def field_cache_context(self) -> FieldCacheContext:
-        """Build a field-cache context with provider isolation metadata."""
+        """Build a field-cache context with provider isolation metadata.
+
+        The executing face's wire family rides along (G8 field addressing):
+        field-addressed rules resolve their effective paths from the
+        protocol registry through it.
+        """
+
+        from ..protocols.defaults import protocol_family
 
         return FieldCacheContext(
             provider=self.provider,
@@ -129,5 +136,6 @@ class NativeProviderContext:
             session_id=self.session_id,
             conversation_id=self.scope_key,
             classifier=self.classifier,
+            protocol_family=protocol_family(self.protocol_name) if self.protocol_name else None,
             metadata={"operation": self.operation, **dict(self.metadata)},
         )

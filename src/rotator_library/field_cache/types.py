@@ -56,11 +56,23 @@ class FieldCacheRule:
     Rules are protocol/provider extensions, not session-affinity logic. Session
     tracking decides continuity; field-cache rules preserve protocol state such
     as reasoning content, thought signatures, prompt cache keys, and response IDs.
+
+    G8 field addressing: a rule may declare ``field="reasoning"`` instead of
+    hand-wired paths. The engine then resolves the effective path/inject/
+    metadata from ``protocols.defaults.FIELD_LOCATIONS`` for the payload's
+    protocol family (``FieldCacheContext.protocol_family``), so ONE rule serves
+    every path-addressable face a provider speaks. Explicit path/inject/
+    metadata declarations still override any single registry slot.
+
+    ``sources=("response", "stream_event")`` is the multi-source convenience:
+    the engine expands it to sibling rules sharing one cache key (identical
+    mode/inject/TTL per the existing shared-key contract). Single ``source``
+    stays the default spelling.
     """
 
     name: str
-    source: FieldCacheSource
-    path: str
+    source: Optional[FieldCacheSource] = None
+    path: str = ""
     mode: FieldCacheMode = "turn"
     turn_count: int = 1
     scope: tuple[FieldCacheScope, ...] = DEFAULT_SCOPE
@@ -78,6 +90,13 @@ class FieldCacheRule:
     cache_key: Optional[str] = None
     max_values: Optional[int] = 1024
     max_bytes: Optional[int] = 4 * 1024 * 1024
+    # G8 field addressing: resolve paths from the protocol registry instead
+    # of declaring them (see class docstring). Mutually indifferent with the
+    # single-slot overrides: an explicit path/inject/metadata still wins.
+    field: Optional[str] = None
+    # Multi-source convenience expanded by the engine to sibling rules that
+    # share one cache key. None (the default) keeps the single-source shape.
+    sources: Optional[tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
         if not self.name or any(char in self.name for char in "/\\:"):
@@ -90,10 +109,24 @@ class FieldCacheRule:
             raise ValueError(f"Unsupported field-cache mode: {self.mode}")
         if not isinstance(self.turn_count, int) or isinstance(self.turn_count, bool) or self.turn_count <= 0:
             raise ValueError("FieldCacheRule.turn_count must be a positive integer")
-        if self.source not in _VALID_SOURCES:
-            raise ValueError(f"Unsupported field-cache source: {self.source}")
+        if self.source is not None and self.sources is not None:
+            raise ValueError(
+                "FieldCacheRule accepts either source (single) or sources (multi), not both"
+            )
+        effective_sources = self.effective_sources()
+        if not effective_sources:
+            raise ValueError("FieldCacheRule requires a source (or a non-empty sources tuple)")
+        for effective_source in effective_sources:
+            if effective_source not in _VALID_SOURCES:
+                raise ValueError(f"Unsupported field-cache source: {effective_source}")
+        if not self.field and not self.path:
+            raise ValueError(
+                f"FieldCacheRule {self.name!r} needs an explicit path or a registry field name"
+            )
         if self.inject and self.inject.target not in _VALID_TARGETS:
             raise ValueError(f"Unsupported field-cache injection target: {self.inject.target}")
+        if self.inject and not self.inject.path and not self.field:
+            raise ValueError(f"FieldCacheRule {self.name!r} injection requires a path")
         if not self.scope:
             raise ValueError("FieldCacheRule.scope must contain at least one dimension")
         invalid_scopes = [scope for scope in self.scope if scope not in _VALID_SCOPES]
@@ -135,6 +168,15 @@ class FieldCacheRule:
         # else by design).
         object.__setattr__(self, "metadata", dict(self.metadata))
 
+    def effective_sources(self) -> tuple[str, ...]:
+        """The declared source set: ``sources`` when present, else (source,)."""
+
+        if self.sources is not None:
+            return tuple(dict.fromkeys(str(source) for source in self.sources))
+        if self.source is not None:
+            return (str(self.source),)
+        return ()
+
 
 def is_provider_continuation_path(path: str) -> bool:
     normalized = path.replace("[", ".").replace("]", "")
@@ -160,6 +202,11 @@ class FieldCacheContext:
     # session IS the conversation).
     conversation_id: Optional[str] = None
     classifier: Optional[str] = None
+    # G8 field addressing: the wire family of the executing face
+    # (openai_chat, ollama, ...). Field-addressed rules resolve their
+    # effective paths from the protocol registry through this value; the
+    # native executor fills it from the executing transport face.
+    protocol_family: Optional[str] = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def value_for_scope(self, scope: FieldCacheScope) -> Optional[str]:

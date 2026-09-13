@@ -9,10 +9,10 @@ provider-bound payload. No provider hardcodes parameter hygiene in its
 own code anymore; the declarations carry it.
 
 Rule sources (later wins): provider class ``param_rules`` declaration →
-JSON runtime config ``param_rules`` → per-model overrides via
-``model_param_rules`` (capability data on the provider, config in JSON).
-Every edit is recorded through the adapter-chain trace like any wire
-change.
+JSON runtime config ``param_rules`` → per-model overrides via the ordered
+``model_rules`` capability table, or the legacy ``model_param_rules``
+mapping (capability data on the provider, config in JSON). Every edit is
+recorded through the adapter-chain trace like any wire change.
 
 Declaration shape (dict)::
 
@@ -26,23 +26,177 @@ Declaration shape (dict)::
     ``map`` values that are absent from the table pass through unchanged
     (declaring an exhaustive table is the provider's choice, not ours).
 
-    ``model_param_rules`` entries may carry ``strip_override`` (a list):
-    when present on a model it REPLACES the provider strip list for that
-    model — the escape hatch for "provider strips X globally, this model
-    allows it". It is terminal: no deep-merge with any inherited strip
-    list (scoped or provider-level), and it resolves to the ordinary
-    ``strip`` table so already-resolved configurations never carry it.
+``model_param_rules`` entries may carry ``strip_override`` (a list):
+when present on a model it REPLACES the provider strip list for that
+model — the escape hatch for "provider strips X globally, this model
+allows it". It is terminal: no deep-merge with any inherited strip
+list (scoped or provider-level), and it resolves to the ordinary
+``strip`` table so already-resolved configurations never carry it.
+``model_param_rules`` is SUPERSEDED by ``model_rules`` (kept working as
+a bridge); when both declare the same knob, the capability table wins.
+
+The capability table (``model_rules``) is an ORDERED tuple of rows, a
+top-to-bottom rule cascade::
+
+    model_rules = (
+        {"match": "*", "strip": ["logit_bias"], "effort_map": {"low": "none"}},
+        {"match": "reasoner-*", "strip": ["logprobs"], "effort_map": {"low": "high"}},
+        {"match": "gpt-5-mini", "allow": ["openai_chat"], "deny": ["responses"]},
+    )
+
+    ``match``      fnmatch wildcard on the model id, case-insensitive;
+                   ``*`` is the provider-default row.
+    row content    the param_rules vocabulary inline (strip, clamp, map,
+                   rename, strip_override) plus ``effort_map`` (sugar that
+                   compiles to a map on ``reasoning_effort``) and
+                   ``allow``/``deny`` (per-model face limiting, enforced by
+                   the provider's protocol resolution — not a param rule).
+    resolution     rows matching the model apply in order; LATER rows
+                   override conflicting keys, non-conflicting keys inherit
+                   (CSS cascade). JSON runtime ``model_rules`` rows append
+                   after the class rows, so config overrides code.
 """
 
 from __future__ import annotations
 
 import logging
 from copy import deepcopy
+from fnmatch import fnmatchcase
 from typing import Any, Dict, Mapping, Optional
 
 from .base import AdapterContext, PayloadAdapter
 
 logger = logging.getLogger("rotator_library.adapters")
+
+# Row keys that never compile into param-rule tables.
+_ROW_STRUCTURE_KEYS = frozenset({"match", "allow", "deny", "effort_map"})
+_ROW_TABLE_KEYS = frozenset({"strip", "clamp", "map", "rename", "strip_override"})
+
+
+class ModelRulesFaceError(ValueError):
+    """A model_rules row refuses the executing protocol face."""
+
+
+def _model_match_candidates(model: str, provider: str = "") -> list[str]:
+    """Case-folded match candidates for a model id.
+
+    A provider-prefixed id (``deepseek/deepseek-chat``) also matches as its
+    stripped form; nested ids (``openrouter/meta/llama``) keep their slashes
+    and simply also try the first segment stripped — the wildcard decides.
+    """
+
+    text = str(model or "")
+    if not text:
+        return []
+    candidates = [text.lower()]
+    stripped = _canonical_stripped_model(text, provider)
+    if stripped and stripped.lower() not in candidates:
+        candidates.append(stripped.lower())
+    return candidates
+
+
+def _canonical_stripped_model(model: str, provider: str = "") -> str:
+    if "/" not in model:
+        return ""
+    prefix = f"{provider}/" if provider else ""
+    if prefix and model.startswith(prefix) and len(model) > len(prefix):
+        return model[len(prefix):]
+    return model.split("/", 1)[1]
+
+
+def _row_matches(row: Mapping[str, Any], candidates: list[str]) -> bool:
+    pattern = str(row.get("match", "")).strip().lower()
+    if not pattern:
+        raise ValueError('model_rules rows require a non-empty "match" wildcard')
+    return any(fnmatchcase(candidate, pattern) for candidate in candidates)
+
+
+def resolve_model_rules(rows: Any, model: str, provider: str = "") -> Dict[str, Any]:
+    """Resolve the capability table for one model (CSS cascade).
+
+    Rows matching the model id apply top-to-bottom: later rows override
+    conflicting keys, non-conflicting keys inherit. ``effort_map`` compiles
+    to a ``map`` entry on ``reasoning_effort`` (an explicit ``map`` on the
+    same knob wins — sugar never beats a direct declaration).
+    """
+
+    if not rows or not model:
+        return {}
+    merged: Dict[str, Any] = {}
+    for row in rows:
+        if not isinstance(row, Mapping):
+            raise ValueError("model_rules rows must be objects")
+        if not _row_matches(row, _model_match_candidates(model, provider)):
+            continue
+        for key, value in row.items():
+            if key == "match":
+                continue
+            merged[key] = value
+    effort_map = merged.pop("effort_map", None)
+    if effort_map is not None:
+        if not isinstance(effort_map, Mapping):
+            raise ValueError("model_rules effort_map must be an object")
+        compiled = {"reasoning_effort": dict(effort_map)}
+        explicit = merged.get("map")
+        merged["map"] = _deep_merge(compiled, explicit, "map") if isinstance(explicit, Mapping) else compiled
+    return merged
+
+
+def model_rules_face_restriction(
+    rows: Any,
+    model: str,
+    provider: str = "",
+) -> tuple[Optional[tuple[str, ...]], Optional[tuple[str, ...]], Optional[str], Optional[str]]:
+    """Return (allow, deny, allow_row, deny_row) for a model.
+
+    The cascade decides each face list independently: the LAST matching
+    row declaring ``allow`` (resp. ``deny``) wins, and the returned row
+    pattern names the deciding declaration in refusal errors.
+    """
+
+    if not rows or not model:
+        return None, None, None, None
+    candidates = _model_match_candidates(model, provider)
+    allow: Optional[tuple[str, ...]] = None
+    deny: Optional[tuple[str, ...]] = None
+    allow_row: Optional[str] = None
+    deny_row: Optional[str] = None
+    for row in rows:
+        if not isinstance(row, Mapping) or not _row_matches(row, candidates):
+            continue
+        if "allow" in row:
+            allow = tuple(str(protocol) for protocol in row["allow"])
+            allow_row = str(row.get("match", "")).strip()
+        if "deny" in row:
+            deny = tuple(str(protocol) for protocol in row["deny"])
+            deny_row = str(row.get("match", "")).strip()
+    return allow, deny, allow_row, deny_row
+
+
+def enforce_model_rules_faces(rows: Any, model: str, protocol: str, provider: str = "") -> None:
+    """Refuse a face outside a model's allow set (or inside its deny set).
+
+    Protocol names match exactly or by wire family (a ``responses`` entry
+    governs the sibling variants). The error names the deciding row so the
+    operator can find the declaration that refused the face.
+    """
+
+    allow, deny, allow_row, deny_row = model_rules_face_restriction(rows, model, provider)
+    if allow is None and deny is None:
+        return
+    from ..protocols.defaults import protocol_family
+
+    names = {str(protocol), protocol_family(str(protocol))}
+    if deny and names & set(deny):
+        raise ModelRulesFaceError(
+            f"model_rules row {deny_row!r} denies protocol face {protocol!r} "
+            f"for model {model!r} on provider {provider!r}"
+        )
+    if allow is not None and not (names & set(allow)):
+        raise ModelRulesFaceError(
+            f"model_rules row {allow_row!r} limits model {model!r} on provider "
+            f"{provider!r} to faces {list(allow)}; {protocol!r} is outside the allowed set"
+        )
 
 
 def _deep_merge(base: Any, override: Any, kind: str = "") -> Any:
@@ -67,6 +221,30 @@ def _deep_merge(base: Any, override: Any, kind: str = "") -> Any:
 _TABLE_KEYS = ("strip", "clamp", "map", "rename")
 
 
+def _apply_model_content(resolved: Dict[str, Any], content: Mapping[str, Any]) -> Dict[str, Any]:
+    """Overlay one model-level rule content onto resolved tables.
+
+    Shared by the legacy ``model_param_rules`` entries and the capability
+    table's cascade output: table keys deep-merge (model wins per key),
+    ``strip_override`` stays the terminal strip replacement.
+    """
+
+    for key, value in content.items():
+        if key in _ROW_STRUCTURE_KEYS:
+            continue
+        if key == "strip_override":
+            # Terminal model-level escape hatch: the override list
+            # REPLACES whatever strip list the provider/scoped tables
+            # produced for this model. It never merges — a model that
+            # allows X must not silently re-inherit a global strip
+            # of X added later.
+            if isinstance(value, (list, tuple)):
+                resolved["strip"] = list(value)
+            continue
+        resolved[key] = _deep_merge(resolved.get(key), value, key) if key in resolved else value
+    return resolved
+
+
 def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, protocol: Optional[str] = None, profile: Optional[str] = None) -> Dict[str, Any]:
     """Merge provider-level rules with model-level overrides (model wins).
 
@@ -80,7 +258,7 @@ def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, prot
     """
 
     resolved: Dict[str, Any] = {}
-    wrapper_keys = ("param_rules", "model_param_rules", "by_protocol", "by_profile")
+    wrapper_keys = ("param_rules", "model_param_rules", "model_rules", "by_protocol", "by_profile")
     is_flat_tables = bool(config) and not any(key in config for key in wrapper_keys) and all(key in _TABLE_KEYS for key in config)
     provider_rules = config if is_flat_tables else config.get("param_rules")
     if isinstance(provider_rules, Mapping):
@@ -96,17 +274,15 @@ def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, prot
     if isinstance(model_rules, Mapping):
         per_model = model_rules.get(model)
         if isinstance(per_model, Mapping):
-            for key, value in per_model.items():
-                if key == "strip_override":
-                    # Terminal model-level escape hatch: the override list
-                    # REPLACES whatever strip list the provider/scoped tables
-                    # produced for this model. It never merges — a model that
-                    # allows X must not silently re-inherit a global strip
-                    # of X added later.
-                    if isinstance(value, (list, tuple)):
-                        resolved["strip"] = list(value)
-                    continue
-                resolved[key] = _deep_merge(resolved.get(key), value, key) if key in resolved else value
+            _apply_model_content(resolved, per_model)
+    # The capability table (G8): ordered cascade over matching rows. It
+    # applies AFTER the legacy per-model mapping — model_param_rules is
+    # the superseded bridge, the table is the successor surface.
+    capability_rows = config.get("model_rules")
+    if capability_rows:
+        content = resolve_model_rules(capability_rows, model, provider)
+        if content:
+            _apply_model_content(resolved, content)
     return resolved
 
 
@@ -182,7 +358,9 @@ def declared_param_rules(provider_plugin: Any, model: str = "", runtime_config: 
     """Resolve the effective param rules for a provider+model.
 
     Class declaration ``param_rules`` (code) is the base; JSON runtime
-    config extends it; ``model_param_rules`` overrides per model.
+    config extends it; the ordered ``model_rules`` capability table (class
+    rows first, JSON rows appended after — config overrides code) and the
+    legacy ``model_param_rules`` override per model.
     """
 
     config: Dict[str, Any] = {}
@@ -192,9 +370,15 @@ def declared_param_rules(provider_plugin: Any, model: str = "", runtime_config: 
     class_model_rules = getattr(provider_plugin, "model_param_rules", None)
     if isinstance(class_model_rules, Mapping):
         config["model_param_rules"] = dict(class_model_rules)
+    capability_rows: list[Any] = list(getattr(provider_plugin, "model_rules", None) or ())
     if isinstance(runtime_config, Mapping):
         for key in ("param_rules", "model_param_rules"):
             value = runtime_config.get(key)
             if isinstance(value, Mapping):
                 config[key] = {**config.get(key, {}), **value}
+        runtime_rows = runtime_config.get("model_rules")
+        if isinstance(runtime_rows, (list, tuple)):
+            capability_rows.extend(runtime_rows)
+    if capability_rows:
+        config["model_rules"] = capability_rows
     return _resolve_rules(getattr(provider_plugin, "provider_env_name", "") or "", model, config)
