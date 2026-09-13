@@ -328,27 +328,18 @@ def add_conversion_warning(
 ) -> None:
     """Record a deliberate omission of an optional conversion hint.
 
-    Deduplicated on (code, message, field, target): build_request may run
-    more than once for one request (retry/rotation passes over the same
-    canonical object).
+    Delegates to the one canonical writer (G10 Phase B follow-up): the
+    dedup key includes the source, and the shape no longer depends on
+    which module noticed the drop.
     """
 
-    for warning in request.warnings:
-        if (
-            warning.code == code
-            and warning.message == message
-            and warning.field == field
-            and warning.target_protocol == target_protocol
-        ):
-            return
-    request.warnings.append(
-        ConversionWarning(
-            code=code,
-            message=message,
-            field=field,
-            source_protocol=request.source_protocol,
-            target_protocol=target_protocol,
-        )
+    record_conversion_warning(
+        request.warnings,
+        code=code,
+        message=message,
+        field=field,
+        source_protocol=request.source_protocol,
+        target_protocol=target_protocol,
     )
 
 
@@ -786,16 +777,14 @@ def disclose_response_drops(unified_response: Any, target_protocol: str) -> None
     from .types import ConversionWarning  # local import: avoid cycles
 
     def _disclose(code: str, message: str, field: str) -> None:
-        if not any(w.code == code and w.message == message for w in unified_response.warnings):
-            unified_response.warnings.append(
-                ConversionWarning(
-                    code=code,
-                    message=message,
-                    field=field,
-                    source_protocol=getattr(unified_response, "source_protocol", None),
-                    target_protocol=target_protocol,
-                )
-            )
+        record_conversion_warning(
+            unified_response.warnings,
+            code=code,
+            message=message,
+            field=field,
+            source_protocol=getattr(unified_response, "source_protocol", None),
+            target_protocol=target_protocol,
+        )
 
     stop_reason = getattr(unified_response, "stop_reason", None)
     if stop_reason == "pause" and target_protocol != "anthropic_messages":
@@ -880,37 +869,6 @@ def attach_conversion_summary(payload: dict[str, Any], unified_response: Any) ->
     log, never on the client payload. Returns the payload untouched."""
 
     return payload
-
-
-def conversion_summary(
-    warnings: list[Any],
-) -> dict[str, Any] | None:
-    """Render recorded conversion warnings as a wire-safe summary block.
-
-    Returned as the value of the response's ``x-proxy-conversion`` extension
-    key: present only when warnings exist, never fabricated, and never on
-    raw-passthrough (same-protocol fast) responses, which produce no warnings.
-    """
-
-    entries = [w for w in warnings if getattr(w, "code", None)]
-    if not entries:
-        return None
-    rendered: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
-    for warning in entries:
-        key = (getattr(warning, "code", None), getattr(warning, "message", None), getattr(warning, "field", None), getattr(warning, "target_protocol", None))
-        if key in seen:
-            continue
-        seen.add(key)
-        rendered.append(
-            {
-                "code": warning.code,
-                "message": warning.message,
-                "field": warning.field,
-                "target": getattr(warning, "target_protocol", None),
-            }
-        )
-    return {"warnings": rendered}
 
 
 def retain_supported_generation_params(

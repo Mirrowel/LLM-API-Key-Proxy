@@ -1314,15 +1314,16 @@ def _format_anthropic_media(block: ContentBlock, *, preserve_source: bool, warni
     # Cache/citation/transform hints on the block extras are provider
     # policy, not portable semantics — cross-protocol drops are recorded.
     if not preserve_source and warnings is not None:
+        from .canonical import record_conversion_warning
+
         for dropped_hint in ("cache_control", "citations", "transformations"):
             if dropped_hint in (block.extra or {}) or (isinstance(block.raw, dict) and dropped_hint in block.raw):
-                warnings.append(
-                    ConversionWarning(
-                        code="unsupported_optional_control",
-                        message=f"{dropped_hint} hint has no cross-protocol representation; dropped",
-                        field=dropped_hint,
-                        source_protocol=None,
-                        target_protocol="anthropic_messages",
-                    )
+                record_conversion_warning(
+                    warnings,
+                    code="unsupported_optional_control",
+                    message=f"{dropped_hint} hint has no cross-protocol representation; dropped",
+                    field=dropped_hint,
+                    source_protocol="anthropic_messages",
+                    target_protocol="anthropic_messages",
                 )
     return payload

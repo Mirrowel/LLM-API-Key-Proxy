@@ -330,6 +330,8 @@ class NativeProviderExecutor:
                 provider_request = outcome.payload
             send_endpoint = transport_view.endpoint or context.endpoint
             send_headers = transport_view.headers if transport_view.headers is not None else context.headers
+            # Late overlays (transport rewrites land after the first sink).
+            self._record_transport_overlays(context, logger)
             send_timeout = transport_view.timeout_seconds
             # G2 R14 (sent): last look at the exact outgoing wire.
             outcome = await self._fire(context, "sent", provider_request, direction="request")
@@ -405,7 +407,11 @@ class NativeProviderExecutor:
                 self._trace(context, "after_response_parsed_hooks", unified_response, direction="response", stage="adapter")
             if outcome.action is HookAction.RESPOND and outcome.payload is not None:
                 # Synthetic short-circuit: the hook answered the request; the
-                # payload is used as-is in the client's shape.
+                # payload is used as-is in the client's shape. The private
+                # disclosure channel never survives to a client (a hook
+                # echoing a count-tokens payload would otherwise leak it).
+                if isinstance(outcome.payload, dict):
+                    outcome.payload.pop("_proxy_warnings", None)
                 return deepcopy(outcome.payload) if isinstance(outcome.payload, (dict, list)) else outcome.payload
             # Response-side injection (canonical target): restore cached state
             # onto the parsed unified response before it is formatted for the
@@ -662,6 +668,8 @@ class NativeProviderExecutor:
             await self._fire(context, "stream_opened", provider_request, direction="stream", transport_view=transport_view)
             send_endpoint = transport_view.endpoint or context.endpoint
             send_headers = transport_view.headers if transport_view.headers is not None else context.headers
+            # Late overlays (transport rewrites land after the first sink).
+            self._record_transport_overlays(context, logger)
             usage_record = extract_usage_record(None, provider=context.provider, model=context.model, source="native_provider_stream")
             response_context = context.protocol_context(
                 source_protocol=protocol.name,
@@ -971,11 +979,23 @@ class NativeProviderExecutor:
 
     @staticmethod
     def _record_transport_overlays(context: NativeProviderContext, logger: Any) -> None:
-        """Sink each transport overlay into the change log (G10 Phase B)."""
+        """Sink each transport overlay into the change log (G10 Phase B).
+
+        Idempotent: overlays already sunk (by identity) are skipped, so a
+        second call after ``transport_ready``/send captures late overlays
+        (transport rewrites, validated/sent edits) without double records.
+        """
 
         if logger is None:
             return
+        sunk = getattr(context, "_sunk_overlays", None)
+        if sunk is None:
+            sunk = set()
+            context._sunk_overlays = sunk
         for overlay in context.request_transport_overlays or []:
+            if id(overlay) in sunk:
+                continue
+            sunk.add(id(overlay))
             logger.log_runtime_event("protocol", "overlay", "transport overlay", overlay)
 
     @staticmethod

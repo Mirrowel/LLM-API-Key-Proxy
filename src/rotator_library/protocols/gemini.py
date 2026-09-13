@@ -423,14 +423,15 @@ class GeminiProtocol(ProtocolAdapter):
             # success. Surface it honestly (with a recorded disclosure) rather
             # than fabricating a candidate or silently emitting an empty 200.
             # Count-token responses legitimately carry no candidates.
-            unified_response.warnings.append(
-                ConversionWarning(
-                    code="empty_candidates",
-                    message="Gemini returned no candidates and no blockReason; empty success surfaced",
-                    field="candidates",
-                    source_protocol=self.name,
-                    target_protocol=None,
-                )
+            from .canonical import record_conversion_warning
+
+            record_conversion_warning(
+                unified_response.warnings,
+                code="empty_candidates",
+                message="Gemini returned no candidates and no blockReason; empty success surfaced",
+                field="candidates",
+                source_protocol=self.name,
+                target_protocol="gemini",
             )
         return unified_response
 
@@ -1476,17 +1477,16 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, emit_opa
         else:
             # inlineData.mimeType is required: mime-less inline data drops
             # with a recorded warning rather than an invented type.
-            if warnings is not None and not any(
-                w.code == "media_dropped" and w.message == "inline media without a mimeType has no Gemini representation; dropped" for w in warnings
-            ):
-                warnings.append(
-                    ConversionWarning(
-                        code="media_dropped",
-                        message="inline media without a mimeType has no Gemini representation; dropped",
-                        field="content[media]",
-                        source_protocol=None,
-                        target_protocol="gemini",
-                    )
+            from .canonical import record_conversion_warning
+
+            if warnings is not None:
+                record_conversion_warning(
+                    warnings,
+                    code="media_dropped",
+                    message="inline media without a mimeType has no Gemini representation; dropped",
+                    field="content[media]",
+                    target_protocol="gemini",
+                    source_protocol="gemini",
                 )
             return None
     else:
@@ -1496,31 +1496,31 @@ def _format_gemini_media(block: ContentBlock, *, preserve_source: bool, emit_opa
         if source.file_id and source.url:
             # Both identities: the canonical file_id is discarded on the
             # wire (undocumented member) — disclosed, never silent.
-            if warnings is not None and not any(w.code == "fileId_dropped" for w in warnings):
-                warnings.append(
-                    ConversionWarning(
-                        code="fileId_dropped",
-                        message="fileId has no documented Gemini FileData member; dropped (the fileUri carries the identity)",
-                        field="content[media]",
-                        source_protocol=None,
-                        target_protocol="gemini",
-                    )
+            from .canonical import record_conversion_warning
+
+            if warnings is not None:
+                record_conversion_warning(
+                    warnings,
+                    code="fileId_dropped",
+                    message="fileId has no documented Gemini FileData member; dropped (the fileUri carries the identity)",
+                    field="content[media]",
+                    target_protocol="gemini",
+                    source_protocol="gemini",
                 )
         file_data: dict[str, Any] = {"fileUri": source.url or ""}
         if not file_data["fileUri"] and not source.data:
             # Nothing representable: an empty fileUri is an illegal shape —
             # disclosed, never a silent empty part.
-            if warnings is not None and not any(
-                w.code == "media_dropped" and w.message == "media without inline data or a fileUri has no Gemini part shape; dropped" for w in warnings
-            ):
-                warnings.append(
-                    ConversionWarning(
-                        code="media_dropped",
-                        message="media without inline data or a fileUri has no Gemini part shape; dropped",
-                        field="content[media]",
-                        source_protocol=None,
-                        target_protocol="gemini",
-                    )
+            from .canonical import record_conversion_warning
+
+            if warnings is not None:
+                record_conversion_warning(
+                    warnings,
+                    code="media_dropped",
+                    message="media without inline data or a fileUri has no Gemini part shape; dropped",
+                    field="content[media]",
+                    target_protocol="gemini",
+                    source_protocol="gemini",
                 )
             return None
         if source.media_type:

@@ -851,6 +851,12 @@ class RequestExecutor:
         client_protocol = get_protocol(context.input_protocol_name)
         source_protocol = get_protocol(source_protocol_name)
         if client_protocol.name == source_protocol.name:
+            # Same-protocol litellm path: the response ships as-is, but the
+            # request-side conversion notes still sink (G10 Phase B — they
+            # were silently dropped here before).
+            request_warnings = getattr(context.unified_request, "warnings", None) or []
+            if request_warnings and getattr(context, "transaction_logger", None) is not None:
+                context.transaction_logger.log_conversion_warnings(request_warnings)
             return response
         if isinstance(response, dict):
             payload = deepcopy(response)
@@ -1745,6 +1751,13 @@ class RequestExecutor:
                                         and payload_carries_opaque_state(context.protocol_request, context.input_protocol_name)
                                     ):
                                         stripped_kwargs = strip_foreign_opaque_state(kwargs, context.input_protocol_name)
+                                        if stripped_kwargs and getattr(context, "transaction_logger", None) is not None:
+                                            context.transaction_logger.log_runtime_event(
+                                                "routing",
+                                                "reactive_strip",
+                                                f"provider rejected echoed signatures; stripped {len(stripped_kwargs)} carrier(s) and retrying once",
+                                                {"carriers": [str(c.get("field", "")) for c in stripped_kwargs]},
+                                            )
                                         if stripped_kwargs:
                                             signature_strip_retried = True
                                             stripped_snapshot = deepcopy(context.protocol_request)
