@@ -1,9 +1,9 @@
 """W11 acceptance: native-by-default execution for declared providers.
 
 LiteLLM is an explicit, logged fallback — never a silent one. Every built-in
-generative provider (except custom-logic providers like deepseek, which keep
-their verified custom path until manually migrated) must resolve to native
-execution in auto mode, for both streaming and non-streaming.
+generative provider (deepseek was the last custom-logic holdout; its G8
+remake flipped it to a pure declaration) must resolve to native execution
+in auto mode, for both streaming and non-streaming.
 """
 
 import sys
@@ -20,7 +20,8 @@ from rotator_library.client.executor import (
 from rotator_library.providers import PROVIDER_PLUGINS
 
 
-#: Built-in generative providers that flipped native-by-default in W11.
+#: Built-in generative providers that flipped native-by-default in W11
+#: (deepseek joined in the G8 remake).
 NATIVE_DEFAULT_PROVIDERS = [
     "openai",
     "openrouter",
@@ -31,10 +32,13 @@ NATIVE_DEFAULT_PROVIDERS = [
     "nanogpt",
     "nvidia_nim",
     "gemini",
+    "deepseek",
 ]
 
 #: Custom-logic providers keep their verified custom path (custom-first).
-CUSTOM_FIRST_PROVIDERS = ["deepseek"]
+#: None remain since the deepseek G8 remake — a provider that opts back in
+#: joins this list (and its parametrized pin below).
+CUSTOM_FIRST_PROVIDERS: list[str] = []
 
 
 def _plugin(name: str):
@@ -58,10 +62,11 @@ def test_generative_providers_stream_native_by_default(provider: str) -> None:
     assert _should_use_native_streaming(plugin, model, None, "auto", provider) is True
 
 
-@pytest.mark.parametrize("provider", CUSTOM_FIRST_PROVIDERS)
-def test_custom_logic_providers_keep_custom_path(provider: str) -> None:
-    plugin = _plugin(provider)
-    assert plugin.has_custom_logic() is True
+def test_deepseek_g8_remake_retired_the_custom_path() -> None:
+    """The last custom-first holdout is now a pure declaration: native
+    execution, no acompletion/SSE/URL-building code of its own."""
+    plugin = _plugin("deepseek")
+    assert plugin.has_custom_logic() is False
 
 
 @pytest.mark.parametrize("provider", NATIVE_DEFAULT_PROVIDERS)
@@ -130,7 +135,9 @@ def test_litellm_fallback_identity_recorded_when_protocol_available() -> None:
 
 def test_litellm_identity_silent_for_undeclared_providers() -> None:
     """Providers without a native declaration running LiteLLM are the normal
-    path — no fallback warning is recorded for them."""
+    path — no fallback warning is recorded for them. (Every built-in
+    provider declares a protocol since the deepseek G8 remake, so the
+    undeclared case is pinned synthetically.)"""
 
     from rotator_library.client.executor import RequestExecutor
 
@@ -147,8 +154,11 @@ def test_litellm_identity_silent_for_undeclared_providers() -> None:
     class _Context:
         transaction_logger = _Logger()
 
-    plugin = _plugin("deepseek")
-    executor._record_litellm_fallback_identity(_Context(), "deepseek", plugin, "deepseek/chat", stream=False)
+    class _UndeclaredPlugin:
+        def get_protocol_name(self, model=""):
+            return None
+
+    executor._record_litellm_fallback_identity(_Context(), "undeclared", _UndeclaredPlugin(), "undeclared/chat", stream=False)
     assert recorder == []
 
 

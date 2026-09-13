@@ -106,6 +106,25 @@ def test_declared_resolution_from_plugin_class():
     assert extended["strip"] == ["n"]
 
 
+def test_resolution_is_idempotent_over_resolved_flat_tables():
+    """get_adapter_config stores the RESOLVED provider+model tables under
+    the adapter's config key; the adapter's own resolution pass must apply
+    them unchanged (the documented idempotence contract)."""
+
+    adapter = _adapter()
+    resolved = {
+        "rename": {"max_completion_tokens": "max_tokens"},
+        "map": {"reasoning_effort": {"medium": "high"}},
+    }
+    context = _ctx("fake", "fake-reasoner", resolved)
+    result = asyncio.run(
+        adapter.transform_request(
+            {"reasoning_effort": "medium", "max_completion_tokens": 8}, context
+        )
+    )
+    assert result == {"reasoning_effort": "high", "max_tokens": 8}
+
+
 def test_protocol_and_profile_scoped_tables():
     """by_protocol / by_profile sections overlay the flat base only on
     their face (the extensibility ruling: same param, different rules

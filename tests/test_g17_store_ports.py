@@ -77,15 +77,21 @@ async def test_usage_save_writes_one_row_per_credential(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_provider_cache_disk_ttl_env_flows_to_engine_row(
+async def test_provider_cache_disk_ttl_flows_to_engine_row(
     monkeypatch,
+    tmp_path: Path,
 ) -> None:
-    monkeypatch.setenv("DEEPSEEK_REASONING_DISK_TTL", "123")
-    monkeypatch.setenv("DEEPSEEK_REASONING_CACHE_TTL", "1")
+    # Pinned originally through DeepseekProvider's hand-rolled reasoning
+    # cache; the G8 remake replaced that cache with a field-cache rule, so
+    # the G17 port contract (row TTL reaches the engine row) is pinned on
+    # ProviderCache directly.
+    from rotator_library.providers.provider_cache import ProviderCache
 
-    from rotator_library.providers.deepseek_provider import DeepseekProvider
-
-    cache = DeepseekProvider()._get_reasoning_cache()
+    cache = ProviderCache(
+        cache_file=tmp_path / "reasoning_content.json",
+        disk_ttl_seconds=123,
+        env_prefix="DEEPSEEK_REASONING_CACHE",
+    )
     before = time.time()
     await cache.store_async("reasoning-key", "reasoning-value")
 

@@ -57,16 +57,25 @@ def _deep_merge(base: Any, override: Any, kind: str = "") -> Any:
     return override
 
 
+_TABLE_KEYS = ("strip", "clamp", "map", "rename")
+
+
 def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, protocol: Optional[str] = None, profile: Optional[str] = None) -> Dict[str, Any]:
     """Merge provider-level rules with model-level overrides (model wins).
 
     Protocol- and profile-scoped tables overlay the flat base when their
     key matches the executing transport (``by_protocol``/``by_profile``) —
     the same strip/clamp/map/rename vocabulary, applied only on that face.
+
+    Already-resolved flat tables (what ``get_adapter_config`` stores for
+    the declared ``param_rules`` adapter) pass through unchanged — the
+    resolution pass is idempotent over them.
     """
 
     resolved: Dict[str, Any] = {}
-    provider_rules = config.get("param_rules")
+    wrapper_keys = ("param_rules", "model_param_rules", "by_protocol", "by_profile")
+    is_flat_tables = bool(config) and not any(key in config for key in wrapper_keys) and all(key in _TABLE_KEYS for key in config)
+    provider_rules = config if is_flat_tables else config.get("param_rules")
     if isinstance(provider_rules, Mapping):
         resolved.update(provider_rules)
     for scope_key, scope_value in (("by_protocol", protocol), ("by_profile", profile)):

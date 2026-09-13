@@ -289,8 +289,11 @@ def test_provider_derives_endpoint_per_profile() -> None:
 def test_single_protocol_providers_ignore_profiles() -> None:
     from rotator_library.providers import PROVIDER_PLUGINS
 
-    deepseek = PROVIDER_PLUGINS["deepseek"]()
-    assert deepseek.get_protocol_name("m") in ("openai_chat", "", None)
+    # deepseek was the original pin but declares three faces since its G8
+    # remake; groq is the honest single-protocol example now.
+    groq = PROVIDER_PLUGINS["groq"]()
+    assert groq.get_protocol_name("m") in ("openai_chat", "", None)
+    assert groq.transport_profiles is None
 
 
 def test_openai_declares_two_faces_with_matching_resolution() -> None:
