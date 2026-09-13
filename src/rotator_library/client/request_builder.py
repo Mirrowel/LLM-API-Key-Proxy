@@ -17,6 +17,7 @@ from ..hooks.binding import make_pipeline_run
 from ..hooks.runner import run_slot
 from ..protocols import ProtocolContext, get_protocol
 from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
+from ..routing.model_args import apply_model_args_to_unified, split_model_args
 from ..routing.types import RouteTarget, RoutingDecision
 from ..session_tracking import SessionTrackingHints
 from ..transaction_logger import TransactionLogger
@@ -295,7 +296,16 @@ class RequestContextBuilder:
             private,
         )
         model = kwargs.get("model", "")
-        routing_decision = self._resolve_routing_decision(model)
+        # Model-string arguments (``model:high``): split before routing so
+        # aliases, groups, and anchors key on the clean id; the hint applies
+        # to the canonical reasoning control only when the client set none.
+        clean_model, model_args = split_model_args(model)
+        if model_args:
+            kwargs["model"] = clean_model
+            if getattr(unified_request, "model", None):
+                unified_request.model = clean_model
+            apply_model_args_to_unified(unified_request, model_args)
+        routing_decision = self._resolve_routing_decision(clean_model)
         routing_targets = routing_decision.targets if routing_decision else None
         provider = routing_targets[0].provider if routing_targets else self._provider_from_model(model)
         if not provider:
