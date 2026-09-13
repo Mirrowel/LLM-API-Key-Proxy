@@ -404,6 +404,10 @@ class NativeProviderExecutor:
             # client. Symmetric with request-side unified_request injection.
             unified_response = await self._inject_unified_response(unified_response, context, cache_engine)
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
+            # G10: the provider response is one of the two non-derivable
+            # external inputs — always a boundary, never only a trace value.
+            if logger is not None:
+                logger.log_provider_response(raw_response)
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
             if raw_basis_used and client_protocol.name == provider_protocol.name:
@@ -648,6 +652,10 @@ class NativeProviderExecutor:
                         yield RelayStreamItem(events=[], raw=raw_frame.raw, is_comment=True)
                         continue
                     raw_chunk = raw_frame.parsed
+                    # G10: provider stream frames are external inputs —
+                    # captured as boundary chunks, not just trace values.
+                    if context.transaction_logger is not None and raw_chunk is not None:
+                        context.transaction_logger.log_provider_frame(raw_chunk)
                     self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
                     if parse_stream_events_plural is not None:
                         frame_events = list(parse_stream_events_plural(raw_chunk, response_context))

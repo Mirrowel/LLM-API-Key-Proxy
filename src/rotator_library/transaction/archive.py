@@ -56,7 +56,9 @@ def archive_filename(
 
     moment = time.localtime(when if when is not None else time.time())
     parts = [
-        time.strftime("%m%d_%H%M%S", moment),
+        # Year leads: newest-N sorts by filename and a year-less stamp
+        # inverts across New Year (December would sort before January).
+        time.strftime("%Y%m%d_%H%M%S", moment),
         sanitize_component(protocol, "proto"),
     ]
     if profile:
@@ -71,7 +73,9 @@ def archive_filename(
     name = "_".join(parts) + ARCHIVE_SUFFIX
     # Windows MAX_PATH guard: leave headroom for the directory.
     if len(name) > 180:
-        digest = hex(hash(name) & 0xFFFFFFFF)[2:]
+        import hashlib
+
+        digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
         name = f"{name[:150]}_{digest}{ARCHIVE_SUFFIX}"
     return name
 
@@ -129,10 +133,20 @@ def _approx_size_json(envelope: dict[str, Any]) -> int:
 
 
 def prune_archives(retention: int, base: Optional[Path] = None) -> int:
-    """Keep only the newest ``retention`` archives; return removed count."""
+    """Keep only the newest ``retention`` archives; return removed count.
+
+    Also sweeps stale ``*.tmp`` spill/crash leftovers — they never match
+    the archive glob and would otherwise leak forever.
+    """
 
     if retention <= 0:
         return 0
+    directory = base or transactions_dir()
+    for stale in directory.glob("*.tmp"):
+        try:
+            stale.unlink()
+        except OSError:
+            pass
     paths = list(iter_archives(base))
     excess = len(paths) - retention
     removed = 0

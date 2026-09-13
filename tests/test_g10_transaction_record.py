@@ -35,7 +35,7 @@ from rotator_library.transaction_logger import (
 
 def test_archive_filename_order_and_sanitization() -> None:
     when = 1_700_000_000
-    stamp = time.strftime("%m%d_%H%M%S", time.localtime(when))
+    stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(when))
     name = archive.archive_filename(
         protocol="openai_chat",
         provider="openai",
@@ -43,7 +43,7 @@ def test_archive_filename_order_and_sanitization() -> None:
         request_id="abc123",
         when=when,
     )
-    assert name == f"{stamp}_openai_chat_openai_gpt-4_abc123.transaction.zst"
+    assert name == f"{stamp}_openai_chat_openai_gpt-4_abc123.transaction.zst"  # %Y leads: retention sorts by name
 
     with_profile = archive.archive_filename(
         protocol="openai_chat",
@@ -189,7 +189,9 @@ def test_boundary_cap_truncates_with_head_marker() -> None:
     payload = record.boundaries["client_request"]
     assert payload["__truncated__"] is True
     assert payload["original_bytes"] == 100
-    assert payload["__head__"] == "x" * 10
+    # Head is the serialized JSON slice (unified for every payload type).
+    assert len(payload["head"]) == 10
+    assert "x" in payload["head"]
     assert "client_request" in record.truncation
 
 

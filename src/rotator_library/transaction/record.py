@@ -19,9 +19,13 @@ The record is append-only: once sealed it is immutable.
 
 from __future__ import annotations
 
+import json
+import os
 import time
+import weakref
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Optional, IO
 
 # Default per-record budget before truncation/spill kicks in (16 MiB —
 # matches the G10 design; oversized streams degrade, never balloon).
@@ -59,6 +63,25 @@ class ChangeEvent:
             "value": self.value,
             "ts": round(self.timestamp, 6),
         }
+
+
+# Live unsealed records (weak — the registry never keeps them alive).
+# The writer thread sweeps this set: a record older than the orphan
+# timeout that never sealed (cancelled request, stuck context) is sealed
+# as incomplete so completed work is never silently lost.
+_LIVE_RECORDS: "weakref.WeakSet[TransactionRecord]" = weakref.WeakSet()
+ORPHAN_TIMEOUT_SECONDS = 600.0
+
+
+def sweep_orphaned_records() -> list["TransactionRecord"]:
+    """Seal and return records that lived past the orphan timeout."""
+
+    now = time.time()
+    orphans = [r for r in list(_LIVE_RECORDS) if r.sealed_at is None and now - r.created_at > ORPHAN_TIMEOUT_SECONDS]
+    for record in orphans:
+        record.truncation.setdefault("orphan", "record never sealed by its request; auto-sealed incomplete")
+        record.mark_escalation("orphan_seal")
+    return orphans
 
 
 class TransactionRecord:
@@ -108,6 +131,11 @@ class TransactionRecord:
         self.truncation: dict[str, str] = {}
         self._seq = 0
         self._approx_bytes = 0
+        # Incremental mode: sections spill to a per-request append file
+        # (RAM stays flat for huge streams); seal() reads it back once.
+        self._spill_path: Optional[Path] = None
+        self._spill_handle: Optional[IO[str]] = None
+        _LIVE_RECORDS.add(self)
 
     # -- boundaries ------------------------------------------------------
 
@@ -122,16 +150,20 @@ class TransactionRecord:
 
         if self.sealed_at is not None:
             return
+        payload = _bounded_head(payload, self.boundary_cap_bytes, self.truncation, name)
         approx = _approx_size(payload)
-        if approx > self.boundary_cap_bytes:
-            self.truncation[name] = f"boundary exceeded {self.boundary_cap_bytes} bytes; kept head only"
-            payload = _truncate_head(payload, self.boundary_cap_bytes)
-            approx = self.boundary_cap_bytes
-        previous = self.boundaries.get(name)
-        self.boundaries[name] = payload
-        if name not in self.boundary_order:
+        if name in self.boundary_order:
+            # Overwrite: refund the previous size, add the new (retries
+            # rewrite provider_request/client_egress; the ledger must
+            # track the replacement, not double-count).
+            previous = self.boundaries.get(name)
+            self._approx_bytes -= min(_approx_size(previous), self.boundary_cap_bytes)
+        else:
             self.boundary_order.append(name)
-            self._approx_bytes += approx
+        self.boundaries[name] = payload
+        self._approx_bytes += approx
+        if self._spill_handle is not None:
+            self._spill_write("boundary", name, payload)
         self._check_budget()
 
     def add_stream_chunk(self, chunk: Any) -> None:
@@ -142,6 +174,10 @@ class TransactionRecord:
         approx = _approx_size(chunk)
         if self._approx_bytes + approx > self.budget_bytes:
             self.truncation["stream_chunks"] = "record budget exceeded; later chunks dropped"
+            return
+        if self._spill_handle is not None:
+            self._spill_write("stream_chunk", None, chunk)
+            self._approx_bytes += approx
             return
         self.stream_chunks.append(chunk)
         self._approx_bytes += approx
@@ -154,6 +190,10 @@ class TransactionRecord:
         approx = _approx_size(chunk)
         if self._approx_bytes + approx > self.budget_bytes:
             self.truncation["client_chunks"] = "record budget exceeded; later chunks dropped"
+            return
+        if self._spill_handle is not None:
+            self._spill_write("client_chunk", None, chunk)
+            self._approx_bytes += approx
             return
         self.client_chunks.append(chunk)
         self._approx_bytes += approx
@@ -178,9 +218,16 @@ class TransactionRecord:
 
         if self.sealed_at is not None:
             return
+        approx_value = _approx_size(value) + 96
+        if self._approx_bytes + approx_value > self.budget_bytes:
+            # Budget gate: the EVENT survives (shape), the VALUE is dropped
+            # with an explicit flag — bounded RAM, no silent event loss.
+            self.truncation["change_log_values"] = "record budget exceeded; later change values dropped"
+            value = None
+            approx_value = 96
         self._seq += 1
         self.change_log.append(ChangeEvent(self._seq, stage, kind, detail=detail, value=value, code=code))
-        self._approx_bytes += _approx_size(value) + 96
+        self._approx_bytes += approx_value
 
     def mark_escalation(self, reason: str) -> None:
         """Flag the record as non-derivable in some aspect.
@@ -193,6 +240,8 @@ class TransactionRecord:
         know why it is there).
         """
 
+        if self.sealed_at is not None:
+            return
         if reason not in self.escalations:
             self.escalations.append(reason)
 
@@ -227,6 +276,7 @@ class TransactionRecord:
             self.sealed_at = time.time()
             if status_code is not None:
                 self.status_code = status_code
+            self._spill_drain()
         envelope = {
             "format": "proxy-transaction/2",
             "sealed_at": self.sealed_at,
@@ -262,6 +312,88 @@ class TransactionRecord:
             self.truncation.setdefault("record", f"record budget {self.budget_bytes} exceeded")
 
 
+    # -- incremental spill -------------------------------------------------
+
+    def enable_spill(self, directory: "Path") -> None:
+        """Switch to incremental mode: sections append to a per-request
+        temp file instead of accumulating in RAM."""
+
+        if self._spill_handle is not None or self.sealed_at is not None:
+            return
+        self._spill_path = directory / f".spill-{self.request_id}.jsonl"
+        self._spill_handle = open(self._spill_path, "w", encoding="utf-8")
+
+    def _spill_write(self, section: str, name: Optional[str], payload: Any) -> None:
+        if self._spill_handle is None:
+            return
+        try:
+            self._spill_handle.write(json.dumps({"s": section, "n": name, "v": payload}, default=str, ensure_ascii=False) + "\n")
+        except Exception:
+            self.truncation.setdefault("spill", "spill write failed; section lost")
+
+    def _spill_drain(self) -> None:
+        """Close the spill file and fold its sections back for sealing."""
+
+        if self._spill_handle is None:
+            return
+        try:
+            self._spill_handle.close()
+        except Exception:
+            pass
+        self._spill_handle = None
+        if self._spill_path is None or not self._spill_path.exists():
+            return
+        try:
+            with open(self._spill_path, "r", encoding="utf-8") as handle:
+                for line in handle:
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    section = entry.get("s")
+                    name = entry.get("n")
+                    value = entry.get("v")
+                    if section == "boundary" and name:
+                        self.boundaries[name] = value
+                        if name not in self.boundary_order:
+                            self.boundary_order.append(name)
+                    elif section == "stream_chunk":
+                        self.stream_chunks.append(value)
+                    elif section == "client_chunk":
+                        self.client_chunks.append(value)
+        except Exception:
+            self.truncation.setdefault("spill", "spill read-back failed")
+        finally:
+            try:
+                self._spill_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._spill_path = None
+
+
+def _bounded_head(payload: Any, cap_bytes: int, truncation: dict[str, str], name: str) -> Any:
+    """Bound ANY payload type by serialized head, with an explicit flag.
+
+    JSON is serialized once and sliced; the retained head carries a marker
+    so readers know shape was lost — the previous dict-branch kept the
+    whole payload while claiming truncation, which was worse than no cap.
+    """
+
+    approx = _approx_size(payload)
+    if approx <= cap_bytes:
+        return payload
+    truncation[name] = f"boundary exceeded {cap_bytes} bytes; serialized head kept only"
+    try:
+        text = json.dumps(payload, default=str, ensure_ascii=False)
+    except Exception:
+        return {"__truncated__": True, "reason": "unserializable payload"}
+    return {
+        "__truncated__": True,
+        "original_bytes": approx,
+        "head": text[:cap_bytes],
+    }
+
+
 def _approx_size(value: Any) -> int:
     if value is None:
         return 0
@@ -277,11 +409,3 @@ def _approx_size(value: Any) -> int:
     return 64
 
 
-def _truncate_head(payload: Any, cap_bytes: int) -> Any:
-    """Keep the head of an oversized payload with an explicit marker."""
-
-    marker = {"__truncated__": True, "original_bytes": _approx_size(payload)}
-    if isinstance(payload, (str, bytes)):
-        text = payload[:cap_bytes] if isinstance(payload, str) else payload[:cap_bytes].decode("utf-8", "replace")
-        return {"__head__": text, **marker}
-    return {"__head_json__": payload, **marker}

@@ -219,7 +219,7 @@ class TransactionLogger:
     ):
         self.enabled = enabled
         self.start_time = time.time()
-        self.request_id = str(uuid.uuid4())[:8]
+        self.request_id = uuid.uuid4().hex[:12]
         self.provider = provider
         self.trace_model = model
         self.session_id: Optional[str] = None
@@ -257,6 +257,10 @@ class TransactionLogger:
                 execution_mode=execution_mode,
             )
             self.log_dir = _get_transactions_dir()
+            if TransactionWriter.instance().mode == "incremental":
+                # Operator-ruled variant: sections spill to a per-request
+                # append file so RAM stays flat for huge streams.
+                self._record.enable_spill(self.log_dir)
         except Exception as exc:
             lib_logger.error("TransactionLogger: record init failed: %s", exc)
             self.enabled = False
@@ -352,7 +356,7 @@ class TransactionLogger:
             self._record.record_error(
                 _normalize_error_type(getattr(error, "error_type", None) or type(error).__name__),
                 scrub_sensitive_text(str(error)),
-                raw=payload,
+                raw=sanitize_for_trace(_make_json_safe(payload)) if payload is not None else None,
             )
             self._error_records.append(
                 {
@@ -381,16 +385,16 @@ class TransactionLogger:
 
     def record_attempt(self, record: Dict[str, Any]) -> None:
         if self._record is not None and isinstance(record, dict):
-            self._record.record_attempt(_make_json_safe(record))
+            self._record.record_attempt(sanitize_for_trace(_make_json_safe(record)))
 
     def record_routing(self, record: Dict[str, Any]) -> None:
         if self._record is not None and isinstance(record, dict):
-            self._record.record_routing(_make_json_safe(record))
+            self._record.record_routing(sanitize_for_trace(_make_json_safe(record)))
 
     def update_metadata(self, **fields: Any) -> None:
-        self._extra_metadata.update(_make_json_safe(dict(fields)))
+        self._extra_metadata.update(sanitize_for_trace(_make_json_safe(dict(fields))))
         if self._record is not None:
-            self._record.update_metadata(**_make_json_safe(dict(fields)))
+            self._record.update_metadata(**sanitize_for_trace(_make_json_safe(dict(fields))))
 
     def finalize_metadata(
         self,
@@ -452,7 +456,19 @@ class TransactionLogger:
     def log_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         if not self.enabled or self._record is None:
             return
-        self._record.add_client_chunk(_make_json_safe(chunk))
+        self._record.add_client_chunk(sanitize_for_trace(_make_json_safe(chunk)))
+
+    def log_provider_frame(self, chunk: Any) -> None:
+        """Record one raw provider stream frame (native path boundary)."""
+
+        if self._record is not None:
+            self._record.add_stream_chunk(_make_json_safe(chunk))
+
+    def log_provider_response(self, response_data: Dict[str, Any]) -> None:
+        """Record the provider's final response as a boundary (native path)."""
+
+        if self._record is not None:
+            self._record.set_boundary("provider_response", sanitize_for_trace(_make_json_safe(response_data)))
 
     def log_response(
         self,
@@ -672,7 +688,19 @@ class ProviderLogger:
 
     def log_response_chunk(self, chunk: str) -> None:
         if self._record is not None:
-            self._record.add_stream_chunk(chunk)
+            self._record.add_stream_chunk(chunk if isinstance(chunk, str) else _make_json_safe(chunk))
+
+    def log_provider_frame(self, chunk: Any) -> None:
+        """Record one raw provider stream frame (native path boundary)."""
+
+        if self._record is not None:
+            self._record.add_stream_chunk(_make_json_safe(chunk))
+
+    def log_provider_response(self, response_data: Dict[str, Any]) -> None:
+        """Record the provider's final response as a boundary (native path)."""
+
+        if self._record is not None:
+            self._record.set_boundary("provider_response", sanitize_for_trace(_make_json_safe(response_data)))
 
     def log_final_response(self, response_data: Dict[str, Any]) -> None:
         if self._record is not None:
@@ -688,5 +716,5 @@ class ProviderLogger:
                 "provider",
                 "provider_extra",
                 detail=str(filename),
-                value=_make_json_safe(data) if isinstance(data, dict) else str(data),
+                value=sanitize_for_trace(_make_json_safe(data)) if isinstance(data, dict) else scrub_sensitive_text(str(data)),
             )
