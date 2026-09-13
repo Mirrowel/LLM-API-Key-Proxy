@@ -142,11 +142,12 @@ def prune_archives(retention: int, base: Optional[Path] = None) -> int:
     if retention <= 0:
         return 0
     directory = base or transactions_dir()
-    for stale in directory.glob("*.tmp"):
-        try:
-            stale.unlink()
-        except OSError:
-            pass
+    for pattern in ("*.tmp", ".spill-*.jsonl"):
+        for stale in directory.glob(pattern):
+            try:
+                stale.unlink()
+            except OSError:
+                pass
     paths = list(iter_archives(base))
     excess = len(paths) - retention
     removed = 0

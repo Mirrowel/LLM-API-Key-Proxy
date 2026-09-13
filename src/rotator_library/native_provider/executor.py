@@ -342,6 +342,14 @@ class NativeProviderExecutor:
             self._trace(context, "raw_native_provider_response", raw_response, direction="response", stage="provider")
             structured_error = structured_api_response_error(raw_response)
             if structured_error:
+                # G10: failed provider payloads are external inputs too —
+                # fallback summaries quote them; they land as a boundary
+                # before the raise (best-effort, never blocks the error).
+                if logger is not None:
+                    try:
+                        logger.log_provider_response(_redact_field_cache_paths(raw_response, context, "response"))
+                    except Exception:
+                        pass
                 raise structured_error
             # G2 P1 (response_received): full power over the raw provider
             # wire before parsing/adapters.
@@ -406,8 +414,9 @@ class NativeProviderExecutor:
             await cache_engine.extract("unified_response", serialize_value(unified_response), context.field_cache_context(), transaction_logger=logger)
             # G10: the provider response is one of the two non-derivable
             # external inputs — always a boundary, never only a trace value.
+            # Field-cache paths are redacted exactly like trace values.
             if logger is not None:
-                logger.log_provider_response(raw_response)
+                logger.log_provider_response(_redact_field_cache_paths(raw_response, context, "response"))
             self._trace(context, "after_unified_response_field_cache_extraction", {"source": "unified_response"}, direction="response", stage="adapter", snapshot=False)
             self._trace(context, "native_response_protocol_selected", {"protocol": client_protocol.name}, direction="metadata", stage="protocol", snapshot=False)
             if raw_basis_used and client_protocol.name == provider_protocol.name:
@@ -653,9 +662,14 @@ class NativeProviderExecutor:
                         continue
                     raw_chunk = raw_frame.parsed
                     # G10: provider stream frames are external inputs —
-                    # captured as boundary chunks, not just trace values.
+                    # captured as boundary chunks (redacted like traces).
                     if context.transaction_logger is not None and raw_chunk is not None:
-                        context.transaction_logger.log_provider_frame(raw_chunk)
+                        try:
+                            context.transaction_logger.log_provider_frame(
+                                _redact_field_cache_paths(raw_chunk, context, "response")
+                            )
+                        except Exception:
+                            pass
                     self._trace(context, "raw_native_provider_stream_chunk", raw_chunk, direction="stream", stage="provider")
                     if parse_stream_events_plural is not None:
                         frame_events = list(parse_stream_events_plural(raw_chunk, response_context))

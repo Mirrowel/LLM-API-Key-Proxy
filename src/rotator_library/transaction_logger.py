@@ -202,6 +202,7 @@ class TransactionLogger:
         "_extra_metadata",
         "_capture_flushed",
         "sealed_envelope",
+        "_spill_dir",
     )
 
     def __init__(
@@ -235,6 +236,7 @@ class TransactionLogger:
         self._error_records: list[Dict[str, Any]] = []
         self._extra_metadata: Dict[str, Any] = {}
         self._capture_flushed = False
+        self._spill_dir: Optional[Path] = None
         self.sealed_envelope: Optional[Dict[str, Any]] = None
 
         model_name = model
@@ -258,9 +260,10 @@ class TransactionLogger:
             )
             self.log_dir = _get_transactions_dir()
             if TransactionWriter.instance().mode == "incremental":
-                # Operator-ruled variant: sections spill to a per-request
-                # append file so RAM stays flat for huge streams.
-                self._record.enable_spill(self.log_dir)
+                # Operator-ruled variant: sections lazily spill to a
+                # per-request append file once the record grows — tiny
+                # requests never pay a file create/unlink.
+                self._spill_dir = self.log_dir
         except Exception as exc:
             lib_logger.error("TransactionLogger: record init failed: %s", exc)
             self.enabled = False
@@ -462,7 +465,9 @@ class TransactionLogger:
         """Record one raw provider stream frame (native path boundary)."""
 
         if self._record is not None:
-            self._record.add_stream_chunk(_make_json_safe(chunk))
+            if self._spill_dir is not None:
+                self._record.maybe_enable_spill(self._spill_dir)
+            self._record.add_stream_chunk(sanitize_for_trace(_make_json_safe(chunk)))
 
     def log_provider_response(self, response_data: Dict[str, Any]) -> None:
         """Record the provider's final response as a boundary (native path)."""
@@ -491,6 +496,11 @@ class TransactionLogger:
 
     def _seal_and_submit(self, status_code: int) -> None:
         if not self.enabled or self._sealed or self._record is None:
+            return
+        if self._record.sealed_at is not None:
+            # The orphan reaper sealed this record while the request was
+            # still finishing — its archive stands; no duplicate submit.
+            self._sealed = True
             return
         self._sealed = True
         duration_ms = (time.time() - self.start_time) * 1000
@@ -688,13 +698,17 @@ class ProviderLogger:
 
     def log_response_chunk(self, chunk: str) -> None:
         if self._record is not None:
-            self._record.add_stream_chunk(chunk if isinstance(chunk, str) else _make_json_safe(chunk))
+            self._record.add_stream_chunk(
+                chunk if isinstance(chunk, str) else sanitize_for_trace(_make_json_safe(chunk))
+            )
 
     def log_provider_frame(self, chunk: Any) -> None:
         """Record one raw provider stream frame (native path boundary)."""
 
         if self._record is not None:
-            self._record.add_stream_chunk(_make_json_safe(chunk))
+            if self._spill_dir is not None:
+                self._record.maybe_enable_spill(self._spill_dir)
+            self._record.add_stream_chunk(sanitize_for_trace(_make_json_safe(chunk)))
 
     def log_provider_response(self, response_data: Dict[str, Any]) -> None:
         """Record the provider's final response as a boundary (native path)."""

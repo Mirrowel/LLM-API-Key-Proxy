@@ -90,7 +90,9 @@ class TransactionWriter:
     # -- lifecycle -------------------------------------------------------
 
     def start(self) -> None:
-        if self._started:
+        if self._started or self._draining:
+            # No resurrection after stop: submissions during/after drain
+            # are counted-lost by submit_sealed instead.
             return
         self._started = True
         self._thread = threading.Thread(target=self._run, name="transaction-writer", daemon=True)
@@ -113,6 +115,11 @@ class TransactionWriter:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        residual = self._queue.qsize()
+        if residual:
+            # Timeout with work still queued: say it — a silent tail loss
+            # in a record-of-truth system is worse than a loud one.
+            lib_logger.warning("transaction writer stop timed out; %d sealed records unwritten", residual)
         self._started = False
 
     # -- submission ------------------------------------------------------
@@ -123,8 +130,13 @@ class TransactionWriter:
         self.start()
         if self._draining:
             # Shutdown window: draining synchronously here would block the
-            # request; the record is logged-lost instead (warned once).
+            # request; the record is counted-lost with a warning.
             self.dropped += 1
+            lib_logger.warning(
+                "transaction writer is draining; sealed record %s not archived (%d lost)",
+                filename,
+                self.dropped,
+            )
             return
         item = {"envelope": envelope, "filename": filename}
         approx = archive._approx_size_json(envelope)
@@ -213,7 +225,13 @@ class TransactionWriter:
                     profile=orphan.profile,
                     when=orphan.created_at,
                 )
-                self._queue.put_nowait({"envelope": envelope, "filename": filename})
+                # Queue discipline applies to reaped records too: bounded
+                # wait instead of put_nowait into a possibly-full queue.
+                try:
+                    self._queue.put({"envelope": envelope, "filename": filename}, timeout=2.0)
+                except queue.Full:
+                    self.dropped += 1
+                    lib_logger.warning("orphan record %s dropped (writer queue full)", orphan.request_id)
         except Exception:
             pass
 
