@@ -16,6 +16,8 @@ from typing import (
     TYPE_CHECKING,
 )
 import os
+from functools import lru_cache
+
 import httpx
 import litellm
 
@@ -146,6 +148,41 @@ def auth_header_pair(
             raise ValueError(f"auth_header_name is required for custom auth{owner}")
         return {auth_header_name: credential_identifier}
     return {"Authorization": f"Bearer {credential_identifier}"}
+
+
+def _hashable_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _hashable_value(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_value(item) for item in value)
+    return value
+
+
+@lru_cache(maxsize=None)
+def _resolved_speaks_profiles(speaks: Tuple[Any, ...]) -> Dict[str, Dict[str, Any]]:
+    """Resolve + cache a speaks tuple (module-level so singleton provider
+    classes share one resolution; entries normalized to hashable form)."""
+
+    from ..protocols.defaults import resolve_speaks
+
+    normalized = tuple(
+        entry if isinstance(entry, str) else tuple(_hashable_value(part) for part in entry)
+        for entry in speaks
+    )
+    # resolve_speaks understands (protocol, overrides-as-pairs)
+    denormalized = tuple(
+        entry if isinstance(entry, str) else tuple(_dehashable(part) for part in entry)
+        for entry in normalized
+    )
+    return resolve_speaks(denormalized)
+
+
+def _dehashable(value: Any) -> Any:
+    if isinstance(value, tuple) and value and all(isinstance(item, tuple) and len(item) == 2 for item in value):
+        return {str(k): _dehashable(v) for k, v in value}
+    if isinstance(value, tuple):
+        return tuple(_dehashable(item) for item in value)
+    return value
 
 
 class ProviderInterface(ABC, metaclass=SingletonABCMeta):
@@ -329,6 +366,13 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # (LiteLLM is an explicit, logged fallback); undeclared providers keep
     # the LiteLLM-backed path.
     protocol_name: Optional[str] = None
+
+    # G8 envelope v2: declare what this provider speaks. Entries are
+    # "protocol" | (protocol, overrides) | (name, protocol, overrides);
+    # profile names default to protocol names, endpoints/auth/listing
+    # inherit from the protocol registry, and the first entry is the
+    # default face. See protocols/defaults.py.
+    speaks: Tuple[Any, ...] = ()
     adapter_names: Tuple[str, ...] = ()
     # Zero-credential providers (e.g. a local Ollama) declare this so routing
     # can mint the internal no-auth rotation slot when no secret is configured.
@@ -357,19 +401,76 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # rule with an ``inject.target`` of request/response/unified_*.
     cache_replay: Optional[List[Dict[str, Any]]] = None
 
-    @abstractmethod
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
-        """
-        Fetches the list of available model names from the provider's API.
+        """Fetch available models through the shared listing implementation.
 
-        Args:
-            api_key: The API key required for authentication.
-            client: An httpx.AsyncClient instance for making requests.
-
-        Returns:
-            A list of model name strings.
+        The default is protocol-aware and shared by every provider: the
+        listing face resolves from this provider's declared faces (the
+        provider's ``listing_profile`` hint wins, else the global
+        protocol priority list picks the first face with a listing
+        descriptor), and the response shape parses per the protocol's
+        descriptor (openai-family ``data[].id``, gemini/ollama
+        ``models[].name`` with prefix stripping). A failed listing is an
+        honest empty — no hardcoded fallbacks. Providers with genuinely
+        different listings override this method and win.
         """
-        pass
+
+        from ..protocols.defaults import listing_descriptor, resolve_listing_protocol
+
+        profiles = self._speaks_profiles()
+        available = tuple(
+            resolved["protocol"] for name, resolved in profiles.items() if not name.startswith("__")
+        )
+        if not available:
+            protocol = self.get_protocol_name() or "openai_chat"
+            available = (protocol,)
+        listing_protocol = getattr(self, "listing_profile", None) or resolve_listing_protocol(available)
+        if not listing_protocol:
+            return []
+        descriptor = listing_descriptor(listing_protocol)
+        if not descriptor:
+            return []
+        endpoint = self.get_native_endpoint(operation="models", profile=getattr(self, "listing_profile", None))
+        headers = await self._listing_headers(api_key, listing_protocol)
+        try:
+            response = await client.get(endpoint, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:
+            self._provider_logger().debug(f"Model listing failed for {self.__class__.__name__}: {exc}")
+            return []
+        ids = self._parse_listing_payload(payload, descriptor.get("shape"))
+        strip_prefix = descriptor.get("strip")
+        if strip_prefix:
+            ids = [model_id[len(strip_prefix):] if model_id.startswith(strip_prefix) else model_id for model_id in ids]
+        prefix = f"{self._provider_config_key()}/"
+        return [f"{prefix}{model_id}" for model_id in ids]
+
+    @staticmethod
+    def _provider_logger():
+        import logging
+
+        return logging.getLogger("rotator_library")
+
+    async def _listing_headers(self, api_key: str, listing_protocol: str) -> Dict[str, str]:
+        """Credential headers for the listing face."""
+
+        from ..protocols.defaults import default_auth_mode
+
+        mode = default_auth_mode(listing_protocol) or "bearer"
+        return auth_header_pair(api_key, mode, None, provider=self._provider_config_key())
+
+    @staticmethod
+    def _parse_listing_payload(payload: Any, shape: Optional[str]) -> List[str]:
+        if not isinstance(payload, dict) or not shape:
+            return []
+        if shape == "data_id":
+            data = payload.get("data")
+            return [entry.get("id") for entry in data if isinstance(entry, dict) and entry.get("id")]
+        if shape == "models_name":
+            data = payload.get("models")
+            return [entry.get("name") for entry in data if isinstance(entry, dict) and entry.get("name")]
+        return []
 
     # [NEW] Add methods for providers that need to bypass litellm
     def has_custom_logic(self) -> bool:
@@ -405,14 +506,35 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     def get_protocol_name(self, model: str = "", profile: Optional[str] = None) -> Optional[str]:
         """Return the native protocol adapter name this provider prefers.
 
-        Multi-profile providers (D13) resolve per profile; single-protocol
-        providers ignore the profile argument. Returning ``None`` keeps the
-        LiteLLM fallback execution behavior. An explicitly requested
+        ``speaks`` (G8 envelope v2) is the declaration surface: profile
+        names default to the protocol names, endpoints/auth inherit from
+        the protocol registry, and entries override only what differs.
+        Legacy ``transport_profiles``/``protocol_name`` declarations keep
+        working (speaks wins when both are present) while providers
+        migrate to the envelope.
+
+        Multi-profile providers resolve per profile; single-protocol
+        providers ignore the profile argument. Returning ``None`` keeps
+        the LiteLLM fallback execution behavior. An explicitly requested
         profile always decides the dialect — a runtime ``protocol_name``
         override applies only to profile-less requests (a silent override
         of an explicit ``provider:profile`` address is forbidden).
         """
 
+        profiles = self._speaks_profiles()
+        if profiles:
+            from ..routing.profiles import ModelReferenceError
+
+            if profile:
+                entry = profiles.get(profile)
+                if entry is None:
+                    raise ModelReferenceError(
+                        f"{self.__class__.__name__} has no profile {profile!r}; "
+                        f"known: {sorted(k for k in profiles if not k.startswith('__'))}"
+                    )
+                return str(entry["protocol"])
+            default = profiles.get("__default__") or {}
+            return str(default.get("protocol")) if default.get("protocol") else None
         if self.transport_profiles and profile:
             entry = self.transport_profiles.get(profile)
             if not isinstance(entry, dict):
@@ -440,6 +562,18 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             protocol = entry.get("protocol") or self.protocol_name
             return str(protocol) if protocol else None
         return self.protocol_name
+
+    def _speaks_profiles(self) -> Dict[str, Dict[str, Any]]:
+        """Resolved ``speaks`` profile table (cached per class)."""
+
+        speaks = getattr(self, "speaks", None)
+        if not speaks:
+            return {}
+        normalized = tuple(
+            entry if isinstance(entry, str) else tuple(_hashable_value(part) for part in entry)
+            for entry in speaks
+        )
+        return _resolved_speaks_profiles(normalized)
 
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
         """Return ordered adapter names for this provider/model.
@@ -628,7 +762,13 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """
 
         entry: Optional[Any] = None
-        if self.transport_profiles and profile:
+        speaks_profiles = self._speaks_profiles()
+        speaks_base: Optional[str] = None
+        if speaks_profiles:
+            resolved = speaks_profiles.get(profile or "") or speaks_profiles.get("__default__") or {}
+            entry = {"protocol": resolved.get("protocol"), "endpoint_paths": resolved.get("endpoint_paths")}
+            speaks_base = resolved.get("base")
+        elif self.transport_profiles and profile:
             entry = self.transport_profiles.get(profile) or {}
         path = declared_endpoint_path(entry, operation)
         if not path:
@@ -639,8 +779,11 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
                 protocol = str(entry.get("protocol") or entry.get("protocol_name") or "")
             if not protocol:
                 protocol = self.get_protocol_name(model, profile=profile) if profile else self.get_protocol_name(model)
-            path = self._default_endpoint_path(protocol or "", operation)
-        base = self.get_provider_api_base()
+            from ..protocols.defaults import default_endpoint_paths
+
+            inherited = default_endpoint_paths(protocol or "")
+            path = inherited.get(operation) or self._default_endpoint_path(protocol or "", operation)
+        base = speaks_base or self.get_provider_api_base()
         if not base:
             raise NotImplementedError(
                 f"{self.__class__.__name__} has no transport base; "
@@ -702,7 +845,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         auth_mode: Optional[str] = None
         auth_header_name: Optional[str] = None
-        if self.transport_profiles and profile:
+        speaks_profiles = self._speaks_profiles()
+        if speaks_profiles:
+            resolved = speaks_profiles.get(profile or "") or speaks_profiles.get("__default__") or {}
+            auth_mode = resolved.get("auth_mode")
+            auth_header_name = resolved.get("auth_header_name")
+        if auth_mode is None and self.transport_profiles and profile:
             entry = self.transport_profiles.get(profile)
             if isinstance(entry, Mapping):
                 auth_mode = entry.get("auth_mode")
