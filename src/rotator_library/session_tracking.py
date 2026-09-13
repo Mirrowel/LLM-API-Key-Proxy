@@ -44,6 +44,14 @@ _SESSION_ROW_PREFIX = "session:"
 _ANCHOR_ROW_PREFIX = "anchor:"
 
 
+def session_row_namespace(persistence_path) -> str:
+    """Row-key namespace for one tracker identity (its persistence path)."""
+
+    import hashlib as _hashlib
+
+    return _hashlib.sha256(str(persistence_path or "default").encode("utf-8")).hexdigest()[:16]
+
+
 class _EngineRowWriter:
     """Persist session/anchor rows to the ``session`` storage engine.
 
@@ -53,6 +61,13 @@ class _EngineRowWriter:
 
     def __init__(self, engine: Any) -> None:
         self._engine = engine
+
+    def __init__(self, engine: Any, namespace: str) -> None:
+        self._engine = engine
+        self._namespace = namespace
+
+    def _row(self, key: str) -> str:
+        return f"{self._namespace}:{key}"
 
     def write(self, payload: Dict[str, Dict[str, Any]]) -> bool:
         now = time.time()
@@ -64,7 +79,9 @@ class _EngineRowWriter:
                     if isinstance(expires_at, (int, float))
                     else None
                 )
-                self._engine.set(key, json.dumps(value).encode("utf-8"), ttl_seconds=ttl)
+                self._engine.set(self._row(key), json.dumps(value).encode("utf-8"), ttl_seconds=ttl)
+            # Compaction: rows pruned in memory must not linger on disk.
+            self._engine.sync_keys(self._row(""), {self._row(k) for k in payload})
             return True
         except Exception:
             return False
@@ -263,7 +280,11 @@ class SessionTracker:
         self._last_persisted_generation = 0
         self._last_save_attempt = 0.0
         self._writer: Optional[Any] = None
-        self._engine = get_engine("session")
+        # Rows are namespaced by the configured persistence path so two
+        # trackers with different data dirs never share session state; the
+        # engine itself is only created when persistence is actually on.
+        self._row_namespace = session_row_namespace(self.persistence_path)
+        self._engine = get_engine("session") if self.persist_to_disk else None
         self._lock = threading.RLock()
         self._save_io_lock = threading.Lock()
         if self.persist_to_disk:
@@ -1675,6 +1696,9 @@ class SessionTracker:
         for key, raw, _meta in rows:
             if len(raw) > self._MAX_PERSISTED_FILE_BYTES:
                 continue
+            ns_prefix = f"{self._row_namespace}:"
+            if key.startswith(ns_prefix):
+                key = key[len(ns_prefix):]
             if key.startswith(_SESSION_ROW_PREFIX):
                 payload = self._decode_row(raw)
                 if payload is not None:
@@ -1807,7 +1831,7 @@ class SessionTracker:
                 "last_seen": record.last_seen,
             }
         if self._writer is None:
-            self._writer = _EngineRowWriter(self._engine)
+            self._writer = _EngineRowWriter(self._engine, self._row_namespace)
         return self._writer, payload, self._dirty_generation
 
     def _write_save_job(

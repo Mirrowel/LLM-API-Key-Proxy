@@ -35,6 +35,7 @@ from rotator_library.protocols.types import (
 )
 from rotator_library.client.rotating_client import _resolve_session_persistence_settings
 from rotator_library.client.request_builder import RequestContextBuilder
+from rotator_library.session_tracking import session_row_namespace
 from rotator_library.storage.engine import get_engine
 
 
@@ -42,18 +43,32 @@ def _session_engine():
     return get_engine("session")
 
 
-def _put_session_row(session_id: str, payload) -> None:
+def _row(key: str, persistence_path=None) -> str:
+    from rotator_library.session_tracking import session_row_namespace
+
+    return f"{session_row_namespace(persistence_path)}:{key}"
+
+
+def _put_session_row(session_id: str, payload, persistence_path=None) -> None:
     _session_engine().set(
-        f"session:{session_id}", json.dumps(payload).encode("utf-8")
+        _row(f"session:{session_id}", persistence_path), json.dumps(payload).encode("utf-8")
     )
 
 
-def _put_anchor_row(value: str, payload) -> None:
-    _session_engine().set(f"anchor:{value}", json.dumps(payload).encode("utf-8"))
+def _put_anchor_row(value: str, payload, persistence_path=None) -> None:
+    _session_engine().set(_row(f"anchor:{value}", persistence_path), json.dumps(payload).encode("utf-8"))
 
 
 def _dump_session_rows():
-    return {key: json.loads(raw) for key, raw, _meta in _session_engine().iterate()}
+    return _dump_session_rows()
+
+
+def _dump_session_rows(persistence_path=None) -> dict:
+    prefix = f"{session_row_namespace(persistence_path)}:"
+    return {
+        key[len(prefix):]: json.loads(raw)
+        for key, raw, _meta in _session_engine().iterate(prefix=prefix)
+    }
 
 
 def _stream_protocol_context(model: str = "model") -> ProtocolContext:
@@ -3845,7 +3860,7 @@ class SessionTrackerTests(unittest.TestCase):
             )
             first = tracker.infer_session(request, provider="gemini", model="pro")
             tracker.flush()
-            persisted = _dump_session_rows()
+            persisted = _dump_session_rows(path)
             original_state = tracker._sessions[first.session_id]
             original_records = {
                 value: (record.strength, record.source, record.group)
@@ -3937,7 +3952,7 @@ class SessionTrackerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
             for session_id, session_payload in sessions.items():
-                _put_session_row(session_id, session_payload)
+                _put_session_row(session_id, session_payload, path)
             _put_anchor_row(
                 evil_anchor,
                 {
@@ -3949,6 +3964,7 @@ class SessionTrackerTests(unittest.TestCase):
                     "expires_at": now + 3600,
                     "last_seen": now,
                 },
+                path,
             )
             with patch.object(SessionTracker, "_MAX_PERSISTED_SESSIONS", 2):
                 tracker = SessionTracker(
@@ -3963,7 +3979,7 @@ class SessionTrackerTests(unittest.TestCase):
     def test_schema_three_loader_rejects_oversized_state_before_json_parsing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
-            _session_engine().set("session:big", ("{" + ("x" * 128)).encode("utf-8"))
+            _session_engine().set(_row("session:big"), ("{" + ("x" * 128)).encode("utf-8"))
             with patch.object(SessionTracker, "_MAX_PERSISTED_FILE_BYTES", 64):
                 tracker = SessionTracker(
                     ttl_seconds=3600,
@@ -4079,7 +4095,7 @@ class SessionTrackerTests(unittest.TestCase):
         for key, raw in payloads:
             with self.subTest(payload=key), tempfile.TemporaryDirectory() as temp_dir:
                 path = Path(temp_dir) / "session_stickiness.json"
-                _session_engine().set(key, raw)
+                _session_engine().set(_row(key), raw)
                 tracker = SessionTracker(
                     ttl_seconds=3600,
                     persist_to_disk=True,
@@ -4152,9 +4168,9 @@ class SessionTrackerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
             for session_id, session_payload in payload["sessions"].items():
-                _put_session_row(session_id, session_payload)
+                _put_session_row(session_id, session_payload, path)
             for value, anchor_payload in payload["anchors"].items():
-                _put_anchor_row(value, anchor_payload)
+                _put_anchor_row(value, anchor_payload, path)
             tracker = SessionTracker(
                 ttl_seconds=3600,
                 persist_to_disk=True,
@@ -4201,9 +4217,9 @@ class SessionTrackerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "session_stickiness.json"
             for session_id, session_payload in payload["sessions"].items():
-                _put_session_row(session_id, session_payload)
+                _put_session_row(session_id, session_payload, path)
             for value, anchor_payload in payload["anchors"].items():
-                _put_anchor_row(value, anchor_payload)
+                _put_anchor_row(value, anchor_payload, path)
             tracker = SessionTracker(
                 ttl_seconds=3600,
                 persist_to_disk=True,

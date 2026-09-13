@@ -339,6 +339,8 @@ def get_responses_store_runtime_settings(
     responses = active.responses if isinstance(active.responses, dict) else {}
     store = responses.get("store", {}) if isinstance(responses.get("store"), dict) else responses
     backend = str(_env_or_json(source, "RESPONSES_STORE_BACKEND", store, "backend", default="engine")).strip().lower()
+    if backend == "provider_cache":
+        backend = "engine"
     if backend not in {"memory", "engine"}:
         raise ExperimentalConfigError("RESPONSES_STORE_BACKEND must be 'memory' or 'engine'")
     return ResponsesStoreRuntimeSettings(

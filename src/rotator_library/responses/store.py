@@ -151,6 +151,7 @@ class ProviderCacheResponsesStore:
             self._key(response.id, response.scope_key or "public"),
             payload,
             ttl_seconds=self._ttl_seconds,
+            created_at=response.created_at,
         )
         await self._prune_expired()
         await self._prune_overflow()
@@ -204,14 +205,15 @@ class ProviderCacheResponsesStore:
         if not self.max_items:
             return
         engine = self._backend()
-        rows = await asyncio.to_thread(
-            lambda: [(k, m["created_at"], m["last_access"]) for k, _v, m in engine.iterate(prefix=f"{self._prefix}:")]
-        )
-        overflow = len(rows) - self.max_items
+        prefix = f"{self._prefix}:"
+        overflow = await asyncio.to_thread(engine.count_prefix, prefix) - self.max_items
         if overflow <= 0:
             return
-        rows.sort(key=lambda item: (item[1], item[2], item[0]))
-        for key, *_ in rows[:overflow]:
+        # Metadata-only trim: oldest-created rows beyond the cap, no blob
+        # reads — a save stays O(overflow), never O(all rows).
+        for key in await asyncio.to_thread(
+            engine.oldest_keys, prefix=prefix, skip=self.max_items, take=overflow
+        ):
             await engine.adelete(key)
 
     def _key(self, response_id: str, scope_key: str) -> str:

@@ -122,6 +122,8 @@ class ProviderCache:
         return f"{self._namespace}:{key}"
 
     def _write(self, key: str, value: str) -> bool:
+        if not self._enable_disk:
+            return False
         try:
             raw = value.encode("utf-8") if isinstance(value, str) else bytes(value)
         except (TypeError, ValueError):
@@ -130,6 +132,8 @@ class ProviderCache:
         return self._engine.set(self._row_key(key), raw, ttl_seconds=ttl)
 
     def _read(self, key: str, *, touch: bool = True) -> Optional[str]:
+        if not self._enable_disk:
+            return None
         raw = self._engine.get(self._row_key(key), touch=touch)
         if raw is None:
             return None

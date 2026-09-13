@@ -37,6 +37,8 @@ from typing import Any, Iterable, Iterator, Optional, Tuple
 
 from ..utils import zstd_io
 
+_engine_logger = __import__("logging").getLogger("rotator_library.storage")
+
 DEFAULT_BUSY_TIMEOUT_MS = 5000
 DEFAULT_SWEEP_INTERVAL_SECONDS = 300
 
@@ -49,6 +51,7 @@ class StorageEngine:
         path: Path,
         *,
         sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS,
+        idle_prune_seconds: float | None = None,
         start_sweeper: bool = True,
     ) -> None:
         self.path = Path(path)
@@ -64,6 +67,7 @@ class StorageEngine:
         self._init_schema()
         self.stats_counters: dict[str, int] = {"gets": 0, "misses": 0, "sets": 0, "dedupe_skips": 0, "deletes": 0, "swept": 0}
         self._sweep_interval = sweep_interval_seconds
+        self._idle_prune = idle_prune_seconds
         self._sweeper: Optional[threading.Thread] = None
         self._stop = threading.Event()
         if start_sweeper:
@@ -145,11 +149,21 @@ class StorageEngine:
                     pass
             return value
 
-    def set(self, key: str, value: bytes, *, ttl_seconds: Optional[float] = None) -> bool:
+    def set(
+        self,
+        key: str,
+        value: bytes,
+        *,
+        ttl_seconds: Optional[float] = None,
+        created_at: Optional[float] = None,
+    ) -> bool:
         """Store one row. Returns True when the blob was written, False on
-        dedupe skip (same content hash — only TTL/access refresh)."""
+        dedupe skip (same content hash — only TTL/access refresh).
+        ``created_at`` lets callers stamp the row's logical creation time
+        (eviction order follows it, not the write clock)."""
 
         now = time.time()
+        stamp = float(created_at) if created_at is not None else now
         expires_at = (now + ttl_seconds) if ttl_seconds is not None and ttl_seconds > 0 else None
         raw = bytes(value)
         digest = hashlib.sha256(raw).hexdigest()
@@ -178,10 +192,12 @@ class StorageEngine:
                         raw_bytes = excluded.raw_bytes,
                         hash = excluded.hash
                     """,
-                    (key, compressed, now, expires_at, now, len(raw), digest),
+                    (key, compressed, stamp, expires_at, now, len(raw), digest),
                 )
                 return True
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                self.stats_counters["write_errors"] = self.stats_counters.get("write_errors", 0) + 1
+                _engine_logger.warning("storage engine write failed for %s: %s", self.path.name, exc)
                 return False
 
     def delete(self, key: str) -> bool:
@@ -190,7 +206,9 @@ class StorageEngine:
             try:
                 cursor = self._conn.execute("DELETE FROM entries WHERE key = ?", (key,))
                 return cursor.rowcount > 0
-            except sqlite3.Error:
+            except sqlite3.Error as exc:
+                self.stats_counters["write_errors"] = self.stats_counters.get("write_errors", 0) + 1
+                _engine_logger.warning("storage engine write failed for %s: %s", self.path.name, exc)
                 return False
 
     def clear(self) -> None:
@@ -226,12 +244,15 @@ class StorageEngine:
                     ).fetchall()
             except sqlite3.Error:
                 return
+        verify = zstd_io.compression_available()
         for key, blob, created_at, expires_at, last_access, raw_bytes, digest in rows:
             if expires_at is not None and expires_at <= now:
                 continue
             try:
                 value = zstd_io.decompress_bytes(bytes(blob))
             except Exception:
+                continue
+            if verify and hashlib.sha256(value).hexdigest() != digest:
                 continue
             yield (
                 str(key),
@@ -244,6 +265,53 @@ class StorageEngine:
                     "hash": digest,
                 },
             )
+
+    def oldest_keys(self, *, prefix: Optional[str] = None, skip: int = 0, take: int = 1) -> list[str]:
+        """Eviction candidates under a prefix, metadata only (no blob reads):
+        rows BEYOND the newest ``skip`` (skip=cap keeps the newest cap and
+        yields the overflow, oldest-evicted order)."""
+
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT key FROM entries WHERE key LIKE ? AND (expires_at IS NULL OR expires_at > ?) "
+                    "ORDER BY created_at DESC, last_access DESC, key LIMIT ? OFFSET ?",
+                    (str(prefix or "") + "%", time.time(), int(take), int(skip)),
+                ).fetchall()
+                return [str(r[0]) for r in rows]
+            except sqlite3.Error:
+                return []
+
+    def count_prefix(self, prefix: str) -> int:
+        with self._lock:
+            try:
+                return int(
+                    self._conn.execute(
+                        "SELECT COUNT(*) FROM entries WHERE key LIKE ? AND (expires_at IS NULL OR expires_at > ?)",
+                        (str(prefix) + "%", time.time()),
+                    ).fetchone()[0]
+                )
+            except sqlite3.Error:
+                return 0
+
+    def sync_keys(self, prefix: str, keep: Iterable[str]) -> int:
+        """Delete rows under the prefix that are NOT in `keep` (compaction
+        for stores whose authoritative set lives in memory)."""
+
+        keep_set = set(keep)
+        removed = 0
+        with self._lock:
+            try:
+                rows = self._conn.execute(
+                    "SELECT key FROM entries WHERE key LIKE ?", (str(prefix) + "%",)
+                ).fetchall()
+            except sqlite3.Error:
+                return 0
+        for (key,) in rows:
+            if str(key) not in keep_set:
+                if self.delete(str(key)):
+                    removed += 1
+        return removed
 
     def keys(self, *, prefix: Optional[str] = None) -> list[str]:
         with self._lock:
@@ -339,7 +407,7 @@ class StorageEngine:
     def _sweep_loop(self) -> None:
         while not self._stop.wait(self._sweep_interval):
             try:
-                self.sweep()
+                self.sweep(max_idle_seconds=self._idle_prune)
             except Exception:
                 pass
 
@@ -348,8 +416,17 @@ class StorageEngine:
     async def aget(self, key: str, *, touch: bool = True) -> Optional[bytes]:
         return await asyncio.to_thread(self.get, key, touch=touch)
 
-    async def aset(self, key: str, value: bytes, *, ttl_seconds: Optional[float] = None) -> bool:
-        return await asyncio.to_thread(self.set, key, value, ttl_seconds=ttl_seconds)
+    async def aset(
+        self,
+        key: str,
+        value: bytes,
+        *,
+        ttl_seconds: Optional[float] = None,
+        created_at: Optional[float] = None,
+    ) -> bool:
+        return await asyncio.to_thread(
+            self.set, key, value, ttl_seconds=ttl_seconds, created_at=created_at
+        )
 
     async def adelete(self, key: str) -> bool:
         return await asyncio.to_thread(self.delete, key)
@@ -376,7 +453,11 @@ def get_engine(family: str, *, directory: Optional[Path] = None) -> StorageEngin
                 from ..utils.paths import get_default_root
 
                 base = Path(get_default_root()) / "store"
-            engine = StorageEngine(base / f"{family}.db")
+            idle_defaults = {"cache": 7 * 86400.0, "usage": 30 * 86400.0, "session": None}
+            engine = StorageEngine(
+                base / f"{family}.db",
+                idle_prune_seconds=idle_defaults.get(family),
+            )
             _ENGINE_CACHE[family] = engine
         return engine
 
