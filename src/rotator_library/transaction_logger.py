@@ -459,6 +459,8 @@ class TransactionLogger:
     def log_stream_chunk(self, chunk: Dict[str, Any]) -> None:
         if not self.enabled or self._record is None:
             return
+        if self._spill_dir is not None:
+            self._record.maybe_enable_spill(self._spill_dir)
         self._record.add_client_chunk(sanitize_for_trace(_make_json_safe(chunk)))
 
     def log_provider_frame(self, chunk: Any) -> None:

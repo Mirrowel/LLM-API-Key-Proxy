@@ -657,7 +657,13 @@ class NativeProviderExecutor:
             try:
                 async for raw_frame in _frame_iterator():
                     if raw_frame.is_comment:
-                        # Provider heartbeat frames relay/observe as comments.
+                        # Provider heartbeat frames relay/observe as comments;
+                        # they are external wire evidence — captured too.
+                        if context.transaction_logger is not None and raw_frame.raw:
+                            try:
+                                context.transaction_logger.log_provider_frame(raw_frame.raw)
+                            except Exception:
+                                pass
                         yield RelayStreamItem(events=[], raw=raw_frame.raw, is_comment=True)
                         continue
                     raw_chunk = raw_frame.parsed

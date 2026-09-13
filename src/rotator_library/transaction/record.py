@@ -287,19 +287,25 @@ class TransactionRecord:
             self.metadata.update(fields)
 
     def record_attempt(self, entry: dict[str, Any]) -> None:
-        if self.sealed_at is not None:
-            return
-        self.attempts.append(entry)
+        with self._lock:
+            if self.sealed_at is not None:
+                return
+            self.last_activity = time.time()
+            self.attempts.append(entry)
 
     def record_routing(self, record: dict[str, Any]) -> None:
-        if self.sealed_at is not None:
-            return
-        self.routing.update(record)
+        with self._lock:
+            if self.sealed_at is not None:
+                return
+            self.last_activity = time.time()
+            self.routing.update(record)
 
     def record_error(self, error_type: str, message: str, raw: Any = None) -> None:
-        if self.sealed_at is not None:
-            return
-        self.errors.append({"type": error_type, "message": str(message)[:2000], "raw": raw})
+        with self._lock:
+            if self.sealed_at is not None:
+                return
+            self.last_activity = time.time()
+            self.errors.append({"type": error_type, "message": str(message)[:2000], "raw": raw})
 
     # -- sealing ---------------------------------------------------------
 
