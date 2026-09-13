@@ -504,7 +504,8 @@ class LauncherTUI:
         self.console.print("   6. :arrows_counterclockwise: Reload Configuration")
         self.console.print("   7. :information_source:  About")
         self.console.print("   8. :mag:  Transaction Explorer")
-        self.console.print("   9. :door: Exit")
+        self.console.print("   9. :card_index_dividers:  Store Explorer")
+        self.console.print("   0. :door: Exit")
 
         self.console.print()
         self.console.print("━" * 70)
@@ -512,7 +513,7 @@ class LauncherTUI:
 
         choice = Prompt.ask(
             "Select option",
-            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+            choices=["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"],
             show_choices=False,
         )
 
@@ -537,6 +538,8 @@ class LauncherTUI:
         elif choice == "8":
             self.launch_transaction_explorer()
         elif choice == "9":
+            self.launch_store_explorer()
+        elif choice == "0":
             self.running = False
             sys.exit(0)
 
@@ -1040,6 +1043,14 @@ class LauncherTUI:
         from proxy_app.transaction_explorer import run_explorer
 
         run_explorer()
+
+    def launch_store_explorer(self):
+        """Launch the storage-engine DB explorer (browse / inspect / maintain)."""
+        clear_screen()
+
+        from proxy_app.store_explorer import run_store_explorer
+
+        run_store_explorer()
 
     def show_about(self):
         """Display About page with project information"""
