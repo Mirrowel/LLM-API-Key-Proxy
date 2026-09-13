@@ -27,7 +27,7 @@ PROVIDER_URL_MAP = {
     "openai": "https://api.openai.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "anthropic": "https://api.anthropic.com/v1",
-    "cohere": "https://api.cohere.ai/v1",
+    "cohere": "https://api.cohere.ai/compatibility/v1",
     "bedrock": "https://bedrock-runtime.us-east-1.amazonaws.com",
     "openrouter": "https://openrouter.ai/api/v1",
 }

@@ -54,8 +54,13 @@ class GroqAdapter(PayloadAdapter):
         needs_parsed = updated.get("tools") or (
             isinstance(updated.get("response_format"), dict)
         )
-        if needs_parsed and "reasoning_format" not in updated:
+        if needs_parsed:
+            # Explicit raw alongside tools is a documented 400 — parsed
+            # wins regardless of what the client asked for; and
+            # include_reasoning is mutually exclusive with
+            # reasoning_format, so it cannot ride along.
             updated["reasoning_format"] = "parsed"
+            updated.pop("include_reasoning", None)
         return updated
 
     async def transform_response(self, payload: Any, context: AdapterContext) -> Any:
@@ -80,6 +85,11 @@ class GroqAdapter(PayloadAdapter):
             delta = choice.get("delta")
             if isinstance(delta, dict) and "reasoning" in delta and "reasoning_content" not in delta:
                 delta["reasoning_content"] = delta.pop("reasoning")
+                changed = True
+        if updated.get("usage") is None:
+            x_groq = updated.get("x_groq")
+            if isinstance(x_groq, dict) and isinstance(x_groq.get("usage"), dict):
+                updated["usage"] = x_groq["usage"]
                 changed = True
         if not changed:
             return payload

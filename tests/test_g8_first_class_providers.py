@@ -148,3 +148,73 @@ def test_cohere_declaration():
     plugin = PROVIDER_PLUGINS["cohere"]
     assert plugin.default_api_base == "https://api.cohere.ai/compatibility/v1"
     assert plugin.protocol_name == "openai_chat"
+    assert plugin.adapter_names == ("cohere",)
+
+
+def test_cohere_effort_narrowing():
+    from rotator_library.adapters.cohere import CohereAdapter
+    from rotator_library.adapters.base import AdapterContext
+
+    adapter = CohereAdapter()
+    context = AdapterContext(provider="cohere", model="command-a-03-2025")
+    narrowed = asyncio.run(
+        adapter.transform_request(
+            {"model": "m", "messages": [], "reasoning_effort": "medium"}, context
+        )
+    )
+    assert narrowed["reasoning_effort"] == "high"
+    kept = asyncio.run(
+        adapter.transform_request(
+            {"model": "m", "messages": [], "reasoning_effort": "none"}, context
+        )
+    )
+    assert kept["reasoning_effort"] == "none"
+    untouched = asyncio.run(adapter.transform_request({"model": "m", "messages": []}, context))
+    assert "reasoning_effort" not in untouched
+
+
+def test_groq_include_reasoning_popped_and_xgroq_usage_lifted():
+    from rotator_library.adapters.groq import GroqAdapter
+    from rotator_library.adapters.base import AdapterContext
+
+    adapter = GroqAdapter()
+    context = AdapterContext(provider="groq", model="m")
+    payload = {
+        "model": "m",
+        "messages": [],
+        "include_reasoning": False,
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+    }
+    result = asyncio.run(adapter.transform_request(payload, context))
+    assert "include_reasoning" not in result and result["reasoning_format"] == "parsed"
+    terminal = {"choices": [], "x_groq": {"id": "x", "usage": {"prompt_tokens": 3}}}
+    lifted = asyncio.run(adapter.transform_stream_event(terminal, context))
+    assert lifted["usage"] == {"prompt_tokens": 3}
+
+
+def test_cohere_effort_aliases_and_null_drop():
+    from rotator_library.adapters.cohere import CohereAdapter
+    from rotator_library.adapters.base import AdapterContext
+
+    adapter = CohereAdapter()
+    context = AdapterContext(provider="cohere", model="m")
+    off = asyncio.run(adapter.transform_request({"reasoning_effort": "off"}, context))
+    assert off["reasoning_effort"] == "none"
+    dropped = asyncio.run(adapter.transform_request({"reasoning_effort": None}, context))
+    assert "reasoning_effort" not in dropped
+
+
+def test_groq_explicit_raw_with_tools_is_forced_parsed():
+    from rotator_library.adapters.groq import GroqAdapter
+    from rotator_library.adapters.base import AdapterContext
+
+    adapter = GroqAdapter()
+    context = AdapterContext(provider="groq", model="m")
+    payload = {
+        "model": "m",
+        "messages": [],
+        "reasoning_format": "raw",
+        "tools": [{"type": "function", "function": {"name": "x"}}],
+    }
+    result = asyncio.run(adapter.transform_request(payload, context))
+    assert result["reasoning_format"] == "parsed"
