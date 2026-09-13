@@ -411,7 +411,9 @@ class NativeProviderExecutor:
                 # disclosure channel never survives to a client (a hook
                 # echoing a count-tokens payload would otherwise leak it).
                 if isinstance(outcome.payload, dict):
-                    outcome.payload.pop("_proxy_warnings", None)
+                    private_notes = outcome.payload.pop("_proxy_warnings", None)
+                    if private_notes and logger is not None:
+                        logger.log_conversion_warnings(private_notes, stage="hook_respond")
                 return deepcopy(outcome.payload) if isinstance(outcome.payload, (dict, list)) else outcome.payload
             # Response-side injection (canonical target): restore cached state
             # onto the parsed unified response before it is formatted for the

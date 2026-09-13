@@ -1160,6 +1160,13 @@ def format_structured_output(value: Any, target_protocol: str) -> Any:
     if target_protocol == "anthropic_messages":
         if output_type == "json_object":
             return {"format": {"type": "json_schema", "schema": {"type": "object"}}}
+        if output_type == "text":
+            # Text is the absence of a format constraint — an explicit text
+            # constraint NEVER fabricates an empty json_schema (a fabricated
+            # schema inverts the semantics: it forces JSON, not text).
+            return None
+        if output_type != "json_schema":
+            return None
         return {
             "format": {
                 key: deepcopy(item)
