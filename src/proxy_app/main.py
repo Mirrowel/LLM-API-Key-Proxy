@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import argparse
 import logging
+import re
 
 # --- Argument Parsing (BEFORE heavy imports) ---
 parser = argparse.ArgumentParser(description="API Key Proxy Server")
@@ -383,11 +384,23 @@ if ENABLE_RAW_LOGGING:
 PROXY_API_KEY = os.getenv("PROXY_API_KEY")
 # Note: PROXY_API_KEY validation moved to server startup to allow credential tool to run first
 
+_API_KEY_NAME_RE = re.compile(r"^(?P<name>.+)_API_KEY(?P<idx>_\d+)?$")
+
+
+def _api_key_provider_name(key: str) -> "str | None":
+    match = _API_KEY_NAME_RE.match(key)
+    if not match:
+        return None
+    name = match.group("name")
+    return None if name == "PROXY" else name
+
+
 # Discover API keys from environment variables
 api_keys = {}
 for key, value in os.environ.items():
-    if "_API_KEY" in key and key != "PROXY_API_KEY":
-        provider = key.split("_API_KEY")[0].lower()
+    provider = _api_key_provider_name(key)
+    if provider:
+        provider = provider.lower()
         if provider not in api_keys:
             api_keys[provider] = []
         api_keys[provider].append(value)

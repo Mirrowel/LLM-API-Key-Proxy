@@ -12,11 +12,14 @@ needs no credential, while a reverse-proxied deployment may present an
 
 from __future__ import annotations
 
+import logging
 from typing import Dict, List, Optional
 
 import httpx
 
 from .provider_interface import ProviderInterface, render_endpoint_path
+
+lib_logger = logging.getLogger("rotator_library")
 
 
 class OllamaProvider(ProviderInterface):
@@ -34,16 +37,20 @@ class OllamaProvider(ProviderInterface):
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """Return ``/api/tags`` model names, provider-prefixed for routing."""
 
-        response = await client.get(f"{self.get_provider_api_base()}/api/tags")
-        response.raise_for_status()
-        payload = response.json()
-        entries = payload.get("models") if isinstance(payload, dict) else []
-        models: List[str] = []
-        for entry in entries or []:
-            name = entry.get("name") or entry.get("model") if isinstance(entry, dict) else entry
-            if name:
-                models.append(f"ollama/{str(name).removeprefix('ollama/')}")
-        return models
+        try:
+            response = await client.get(f"{self.get_provider_api_base()}/api/tags")
+            response.raise_for_status()
+            payload = response.json()
+            entries = payload.get("models") if isinstance(payload, dict) else []
+            models: List[str] = []
+            for entry in entries or []:
+                name = entry.get("name") or entry.get("model") if isinstance(entry, dict) else entry
+                if name:
+                    models.append(f"ollama/{str(name).removeprefix('ollama/')}")
+            return models
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            lib_logger.error(f"Failed to fetch Ollama models: {e}")
+            return []
 
     def get_native_headers(
         self,

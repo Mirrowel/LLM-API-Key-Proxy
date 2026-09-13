@@ -994,7 +994,7 @@ def classify_error(e: Exception, provider: Optional[str] = None) -> ClassifiedEr
         try:
             from .providers import PROVIDER_PLUGINS
 
-            provider_class = PROVIDER_PLUGINS.get(provider)
+            provider_class = PROVIDER_PLUGINS.get(str(provider).lower())
 
             if provider_class and hasattr(provider_class, "parse_quota_error"):
                 # Get error body if available

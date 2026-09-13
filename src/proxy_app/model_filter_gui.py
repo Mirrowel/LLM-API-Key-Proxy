@@ -31,6 +31,17 @@ from typing import List, Dict, Tuple, Optional, Callable, Set
 from dotenv import load_dotenv, set_key, unset_key
 
 
+_API_KEY_NAME_RE = re.compile(r"^(?P<name>.+)_API_KEY(?P<idx>_\d+)?$")
+
+
+def _api_key_provider_name(key: str) -> "str | None":
+    match = _API_KEY_NAME_RE.match(key)
+    if not match:
+        return None
+    name = match.group("name")
+    return None if name == "PROXY" else name
+
+
 # ════════════════════════════════════════════════════════════════════════════════
 # CONSTANTS & CONFIGURATION
 # ════════════════════════════════════════════════════════════════════════════════
@@ -582,10 +593,10 @@ class ModelFetcher:
 
         # Scan environment for API keys (handles numbered keys like GEMINI_API_KEY_1)
         for key in os.environ:
-            if "_API_KEY" in key and "PROXY_API_KEY" not in key:
+            provider = _api_key_provider_name(key)
+            if provider:
                 # Extract provider: NVIDIA_NIM_API_KEY_1 -> nvidia_nim
-                provider = key.split("_API_KEY")[0].lower()
-                providers.add(provider)
+                providers.add(provider.lower())
 
         # Check for OAuth providers
         oauth_dir = Path("oauth_creds")

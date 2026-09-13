@@ -20,10 +20,6 @@ class MistralProvider(ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://api.mistral.ai/v1"
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
-        return f"{base}/chat/completions"
-
 
     MISTRAL_MODEL_PATTERNS = [
         "mistral-medium",
@@ -41,7 +37,7 @@ class MistralProvider(ProviderInterface):
         """
         try:
             response = await client.get(
-                "https://api.mistral.ai/v1/models",
+                f"{self.get_provider_api_base()}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             response.raise_for_status()
@@ -49,7 +45,7 @@ class MistralProvider(ProviderInterface):
                 f"mistral/{model['id']}"
                 for model in response.json().get("data", [])
             ]
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             lib_logger.error(f"Failed to fetch Mistral models: {e}")
             return []
 

@@ -13,13 +13,12 @@ if not lib_logger.handlers:
 
 
 class NvidiaProvider(ProviderInterface):
+    # Registry registers this module as `nvidia_nim`; JSON config sections
+    # address the same identity (one key everywhere).
+    config_key_alias = "nvidia_nim"
     protocol_name = "openai_chat"
     native_streaming_supported = True
     default_api_base = "https://integrate.api.nvidia.com/v1"
-
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
-        return f"{base}/chat/completions"
 
     skip_cost_calculation = True
     """
@@ -32,7 +31,7 @@ class NvidiaProvider(ProviderInterface):
         """
         try:
             response = await client.get(
-                "https://integrate.api.nvidia.com/v1/models",
+                f"{self.get_provider_api_base()}/models",
                 headers={"Authorization": f"Bearer {api_key}"},
             )
             response.raise_for_status()
@@ -40,7 +39,7 @@ class NvidiaProvider(ProviderInterface):
                 f"nvidia_nim/{model['id']}" for model in response.json().get("data", [])
             ]
             return models
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             lib_logger.error(f"Failed to fetch NVIDIA models: {e}")
             return []
 

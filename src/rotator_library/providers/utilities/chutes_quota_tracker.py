@@ -29,9 +29,6 @@ import httpx
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
 
-# Chutes API endpoint
-CHUTES_QUOTA_API_URL = "https://api.chutes.ai/users/me/quota_usage/me"
-
 
 class ChutesQuotaTracker:
     """
@@ -54,9 +51,13 @@ class ChutesQuotaTracker:
     # Type hints for attributes from provider
     _quota_cache: Dict[str, Dict[str, Any]]
     _quota_refresh_interval: int
+    _quota_api_base: str
 
     # Tier thresholds
     TIER_THRESHOLDS = {200: "legacy", 300: "base", 2000: "plus", 5000: "pro"}
+
+    def __init__(self, api_base: Optional[str] = None, *args: Any, **kwargs: Any) -> None:
+        self._quota_api_base = str(api_base or "").rstrip("/")
 
     # =========================================================================
     # QUOTA USAGE API
@@ -95,12 +96,16 @@ class ChutesQuotaTracker:
 
             if client is not None:
                 response = await client.get(
-                    CHUTES_QUOTA_API_URL, headers=headers, timeout=30
+                    f"{self._quota_api_base}/users/me/quota_usage/me",
+                    headers=headers,
+                    timeout=30,
                 )
             else:
                 async with httpx.AsyncClient() as new_client:
                     response = await new_client.get(
-                        CHUTES_QUOTA_API_URL, headers=headers, timeout=30
+                        f"{self._quota_api_base}/users/me/quota_usage/me",
+                        headers=headers,
+                        timeout=30,
                     )
             response.raise_for_status()
             data = response.json()

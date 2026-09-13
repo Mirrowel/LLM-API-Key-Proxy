@@ -28,9 +28,6 @@ import httpx
 # Use the shared rotator_library logger
 lib_logger = logging.getLogger("rotator_library")
 
-# NanoGPT API base URL
-NANOGPT_API_BASE = "https://nano-gpt.com"
-
 
 class NanoGptQuotaTracker:
     """
@@ -53,6 +50,10 @@ class NanoGptQuotaTracker:
     # Type hints for attributes from provider
     _subscription_cache: Dict[str, Dict[str, Any]]
     _quota_refresh_interval: int
+    _quota_api_base: str
+
+    def __init__(self, api_base: Optional[str] = None, *args: Any, **kwargs: Any) -> None:
+        self._quota_api_base = str(api_base or "").rstrip("/")
 
     # =========================================================================
     # SUBSCRIPTION USAGE API
@@ -93,7 +94,7 @@ class NanoGptQuotaTracker:
             }
         """
         try:
-            url = f"{NANOGPT_API_BASE}/api/subscription/v1/usage"
+            url = f"{self._quota_api_base}/api/subscription/v1/usage"
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Accept": "application/json",

@@ -8,6 +8,7 @@ Provides a beautiful Rich-based interface for configuration and execution.
 
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +22,17 @@ from rich.text import Text
 from dotenv import load_dotenv, set_key
 
 console = Console()
+
+
+_API_KEY_NAME_RE = re.compile(r"^(?P<name>.+)_API_KEY(?P<idx>_\d+)?$")
+
+
+def _api_key_provider_name(key: str) -> "str | None":
+    match = _API_KEY_NAME_RE.match(key)
+    if not match:
+        return None
+    name = match.group("name")
+    return None if name == "PROXY" else name
 
 
 def _get_env_file() -> Path:
@@ -172,8 +184,9 @@ class SettingsDetector:
         # Scan for API keys
         env_vars = SettingsDetector._load_local_env()
         for key, value in env_vars.items():
-            if "_API_KEY" in key and key != "PROXY_API_KEY":
-                provider = key.split("_API_KEY")[0].lower()
+            provider = _api_key_provider_name(key)
+            if provider:
+                provider = provider.lower()
                 if provider not in providers:
                     providers[provider] = {"api_keys": 0, "oauth": 0, "custom": False}
                 providers[provider]["api_keys"] += 1

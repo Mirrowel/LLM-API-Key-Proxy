@@ -528,11 +528,18 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         """Return the JSON providers-section key for this provider."""
 
         if self.provider_env_name:
-            return self.provider_env_name.lower()
-        name = self.__class__.__name__
-        if name.endswith("Provider"):
-            name = name[: -len("Provider")]
-        return name.lower()
+            key = self.provider_env_name.lower()
+        else:
+            name = self.__class__.__name__
+            if name.endswith("Provider"):
+                name = name[: -len("Provider")]
+            key = name.lower()
+        # Registry remap (nvidia registers as nvidia_nim): one identity per
+        # provider across registry, credentials, and the JSON section.
+        remap = getattr(self.__class__, "config_key_alias", None) or getattr(
+            self, "config_key_alias", None
+        )
+        return remap if remap else key
 
     def supports_native_operation(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> bool:
         """Return whether this provider supports a native operation.
@@ -602,7 +609,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         placeholders are rendered here. The profile's declarations win over
         provider-level JSON declarations; profiles without an explicit path
         get the per-protocol conventional path. Single-protocol providers
-        that did not override and have no endpoint declaration fail loudly.
+        that did not override fall through to the protocol's default path.
         """
 
         entry: Optional[Any] = None
@@ -612,12 +619,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         if not path:
             path = declared_endpoint_path(self._get_runtime_config(model), operation)
         if not path:
-            if entry is None:
-                raise NotImplementedError(
-                    f"{self.__class__.__name__} does not define a native endpoint"
-                )
-            protocol = str(entry.get("protocol") or entry.get("protocol_name") or self.protocol_name or "")
-            path = self._default_endpoint_path(protocol, operation)
+            protocol = ""
+            if isinstance(entry, Mapping):
+                protocol = str(entry.get("protocol") or entry.get("protocol_name") or "")
+            if not protocol:
+                protocol = self.get_protocol_name(model, profile=profile) if profile else self.get_protocol_name(model)
+            path = self._default_endpoint_path(protocol or "", operation)
         base = self.get_provider_api_base()
         if not base:
             raise NotImplementedError(
@@ -627,25 +634,46 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         return f"{base}{render_endpoint_path(path, model=self.normalize_native_model(model), operation=operation, provider=self._provider_config_key())}"
 
     def _default_endpoint_path(self, protocol: str = "", operation: str = "chat") -> str:
-        """Conventional per-protocol endpoint path (profiles without one)."""
+        """Conventional per-protocol endpoint path (profiles without one).
+
+        Honest by operation: a protocol only answers for the operations it
+        declares (plus the listing pseudo-operation ``models``); anything
+        else raises rather than silently returning the chat path.
+        """
 
         from ..protocols.canonical import family_wire_name
 
-        if family_wire_name(protocol or "") == "responses":
-            return "/responses"
-        if protocol == "anthropic_messages":
-            return "/v1/messages"
+        if operation == "models":
+            return "/api/tags" if protocol == "ollama" else "/models"
+        wire = family_wire_name(protocol or "")
         if protocol == "gemini":
             raise NotImplementedError(
                 "Gemini endpoints are model-ridden; declare endpoint_paths for gemini profiles"
             )
         if protocol == "ollama":
-            return {
+            paths = {
+                "chat": "/api/chat",
                 "ollama_chat": "/api/chat",
                 "ollama_generate": "/api/generate",
                 "embeddings": "/api/embed",
-            }.get(operation, "/api/chat")
-        return "/chat/completions"
+            }
+        elif protocol == "anthropic_messages":
+            paths = {
+                "chat": "/v1/messages",
+                "messages": "/v1/messages",
+                "count_tokens": "/v1/messages/count_tokens",
+            }
+        elif wire == "responses":
+            paths = {"chat": "/responses", "responses": "/responses"}
+        else:
+            paths = {"chat": "/chat/completions"}
+        path = paths.get(operation)
+        if path is None:
+            raise NotImplementedError(
+                f"{self.__class__.__name__} has no default endpoint for "
+                f"{protocol or 'unknown'!r} operation {operation!r}"
+            )
+        return path
 
     def get_native_headers(self, credential_identifier: str, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> Dict[str, str]:
         """Return non-payload HTTP headers for native requests.

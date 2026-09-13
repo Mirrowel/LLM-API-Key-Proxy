@@ -19,9 +19,8 @@ class CohereProvider(ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://api.cohere.ai/compatibility/v1"
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
-        return f"{base}/chat/completions"
+    def _models_url(self) -> str:
+        return f"{self.get_provider_api_base()}/models"
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -29,11 +28,11 @@ class CohereProvider(ProviderInterface):
         """
         try:
             response = await client.get(
-                "https://api.cohere.ai/v1/models",
+                self._models_url(),
                 headers={"Authorization": f"Bearer {api_key}"}
             )
             response.raise_for_status()
             return [f"cohere/{model['name']}" for model in response.json().get("models", [])]
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             lib_logger.error(f"Failed to fetch Cohere models: {e}")
             return []

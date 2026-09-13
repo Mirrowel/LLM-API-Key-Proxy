@@ -8,6 +8,7 @@ Provides interactive configuration for custom providers, model definitions, and 
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from rich.console import Console
@@ -30,6 +31,16 @@ console = Console()
 
 # Sentinel value for distinguishing "no pending change" from "pending change to None"
 _NOT_FOUND = object()
+
+_API_KEY_NAME_RE = re.compile(r"^(?P<name>.+)_API_KEY(?P<idx>_\d+)?$")
+
+
+def _api_key_provider_name(key_name: str) -> "str | None":
+    match = _API_KEY_NAME_RE.match(key_name)
+    if not match:
+        return None
+    name = match.group("name")
+    return None if name == "PROXY" else name
 
 def clear_screen(subtitle: str = ""):
     """
@@ -634,13 +645,11 @@ class SettingsTool:
                         # Skip comments and empty lines
                         if not line or line.startswith("#"):
                             continue
-                        if (
-                            "_API_KEY" in line
-                            and "PROXY_API_KEY" not in line
-                            and "=" in line
-                        ):
-                            provider = line.split("_API_KEY")[0].strip().lower()
-                            providers.add(provider)
+                        if "=" in line:
+                            key_name = line.partition("=")[0].strip()
+                            provider = _api_key_provider_name(key_name)
+                            if provider:
+                                providers.add(provider.lower())
             except (IOError, OSError):
                 pass
 

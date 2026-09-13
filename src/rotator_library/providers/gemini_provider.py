@@ -159,7 +159,7 @@ class GeminiProvider(ProviderInterface):
                 if not page_token:
                     break
             return models
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             lib_logger.error(f"Failed to fetch Gemini models: {e}")
             return []
 

@@ -36,9 +36,6 @@ lib_logger.propagate = False
 if not lib_logger.handlers:
     lib_logger.addHandler(logging.NullHandler())
 
-# NanoGPT API base URL
-NANOGPT_API_BASE = "https://nano-gpt.com"
-
 # Concurrency limit for parallel quota fetches
 QUOTA_FETCH_CONCURRENCY = 5
 
@@ -64,9 +61,15 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://nano-gpt.com/api/v1"
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
-        return f"{base}/chat/completions"
+    def _models_url(self) -> str:
+        return f"{self.get_provider_api_base()}/models"
+
+    def _resolve_quota_api_base(self) -> str:
+        base = (self.get_provider_api_base() or "").rstrip("/")
+        for suffix in ("/api/v1", "/v1"):
+            if base.endswith(suffix):
+                return base[: -len(suffix)]
+        return base
 
 
     # Skip cost calculation - NanoGPT uses "usage units", not tokens
@@ -95,6 +98,7 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
     }
 
     def __init__(self):
+        super().__init__(api_base=self._resolve_quota_api_base())
         self.model_definitions = ModelDefinitions()
 
         # Quota tracking cache
@@ -225,7 +229,7 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         # Source 2: Dynamic discovery from API
         try:
             response = await client.get(
-                f"{NANOGPT_API_BASE}/api/v1/models",
+                self._models_url(),
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30,
             )
@@ -289,7 +293,7 @@ class NanoGptProvider(NanoGptQuotaTracker, ProviderInterface):
         """
         try:
             response = await client.get(
-                f"{NANOGPT_API_BASE}/api/subscription/v1/models",
+                f"{self._quota_api_base}/api/subscription/v1/models",
                 headers={"Authorization": f"Bearer {api_key}"},
                 timeout=30,
             )

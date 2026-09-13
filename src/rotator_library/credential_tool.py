@@ -75,6 +75,17 @@ def _extract_key_number(key_name: str) -> int:
     return int(match.group(1)) if match else 0
 
 
+_API_KEY_NAME_RE = re.compile(r"^(?P<name>.+)_API_KEY(?P<idx>_\d+)?$")
+
+
+def _api_key_provider_name(key_name: str) -> "str | None":
+    match = _API_KEY_NAME_RE.match(key_name)
+    if not match:
+        return None
+    name = match.group("name")
+    return None if name == "PROXY" else name
+
+
 def format_tier_for_display(tier: str) -> str:
     """Format a stored provider tier for compact credential summaries."""
 
@@ -140,27 +151,24 @@ def _get_api_keys_from_env() -> dict:
                     continue
 
                 # Look for lines with API_KEY pattern
-                if "_API_KEY" in line and "=" in line:
+                if "=" in line:
                     key_name, _, key_value = line.partition("=")
                     key_name = key_name.strip()
                     key_value = key_value.strip().strip('"').strip("'")
 
-                    # Skip PROXY_API_KEY and empty values
-                    if key_name == "PROXY_API_KEY" or not key_value:
+                    provider_name = _api_key_provider_name(key_name)
+                    if provider_name is None or not key_value:
                         continue
 
                     # Skip placeholder values
-                    if key_value.startswith("YOUR_") or key_value == "":
+                    if key_value.startswith("YOUR_"):
                         continue
 
-                    # Extract provider name (everything before _API_KEY)
-                    # Handle cases like GEMINI_API_KEY_1 -> GEMINI
-                    parts = key_name.split("_API_KEY")
-                    if parts:
-                        provider_name = parts[0]
-                        if provider_name not in api_keys:
-                            api_keys[provider_name] = []
-                        api_keys[provider_name].append((key_name, key_value))
+                    # Provider name is everything before _API_KEY
+                    # (GEMINI_API_KEY_1 -> GEMINI)
+                    if provider_name not in api_keys:
+                        api_keys[provider_name] = []
+                    api_keys[provider_name].append((key_name, key_value))
 
         # Sort keys numerically within each provider
         for provider_name in api_keys:
@@ -335,10 +343,10 @@ def _get_existing_custom_providers() -> list:
                     # Only include if NOT a known provider
                     if provider_name not in KNOWN_PROVIDERS:
                         api_bases[provider_name] = value
-                elif "_API_KEY" in key_name and value:
-                    # Extract provider name from API key
-                    provider_prefix = key_name.split("_API_KEY")[0].lower()
-                    api_keys.add(provider_prefix)
+                else:
+                    provider_prefix = _api_key_provider_name(key_name)
+                    if provider_prefix and value:
+                        api_keys.add(provider_prefix.lower())
 
         # Build result list
         for provider_name, api_base in sorted(api_bases.items()):
@@ -1153,7 +1161,7 @@ async def setup_api_key():
     # Discover custom providers from project's provider registry
     # -------------------------------------------------------------------------
     _, PROVIDER_PLUGINS = _ensure_providers_loaded()
-    from .providers import DynamicOpenAICompatibleProvider
+    from .providers.dynamic import DynamicProvider
     from .providers.provider_interface import ProviderInterface
 
     # Build a set of API key env vars already in SCRAPED_PROVIDERS
@@ -1222,7 +1230,7 @@ async def setup_api_key():
         # Check if this is a dynamic OpenAI-compatible provider
         try:
             is_dynamic = isinstance(provider_class, type) and issubclass(
-                provider_class, DynamicOpenAICompatibleProvider
+                provider_class, DynamicProvider
             )
         except TypeError:
             is_dynamic = False

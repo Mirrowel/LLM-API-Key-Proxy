@@ -6,6 +6,7 @@ import pkgutil
 import os
 from typing import Any, Dict, Mapping, Optional, Type
 
+from .dynamic import DynamicProvider
 from .provider_interface import (
     ProviderInterface,
     auth_header_pair,
@@ -22,14 +23,23 @@ PROVIDER_PLUGINS: Dict[str, Type[ProviderInterface]] = {}
 def _create_dynamic_plugin_class(
     name: str,
     config_snapshot: Any = None,
+    *,
+    no_auth: bool = False,
 ) -> Type[ProviderInterface]:
-    """Create one ProviderInterface implementation bound to a config name."""
+    """Create one ProviderInterface implementation bound to a config name.
 
-    class DynamicPlugin(DynamicOpenAICompatibleProvider, ProviderInterface):
+    ``no_auth`` mints the provider for keyless local serving: the internal
+    no-auth credential slot applies and nothing is ever sent as a Bearer
+    credential on fallback or discovery.
+    """
+
+    class DynamicPlugin(DynamicProvider, ProviderInterface):
         provider_env_name = name
+        if no_auth:
+            default_auth_mode = "none"
 
         def __init__(self):
-            DynamicOpenAICompatibleProvider.__init__(
+            DynamicProvider.__init__(
                 self,
                 name,
                 config_snapshot=config_snapshot,
@@ -37,200 +47,6 @@ def _create_dynamic_plugin_class(
 
     DynamicPlugin.__name__ = f"{''.join(part.title() for part in name.split('_'))}DynamicProvider"
     return DynamicPlugin
-
-
-class DynamicOpenAICompatibleProvider:
-    """
-    Dynamic provider for safe config or ``*_API_BASE`` declarations.
-
-    Environment-only declarations retain the existing OpenAI-compatible
-    LiteLLM path. Structured config may additionally opt the provider into any
-    registered native protocol without storing credentials in the config file.
-    """
-
-    # Class attribute - no need to instantiate
-    skip_cost_calculation: bool = True
-
-    def __init__(self, provider_name: str, *, config_snapshot: Any = None):
-        self.provider_name = provider_name
-        self.provider_env_name = provider_name
-        from ..config.experimental import get_provider_runtime_config, load_experimental_config
-
-        self._config_snapshot = (
-            config_snapshot
-            if config_snapshot is not None
-            else load_experimental_config()
-        )
-        runtime = get_provider_runtime_config(
-            provider_name,
-            config=self._config_snapshot,
-        )
-        self.api_base = runtime.api_base or os.getenv(f"{provider_name.upper()}_API_BASE")
-        if not self.api_base:
-            raise ValueError(
-                f"API base URL is required for dynamic provider {provider_name!r}"
-            )
-
-        # D13 profile surface (fix-pass G7): JSON-declared transport profiles
-        # bind onto the instance; env-only dynamics default to native
-        # openai_chat (W11) instead of silently falling back to LiteLLM.
-        self.transport_profiles = (
-            dict(runtime.transport_profiles) if runtime.transport_profiles else None
-        )
-        self.default_profile = runtime.default_profile
-        self.protocol_name = runtime.protocol_name or "openai_chat"
-
-        # Import model definitions
-        from ..model_definitions import ModelDefinitions
-
-        self.model_definitions = ModelDefinitions()
-
-    def _runtime_config(self, model: str = ""):
-        from ..config.experimental import get_provider_runtime_config
-
-        return get_provider_runtime_config(
-            self.provider_name,
-            model,
-            config=self._config_snapshot,
-        )
-
-    def _get_runtime_config(self, model: str = ""):
-        """Keep custom provider transport identity immutable after startup."""
-
-        return self._runtime_config(model)
-
-    def get_api_base(self) -> str:
-        return str(self._runtime_config().api_base or self.api_base).rstrip("/")
-
-    async def get_models(self, api_key: str, client):
-        """Return configured models or discover common ``/models`` shapes."""
-        configured = self._runtime_config().models
-        if configured:
-            return [
-                model if model.startswith(f"{self.provider_name}/") else f"{self.provider_name}/{model}"
-                for model in configured
-            ]
-        response = await client.get(
-            f"{self.get_api_base()}/models",
-            headers=self.get_native_headers(api_key, operation="models"),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        entries = payload.get("data") or payload.get("models") or [] if isinstance(payload, dict) else []
-        models: list[str] = []
-        for entry in entries:
-            raw_id = entry.get("id") or entry.get("name") if isinstance(entry, dict) else entry
-            model_id = str(raw_id or "").removeprefix("models/")
-            if model_id:
-                models.append(f"{self.provider_name}/{model_id}")
-        return models
-
-    def get_model_options(self, model_name: str) -> Dict[str, Any]:
-        """Get model options from static definitions."""
-        # Extract model name without provider prefix if present
-        if "/" in model_name:
-            model_name = model_name.split("/")[-1]
-
-        return self.model_definitions.get_model_options(self.provider_name, model_name)
-
-    def has_custom_logic(self) -> bool:
-        """Returns False since we want to use the standard litellm flow."""
-        return False
-
-    def get_auth_header(self, credential_identifier: str) -> Dict[str, str]:
-        """Return the configured credential header."""
-        return self.get_native_headers(credential_identifier)
-
-    def get_native_operation(
-        self,
-        model: str = "",
-        request: Optional[Dict[str, Any]] = None,
-        stream: bool = False,
-        profile: Optional[str] = None,
-    ) -> str:
-        return ProviderInterface.get_native_operation(
-            self, model, request, stream=stream, profile=profile
-        )
-
-    def normalize_native_model(self, model: str = "") -> str:
-        prefix = f"{self.provider_name}/"
-        return model[len(prefix):] if model.startswith(prefix) else model
-
-    def get_native_endpoint(
-        self,
-        model: str = "",
-        operation: str = "chat",
-        profile: Optional[str] = None,
-    ) -> str:
-        runtime = self._runtime_config(model)
-        protocol = self.get_protocol_name(model, profile=profile) if profile else self.get_protocol_name(model)
-        protocol = protocol or "openai_chat"
-        entry: Optional[Any] = None
-        if profile and self.transport_profiles:
-            entry = self.transport_profiles.get(profile)
-        path = declared_endpoint_path(entry, operation) or runtime.endpoint_paths.get(operation)
-        if not path:
-            defaults = {
-                "openai_chat": {"chat": "/chat/completions"},
-                "responses": {"responses": "/responses"},
-                "anthropic_messages": {
-                    "messages": "/messages",
-                    # G14: official count endpoint shares the messages body.
-                    "count_tokens": "/messages/count_tokens",
-                },
-                "gemini": {
-                    "generate": "/models/{model}:generateContent",
-                    "stream_generate": "/models/{model}:streamGenerateContent?alt=sse",
-                    "count_tokens": "/models/{model}:countTokens",
-                },
-                "ollama": {
-                    "ollama_chat": "/api/chat",
-                    "ollama_generate": "/api/generate",
-                    "embeddings": "/api/embed",
-                },
-            }
-            path = defaults.get(protocol, {}).get(operation)
-        if not path:
-            raise NotImplementedError(
-                f"Dynamic provider {self.provider_name} has no endpoint for {protocol}/{operation}"
-            )
-        rendered = render_endpoint_path(
-            path,
-            model=self.normalize_native_model(model),
-            operation=operation,
-            provider=self.provider_name,
-        )
-        if rendered.startswith(("http://", "https://")):
-            return rendered
-        return f"{self.get_api_base()}/{rendered.lstrip('/')}"
-
-    def get_native_headers(
-        self,
-        credential_identifier: str,
-        model: str = "",
-        operation: str = "chat",
-        profile: Optional[str] = None,
-    ) -> Dict[str, str]:
-        runtime = self._runtime_config(model)
-        auth_mode = runtime.auth_mode
-        auth_header_name = runtime.auth_header_name
-        if profile and self.transport_profiles:
-            entry = self.transport_profiles.get(profile)
-            if isinstance(entry, Mapping):
-                auth_mode = entry.get("auth_mode") or auth_mode
-                auth_header_name = entry.get("auth_header_name") or auth_header_name
-        headers: Dict[str, str] = {"Content-Type": "application/json"}
-        if operation == "stream_generate":
-            headers["Accept"] = "text/event-stream"
-        headers.update(
-            auth_header_pair(
-                credential_identifier,
-                auth_mode,
-                auth_header_name,
-                provider=self.provider_name,
-            )
-        )
-        return headers
 
 
 def validate_provider_hooks(config_snapshot: Any = None) -> None:
@@ -335,6 +151,8 @@ def _register_providers():
     # Import KNOWN_PROVIDERS to check against
     from ..provider_config import KNOWN_PROVIDERS
 
+    configured = config_snapshot.providers
+
     for env_var in os.environ:
         if env_var.endswith("_API_BASE"):
             provider_name = env_var[:-9].lower()  # Remove '_API_BASE' suffix
@@ -347,9 +165,30 @@ def _register_providers():
             if provider_name in PROVIDER_PLUGINS:
                 continue
 
+            raw_base = str(os.environ[env_var] or "").strip()
+            if not raw_base:
+                # An empty declaration is a configuration error, not a
+                # deferred crash at first request.
+                raise ValueError(
+                    f"Environment variable {env_var} is set but empty — "
+                    "remove it or provide the provider's base URL"
+                )
+
+            # Keyless local serving: no credential env of any shape and no
+            # explicit auth declaration means the internal no-auth slot.
+            has_credential_env = any(
+                other.startswith(f"{provider_name.upper()}_API_KEY")
+                for other in os.environ
+            )
+            explicit_auth = False
+            raw_config = configured.get(provider_name)
+            if isinstance(raw_config, dict):
+                explicit_auth = bool(raw_config.get("auth_mode"))
+
             plugin_class = _create_dynamic_plugin_class(
                 provider_name,
                 config_snapshot=config_snapshot,
+                no_auth=not has_credential_env and not explicit_auth,
             )
             PROVIDER_PLUGINS[provider_name] = plugin_class
             import logging
@@ -360,7 +199,6 @@ def _register_providers():
 
     # Structured config can define custom providers without a parallel API_BASE
     # environment variable. Credentials remain in the existing secret stores.
-    configured = config_snapshot.providers
     for raw_name, raw in configured.items():
         provider_name = str(raw_name).lower()
         if provider_name in PROVIDER_PLUGINS:

@@ -25,7 +25,8 @@ from ..usage.costs import ModelPricing
 
 _CONFIG_ENV_KEYS = ("LLM_PROXY_CONFIG_FILE", "PROXY_CONFIG_FILE")
 _KNOWN_SECTIONS = {"routing", "pricing", "streaming", "field_cache", "providers", "retry", "responses", "hooks"}
-_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "credential", "credentials", "password")
+_SECRET_KEY_PARTS = ("api_key", "apikey", "authorization", "access_token", "accesstoken", "refresh_token", "refreshtoken", "oauth_token", "oauthtoken", "oauth_token_secret", "oauthtokensecret", "id_token", "idtoken", "token_secret", "tokensecret", "client_secret", "clientsecret", "secret_key", "secretkey", "bearer_token", "bearertoken", "credential", "credentials", "password", "token", "key", "auth")
+_BARE_SECRET_KEY_PARTS = frozenset({"token", "key", "auth"})
 _PROVIDER_CONFIG_KEYS = {
     "protocol_name",
     "api_base",
@@ -53,6 +54,7 @@ _HTTP_TOKEN_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 _CONFIG_CACHE: dict[tuple[str, int], "ExperimentalConfig"] = {}
 _PROVIDER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 _ENDPOINT_TEMPLATE_FIELDS = {"model", "operation", "provider"}
+_LISTING_OPERATIONS = frozenset({"models"})
 
 
 class ExperimentalConfigError(ValueError):
@@ -365,7 +367,7 @@ def get_provider_runtime_config(
     source = env if env is not None else os.environ
     active = config if config is not None else load_experimental_config(env=source)
     providers = active.providers if isinstance(active.providers, dict) else {}
-    raw = providers.get(provider, {})
+    raw = providers.get(str(provider).lower(), {})
     if not isinstance(raw, Mapping) or not raw:
         return ProviderRuntimeConfig()
     _validate_provider_sections({provider: raw})
@@ -383,7 +385,7 @@ def get_provider_runtime_config(
     return ProviderRuntimeConfig(
         protocol_name=protocol_name,
         api_base=_configured_api_base(raw.get("api_base")),
-        endpoint_paths=_configured_endpoint_paths(raw.get("endpoint_paths")),
+        endpoint_paths=_configured_endpoint_paths(raw.get("endpoint_paths"), protocol_name),
         auth_mode=_configured_auth_mode(raw.get("auth_mode")),
         auth_header_name=_configured_auth_header_name(raw.get("auth_header_name")),
         models=_configured_models(raw.get("models")),
@@ -516,7 +518,7 @@ def _validate_provider_sections(value: Any) -> None:
         _configured_adapters(raw.get("adapter_names"))
         _configured_adapter_config(raw.get("adapter_config", {}))
         _configured_api_base(raw.get("api_base"))
-        _configured_endpoint_paths(raw.get("endpoint_paths"))
+        _configured_endpoint_paths(raw.get("endpoint_paths"), raw.get("protocol_name"))
         _configured_default_profile(
             raw.get("default_profile"), _configured_transport_profiles(_profiles_raw(raw))
         )
@@ -581,11 +583,25 @@ def _configured_api_base(value: Any) -> Optional[str]:
     return url.rstrip("/")
 
 
-def _configured_endpoint_paths(value: Any) -> dict[str, str]:
+def _supported_protocol_operations(protocol: Any) -> Optional[frozenset[str]]:
+    """Return the declared operations for a protocol, or None if unknown."""
+
+    if protocol in (None, ""):
+        return None
+    try:
+        from ..protocols import get_protocol
+
+        return frozenset(get_protocol(str(protocol).strip().lower()).supported_operations)
+    except Exception:
+        return None
+
+
+def _configured_endpoint_paths(value: Any, protocol: Any = None) -> dict[str, str]:
     if value in (None, {}):
         return {}
     if not isinstance(value, Mapping):
         raise ExperimentalConfigError("providers.endpoint_paths must be an object")
+    supported = _supported_protocol_operations(protocol)
     result: dict[str, str] = {}
     for operation, path in value.items():
         name = str(operation).strip()
@@ -595,6 +611,15 @@ def _configured_endpoint_paths(value: Any) -> dict[str, str]:
             raise ExperimentalConfigError("providers.endpoint_paths entries require a non-empty operation name")
         if not _PROVIDER_NAME_RE.fullmatch(name):
             raise ExperimentalConfigError("providers.endpoint_paths operation names are invalid")
+        if (
+            supported is not None
+            and name not in supported
+            and name not in _LISTING_OPERATIONS
+        ):
+            raise ExperimentalConfigError(
+                f"providers.endpoint_paths declares unsupported operation {name!r} "
+                f"for protocol {protocol!r}"
+            )
         result[name] = _validate_endpoint_path(path)
     return result
 
@@ -699,7 +724,7 @@ def _configured_transport_profiles(value: Any) -> Optional[dict[str, dict[str, A
             )
         result[profile_name] = {
             "protocol": protocol,
-            "endpoint_paths": _configured_endpoint_paths(entry.get("endpoint_paths")),
+            "endpoint_paths": _configured_endpoint_paths(entry.get("endpoint_paths"), protocol),
             "endpoint_path": _configured_endpoint_path(entry.get("endpoint_path")),
             "auth_mode": auth_mode,
             "auth_header_name": auth_header_name,
@@ -733,14 +758,23 @@ def _configured_auth_mode(value: Any) -> str:
 
 
 def _is_secret_like_key(value: Any) -> bool:
-    """Return whether a config key names credential or authentication data."""
+    """Return whether a config key names credential or authentication data.
+
+    Bare generic parts (``token``/``key``/``auth``) match only the whole key
+    so compound, legitimate keys (``auth_mode``, ``cache_key``) survive.
+    """
 
     key_text = str(value).lower()
+    if key_text in _BARE_SECRET_KEY_PARTS:
+        return True
+    compound_parts = tuple(
+        part for part in _SECRET_KEY_PARTS if part not in _BARE_SECRET_KEY_PARTS
+    )
     compact_key = re.sub(r"[^a-z0-9]+", "", key_text)
     underscored_key = re.sub(r"[^a-z0-9]+", "_", key_text)
     return any(
         part in key_text or part in compact_key or part in underscored_key
-        for part in _SECRET_KEY_PARTS
+        for part in compound_parts
     )
 
 

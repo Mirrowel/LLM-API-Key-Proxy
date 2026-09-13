@@ -228,30 +228,43 @@ R11 (live round, with user)
 **Files:** `session_tracking.py`, `utils/zstd_io.py`, `field_cache/store.py`, `provider_cache.py`.
 **Tests:** session suites as base; add: graceful-load pin, dedupe pin, compression round-trip, protocol-anchor pins.
 
-## 14. G11 — Variants & stores (XL, P1 — window 3, with G16)
+## 14. G11 — Variants & stores (XL, P1 — window 3, with G16; executed in research-grounded phases)
 
-**Sources:** #33, #34, #35 R8 split, #36 hybrid, #37 taxonomy, #40, #46, #47; sweep R7. Detail: sweep R7.
+**Sources:** #33, #34, #35 R8 split, #36 hybrid, #37 taxonomy, #40, #46, #47; sweep R7; operator rulings 2026-09-12/13 (variant opt-in model, first-class WS, two-URL gemini faces, storage interim + engine rework).
 
-**Deliverables:**
-1. **Responses → 3 sibling protocols** in the registry (stateless / stateful-id / websocket — taxonomy always labeled); providers declare variants; per-variant capability semantics.
-2. **Hybrid continuation (#36):** plexus-first local store+replay+scope/capability + gomodel same-protocol passthrough (provider ids honored; foreign-shaped ids → provider passthrough; untracked ids → provider-fallback GET).
-3. Store-never-fails (deliver + log — probe-violated on both paths today); store default → durable; `expires_at` validated at load; cross-lane fork eviction preserves the parent (per-lane tracking); lineage: silent truncation disclosed + failed/in_progress parents rejected; created_at proxy-stamped (not provider); unbounded default store bounded; provider_cache backend: 48h hard TTL vs configured, whole-file rewrite O(N), corrupt-reset → scoped.
-4. **Bridge deleted entirely** (to_chat_kwargs, from_chat_response, legacy stream_events, parse_chat_sse_chunk, hasattr branch, stale bridge vocabulary) — fabricated-completed-on-truncation is one more reason.
-5. WS: official current guide reconciled (multiplexing/steering/lanes — implement or document the downgrade explicitly with the variant split); `response.cancel` NOT a client event per current docs — drop that directive, HTTP cancel route decided with the background-mode decision; capture-on-error fires on WS turns; warmup scope from frame routing kwargs + validates + preserves tools; error frames spec-shaped (inner error.type; stream-id code); turn handler uses the formatter; frame-size cap; lanes bounded; connection-limit send-guard; `MAX_CONNECTION_SECONDS` isfinite.
-6. **Gemini surface:** transport_profiles {native: gemini@v1beta, openai: openai_chat@/v1beta/openai Bearer}, default native; `/v1beta/openai/chat/completions` + `/v1beta/openai/models` ingress bound to the openai profile; drop `/v1/` ingress; error classification by body error.status (rides G1); traffic model native-v1beta OR straight-through gemini:openai.
-7. Sequence-number domain unified per stream (burns fixed — with G16); finally/aclose on the native stream loop; failure terminals correlate ids (no fresh minting); `[DONE]` asymmetry resolved; store_in_progress honored or removed; DELETE object literal.
+**Operator rulings that govern this group (2026-09-12/13):**
+- Responses variants are **per-provider opt-in capabilities**: stateless is the automatic baseline every responses-capable provider has; **stateful and WS exist on a provider only when it declares them** (WS is exclusive to one provider in practice; stateful to few). "Provider can support part of the responses — and that is normal."
+- **Gemini two faces by URL**: `v1beta/models/...` = native gemini format, `v1beta/openai/...` = Google's OpenAI-compat surface (Bearer auth). The gemini FORMAT is Google's several services (AI Studio, Vertex, Cloud) plus possible third parties — the protocol stays declarable by anyone; the two faces are transport profiles on Google-shaped providers. Default face: native.
+- **WS is first-class**: parallel conversations on one connection (lanes/steering) are IN SCOPE, not deferred. **A failure never deletes conversation memory** (fork-eviction ban).
+- **Storage is two-step**: durable JSON now (Phase B), then the full storage-engine rework as its own planned group (G17) — compressed storage, append-friendly medium (no whole-store recompression per write), access-time pruning, dedupe; covers every cache AND transaction logs.
 
-**Files:** `responses/*`, `protocols/responses.py`, `providers/gemini_provider.py`, `providers/__init__.py`, `proxy_app/main.py`.
-**Tests:** responses suites as base (bridge tests deleted by design); add: variant matrix, hybrid continuation pins, gemini openai-profile passthrough pin, store-never-fails pin.
+**Phase A — The split (research trio first):** three responses siblings as registry entries (stateless / stateful / websocket) sharing a wire base class; provider declarations for variant opt-in (stateless automatic, stateful/WS declared); variant matching via base family (client "responses" matches all siblings → existing ambiguity/default-profile machinery decides); D13 priority stays family-level. Gemini two faces: transport_profiles {native: gemini@v1beta, openai: openai_chat@/v1beta/openai Bearer}, default native; `/v1beta/openai/chat/completions` + `/v1beta/openai/models` ingress bound to the openai profile; drop `/v1/` ingress. Research grounds: official stateful/stateless semantics, WS lane/steering grammar (feeds Phase C), Vertex-vs-AI-Studio endpoint/auth differences (same format, different auth surfaces).
 
-## 15. G16 — Responses synthesis SDK-conformance (M, P1 — window 3, with G11)
+**Phase B — Memory (research trio where needed):** hybrid continuation (#36, gomodel shape): local store first → provider passthrough on miss for same-dialect responses-native targets (provider ids honored, provider-continuation field-cache rules PRESERVED — `_disable_provider_continuation` derives from the chosen path, never from lineage existence); cross-protocol or switched provider → local replay; unknown ids → provider-GET fallback before 404; scope/capability checks stay local and ahead of any fallback (anti-injection); provenance (provider/route) stamped on stored rows. Store default → durable JSON (interim); `expires_at` validated at load (poison-row containment); store-never-fails (one safe-store helper at every site — deliver + log, never kill a finished answer); unbounded default store bounded; created_at not provider-stampable.
+
+**Phase C — WS first-class (research trio: full official WS event/lane grammar):** parallel conversations per connection (lanes, steering, stream_id grammar); failure NEVER evicts conversation memory (per-lane parent tracking via the written-never-read LaneState); warmup scope from frame routing kwargs + validation + tool preservation; error frames spec-shaped (inner error.type, invalid_stream_id code); capture-on-error fires on WS turns; turn handler goes through the formatter; frame-size cap; lanes bounded; `MAX_CONNECTION_SECONDS` isfinite; the WebSocketStreamFormatter transport seam wired (G13's hand-off).
+
+**Phase D — Polish (with G16):** bridge deleted entirely (fabricated-completed-on-truncation dies with it; PROXY_ROUTING_KEYS relocated); sequence-number domain unified per stream (burns fixed — one counter, not the module global); finally/aclose on the native stream loop; failure terminals correlate ids (no fresh minting); `[DONE]` asymmetry resolved; store_in_progress honored or removed; DELETE object literal; HTTP cancel route implemented for real (gomodel shape: stored row → provider cancel via provenance → store update; unknown → 404; scoped stays local; WS cancel stays rejected per current docs).
+
+**Files:** `responses/*`, `protocols/responses.py`, `providers/gemini_provider.py`, `providers/__init__.py`, `proxy_app/main.py`, `routing/profiles.py`, `config/experimental.py`.
+**Tests:** responses suites as base (bridge tests deleted by design); add: variant matrix, hybrid continuation pins, gemini openai-profile passthrough pin, store-never-fails pin, WS lanes/steering matrix.
+
+## 15. G16 — Responses synthesis SDK-conformance (M, P1 — window 3, executes as G11 Phase D)
 
 **Sources:** sweep R7 (synthesis cluster). Detail: sweep R7.
 
-**Deliverables:** every proxy-synthesized Responses object SDK-valid (required fields: created_at/parallel_tool_calls/tool_choice/tools; usage detail objects not zero-omitted — official SDK model_validate passes on OUR failure paths); input_items correct envelope + normalized items + pagination params; error objects use official code vocabulary (+ proxy extension codes documented); capability token per-scope (chain access stable across turns — per-create rotation orphans); WS error frames + limit frame per spec; native top-level `error` stream event terminal; provider completed-without-object handled (no double terminal); poison-row containment (with G11); sequence burns (with G11); store_failed default documented true (config-reference fixed).
+**Deliverables:** every proxy-synthesized Responses object SDK-valid (required fields: created_at/parallel_tool_calls/tool_choice/tools; usage detail objects not zero-omitted — official SDK model_validate passes on OUR failure paths); input_items correct envelope + normalized items + pagination params (first_id/last_id/has_more + after/limit/order/include); error objects use official code VOCABULARY (strings, not numeric status); capability token per-scope (chain access stable across turns — per-create rotation orphans); WS error frames + limit frame per spec; native top-level `error` stream event terminal (no double terminal); provider completed-without-object handled; poison-row containment (with G11-B); sequence burns (with G11-D); store_failed default documented true (config-reference fixed). No vendor SDKs are used anywhere — conformance is about OUR output shapes (operator Q&A 2026-09-13).
 
 **Files:** `responses/streaming.py`, `responses/service.py`, `responses/websocket.py`, `responses/store.py`.
 **Tests:** SDK-model_validate pins for every synthesized object family; capability-token chain pin; error-vocabulary pin.
+
+## 15b. G17 — Storage engine rework (L, P1 — RESEARCH AND PLAN FIRST; operator directive 2026-09-13)
+
+**Operator directive:** "Rework of all the cache needs to be done to compress everything stored, select a better medium. The cache will balloon too much (it already does). Maybe compress with zstd? Need a format that allows this natively, WITHOUT recompressing the whole thing again. And decent pruning — delete entries not accessed for X amount of time. Same applies to transaction logs."
+
+**Scope:** every persisted store (provider cache, field cache, responses store, session state, quota/usage state, transaction logs). Mandatory research phase (trio, exhaustive, docs-grounded) BEFORE any planning decision: medium candidates (embedded DB e.g. stdlib sqlite vs compressed append-segment files vs hybrid), access-time-based pruning (LRU-by-touch semantics), compression strategy per medium (row-level zstd vs page-level vs segment compaction), dedupe (identical payloads recorded once — operator note from R9), migration from current JSON files, retention caps. Then a full plan presentation to the operator for approval BEFORE implementation. Existing CACHE-dedupe/size items from R9 fold in here.
+
+**Position:** after G11 phases; before or alongside G8/G9 (which are read-heavy on cache surfaces) — exact slot decided at its planning presentation.
 
 ## 16. G9 — Provider porting pass + embeddings (XL, P1 — after skeleton)
 

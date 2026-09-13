@@ -81,7 +81,7 @@ async def bootstrap_oauth_credentials(
     for provider, paths in credentials_to_initialize.items():
         if not paths:
             continue
-        provider_plugin_class = PROVIDER_PLUGINS.get(provider)
+        provider_plugin_class = PROVIDER_PLUGINS.get(str(provider).lower())
         if not provider_plugin_class:
             continue
         provider_instance = provider_plugin_class()

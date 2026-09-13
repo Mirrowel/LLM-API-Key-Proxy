@@ -19,9 +19,8 @@ class OpenRouterProvider(ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://openrouter.ai/api/v1"
 
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
-        return f"{base}/chat/completions"
+    def _models_url(self) -> str:
+        return f"{self.get_provider_api_base()}/models"
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
         """
@@ -29,11 +28,11 @@ class OpenRouterProvider(ProviderInterface):
         """
         try:
             response = await client.get(
-                "https://openrouter.ai/api/v1/models",
+                self._models_url(),
                 headers={"Authorization": f"Bearer {api_key}"}
             )
             response.raise_for_status()
             return [f"openrouter/{model['id']}" for model in response.json().get("data", [])]
-        except httpx.RequestError as e:
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
             lib_logger.error(f"Failed to fetch OpenRouter models: {e}")
             return []

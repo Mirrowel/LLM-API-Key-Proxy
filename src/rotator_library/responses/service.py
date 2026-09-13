@@ -1340,7 +1340,7 @@ def _provider_continuation_target(raw_request: dict[str, Any]) -> Optional[str]:
             target = str(group.targets[0])
 
         reference = parse_model_reference(target)
-        plugin_class = PROVIDER_PLUGINS.get(reference.provider)
+        plugin_class = PROVIDER_PLUGINS.get(reference.provider.lower())
         if plugin_class is None:
             return None
         # PROVIDER_PLUGINS stores CLASSES (SingletonABCMeta) — unbound

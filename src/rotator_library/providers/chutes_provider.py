@@ -27,10 +27,7 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
     protocol_name = "openai_chat"
     native_streaming_supported = True
     default_api_base = "https://llm.chutes.ai/v1"
-
-    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
-        base = self.get_provider_api_base()
-        return f"{base}/chat/completions"
+    quota_api_base = "https://api.chutes.ai"
 
 
     # Enable environment variable overrides (e.g., QUOTA_GROUPS_CHUTES_GLOBAL)
@@ -54,7 +51,7 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
 
     def __init__(self, *args, **kwargs):
         """Initialize ChutesProvider with quota tracking."""
-        super().__init__(*args, **kwargs)
+        super().__init__(*args, api_base=self.quota_api_base, **kwargs)
 
         # Quota tracking cache and refresh interval
         self._quota_cache: Dict[str, Dict[str, Any]] = {}

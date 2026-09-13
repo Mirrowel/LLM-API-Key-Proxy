@@ -108,7 +108,7 @@ def _add_configured_no_auth_credentials(
             continue
         # Code providers may declare a zero-credential default (local Ollama):
         # they still need one internal rotation/accounting slot.
-        plugin = PROVIDER_PLUGINS.get(provider)
+        plugin = PROVIDER_PLUGINS.get(str(provider).lower())
         if plugin is not None and getattr(plugin, "default_auth_mode", None) == "none":
             credentials[provider] = [NO_AUTH_CREDENTIAL]
 

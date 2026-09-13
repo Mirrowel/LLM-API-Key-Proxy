@@ -116,6 +116,6 @@ Providers declaring `protocol_name` execute natively by default (`auto`); LiteLL
 | `ADVISORY_MODEL_PRICING` | — | Optional pricing overrides JSON (cost estimates). |
 | `SUPPRESS_LITELLM_SERIALIZATION_WARNINGS` | `true` | Silence litellm console noise. |
 | `ROTATOR_LIBRARY_FINGERPRINT_KEY` | derived | Cache fingerprint secret. |
-| `CHUTES_QUOTA_REFRESH_INTERVAL` / `NANOGPT_QUOTA_REFRESH_INTERVAL` / `FIRMWARE_QUOTA_REFRESH_INTERVAL` | provider defaults | Provider quota-poll cadence. |
+| `CHUTES_QUOTA_REFRESH_INTERVAL` / `NANOGPT_QUOTA_REFRESH_INTERVAL` | provider defaults | Provider quota-poll cadence. |
 
 Streaming observability (`STREAM_TTFB_TIMEOUT_SECONDS`, stall windows) is documented in `src/rotator_library/config/defaults.py` alongside every tunable default — that module remains the canonical source; this file is the index.

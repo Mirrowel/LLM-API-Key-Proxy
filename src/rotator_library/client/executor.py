@@ -44,6 +44,7 @@ from litellm.exceptions import (
 
 from ..core.types import RequestContext, ErrorAction
 from ..core.utils import normalize_usage_for_response
+from .scopes import NO_AUTH_CREDENTIAL as _NO_AUTH_CREDENTIAL
 from ..protocols.canonical import family_wire_name
 from ..protocols.opaque_strip import (
     payload_carries_opaque_state,
@@ -825,7 +826,9 @@ class RequestExecutor:
     ) -> Any:
         """Execute the existing LiteLLM request path."""
 
-        kwargs["api_key"] = credential_secret
+        kwargs["api_key"] = (
+            None if credential_secret == _NO_AUTH_CREDENTIAL else credential_secret
+        )
         self._apply_litellm_logger(kwargs)
         kwargs.pop("transaction_context", None)
         if context:
@@ -2107,7 +2110,9 @@ class RequestExecutor:
                                     # prefers custom before native streaming.
                                     native_stream_context = None
                                     if execution == "litellm_fallback":
-                                        kwargs["api_key"] = credential_secret
+                                        kwargs["api_key"] = (
+            None if credential_secret == _NO_AUTH_CREDENTIAL else credential_secret
+        )
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
                                         kwargs.pop("transaction_context", None)
@@ -2162,7 +2167,9 @@ class RequestExecutor:
                                         stream_provider_protocol = native_context.protocol_name
                                         native_stream_context = native_context
                                     else:
-                                        kwargs["api_key"] = credential_secret
+                                        kwargs["api_key"] = (
+            None if credential_secret == _NO_AUTH_CREDENTIAL else credential_secret
+        )
                                         kwargs["stream"] = True
                                         self._apply_litellm_logger(kwargs)
                                         # Remove internal context before litellm call

@@ -137,9 +137,14 @@ class ModelDiscoveryService:
         if not api_base:
             return []
 
+        from .scopes import NO_AUTH_CREDENTIAL
+
+        headers: Dict[str, str] = {}
+        if api_key and api_key != NO_AUTH_CREDENTIAL:
+            headers["Authorization"] = f"Bearer {api_key}"
         response = await self._get_http_client().get(
             f"{str(api_base).rstrip('/')}/models",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=headers,
         )
         response.raise_for_status()
         return [

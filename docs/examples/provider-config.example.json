@@ -1,0 +1,121 @@
+{
+  "providers": {
+    "myserver": {
+      "api_base": "https://api.myserver.example/v1",
+      "protocol_name": "openai_chat",
+      "models": [
+        "frontier-v2",
+        "frontier-v2-mini",
+        "reasoner-v1"
+      ],
+      "native_streaming_supported": true,
+      "auth_mode": "bearer",
+      "endpoint_paths": {
+        "chat": "/chat/completions",
+        "models": "/models"
+      },
+      "adapter_names": [
+        "model_override"
+      ],
+      "adapter_config": {
+        "model_override": {
+          "model": "frontier-v2-2026-01"
+        }
+      },
+      "model_quota_groups": {
+        "frontier": [
+          "frontier-v2",
+          "frontier-v2-mini"
+        ]
+      },
+      "field_cache": [
+        {
+          "name": "prompt_cache_key",
+          "source": "response",
+          "path": "id",
+          "keep": "last",
+          "inject": {
+            "target": "request",
+            "path": "prompt_cache_key",
+            "if": "auto"
+          },
+          "scope": [
+            "provider",
+            "model",
+            "credential",
+            "session"
+          ],
+          "ttl_seconds": 3600
+        }
+      ],
+      "hooks": [
+        {
+          "name": "adapter:suppress_developer_role",
+          "priority": 150
+        }
+      ]
+    },
+    "acme": {
+      "api_base": "https://api.acme.example",
+      "protocol_name": "gemini",
+      "default_profile": "native",
+      "models": [
+        "acme-pro",
+        "acme-flash"
+      ],
+      "native_streaming_supported": true,
+      "transport_profiles": {
+        "native": {
+          "protocol": "gemini",
+          "endpoint_paths": {
+            "generate": "/v1/models/{model}:generateContent",
+            "stream_generate": "/v1/models/{model}:streamGenerateContent?alt=sse",
+            "count_tokens": "/v1/models/{model}:countTokens",
+            "models": "/v1/models"
+          },
+          "auth_mode": "x-goog-api-key"
+        },
+        "openai": {
+          "protocol": "openai_chat",
+          "endpoint_paths": {
+            "chat": "/v1/openai/chat/completions",
+            "models": "/v1/openai/models"
+          },
+          "auth_mode": "bearer"
+        },
+        "anthropic": {
+          "protocol": "anthropic_messages",
+          "endpoint_paths": {
+            "messages": "/v1/messages",
+            "count_tokens": "/v1/messages/count_tokens"
+          },
+          "auth_mode": "x-api-key"
+        }
+      },
+      "model_quota_groups": {
+        "acme-pro": [
+          "acme-pro"
+        ]
+      }
+    },
+    "local-ollama": {
+      "api_base": "http://localhost:11434",
+      "protocol_name": "ollama",
+      "auth_mode": "none",
+      "native_streaming_supported": true,
+      "models": [
+        "llama3.1:8b",
+        "qwen2.5-coder:7b"
+      ]
+    },
+    "gateway": {
+      "api_base": "https://gateway.internal.example/v1",
+      "protocol_name": "openai_chat",
+      "auth_mode": "custom",
+      "auth_header_name": "X-API-Token",
+      "models": [
+        "gpt-oss-120b"
+      ]
+    }
+  }
+}

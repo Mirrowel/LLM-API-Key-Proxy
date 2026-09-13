@@ -29,7 +29,6 @@ NATIVE_DEFAULT_PROVIDERS = [
     "cohere",
     "chutes",
     "nanogpt",
-    "firmware",
     "nvidia_nim",
     "gemini",
 ]
