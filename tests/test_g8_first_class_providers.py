@@ -5,9 +5,10 @@
 
 Re-expressed on the G8 envelope: ``speaks`` replaces ``transport_profiles``
 / ``protocol_name``, groq's parameter hygiene lives in ``model_rules``
-(with the adapter keeping only the conditional wire surgery), and listing
-is the shared, protocol-aware interface implementation with an honest
-empty on failure.
+(with the adapter keeping only the conditional wire surgery), cohere is a
+pure declaration (its effort narrowing is the capability cascade's
+``effort_accept`` now), and listing is the shared, protocol-aware
+interface implementation with an honest empty on failure.
 """
 
 from __future__ import annotations
@@ -286,7 +287,7 @@ def test_groq_explicit_raw_with_tools_is_forced_parsed():
     assert result["reasoning_format"] == "parsed"
 
 
-# --- cohere: shared listing + kept adapter --------------------------------------
+# --- cohere: shared listing + declaration-only shaping --------------------------
 
 
 def test_cohere_compat_models_via_shared_listing():
@@ -335,39 +336,55 @@ def test_cohere_declaration():
     assert plugin.default_api_base == "https://api.cohere.ai/compatibility/v1"
     assert plugin.speaks == ("openai_chat",)
     assert plugin.get_protocol_name("m") == "openai_chat"
-    assert plugin.adapter_names == ("cohere",)
+    # The effort adapter is dead; the always-on param engine is the chain.
+    assert plugin.adapter_names == ()
+    assert plugin.get_adapter_names("m") == ("param_rules",)
     assert plugin.default_profile is None
 
 
-def test_cohere_effort_narrowing():
-    from rotator_library.adapters.cohere import CohereAdapter
-    from rotator_library.adapters.base import AdapterContext
+def test_cohere_capability_row_declares_effort_and_tool_choice():
+    """One wildcard row carries the whole compat-face vocabulary: the
+    {off, high} effort acceptance and the required→any tool_choice fold."""
 
-    adapter = CohereAdapter()
-    context = AdapterContext(provider="cohere", model="command-a-03-2025")
-    narrowed = asyncio.run(
-        adapter.transform_request(
-            {"model": "m", "messages": [], "reasoning_effort": "medium"}, context
-        )
+    from rotator_library.protocols.effort import resolve_accepted_effort
+    from rotator_library.providers import PROVIDER_PLUGINS
+
+    plugin = PROVIDER_PLUGINS["cohere"]()
+    (row,) = plugin.model_rules
+    assert row["match"] == "*"
+    assert row["effort_accept"] == ["off", "high"]
+    assert row["map"] == {"tool_choice": {"required": "any"}}
+    accepted, source = resolve_accepted_effort(
+        plugin, "command-a-03-2025", protocol_family="openai_chat"
     )
-    assert narrowed["reasoning_effort"] == "high"
-    kept = asyncio.run(
-        adapter.transform_request(
-            {"model": "m", "messages": [], "reasoning_effort": "none"}, context
-        )
+    assert accepted == ("off", "high")
+    assert source.startswith("model_rules:")
+
+
+def test_cohere_effort_words_fold_through_the_ladder():
+    """The ladder owns the narrowing the adapter used to do: every ON word
+    lands on the nearest accepted rung (high), off keeps the wire's own
+    ``none`` spelling, and unknown words drop with a recorded note."""
+
+    from rotator_library.native_provider.effort_emission import normalize_wire_effort
+    from rotator_library.providers import PROVIDER_PLUGINS
+
+    plugin = PROVIDER_PLUGINS["cohere"]()
+
+    medium = {"reasoning_effort": "medium"}
+    normalize_wire_effort(
+        medium, provider_plugin=plugin, model="command-a-03-2025", protocol_name="openai_chat"
     )
-    assert kept["reasoning_effort"] == "none"
-    untouched = asyncio.run(adapter.transform_request({"model": "m", "messages": []}, context))
-    assert "reasoning_effort" not in untouched
+    assert medium["reasoning_effort"] == "high"
 
-
-def test_cohere_effort_aliases_and_null_drop():
-    from rotator_library.adapters.cohere import CohereAdapter
-    from rotator_library.adapters.base import AdapterContext
-
-    adapter = CohereAdapter()
-    context = AdapterContext(provider="cohere", model="m")
-    off = asyncio.run(adapter.transform_request({"reasoning_effort": "off"}, context))
+    off = {"reasoning_effort": "none"}
+    normalize_wire_effort(
+        off, provider_plugin=plugin, model="command-a-03-2025", protocol_name="openai_chat"
+    )
     assert off["reasoning_effort"] == "none"
-    dropped = asyncio.run(adapter.transform_request({"reasoning_effort": None}, context))
-    assert "reasoning_effort" not in dropped
+
+    unknown = {"reasoning_effort": "banana"}
+    normalize_wire_effort(
+        unknown, provider_plugin=plugin, model="command-a-03-2025", protocol_name="openai_chat"
+    )
+    assert "reasoning_effort" not in unknown

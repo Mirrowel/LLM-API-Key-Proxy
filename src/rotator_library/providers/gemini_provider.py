@@ -28,7 +28,7 @@ an honest empty.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Optional
 
 from .provider_interface import ProviderInterface
 
@@ -147,54 +147,24 @@ class GeminiProvider(ProviderInterface):
     #   - GeminiProvider.convert_safety_settings       (this file)
     # =========================================================================
 
-    def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
-        """
-        Handles reasoning parameters for Gemini models, with three distinct paths:
-        1. Applies a non-standard, high-value token budget if 'custom_reasoning_budget' is true.
-        2. Leaves the 'reasoning_effort' parameter alone for LiteLLM to handle if it's present
-           without the custom flag.
-        3. Applies a default 'thinking' value for specific models if no other reasoning
-           parameters are provided, ensuring they 'think' by default.
-        """
-        # Set default temperature to 1 if not provided
-        if "temperature" not in payload:
-            payload["temperature"] = 1
-
-        custom_reasoning_budget = payload.get("custom_reasoning_budget", False)
-        reasoning_effort = payload.get("reasoning_effort")
-
-        # If 'thinking' is already explicitly set, do nothing to avoid overriding it.
-        if "thinking" in payload:
-            return
-
-        # Path 1: Custom budget is explicitly requested.
-        if custom_reasoning_budget:
-            # Case 1a: Both params are present, so we can apply the custom budget.
-            if reasoning_effort:
-                if "gemini-2.5-pro" in model:
-                    budgets = {"low": 8192, "medium": 16384, "high": 32768}
-                elif "gemini-2.5-flash" in model:
-                    budgets = {"low": 6144, "medium": 12288, "high": 24576}
-                else:  # Fallback for other models if the custom flag is still used
-                    budgets = {"low": 1024, "medium": 2048, "high": 4096}
-
-                budget = budgets.get(reasoning_effort)
-                if budget is not None:
-                    payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
-                elif reasoning_effort == "disable":
-                    payload["thinking"] = {"type": "enabled", "budget_tokens": 0}
-
-                # Clean up the handled 'reasoning_effort' parameter.
-                payload.pop("reasoning_effort", None)
-
-            # Case 1b: In all cases where the custom flag was present, remove it
-            # as it's not a standard LiteLLM parameter.
-            payload.pop("custom_reasoning_budget", None)
-            return
-
-        # Path 2: No custom budget. Now check for standard or default behavior.
-        # If 'reasoning_effort' is present, we do nothing, allowing LiteLLM to handle it.
-        # If 'reasoning_effort' is NOT present, then we apply the default thinking behavior.
-        if not reasoning_effort:
-            if "gemini-2.5-pro" in model or "gemini-2.5-flash" in model:
-                payload["thinking"] = {"type": "enabled", "budget_tokens": -1}
+    # =========================================================================
+    # LEGACY THINKING HANDLER (REMOVED)
+    # =========================================================================
+    #
+    # ``handle_thinking_parameter`` was a LiteLLM-fallback-era handler that
+    # injected ``temperature``/``thinking`` budgets (and consumed the
+    # non-standard ``custom_reasoning_budget`` flag) before the request
+    # reached litellm. It is gone:
+    #
+    # - The native path emits the real Gemini controls through the protocol
+    #   formatters — ``thinkingBudget`` for the native face and
+    #   ``thinkingLevel`` where the model accepts a level — so no legacy
+    #   budget injection is needed (or wanted) there.
+    # - The explicit LiteLLM fallback now DEGRADES TO MODEL-DEFAULT thinking
+    #   (documented trade): the proxy no longer injects a default budget for
+    #   gemini-2.5-pro/flash, coerces temperature to 1, or honors
+    #   ``custom_reasoning_budget``. A client that wants thinking on the
+    #   fallback path must send the provider-native control itself.
+    #
+    # The generic client-transform wiring (``_transform_gemini_thinking``)
+    # was removed with it; nothing else consumed this method.

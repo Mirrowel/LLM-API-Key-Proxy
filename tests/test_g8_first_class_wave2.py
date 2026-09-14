@@ -17,17 +17,22 @@ if str(SRC) not in sys.path:
 
 def test_chutes_declaration_and_listing():
     from rotator_library.providers import PROVIDER_PLUGINS
-    from rotator_library.providers.chutes_provider import ChutesProvider
 
     provider_class = PROVIDER_PLUGINS["chutes"]
     plugin = provider_class()
     assert plugin.default_api_base == "https://llm.chutes.ai/v1"
     assert plugin.adapter_names == ("chutes",)
-    # The envelope declares the chat face; the custom listing (below) is
-    # the one genuinely provider-specific discovery rule.
+    # The envelope declares the chat face; discovery rides the SHARED
+    # listing cascade with the declarable routing pseudo-model exclusions.
     assert plugin.speaks == ("openai_chat",)
     assert plugin.get_protocol_name("m") == "openai_chat"
     assert plugin.transport_profiles is None
+    assert plugin.listing_filters == ("default*", "*,*")
+    assert "get_models" not in vars(provider_class)
+
+    (row,) = plugin.model_rules
+    assert row["match"] == "*"
+    assert row["rename"] == {"max_completion_tokens": "max_tokens"}
 
     class _FakeResponse:
         def raise_for_status(self):
@@ -47,7 +52,7 @@ def test_chutes_declaration_and_listing():
         async def get(self, url, headers=None, **kwargs):
             return _FakeResponse()
 
-    models = asyncio.run(ChutesProvider().get_models("k", _Client()))
+    models = asyncio.run(plugin.get_models("k", _Client()))
     assert models == ["chutes/deepseek-ai/DeepSeek-V3.2-TEE"]
 
 
@@ -61,6 +66,10 @@ def test_nanogpt_declaration_and_profiles():
     assert profiles["responses"]["protocol"] == "responses"
     assert default == "chat"
     assert plugin.adapter_names == ("nanogpt",)
+    # The shared length rename is declared on the capability cascade.
+    (row,) = plugin.model_rules
+    assert row["match"] == "*"
+    assert row["rename"] == {"max_completion_tokens": "max_tokens"}
     # The subscription pool's own base is a real override on the face —
     # not the inert legacy ``base_url`` key the profile machinery ignored.
     assert plugin.get_native_endpoint("m", "chat", profile="subscription") == (
@@ -92,12 +101,12 @@ def test_openai_declaration_responses_first():
     assert plugin.get_native_endpoint("m", "chat") == "https://api.openai.com/v1/responses"
 
 
-def test_chutes_nanogpt_adapters():
-    from rotator_library.adapters.chutes_nanogpt import ChutesAdapter, NanoGPTAdapter
-    from rotator_library.adapters.base import AdapterContext
+def test_chutes_nanogpt_adapters_and_declared_length_rename():
+    from rotator_library.adapters import AdapterContext, get_adapter, run_adapter_chain
+    from rotator_library.adapters.chutes import ChutesAdapter
+    from rotator_library.adapters.nanogpt import NanoGPTAdapter
+    from rotator_library.providers import PROVIDER_PLUGINS
 
-    chutes = ChutesAdapter()
-    nanogpt = NanoGPTAdapter()
     context = AdapterContext(provider="chutes", model="m")
     payload = {
         "model": "m",
@@ -108,21 +117,52 @@ def test_chutes_nanogpt_adapters():
         "best_of": 2,
         "n": 3,
     }
-    fixed = asyncio.run(chutes.transform_request(payload, context))
-    assert fixed["max_tokens"] == 512 and "max_completion_tokens" not in fixed
+    # The Chutes adapter owns the data-center sampling hygiene only: the
+    # shared length rename is declared, so a raw payload keeps its spelling...
+    raw = asyncio.run(ChutesAdapter().transform_request(payload, context))
+    assert raw["max_completion_tokens"] == 512 and "max_tokens" not in raw
     # Penalties stay: the live sampling whitelist advertises them per model.
-    assert "frequency_penalty" in fixed
-    assert "logprobs" not in fixed and "best_of" not in fixed
-    assert fixed["n"] == 1
-    mapped = asyncio.run(nanogpt.transform_request({"max_completion_tokens": 9}, context))
-    assert mapped["max_tokens"] == 9
+    assert "frequency_penalty" in raw
+    assert "logprobs" not in raw and "best_of" not in raw
+    assert raw["n"] == 1
+
+    # ...while the full declared chain performs the rename on BOTH providers.
+    for provider in ("chutes", "nanogpt"):
+        plugin = PROVIDER_PLUGINS[provider]()
+        chain_context = AdapterContext(
+            provider=provider,
+            model="m",
+            protocol="openai_chat",
+            adapter_config=plugin.get_adapter_config("m"),
+        )
+        adapters = [get_adapter(name) for name in plugin.get_adapter_names("m")]
+        mapped = asyncio.run(
+            run_adapter_chain(
+                adapters,
+                {"model": "m", "messages": [], "max_completion_tokens": 9},
+                chain_context,
+                stage="request",
+            )
+        )
+        assert mapped["max_tokens"] == 9 and "max_completion_tokens" not in mapped
 
     response = {"choices": [{"message": {"role": "assistant", "reasoning": "hmm"}}]}
-    fixed = asyncio.run(chutes.transform_response(response, context))
+    fixed = asyncio.run(ChutesAdapter().transform_response(response, context))
     assert fixed["choices"][0]["message"]["reasoning_content"] == "hmm"
     chunk = {"choices": [{"delta": {"reasoning": "vllm"}}]}
-    fixed = asyncio.run(nanogpt.transform_stream_event(chunk, context))
+    nanogpt_context = AdapterContext(provider="nanogpt", model="m")
+    fixed = asyncio.run(NanoGPTAdapter().transform_stream_event(chunk, nanogpt_context))
     assert fixed["choices"][0]["delta"]["reasoning_content"] == "vllm"
+
+    # NanoGPT additionally folds a top-level reasoning_tokens count into the
+    # standard completion_tokens_details shape.
+    usage_payload = {
+        "choices": [],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 20, "reasoning_tokens": 7},
+    }
+    folded = asyncio.run(NanoGPTAdapter().transform_response(usage_payload, nanogpt_context))
+    assert folded["usage"]["completion_tokens_details"]["reasoning_tokens"] == 7
+    assert "reasoning_tokens" not in folded["usage"]
 
 
 def test_402_balance_bodies_classify_as_quota():

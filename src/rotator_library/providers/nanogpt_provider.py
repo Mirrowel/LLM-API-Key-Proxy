@@ -12,9 +12,10 @@ its ``data[].id`` shape — inherits; only the subscription base is a real
 override.
 
 The ``nanogpt`` adapter owns the genuinely custom wire handling (the
-``max_tokens`` spelling, reasoning-field normalization); the quota
-tracker, quota groups, usage windows, and background refresh job below
-are provider-owned state and stay untouched.
+reasoning-field normalization and the usage fold); the ``max_tokens``
+length spelling is a declared ``model_rules`` row (the same declaration
+lands on Chutes). The quota tracker, quota groups, usage windows, and
+background refresh job below are provider-owned state and stay untouched.
 
 Model listing is the shared, protocol-aware interface implementation; a
 failed listing is an honest empty.
@@ -58,6 +59,15 @@ class NanoGPTProvider(NanoGptQuotaTracker, ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://nano-gpt.com/api/v1"
     adapter_names = ("nanogpt",)
+    model_rules = (
+        {
+            "match": "*",
+            # NanoGPT spells the length parameter ``max_tokens``; the
+            # shared rename is declared here instead of riding provider
+            # code (Chutes carries the same row).
+            "rename": {"max_completion_tokens": "max_tokens"},
+        },
+    )
     # NOTE(for-removal): dies with the cost phase.
     skip_cost_calculation = True
     provider_env_name = "nanogpt"

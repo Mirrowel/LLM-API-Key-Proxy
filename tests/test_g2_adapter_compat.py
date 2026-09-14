@@ -135,7 +135,7 @@ def test_stage_mapping_from_supported_stages():
 
 
 def test_registered_adapters_are_mirrored_as_hooks():
-    for name in ("noop", "model_override", "field_rename", "reasoning_content"):
+    for name in ("noop", "model_override", "suppress_developer_role"):
         assert f"adapter:{name}" in list_hooks()
     bridge = get_hook("adapter:model_override")
     assert isinstance(bridge, AdapterHookBridge)

@@ -992,7 +992,7 @@ class RequestExecutor:
                     client_protocol,
                 )
         public_model = model
-        native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
+        native_model = _normalize_native_model(plugin, model, profile)
         # Operation resolution is profile-aware (D13): the selected profile's
         # protocol vocabulary governs, not the default profile's. A
         # client-requested operation (G14: count_tokens) overrides the
@@ -3566,7 +3566,7 @@ def _should_use_native_protocol(plugin: Any, model: str, target: Optional[RouteT
     protocol_name = _provider_native_protocol(plugin, model, target)
     if not plugin or not protocol_name:
         return False
-    native_model = plugin.normalize_native_model(model) if hasattr(plugin, "normalize_native_model") else _strip_provider_prefix(model)
+    native_model = _normalize_native_model(plugin, model, target.profile if target else None)
     operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
     hook = getattr(plugin, "should_use_native_protocol", None)
     if callable(hook):
@@ -3579,6 +3579,23 @@ def _strip_provider_prefix(model: str) -> str:
     """Return model without the proxy-facing provider prefix."""
 
     return model.split("/", 1)[1] if "/" in model else model
+
+
+def _normalize_native_model(plugin: Any, model: str, profile: Optional[str] = None) -> str:
+    """Resolve the upstream model id, passing the profile when accepted.
+
+    Signature inspection (like ``_call_profile_aware``): a per-face
+    normalization override (an id spelling only one transport face
+    expects) declares the ``profile`` parameter; pre-D13 single-argument
+    implementations keep working unchanged.
+    """
+
+    method = getattr(plugin, "normalize_native_model", None)
+    if not callable(method):
+        return _strip_provider_prefix(model)
+    if profile and _accepts_profile_param(method):
+        return method(model, profile=profile)
+    return method(model)
 
 
 def _provider_supports_native_streaming(plugin: Any, model: str) -> bool:

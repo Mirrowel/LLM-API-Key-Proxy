@@ -150,7 +150,7 @@ State          field_cache_rules (field-addressed), legacy cache_replay
 Adapters       adapter_names (escape hatch), get_adapter_names/config
 Hooks          hooks
 Execution      has_custom_logic(), acompletion()/aembedding()
-Discovery      get_models() (shared; optional listing_profile hint)
+Discovery      get_models() (shared cascade; optional listing_profile hint, listing_filters)
 Sessions       get_session_tracking_hints()
 Quota/usage    model_quota_groups, model_usage_weights, default_*,
                usage_window_definitions, on_request_complete(),
@@ -619,7 +619,10 @@ class ExampleProvider(ProviderInterface):
     #   per-face auth declarations already win, and credentials belong HERE,
     #   never in the payload.
     # normalize_native_model(...) override for id aliases; the base strips
-    #   the provider prefix.
+    #   the provider prefix. An override may declare a ``profile`` parameter
+    #   for per-face spellings (the executor passes the resolved face only
+    #   when the signature accepts it — the Ollama cloud face strips its
+    #   trailing "-cloud" routing suffix this way).
     # prepare_native_request(...) LAST provider-owned payload adjustment
     #   before send; add required defaults/envelopes only.
     # get_adapter_names/config   per-model chain/config quirks.
@@ -639,20 +642,22 @@ class ExampleProvider(ProviderInterface):
     # -------------------------------------------------------------------------
     # DISCOVERY
     # -------------------------------------------------------------------------
-    # Model listing is INHERITED and shared: the interface resolves the
-    # listing face (an optional ``listing_profile`` hint wins, else the
-    # protocol priority list picks the first face with a listing descriptor),
-    # fetches the descriptor's route with per-protocol auth, parses the
-    # descriptor's shape (``data[].id`` for the openai family,
-    # ``models[].name`` with prefix stripping for gemini/ollama), and
-    # returns provider-prefixed ids. A failed listing is an HONEST EMPTY —
-    # there are no hardcoded fallback lists.
+    # Model listing is INHERITED and shared: the interface walks every
+    # listing-capable face (an optional ``listing_profile`` hint is pinned
+    # first, else faces are ordered per the protocol priority list), fetches
+    # the descriptor's route with per-face auth, parses the descriptor's
+    # shape (``data[].id`` for the openai family, ``models[].name`` with
+    # prefix stripping for gemini/ollama), and returns provider-prefixed
+    # ids. A failed face logs a maintainer warning and the cascade falls
+    # through; when every face fails (or none can list) an ERROR is logged
+    # and the HONEST EMPTY is returned — there are no hardcoded fallbacks.
     #
-    # Override ONLY when the upstream's listing genuinely deviates (a
-    # gateway that advertises uncallable pseudo-models — ``ChutesProvider``
-    # is the worked example) or when a config-defined upstream must return
-    # its configured model list. If you do, return ids prefixed with the
-    # registry key, and keep failures empty:
+    # An upstream that advertises uncallable pseudo-models does NOT need an
+    # override: declare ``listing_filters`` (fnmatch exclusions applied
+    # before prefixing; ``ChutesProvider`` declares ("default*", "*,*") for
+    # its routing aliases). Override ONLY when the listing genuinely
+    # deviates in shape or route — then return ids prefixed with the
+    # registry key and keep failures empty:
     #
     #     async def get_models(self, api_key, client):
     #         response = await client.get(

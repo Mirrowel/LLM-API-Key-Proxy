@@ -526,6 +526,20 @@ def test_provider_base_strips_version_and_profile_endpoints(monkeypatch) -> None
     assert _strip_gemini_api_version("https://x.example/v1") == "https://x.example"
 
 
+def test_legacy_thinking_handler_and_wiring_are_gone() -> None:
+    """G8 final: the LiteLLM-era ``handle_thinking_parameter`` and its
+    client-transform wiring were removed — the native path emits real
+    thinking controls and the fallback degrades to model defaults."""
+
+    from rotator_library.client.transforms import ProviderTransforms
+
+    assert not hasattr(GeminiProvider, "handle_thinking_parameter")
+    assert "_transform_gemini_thinking" not in [
+        getattr(fn, "__name__", "")
+        for fn in ProviderTransforms(provider_plugins={})._transforms.get("gemini", [])
+    ]
+
+
 @pytest.mark.asyncio
 async def test_provider_get_models_uses_configured_base_and_descriptor(monkeypatch) -> None:
     """Listing is the shared, protocol-aware implementation: the

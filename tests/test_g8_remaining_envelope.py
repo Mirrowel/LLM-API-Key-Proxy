@@ -6,16 +6,18 @@
 One pin set over the whole migration: every provider declares its faces
 through ``speaks`` (no ``transport_profiles`` / ``protocol_name`` /
 ``default_profile`` survives), the always-on param engine heads every
-adapter chain, shared listing resolves the descriptor's route with the
-provider prefix and returns an honest empty on failure, and no hardcoded
-fallback listing remains. Provider-specific extras (groq's declared
-parameter cascade, nanogpt's subscription base, gemini's native listing
-hint, chutes' genuinely custom pseudo-model filter) are pinned here too.
+adapter chain, and the shared listing cascade walks every listing-capable
+face (explicit ``listing_profile`` first, then protocol priority),
+warning per failed face and erroring when all fail — never a silent empty
+and never a hardcoded fallback list. Provider-specific extras (groq's
+declared parameter cascade, nanogpt's subscription base, gemini's native
+listing hint, chutes' declarable pseudo-model filters) are pinned here too.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 
@@ -25,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
+
+from rotator_library.providers.provider_interface import ProviderInterface  # noqa: E402
 
 MIGRATED = ("openai", "groq", "cohere", "chutes", "nanogpt", "openrouter", "gemini", "ollama")
 
@@ -60,7 +64,10 @@ FACES = {
         },
     ),
     "gemini": ("native", {"native": "gemini", "openai": "openai_chat"}),
-    "ollama": ("ollama", {"ollama": "ollama"}),
+    "ollama": (
+        "ollama",
+        {"ollama": "ollama", "cloud": "ollama"},
+    ),
 }
 
 #: Shared-listing expectations: route, auth headers, response body, ids.
@@ -147,7 +154,7 @@ def test_param_engine_heads_the_adapter_chain(provider: str) -> None:
     [
         ("openai", ()),
         ("groq", ("groq",)),
-        ("cohere", ("cohere",)),
+        ("cohere", ()),
         ("chutes", ("chutes",)),
         ("nanogpt", ("nanogpt",)),
         ("openrouter", ()),
@@ -200,17 +207,120 @@ def test_failed_listing_is_an_honest_empty(provider: str) -> None:
     assert asyncio.run(plugin.get_models("k", _Client())) == []
 
 
-@pytest.mark.parametrize(
-    "provider", [name for name in MIGRATED if name != "chutes"]
-)
+@pytest.mark.parametrize("provider", MIGRATED)
 def test_shared_listing_providers_declare_no_custom_get_models(provider: str) -> None:
-    """Chutes is the one genuinely custom lister (routing pseudo-models);
-    every other migrated provider inherits the shared implementation — the
-    hand-rolled fetches (and their fallback lists) are gone."""
+    """Every migrated provider inherits the shared cascade — the hand-rolled
+    fetches (and their fallback lists) are gone, Chutes' included: its
+    routing pseudo-model filter is the declarable ``listing_filters``."""
 
     from rotator_library.providers import PROVIDER_PLUGINS
 
     assert "get_models" not in vars(PROVIDER_PLUGINS[provider])
+
+
+# --- listing cascade: per-face warnings, honest errors --------------------------
+
+
+class _CascadeProvider(ProviderInterface):
+    """Two listing-capable faces for the fallback-cascade pins.
+
+    ``primary`` fails in the fallback test; declaration order is the
+    cascade order (both faces are openai_chat, so the global priority list
+    keeps their declaration order stable).
+    """
+
+    provider_env_name = "cascade_pin"
+    speaks = (
+        ("primary", "openai_chat", {"base": "https://primary.test"}),
+        ("backup", "openai_chat", {"base": "https://backup.test"}),
+    )
+
+
+class _JSONResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _CascadeClient:
+    def __init__(self, failing: tuple[str, ...] = ()):
+        self.failing = failing
+        self.calls: list[str] = []
+
+    async def get(self, url, headers=None, **kwargs):
+        self.calls.append(url)
+        if any(fragment in url for fragment in self.failing):
+            raise RuntimeError("network down")
+        return _JSONResponse({"data": [{"id": "model-x"}]})
+
+
+@pytest.fixture
+def library_logs(caplog, monkeypatch):
+    """caplog with propagation re-enabled (provider modules mute it)."""
+
+    logger = logging.getLogger("rotator_library")
+    monkeypatch.setattr(logger, "propagate", True)
+    caplog.set_level(logging.DEBUG, logger="rotator_library")
+    return caplog
+
+
+def test_listing_first_face_success_logs_no_warning(library_logs) -> None:
+    client = _CascadeClient()
+
+    models = asyncio.run(_CascadeProvider().get_models("k", client))
+
+    assert models == ["cascade_pin/model-x"]
+    assert client.calls == ["https://primary.test/models"]
+    assert "model listing failed" not in library_logs.text
+
+
+def test_listing_falls_back_to_next_face_with_warning(library_logs) -> None:
+    client = _CascadeClient(failing=("primary.test",))
+
+    models = asyncio.run(_CascadeProvider().get_models("k", client))
+
+    assert models == ["cascade_pin/model-x"]
+    assert client.calls == [
+        "https://primary.test/models",
+        "https://backup.test/models",
+    ]
+    warnings = [record for record in library_logs.records if record.levelno == logging.WARNING]
+    assert any(
+        "primary face 'primary'" in record.getMessage()
+        and "falling back" in record.getMessage()
+        for record in warnings
+    )
+    assert "all speakable faces" not in library_logs.text
+
+
+def test_listing_all_faces_failing_logs_error(library_logs) -> None:
+    client = _CascadeClient(failing=("primary.test", "backup.test"))
+
+    assert asyncio.run(_CascadeProvider().get_models("k", client)) == []
+
+    errors = [record for record in library_logs.records if record.levelno == logging.ERROR]
+    assert any("all speakable faces" in record.getMessage() for record in errors)
+
+
+def test_listing_without_any_listing_descriptor_logs_error(library_logs) -> None:
+    class _NoListingProvider(ProviderInterface):
+        provider_env_name = "no_listing_pin"
+        # The responses_websocket variant is the one family member with no
+        # listing descriptor (path is None), so it cannot list at all.
+        speaks = ("responses_websocket",)
+
+    assert asyncio.run(_NoListingProvider().get_models("k", _CascadeClient())) == []
+
+    errors = [record for record in library_logs.records if record.levelno == logging.ERROR]
+    assert any(
+        "no speakable face has a listing descriptor" in record.getMessage()
+        for record in errors
+    )
 
 
 # --- provider-specific envelope extras -----------------------------------------
@@ -286,9 +396,10 @@ def test_gemini_native_listing_hint_and_endpoints() -> None:
     }
 
 
-def test_chutes_custom_listing_filters_routing_pseudo_models() -> None:
-    """The one kept hand-rolled lister: the gateway advertises ``default``
-    and comma-separated fallback chains that are not callable ids."""
+def test_chutes_declared_listing_filters_drop_routing_pseudo_models() -> None:
+    """The listing rides the shared cascade; the gateway's non-callable
+    routing pseudo-models (``default``, comma fallback chains) are excluded
+    by the declarable ``listing_filters`` instead of a hand-rolled lister."""
 
     from rotator_library.providers.chutes_provider import ChutesProvider
 
@@ -309,6 +420,8 @@ def test_chutes_custom_listing_filters_routing_pseudo_models() -> None:
         async def get(self, url, headers=None, **kwargs):
             return _FakeResponse()
 
-    assert asyncio.run(ChutesProvider().get_models("k", _Client())) == [
+    provider = ChutesProvider()
+    assert provider.listing_filters == ("default*", "*,*")
+    assert asyncio.run(provider.get_models("k", _Client())) == [
         "chutes/deepseek-ai/DeepSeek-V3.2-TEE"
     ]

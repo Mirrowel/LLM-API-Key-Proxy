@@ -7,7 +7,7 @@ Provider-specific request transformations.
 This module isolates all provider-specific request mutations that were
 scattered throughout client.py, including:
 - gemma-3 system message conversion
-- Gemini safety settings and thinking parameter
+- Gemini safety settings (deliberately inert passthrough)
 - NVIDIA thinking parameter
 - dedaluslabs tool_choice=auto removal
 
@@ -56,7 +56,10 @@ class ProviderTransforms:
         # Each provider can have multiple transform functions
         self._transforms: Dict[str, List[Callable]] = {
             "gemma": [self._transform_gemma_system_messages],
-            "gemini": [self._transform_gemini_safety, self._transform_gemini_thinking],
+            # Gemini keeps only the (deliberately inert) safety passthrough;
+            # its legacy thinking handler was removed (native controls own
+            # reasoning; the LiteLLM fallback degrades to model defaults).
+            "gemini": [self._transform_gemini_safety],
             "nvidia_nim": [self._transform_nvidia_thinking],
             "dedaluslabs": [self._transform_dedaluslabs_tool_choice],
         }
@@ -329,26 +332,6 @@ class ProviderTransforms:
         # Safety settings are passed through unchanged. No defaults are injected
         # because some Gemini-family models (e.g. Gemma) reject unknown safety
         # categories with a 400 error.
-        return None
-
-    def _transform_gemini_thinking(
-        self,
-        kwargs: Dict[str, Any],
-        model: str,
-        provider: str,
-    ) -> Optional[str]:
-        """
-        Handle thinking parameter for Gemini.
-
-        Delegates to provider plugin's handle_thinking_parameter method.
-        """
-        if provider != "gemini":
-            return None
-
-        plugin = self._get_plugin_instance(provider)
-        if plugin and hasattr(plugin, "handle_thinking_parameter"):
-            plugin.handle_thinking_parameter(kwargs, model)
-            return "gemini: handled thinking parameter"
         return None
 
     def _transform_nvidia_thinking(

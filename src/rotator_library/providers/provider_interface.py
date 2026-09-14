@@ -16,6 +16,7 @@ from typing import (
     TYPE_CHECKING,
 )
 import os
+from fnmatch import fnmatchcase
 from functools import lru_cache
 
 import httpx
@@ -156,6 +157,28 @@ def _hashable_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return tuple(_hashable_value(item) for item in value)
     return value
+
+
+def _accepts_parameter(method: Any, name: str) -> bool:
+    """Whether a callable declares ``name`` (or ``**kwargs``).
+
+    Signature inspection, not exception catching — the same convention the
+    executor's profile-aware calls use: a pre-D13 override without the
+    ``profile`` parameter keeps its single-argument call, and a TypeError
+    raised INSIDE an implementation must propagate rather than be masked
+    by a retry.
+    """
+
+    try:
+        import inspect
+
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    parameters = signature.parameters
+    if name in parameters:
+        return True
+    return any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
 
 
 @lru_cache(maxsize=None)
@@ -374,6 +397,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # default face. See protocols/defaults.py.
     speaks: Tuple[Any, ...] = ()
     adapter_names: Tuple[str, ...] = ()
+    # Optional fnmatch EXCLUSION patterns for model listing (G8 final): a
+    # parsed listing id matching any pattern is dropped before the provider
+    # prefix is added. Chutes declares ("default*", "*,*") to hide the
+    # gateway's non-callable routing pseudo-models. ``listing_filters`` is
+    # the declarable successor of a hand-rolled lister.
+    listing_filters: Tuple[str, ...] = ()
     # Zero-credential providers (e.g. a local Ollama) declare this so routing
     # can mint the internal no-auth rotation slot when no secret is configured.
     default_auth_mode: Optional[str] = None
@@ -416,63 +445,127 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     cache_replay: Optional[List[Dict[str, Any]]] = None
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
-        """Fetch available models through the shared listing implementation.
+        """Fetch available models through the shared listing cascade.
 
-        The default is protocol-aware and shared by every provider: the
-        listing face resolves from this provider's declared faces (the
-        provider's ``listing_profile`` hint wins, else the global
-        protocol priority list picks the first face with a listing
-        descriptor), and the response shape parses per the protocol's
-        descriptor (openai-family ``data[].id``, gemini/ollama
-        ``models[].name`` with prefix stripping). A failed listing is an
-        honest empty — no hardcoded fallbacks. Providers with genuinely
+        The default is protocol-aware and shared by every provider: every
+        declared face that carries a listing descriptor is collected in
+        cascade order (the provider's ``listing_profile`` hint first, then
+        the global protocol priority list, then remaining declaration
+        order) and tried in that order. A failed face logs a maintainer
+        warning naming the face — the first warning points at
+        ``listing_profile`` as the pin — and the cascade falls through to
+        the next face. When every face fails, or none can list at all, an
+        ERROR is logged and the honest empty is returned: no hardcoded
+        fallbacks, no silent failure.
+
+        ``listing_filters`` (when declared) excludes parsed ids before the
+        provider prefix is added. Response shapes parse per the face's
+        protocol descriptor (openai-family ``data[].id``, gemini/ollama
+        ``models[].name`` with prefix stripping). Providers with genuinely
         different listings override this method and win.
         """
 
-        from ..protocols.defaults import listing_descriptor, resolve_listing_protocol
+        from ..protocols.defaults import listing_descriptor
+
+        logger = self._provider_logger()
+        faces = self._listing_faces()
+        if not faces:
+            logger.error(
+                "no speakable face has a listing descriptor for %s; returning empty model list",
+                self._provider_config_key(),
+            )
+            return []
+        last_error: Optional[Exception] = None
+        for position, (face_name, protocol) in enumerate(faces):
+            descriptor = listing_descriptor(protocol)
+            try:
+                # Endpoint + auth construction is part of trying the face:
+                # a face whose declaration cannot resolve falls through to
+                # the next one instead of aborting the cascade.
+                endpoint = self.get_native_endpoint(operation="models", profile=face_name or None)
+                headers = await self._listing_headers(api_key, protocol, profile=face_name or None)
+                payload = await self._fetch_listing(client, endpoint, headers, descriptor)
+            except Exception as exc:
+                last_error = exc
+                if position == 0:
+                    logger.warning(
+                        "model listing failed on primary face %r for %s: %s; "
+                        "falling back — declare listing_profile to pin the right face",
+                        face_name,
+                        self._provider_config_key(),
+                        exc,
+                    )
+                else:
+                    logger.warning(
+                        "model listing failed on fallback face %r for %s: %s",
+                        face_name,
+                        self._provider_config_key(),
+                        exc,
+                    )
+                continue
+            ids = self._parse_listing_payload(payload, descriptor.get("shape"))
+            strip_prefix = descriptor.get("strip")
+            if strip_prefix:
+                ids = [model_id[len(strip_prefix):] if model_id.startswith(strip_prefix) else model_id for model_id in ids]
+            filters = tuple(getattr(self, "listing_filters", None) or ())
+            if filters:
+                ids = [model_id for model_id in ids if not any(fnmatchcase(model_id, pattern) for pattern in filters)]
+            prefix = f"{self._provider_config_key()}/"
+            return [f"{prefix}{model_id}" for model_id in ids]
+        logger.error(
+            "model listing failed on all speakable faces for %s: %s; returning empty model list",
+            self._provider_config_key(),
+            last_error,
+        )
+        return []
+
+    def _listing_faces(self) -> Tuple[Tuple[str, str], ...]:
+        """Speakable faces that can list models, in cascade order.
+
+        The ``listing_profile`` hint (a PROFILE name; a bare protocol name
+        survives the legacy path) is pinned first so the endpoint and auth
+        resolve exactly as the pinned face addresses them. Every other
+        declared face follows per the global protocol priority list, then
+        any remaining face in declaration order. Legacy single-protocol
+        providers contribute their one implicit face under the empty name;
+        faces whose protocol carries no listing descriptor never enter the
+        cascade (the caller reports the honest empty).
+        """
+
+        from ..protocols.defaults import PROTOCOL_PRIORITY, listing_descriptor
 
         profiles = self._speaks_profiles()
-        available = tuple(
-            resolved["protocol"] for name, resolved in profiles.items() if not name.startswith("__")
-        )
-        if not available:
-            protocol = self.get_protocol_name() or "openai_chat"
-            available = (protocol,)
-        # A declared ``listing_profile`` is a PROFILE name: resolve it to
-        # its protocol so the descriptor matches the face the endpoint
-        # builder addresses (a two-face provider's listing face may not be
-        # its default face). A bare protocol name survives the legacy path.
-        listing_profile = getattr(self, "listing_profile", None)
-        listing_protocol: Optional[str] = None
-        if listing_profile:
-            entry: Optional[Any] = profiles.get(listing_profile)
-            if entry is None and isinstance(self.transport_profiles, Mapping):
-                legacy_entry = self.transport_profiles.get(listing_profile)
-                entry = legacy_entry if isinstance(legacy_entry, Mapping) else None
-            if isinstance(entry, Mapping):
-                listing_protocol = str(entry.get("protocol") or entry.get("protocol_name") or "")
-            else:
-                listing_protocol = str(listing_profile)
-        if not listing_protocol:
-            listing_protocol = resolve_listing_protocol(available)
-        if not listing_protocol:
-            return []
-        descriptor = listing_descriptor(listing_protocol)
-        if not descriptor:
-            return []
-        endpoint = self.get_native_endpoint(operation="models", profile=listing_profile)
-        headers = await self._listing_headers(api_key, listing_protocol)
-        try:
-            payload = await self._fetch_listing(client, endpoint, headers, descriptor)
-        except Exception as exc:
-            self._provider_logger().debug(f"Model listing failed for {self.__class__.__name__}: {exc}")
-            return []
-        ids = self._parse_listing_payload(payload, descriptor.get("shape"))
-        strip_prefix = descriptor.get("strip")
-        if strip_prefix:
-            ids = [model_id[len(strip_prefix):] if model_id.startswith(strip_prefix) else model_id for model_id in ids]
-        prefix = f"{self._provider_config_key()}/"
-        return [f"{prefix}{model_id}" for model_id in ids]
+        if profiles:
+            names = [name for name in profiles if not name.startswith("__")]
+            protocol_by_name: Dict[str, str] = {
+                name: str(profiles[name].get("protocol") or "") for name in names
+            }
+        else:
+            names = [""]
+            protocol_by_name = {"": self.get_protocol_name() or "openai_chat"}
+        hint = getattr(self, "listing_profile", None)
+        ordered: List[str] = []
+        if hint:
+            hint_protocol = protocol_by_name.get(hint, "")
+            if not hint_protocol and isinstance(self.transport_profiles, Mapping):
+                entry = self.transport_profiles.get(hint)
+                if isinstance(entry, Mapping):
+                    hint_protocol = str(entry.get("protocol") or entry.get("protocol_name") or "")
+            if not hint_protocol:
+                # A bare protocol name survives the legacy path.
+                hint_protocol = str(hint)
+            ordered.append(hint)
+            protocol_by_name[hint] = hint_protocol
+        priority = {protocol: index for index, protocol in enumerate(PROTOCOL_PRIORITY)}
+        remaining = [name for name in names if name != hint]
+        remaining.sort(key=lambda name: priority.get(protocol_by_name.get(name, ""), len(PROTOCOL_PRIORITY)))
+        ordered.extend(remaining)
+        faces: List[Tuple[str, str]] = []
+        for name in ordered:
+            protocol = protocol_by_name.get(name, "")
+            if protocol and listing_descriptor(protocol):
+                faces.append((name, protocol))
+        return tuple(faces)
 
     @staticmethod
     def _provider_logger():
@@ -480,18 +573,25 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
 
         return logging.getLogger("rotator_library")
 
-    async def _listing_headers(self, api_key: str, listing_protocol: str) -> Dict[str, str]:
-        """Credential headers for the listing face.
+    async def _listing_headers(self, api_key: str, listing_protocol: str, profile: Optional[str] = None) -> Dict[str, str]:
+        """Credential headers for one listing face.
 
         The provider's own header logic wins when it exists (an
         authenticated Ollama behind a proxy sends its Bearer; the gemini
         faces send x-goog or bearer per face) — the protocol-default
-        pair is only the fallback for duck-typed providers.
+        pair is only the fallback for duck-typed providers. The face's
+        profile rides through so per-face auth declarations actually
+        reach the listing request.
         """
 
         if hasattr(self, "get_native_headers"):
+            method = self.get_native_headers
             try:
-                return self.get_native_headers(api_key, operation="models")
+                if profile and _accepts_parameter(method, "profile"):
+                    return method(api_key, operation="models", profile=profile)
+                # A pre-D13 override without the profile parameter keeps its
+                # original call shape (never a masked TypeError retry).
+                return method(api_key, operation="models")
             except Exception:
                 pass
         from ..protocols.defaults import default_auth_mode
@@ -1076,13 +1176,19 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             pass
         return key
 
-    def normalize_native_model(self, model: str) -> str:
+    def normalize_native_model(self, model: str, profile: Optional[str] = None) -> str:
         """Return the upstream model name for native provider calls.
 
         The proxy-facing model commonly includes a provider prefix such as
         ``provider/model``. Native upstream APIs usually expect only ``model``.
         Providers may override this for aliases, but stripping the first prefix
         is the safe default for native execution.
+
+        ``profile`` is the resolved transport face (None for single-face
+        providers or bare addressing). Overrides that normalize per face
+        (an id spelling only one face expects) declare the parameter;
+        callers pass it only when the override accepts it, so pre-D13
+        single-argument overrides keep working.
         """
 
         return model.split("/", 1)[1] if "/" in model else model

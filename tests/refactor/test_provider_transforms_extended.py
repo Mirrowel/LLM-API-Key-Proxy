@@ -24,14 +24,19 @@ def test_gemini_safety_injection_removed():
     assert result["safety_settings"] == {"harassment": "OFF"}
 
 
-def test_thinking_transforms_for_gemini_and_nvidia():
+def test_thinking_transform_remains_for_nvidia_only():
+    # Gemini's legacy thinking handler + wiring were removed (G8 final): the
+    # native path emits real thinking controls and the LiteLLM fallback
+    # degrades to model-default thinking. NVIDIA keeps its delegation.
     transforms = ProviderTransforms(
         provider_plugins={"gemini": ThinkingProvider, "nvidia_nim": ThinkingProvider}
     )
+    gemini_transforms = [getattr(fn, "__name__", "") for fn in transforms._transforms.get("gemini", [])]
+    assert "_transform_gemini_thinking" not in gemini_transforms
 
     payload = {}
     result = transforms.apply_sync("gemini", "gemini-1.5-pro", payload)
-    assert result["thinking_handled"] is True
+    assert "thinking_handled" not in result
 
     payload = {}
     result = transforms.apply_sync("nvidia_nim", "nvidia/test", payload)

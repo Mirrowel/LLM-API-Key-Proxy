@@ -32,11 +32,16 @@ def test_adapter_registry_auto_discovers_builtins_and_aliases() -> None:
 
     assert "noop" in adapters
     assert "model_override" in adapters
-    assert "field_rename" in adapters
+    assert "suppress_developer_role" in adapters
+    assert "antigravity_envelope" in adapters
+    # The retired escape-hatch-thin adapters are gone (declarable behavior).
+    assert "field_rename" not in adapters
+    assert "reasoning_content" not in adapters
     assert resolve_adapter_name("passthrough") == "noop"
-    assert resolve_adapter_name("field_copy") == "field_rename"
     assert get_adapter_class("override_model").name == "model_override"
     assert get_adapter("none") is get_adapter("noop")
+    with pytest.raises(KeyError):
+        resolve_adapter_name("field_copy")
 
 
 def test_adapter_registry_rejects_duplicate_names_and_alias_collisions() -> None:
@@ -88,35 +93,6 @@ async def test_suppress_developer_role_converts_or_drops_messages() -> None:
 
     assert system_result["messages"][0]["role"] == "system"
     assert [message["role"] for message in drop_result["messages"]] == ["user"]
-
-
-@pytest.mark.asyncio
-async def test_reasoning_content_adapter_copies_common_reasoning_field() -> None:
-    payload = {"choices": [{"message": {"role": "assistant", "reasoning": "hidden"}}]}
-
-    result = await run_adapter_chain([get_adapter("reasoning_content")], payload, AdapterContext(), stage="response")
-
-    assert result["choices"][0]["message"]["reasoning_content"] == "hidden"
-
-
-@pytest.mark.asyncio
-async def test_field_rename_adapter_copies_and_moves_configured_fields() -> None:
-    payload = {"old": {"field": "value"}, "messages": [{}]}
-    context = AdapterContext(
-        adapter_config={
-            "field_rename": {
-                "rules": [
-                    {"source_path": "old.field", "target_path": "messages[-1].new_field", "move": True}
-                ]
-            }
-        }
-    )
-
-    result = await run_adapter_chain([get_adapter("field_rename")], payload, context, stage="request")
-
-    assert result["messages"][-1]["new_field"] == "value"
-    assert "field" not in result["old"]
-    assert payload["old"]["field"] == "value"
 
 
 @pytest.mark.asyncio

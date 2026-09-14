@@ -372,9 +372,13 @@ class _FakeHTTP:
 
 def test_ollama_provider_endpoints_models_and_optional_auth() -> None:
     provider = PROVIDER_PLUGINS["ollama"]()
-    # The envelope declares the native face; endpoints (including the
-    # /api/tags listing route) inherit from the protocol registry.
-    assert provider.speaks == ("ollama",)
+    # The envelope declares both faces (local default + hosted cloud); the
+    # endpoints — including the /api/tags listing route — inherit from the
+    # protocol registry.
+    assert provider.speaks == (
+        "ollama",
+        ("cloud", "ollama", {"base": "https://ollama.com", "auth_mode": "bearer"}),
+    )
     assert provider.get_protocol_name() == "ollama"
     assert provider.transport_profiles is None
     assert provider.protocol_name is None
@@ -416,6 +420,83 @@ async def test_ollama_provider_models_from_tags_shape() -> None:
             raise RuntimeError("offline")
 
     assert await provider.get_models("", _BrokenHTTP()) == []
+
+
+def test_ollama_cloud_face_routes_auth_and_normalizes_cloud_ids() -> None:
+    """The cloud face is a real face on the same protocol: hosted base,
+    declared bearer auth, ``ollama:cloud/model`` addressing, and the bare
+    library spelling for locally ``-cloud``-suffixed model ids."""
+
+    from rotator_library.routing.profiles import parse_model_reference, resolve_profile
+
+    provider = PROVIDER_PLUGINS["ollama"]()
+    profiles, default = provider.get_declared_profiles()
+    assert default == "ollama"
+    assert set(profiles) == {"ollama", "cloud"}
+    assert profiles["cloud"]["protocol"] == "ollama"
+
+    # Same native routes on the hosted base; the local default keeps its own.
+    assert provider.get_native_endpoint("m", "chat", profile="cloud") == "https://ollama.com/api/chat"
+    assert provider.get_native_endpoint("m", "chat") == "http://localhost:11434/api/chat"
+    assert provider.get_native_endpoint("m", "models", profile="cloud") == "https://ollama.com/api/tags"
+
+    # Auth differs per face: a real secret rides Bearer on both; the minted
+    # no-auth slot stays anonymous EVERYWHERE — including the cloud face,
+    # whose declared bearer is an auth MODE, not a license to present the
+    # internal sentinel as a literal credential. A cloud call with no real
+    # key goes anonymous and fails the cloud's 401 honestly.
+    assert provider.get_native_headers("k")["Authorization"] == "Bearer k"
+    assert provider.get_native_headers("k", profile="cloud")["Authorization"] == "Bearer k"
+    assert "Authorization" not in provider.get_native_headers("__proxy_no_auth__")
+    assert "Authorization" not in provider.get_native_headers(
+        "__proxy_no_auth__", profile="cloud"
+    )
+
+    # ``ollama:cloud/model`` addressing resolves the cloud face.
+    ref = parse_model_reference("ollama:cloud/gpt-oss:120b-cloud")
+    assert (ref.provider, ref.profile, ref.model) == ("ollama", "cloud", "gpt-oss:120b-cloud")
+    declared, default_name = provider.get_declared_profiles()
+    assert (
+        resolve_profile(
+            declared_profiles=declared,
+            default_profile=default_name,
+            protocol_name=None,
+            client_protocol="ollama",
+            requested_profile=ref.profile,
+            provider="ollama",
+        )
+        == "cloud"
+    )
+
+    # The direct cloud API takes the bare library name: the local daemon's
+    # trailing routing suffix strips on the cloud face ONLY (a locally
+    # hosted model may legitimately end in ``-cloud``).
+    assert provider.normalize_native_model("gpt-oss:120b-cloud", profile="cloud") == "gpt-oss:120b"
+    assert provider.normalize_native_model("ollama:cloud/gpt-oss:120b-cloud", profile="cloud") == "gpt-oss:120b"
+    assert provider.normalize_native_model("gpt-oss:120b-cloud") == "gpt-oss:120b-cloud"
+    assert provider.normalize_native_model("gpt-oss:120b") == "gpt-oss:120b"
+
+
+async def test_ollama_cloud_listing_falls_back_from_the_local_face_with_bearer() -> None:
+    """The listing cascade crosses faces: a dead local daemon warns and the
+    configured cloud key lists ``/api/tags`` on ``https://ollama.com`` with
+    its per-face Bearer auth (the plumbed profile reaches the listing)."""
+
+    provider = PROVIDER_PLUGINS["ollama"]()
+    calls: list[dict] = []
+
+    class _FakeHTTP:
+        async def get(self, url, headers=None, **kwargs):
+            calls.append({"url": url, "headers": dict(headers or {})})
+            if "localhost" in url:
+                raise RuntimeError("local daemon offline")
+            return _FakeResponse({"models": [{"name": "gpt-oss:120b"}]})
+
+    models = await provider.get_models("k", _FakeHTTP())
+
+    assert models == ["ollama/gpt-oss:120b"]
+    assert calls[-1]["url"] == "https://ollama.com/api/tags"
+    assert calls[-1]["headers"]["Authorization"] == "Bearer k"
 
 
 # ---------------------------------------------------------------------------

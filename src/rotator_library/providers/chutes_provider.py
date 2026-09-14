@@ -22,9 +22,12 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
     balance or plan allowance is gone (never retried), 429 is throttling.
     Model ids keep their vendor prefix and -TEE suffix; routing syntax
     (``default``, comma lists, ``:latency``/``:throughput``) never appears
-    in listings. The ``chutes`` wire adapter owns parameter hygiene and
-    the dual reasoning-field spellings (vLLM ``reasoning`` vs SGLang
-    ``reasoning_content``).
+    in listings — the ``listing_filters`` declaration excludes those
+    pseudo-model ids from the shared listing cascade (the gateway itself
+    advertises them). The ``chutes`` wire adapter owns the data-center
+    parameter hygiene (vLLM/SGLang sampling whitelist and dual
+    reasoning-field spellings); the shared ``max_completion_tokens`` →
+    ``max_tokens`` rename is a declared ``model_rules`` row.
     """
 
     # -- transport (the envelope) ---------------------------------------
@@ -35,6 +38,20 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://llm.chutes.ai/v1"
     adapter_names = ("chutes",)
+    # The gateway's listing advertises routing pseudo-models that are not
+    # callable ids: the ``default`` alias and comma-separated fallback
+    # chains (``a,b:latency``). fnmatch exclusions keep them out of the
+    # pool before the provider prefix is added.
+    listing_filters = ("default*", "*,*")
+    model_rules = (
+        {
+            "match": "*",
+            # Both Chutes and NanoGPT spell the length parameter
+            # ``max_tokens``; the shared rename is declared here instead of
+            # riding provider code.
+            "rename": {"max_completion_tokens": "max_tokens"},
+        },
+    )
     quota_api_base = "https://api.chutes.ai"
     model_quota_groups = {
         "chutes_global": ["_quota"],
@@ -136,37 +153,3 @@ class ChutesProvider(ChutesQuotaTracker, ProviderInterface):
                 refresh_single_credential(api_key, client) for api_key in credentials
             ]
             await asyncio.gather(*tasks, return_exceptions=True)
-
-    def _models_url(self) -> str:
-        """Chutes' listing route on the configured transport base."""
-
-        return f"{self.get_provider_api_base()}/models"
-
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
-        """List models through the gateway's data-center filter.
-
-        This is the one provider whose listing is GENUINELY custom: the
-        gateway advertises routing pseudo-models that are not callable
-        ids — the ``default`` alias and comma-separated fallback chains
-        (``a,b:latency``) — so the shared openai-shaped parser would
-        expose unusable entries. Everything genuine (``data[].id`` shape,
-        prefix) rides the inherited convention; the filter rides here.
-        A failed listing is an honest empty.
-        """
-
-        prefix = f"{self._provider_config_key()}/"
-        try:
-            response = await client.get(self._models_url())
-            response.raise_for_status()
-            models = []
-            for model in response.json().get("data", []):
-                if not isinstance(model, dict):
-                    continue
-                model_id = str(model.get("id") or "")
-                if not model_id or model_id.startswith("default") or "," in model_id:
-                    continue
-                models.append(f"{prefix}{model_id}")
-            return models
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            lib_logger.error(f"Failed to fetch Chutes models: {e}")
-            return []

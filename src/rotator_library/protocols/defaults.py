@@ -130,9 +130,9 @@ PROTOCOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-# The priority list used when a face must be chosen without an explicit
-# declaration (model listing on a multi-face provider, zero-match
-# conversion). Mirrors the routing priority list.
+# The priority list used when listing faces are ordered without an explicit
+# ``listing_profile`` declaration (the shared ``get_models`` cascade tries
+# faces in this order). Mirrors the routing priority list.
 PROTOCOL_PRIORITY: Tuple[str, ...] = (
     "openai_chat",
     "responses",
@@ -157,20 +157,6 @@ def listing_descriptor(protocol: str) -> Optional[Dict[str, Any]]:
     if not listing or not listing.get("path"):
         return None
     return dict(listing)
-
-
-def resolve_listing_protocol(available: Tuple[str, ...]) -> Optional[str]:
-    """Pick the listing face: the provider's explicit choice wins; else the
-    first protocol in priority order that both is available and has a
-    listing descriptor."""
-
-    for candidate in PROTOCOL_PRIORITY:
-        if candidate in available and listing_descriptor(candidate):
-            return candidate
-    for candidate in available:
-        if listing_descriptor(candidate):
-            return candidate
-    return None
 
 
 # ---------------------------------------------------------------------------
