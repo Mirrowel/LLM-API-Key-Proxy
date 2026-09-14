@@ -51,7 +51,7 @@ _AUTH_NONE = {"auth_mode": "none"}
 #            (gemini/ollama), none (no listing on this protocol)
 #   strip:   prefix stripped from listed ids (gemini "models/")
 _LISTING_OPENAI = {"path": "/models", "shape": "data_id"}
-_LISTING_GEMINI = {"path": "/models", "shape": "models_name", "strip": "models/"}
+_LISTING_GEMINI = {"path": "/models", "shape": "models_name", "strip": "models/", "paginated": True}
 _LISTING_OLLAMA = {"path": "/api/tags", "shape": "models_name"}
 _LISTING_NONE = {"path": None, "shape": None}
 

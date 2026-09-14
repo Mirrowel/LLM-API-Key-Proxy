@@ -224,36 +224,33 @@ class NanoGPTProvider(NanoGptQuotaTracker, ProviderInterface):
                         tier = self.get_tier_from_state(state)
                         self._tier_cache[api_key] = tier
 
-                        # Extract quota data for daily and monthly limits
-                        daily_data = usage_data.get("daily", {})
-                        monthly_data = usage_data.get("monthly", {})
-                        limits = usage_data.get("limits", {})
+                        # Extract quota data — the live subscription-usage
+                        # API reports token-count spellings
+                        # (dailyInputTokens/weeklyInputTokens under limits
+                        # and top-level usage counts), while older shapes
+                        # carried remaining/reset_at fractions. Both are
+                        # accepted; whichever carries data wins.
+                        limits = usage_data.get("limits", {}) or {}
+                        daily_data = usage_data.get("daily", {}) or {}
 
-                        daily_limit = limits.get("daily", 0)
-                        monthly_limit = limits.get("monthly", 0)
-                        daily_remaining = daily_data.get("remaining", 0)
-                        monthly_remaining = monthly_data.get("remaining", 0)
+                        daily_limit = limits.get("dailyInputTokens") or limits.get("daily") or 0
+                        weekly_limit = limits.get("weeklyInputTokens") or limits.get("monthly") or 0
+                        if usage_data.get("dailyInputTokens") is not None:
+                            # New shape: counts + limits, no fractions.
+                            daily_used = int(usage_data.get("dailyInputTokens") or 0)
+                            daily_reset_ts = 0
+                        else:
+                            daily_remaining = daily_data.get("remaining", 0)
+                            daily_fraction = (
+                                daily_remaining / daily_limit if daily_limit > 0 else 1.0
+                            )
+                            daily_used = (
+                                int((1.0 - daily_fraction) * daily_limit)
+                                if daily_limit > 0
+                                else 0
+                            )
+                            daily_reset_ts = daily_data.get("reset_at", 0)
 
-                        # Calculate remaining fractions
-                        daily_fraction = (
-                            daily_remaining / daily_limit if daily_limit > 0 else 1.0
-                        )
-                        monthly_fraction = (
-                            monthly_remaining / monthly_limit
-                            if monthly_limit > 0
-                            else 1.0
-                        )
-
-                        # Get reset timestamps
-                        daily_reset_ts = daily_data.get("reset_at", 0)
-                        monthly_reset_ts = monthly_data.get("reset_at", 0)
-
-                        # Store daily quota baseline
-                        daily_used = (
-                            int((1.0 - daily_fraction) * daily_limit)
-                            if daily_limit > 0
-                            else 0
-                        )
                         await usage_manager.update_quota_baseline(
                             api_key,
                             "nanogpt/_daily",
@@ -264,26 +261,37 @@ class NanoGPTProvider(NanoGptQuotaTracker, ProviderInterface):
                             quota_used=daily_used,
                         )
 
-                        # Store monthly quota baseline
-                        monthly_used = (
-                            int((1.0 - monthly_fraction) * monthly_limit)
-                            if monthly_limit > 0
-                            else 0
-                        )
+                        # Weekly baseline (the new API reports weekly token
+                        # limits; the legacy spelling was monthly).
+                        if usage_data.get("weeklyInputTokens") is not None:
+                            weekly_used = int(usage_data.get("weeklyInputTokens") or 0)
+                            weekly_reset_ts = 0
+                        else:
+                            monthly_data = usage_data.get("monthly", {}) or {}
+                            monthly_remaining = monthly_data.get("remaining", 0)
+                            monthly_fraction = (
+                                monthly_remaining / weekly_limit if weekly_limit > 0 else 1.0
+                            )
+                            weekly_reset_ts = monthly_data.get("reset_at", 0)
+                            weekly_used = (
+                                int((1.0 - monthly_fraction) * weekly_limit)
+                                if weekly_limit > 0
+                                else 0
+                            )
                         await usage_manager.update_quota_baseline(
                             api_key,
                             "nanogpt/_monthly",
-                            quota_max_requests=monthly_limit,
-                            quota_reset_ts=monthly_reset_ts
-                            if monthly_reset_ts > 0
+                            quota_max_requests=weekly_limit,
+                            quota_reset_ts=weekly_reset_ts
+                            if weekly_reset_ts > 0
                             else None,
-                            quota_used=monthly_used,
+                            quota_used=weekly_used,
                         )
 
                         lib_logger.debug(
                             f"Updated NanoGPT quota baselines: "
-                            f"daily={daily_remaining}/{daily_limit}, "
-                            f"monthly={monthly_remaining}/{monthly_limit}"
+                            f"daily={daily_used}/{daily_limit}, "
+                            f"weekly={weekly_used}/{weekly_limit}"
                         )
 
                 except Exception as e:

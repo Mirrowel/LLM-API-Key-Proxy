@@ -98,7 +98,7 @@ def test_openrouter_models_parse_and_prefix():
         def __init__(self):
             self.calls = []
 
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             self.calls.append((url, headers))
             return _FakeResponse()
 
@@ -113,7 +113,7 @@ def test_openrouter_failed_listing_is_an_honest_empty():
     from rotator_library.providers.openrouter_provider import OpenRouterProvider
 
     class _Client:
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             raise RuntimeError("network down")
 
     assert asyncio.run(OpenRouterProvider().get_models("k", _Client())) == []
@@ -307,7 +307,7 @@ def test_cohere_compat_models_via_shared_listing():
         def __init__(self):
             self.calls = []
 
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             self.calls.append((url, headers))
             return _FakeResponse()
 
@@ -322,7 +322,7 @@ def test_cohere_failed_listing_is_an_honest_empty():
     from rotator_library.providers.cohere_provider import CohereProvider
 
     class _Client:
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             raise RuntimeError("network down")
 
     assert asyncio.run(CohereProvider().get_models("k", _Client())) == []

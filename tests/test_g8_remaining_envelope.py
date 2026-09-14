@@ -103,7 +103,10 @@ LISTING = {
     ),
     "ollama": (
         "http://localhost:11434/api/tags",
-        {},
+        # A supplied real credential rides the listing too (authenticated
+        # Ollama behind a proxy), plus the provider's JSON content header;
+        # the no-auth sentinel yields only the content header.
+        {"Authorization": "Bearer k", "Content-Type": "application/json"},
         {"models": [{"name": "llama3:latest"}]},
         ["ollama/llama3:latest"],
     ),
@@ -303,7 +306,7 @@ def test_chutes_custom_listing_filters_routing_pseudo_models() -> None:
             }
 
     class _Client:
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             return _FakeResponse()
 
     assert asyncio.run(ChutesProvider().get_models("k", _Client())) == [

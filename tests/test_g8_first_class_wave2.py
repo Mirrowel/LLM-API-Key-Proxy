@@ -44,7 +44,7 @@ def test_chutes_declaration_and_listing():
             }
 
     class _Client:
-        async def get(self, url, headers=None):
+        async def get(self, url, headers=None, **kwargs):
             return _FakeResponse()
 
     models = asyncio.run(ChutesProvider().get_models("k", _Client()))

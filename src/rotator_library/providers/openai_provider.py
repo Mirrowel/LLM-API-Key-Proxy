@@ -44,5 +44,15 @@ class OpenAIProvider(ProviderInterface):
     native_streaming_supported = True
     default_api_base = "https://api.openai.com/v1"
 
+    # -- payload shaping --------------------------------------------------
+    # OpenAI's current families accept the wider effort vocabulary
+    # (minimal through xhigh per model; the models.dev capability seam
+    # will own per-model sets). Without this row the protocol base
+    # (off, low, medium, high) would fold minimal→low and xhigh→high —
+    # legal but lossy; with it the words ride natively.
+    model_rules = (
+        {"match": "*", "effort_accept": ["off", "minimal", "low", "medium", "high", "xhigh"]},
+    )
+
     # -- discovery -----------------------------------------------------------
     # Model listing is the shared, protocol-aware interface implementation.

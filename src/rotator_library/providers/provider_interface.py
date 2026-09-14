@@ -463,9 +463,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         endpoint = self.get_native_endpoint(operation="models", profile=listing_profile)
         headers = await self._listing_headers(api_key, listing_protocol)
         try:
-            response = await client.get(endpoint, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
+            payload = await self._fetch_listing(client, endpoint, headers, descriptor)
         except Exception as exc:
             self._provider_logger().debug(f"Model listing failed for {self.__class__.__name__}: {exc}")
             return []
@@ -483,12 +481,61 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         return logging.getLogger("rotator_library")
 
     async def _listing_headers(self, api_key: str, listing_protocol: str) -> Dict[str, str]:
-        """Credential headers for the listing face."""
+        """Credential headers for the listing face.
 
+        The provider's own header logic wins when it exists (an
+        authenticated Ollama behind a proxy sends its Bearer; the gemini
+        faces send x-goog or bearer per face) — the protocol-default
+        pair is only the fallback for duck-typed providers.
+        """
+
+        if hasattr(self, "get_native_headers"):
+            try:
+                return self.get_native_headers(api_key, operation="models")
+            except Exception:
+                pass
         from ..protocols.defaults import default_auth_mode
 
         mode = default_auth_mode(listing_protocol) or "bearer"
         return auth_header_pair(api_key, mode, None, provider=self._provider_config_key())
+
+    async def _fetch_listing(
+        self,
+        client: httpx.AsyncClient,
+        endpoint: str,
+        headers: Dict[str, str],
+        descriptor: Optional[Dict[str, Any]],
+    ) -> Any:
+        """Fetch the listing payload, following page tokens when the
+        protocol paginates (gemini's ListModels defaults to 50 per page
+        — a single bare GET silently truncates large catalogs).
+
+        Caps at 20 pages as a runaway guard; a failure mid-pagination
+        returns the pages gathered so far (honest partial beats empty).
+        """
+
+        paginated = bool((descriptor or {}).get("paginated"))
+        params: Dict[str, str] = {"pageSize": "1000"} if paginated else {}
+        first = await client.get(endpoint, headers=headers, params=params or None)
+        first.raise_for_status()
+        payload = first.json()
+        if not paginated:
+            return payload
+        merged = payload
+        for _ in range(20):
+            token = None
+            if isinstance(payload, dict):
+                token = payload.get("nextPageToken")
+            if not token:
+                break
+            response = await client.get(endpoint, headers=headers, params={"pageSize": "1000", "pageToken": str(token)})
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(merged, dict) and isinstance(payload, dict):
+                models = list(merged.get("models") or []) + list(payload.get("models") or [])
+                merged = dict(payload)
+                merged["models"] = models
+        return merged
 
     @staticmethod
     def _parse_listing_payload(payload: Any, shape: Optional[str]) -> List[str]:
