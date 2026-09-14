@@ -152,7 +152,105 @@ def normalize_wire_effort(
         payload["reasoning_effort"] = normalized
 
 
-def apply_effort_toggle(
+def _set_dotted(payload: dict, path: str, value: Any) -> None:
+    """Write ``value`` at a dotted path, creating intermediate objects.
+
+    ``chat_template_kwargs.thinking`` materializes the ctk dict before
+    writing the leaf. A non-dict intermediate is never silently coerced:
+    the write is skipped with a warning (a provider's payload shape wins
+    over a declaration mistake).
+    """
+
+    parts = [part for part in str(path).split(".") if part]
+    if not parts:
+        return
+    cursor: Any = payload
+    for part in parts[:-1]:
+        nxt = cursor.get(part)
+        if not isinstance(nxt, dict):
+            if nxt is not None:
+                logger.warning(
+                    "reasoning emission: path %r collides with a non-object at %r; write skipped",
+                    path,
+                    part,
+                )
+                return
+            nxt = {}
+            cursor[part] = nxt
+        cursor = nxt
+    cursor[parts[-1]] = value
+
+
+# The legacy ``toggle: True`` declaration means the DeepSeek-style object
+# toggle; expressed as the generalized preset it now is.
+_OBJECT_TOGGLE_PRESET = {
+    "toggle_field": "thinking",
+    "toggle_on": {"type": "enabled"},
+    "toggle_off": {"type": "disabled"},
+}
+
+
+def resolve_reasoning_targets(
+    provider_plugin: Any = None,
+    model: str = "",
+    *,
+    runtime_config: Any = None,
+) -> Dict[str, Any]:
+    """Resolve the emission targets for (provider, model).
+
+    Keys: ``effort_field`` (where the folded effort word lands; default
+    top-level ``reasoning_effort``), ``toggle_field`` / ``toggle_on`` /
+    ``toggle_off`` (the thinking-toggle target and its on/off values —
+    booleans for the vLLM families, the DeepSeek object pair via the
+    legacy preset). Declared in ``model_rules`` rows (model-level beats
+    provider-wide attrs ``reasoning_toggle_field`` etc., which beat the
+    legacy ``reasoning_effort_toggle``/``toggle: True`` preset).
+    """
+
+    targets: Dict[str, Any] = {}
+    if provider_plugin is not None:
+        row_declared_toggle = False
+        for key, attr in (
+            ("effort_field", "reasoning_effort_field"),
+            ("toggle_field", "reasoning_toggle_field"),
+            ("toggle_on", "reasoning_toggle_on"),
+            ("toggle_off", "reasoning_toggle_off"),
+        ):
+            value = getattr(provider_plugin, attr, None)
+            if value is not None:
+                targets[key] = value
+        if resolve_effort_toggle(provider_plugin, model, runtime_config=runtime_config):
+            # The legacy object preset (DeepSeek): the effort word KEEPS
+            # riding top-level next to the toggle object.
+            targets.setdefault("toggle_field", _OBJECT_TOGGLE_PRESET["toggle_field"])
+            targets.setdefault("toggle_on", _OBJECT_TOGGLE_PRESET["toggle_on"])
+            targets.setdefault("toggle_off", _OBJECT_TOGGLE_PRESET["toggle_off"])
+            targets["effort_rides"] = True
+        from ..adapters.param_rules import _model_match_candidates, _row_matches
+        from ..protocols.effort import _model_rule_rows
+
+        for row in _model_rule_rows(provider_plugin, model):
+            if not _row_matches(row, _model_match_candidates(model)):
+                continue
+            if "toggle_field" in row and "effort_field" not in row:
+                row_declared_toggle = True
+            for key in ("effort_field", "toggle_field", "toggle_on", "toggle_off"):
+                if key in row:
+                    targets[key] = row[key]
+            if row.get("toggle") is True:
+                targets.setdefault("toggle_field", _OBJECT_TOGGLE_PRESET["toggle_field"])
+                targets.setdefault("toggle_on", _OBJECT_TOGGLE_PRESET["toggle_on"])
+                targets.setdefault("toggle_off", _OBJECT_TOGGLE_PRESET["toggle_off"])
+        if row_declared_toggle:
+            targets["toggle_only"] = True
+    if isinstance(runtime_config, Mapping):
+        for key in ("effort_field", "toggle_field", "toggle_on", "toggle_off"):
+            if key in runtime_config:
+                targets[key] = runtime_config[key]
+    return targets
+
+
+def apply_reasoning_emission(
     payload: Any,
     *,
     provider_plugin: Any = None,
@@ -160,33 +258,61 @@ def apply_effort_toggle(
     protocol_name: str = "",
     runtime_config: Optional[Mapping[str, Any]] = None,
 ) -> bool:
-    """Emit the declared thinking toggle on the chat wire.
+    """Emit the declared reasoning controls on the chat wire.
 
-    OFF drops the effort word and emits ``{"thinking": {"type":
-    "disabled"}}``; an ON word stays and rides next to ``{"thinking":
-    {"type": "enabled"}}``. Only the openai_chat wire is touched, and only
-    when the resolved declaration says the OFF control rides the toggle.
-    Returns whether the payload was modified.
+    The effort word (already ladder-normalized by
+    :func:`normalize_wire_effort`) lands at the declared
+    ``effort_field`` — top-level by default, nested for the
+    chat-template families — and a declared toggle target receives its
+    on value alongside. OFF words drop the effort write and set the
+    toggle's off value (an object, a boolean, whatever the family's
+    wire shape is). Only the openai_chat wire is touched; providers
+    without declarations keep the plain top-level emission. Returns
+    whether the payload was modified.
     """
 
     if family_wire_name(protocol_name) != "openai_chat":
         return False
-    if not isinstance(payload, dict) or "reasoning_effort" not in payload:
+    if not isinstance(payload, dict):
         return False
     value = payload.get("reasoning_effort")
     if value is None:
         # A null control is an absence, not an OFF request.
         return False
-    if not resolve_effort_toggle(
-        provider_plugin,
-        model,
-        runtime_config=dict(runtime_config) if isinstance(runtime_config, Mapping) else runtime_config,
-    ):
+    targets = resolve_reasoning_targets(
+        provider_plugin, model, runtime_config=runtime_config
+    )
+    if not targets:
         return False
+    toggle_field = targets.get("toggle_field")
     word = str(value).strip().lower()
+    effort_field = targets.get("effort_field") or "reasoning_effort"
+    if toggle_field and targets.get("toggle_only"):
+        # Boolean-toggle family without a declared effort target: the
+        # family's wire takes the toggle ONLY (kimi-k2's thinking bool,
+        # enable_thinking) — the top-level word never rides.
+        payload.pop("reasoning_effort", None)
+        if word in OFF_WORDS:
+            _set_dotted(payload, toggle_field, targets.get("toggle_off", False))
+        else:
+            _set_dotted(payload, toggle_field, targets.get("toggle_on", True))
+        return True
     if word in OFF_WORDS:
         payload.pop("reasoning_effort", None)
-        payload["thinking"] = {"type": "disabled"}
+        if toggle_field:
+            _set_dotted(payload, toggle_field, targets.get("toggle_off", False))
+            return True
+        if effort_field == "reasoning_effort":
+            # No toggle target: the wire keeps its own off spelling
+            # (e.g. ``reasoning_effort: "none"`` on surfaces that
+            # accept it).
+            payload["reasoning_effort"] = value
+        return True
+    if effort_field == "reasoning_effort":
+        payload["reasoning_effort"] = value
     else:
-        payload["thinking"] = {"type": "enabled"}
+        payload.pop("reasoning_effort", None)
+        _set_dotted(payload, effort_field, value)
+    if toggle_field:
+        _set_dotted(payload, toggle_field, targets.get("toggle_on", True))
     return True

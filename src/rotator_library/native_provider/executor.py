@@ -42,7 +42,7 @@ from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from .context import NativeProviderContext
-from .effort_emission import apply_effort_toggle, normalize_request_effort, normalize_wire_effort
+from .effort_emission import apply_reasoning_emission, normalize_request_effort, normalize_wire_effort
 from .http import NativeHTTPTransport
 from .streaming import stream_event_payload
 
@@ -284,7 +284,7 @@ class NativeProviderExecutor:
                 model=context.model,
                 protocol_name=provider_protocol.name,
             )
-            apply_effort_toggle(
+            apply_reasoning_emission(
                 provider_request,
                 provider_plugin=context.provider_plugin,
                 model=context.model,
@@ -641,7 +641,7 @@ class NativeProviderExecutor:
                 model=context.model,
                 protocol_name=protocol.name,
             )
-            apply_effort_toggle(
+            apply_reasoning_emission(
                 provider_request,
                 provider_plugin=context.provider_plugin,
                 model=context.model,

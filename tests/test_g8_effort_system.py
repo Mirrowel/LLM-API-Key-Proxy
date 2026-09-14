@@ -29,7 +29,7 @@ from rotator_library.native_provider import (
     NativeProviderExecutor,
 )
 from rotator_library.native_provider.effort_emission import (
-    apply_effort_toggle,
+    apply_reasoning_emission,
     normalize_request_effort,
     normalize_wire_effort,
 )
@@ -264,7 +264,7 @@ def test_wire_normalization_keeps_the_wire_off_spelling() -> None:
 
 def test_toggle_off_emits_disabled_and_drops_the_effort_word() -> None:
     payload = {"reasoning_effort": "none"}
-    assert apply_effort_toggle(
+    assert apply_reasoning_emission(
         payload,
         provider_plugin=_DeclaredPlugin(),
         model="current",
@@ -282,7 +282,7 @@ def test_toggle_on_rides_next_to_the_folded_word() -> None:
         model="old-snapshot",
         protocol_name="openai_chat",
     )
-    assert apply_effort_toggle(
+    assert apply_reasoning_emission(
         payload,
         provider_plugin=_DeclaredPlugin(),
         model="old-snapshot",
@@ -293,14 +293,14 @@ def test_toggle_on_rides_next_to_the_folded_word() -> None:
 
 def test_toggle_never_touches_other_wires() -> None:
     payload = {"reasoning": {"effort": "none"}}
-    assert apply_effort_toggle(
+    assert apply_reasoning_emission(
         payload,
         provider_plugin=_DeclaredPlugin(),
         model="current",
         protocol_name="responses",
     ) is False
     assert payload == {"reasoning": {"effort": "none"}}
-    assert apply_effort_toggle(
+    assert apply_reasoning_emission(
         payload,
         provider_plugin=_DeclaredPlugin(),
         model="current",
@@ -320,7 +320,7 @@ def test_non_toggle_provider_keeps_plain_effort_emission() -> None:
         model="m",
         protocol_name="openai_chat",
     )
-    assert apply_effort_toggle(
+    assert apply_reasoning_emission(
         payload,
         provider_plugin=NonTogglePlugin(),
         model="m",
