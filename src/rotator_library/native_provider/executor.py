@@ -42,6 +42,7 @@ from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from .context import NativeProviderContext
+from .effort_emission import apply_effort_toggle, normalize_request_effort, normalize_wire_effort
 from .http import NativeHTTPTransport
 from .streaming import stream_event_payload
 
@@ -250,9 +251,21 @@ class NativeProviderExecutor:
                         overlays.append({"field": "model", "from": provider_request.get("model"), "to": context.model})
                         provider_request["model"] = context.model
                 else:
+                    normalize_request_effort(
+                        unified_request,
+                        provider_plugin=context.provider_plugin,
+                        model=context.model,
+                        protocol_name=provider_protocol.name,
+                    )
                     provider_request = provider_protocol.build_request(unified_request, provider_context)
                     overlays.append({"kind": "canonical_rebuild", "reason": "payload_divergence"})
             else:
+                normalize_request_effort(
+                    unified_request,
+                    provider_plugin=context.provider_plugin,
+                    model=context.model,
+                    protocol_name=provider_protocol.name,
+                )
                 provider_request = provider_protocol.build_request(unified_request, provider_context)
                 if not same_protocol:
                     overlays.append({"kind": "canonical_rebuild", "reason": "cross_protocol"})
@@ -260,6 +273,23 @@ class NativeProviderExecutor:
                     overlays.append({"kind": "canonical_rebuild", "reason": "unified_state_injection"})
                 else:
                     overlays.append({"kind": "canonical_rebuild", "reason": "no_wire_payload"})
+            # G8 effort emission: the flat wire word is folded against the
+            # declared vocabulary (covers the raw fast path and the
+            # same-protocol verbatim replay), then the declared thinking
+            # toggle shapes the chat wire.
+            normalize_wire_effort(
+                provider_request,
+                unified_request=unified_request,
+                provider_plugin=context.provider_plugin,
+                model=context.model,
+                protocol_name=provider_protocol.name,
+            )
+            apply_effort_toggle(
+                provider_request,
+                provider_plugin=context.provider_plugin,
+                model=context.model,
+                protocol_name=provider_protocol.name,
+            )
             context.request_transport_overlays = overlays
             self._pipeline_run(context).context.state["transport_basis"] = {
                 "basis": "raw" if raw_basis_used else "rebuild",
@@ -597,7 +627,26 @@ class NativeProviderExecutor:
                     )
                 ),
             )
+            normalize_request_effort(
+                unified_request,
+                provider_plugin=context.provider_plugin,
+                model=context.model,
+                protocol_name=protocol.name,
+            )
             provider_request = protocol.build_request(unified_request, provider_context)
+            normalize_wire_effort(
+                provider_request,
+                unified_request=unified_request,
+                provider_plugin=context.provider_plugin,
+                model=context.model,
+                protocol_name=protocol.name,
+            )
+            apply_effort_toggle(
+                provider_request,
+                provider_plugin=context.provider_plugin,
+                model=context.model,
+                protocol_name=protocol.name,
+            )
             # G3 stream-strip parity: opaque per-provider state echoed by the
             # client is foreign to a switched executing provider. The stream
             # path has no raw basis, so the strip runs on the built provider

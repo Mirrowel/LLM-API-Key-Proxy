@@ -25,6 +25,12 @@ FieldCacheTarget = Literal[
 ]
 FieldCacheMode = Literal["turn", "turns", "all"]
 FieldCacheScope = Literal["provider", "model", "credential", "session", "classifier"]
+FieldCacheInject = Literal["auto", "always"]
+
+# Behavior words for the string ``inject`` spelling: "auto" restores only
+# where the field is absent, "always" overwrites. Both keep the EMPTY path
+# so a field-addressed rule still derives its path from the registry.
+_INJECT_BEHAVIORS: dict[str, bool] = {"auto": True, "always": False}
 
 DEFAULT_SCOPE: tuple[FieldCacheScope, ...] = ("provider", "model", "credential", "session")
 # D11: provider+model are the REQUIRED identity for cached provider state;
@@ -76,7 +82,11 @@ class FieldCacheRule:
     mode: FieldCacheMode = "turn"
     turn_count: int = 1
     scope: tuple[FieldCacheScope, ...] = DEFAULT_SCOPE
-    inject: Optional[FieldCacheInjection] = None
+    # Injection is either the full declaration or the behavior word
+    # ("auto" = only when missing, "always" = overwrite); the word
+    # normalizes to a target=request injection with an EMPTY path, so a
+    # field-addressed rule derives the path from the registry.
+    inject: Optional[FieldCacheInjection | FieldCacheInject] = None
     enabled: bool = True
     placeholder: Optional[str] = None
     # Rule-level escape hatch (G2 containment): by default a rule error is
@@ -99,6 +109,22 @@ class FieldCacheRule:
     sources: Optional[tuple[str, ...]] = None
 
     def __post_init__(self) -> None:
+        if isinstance(self.inject, str):
+            behavior = self.inject.strip().lower()
+            if behavior not in _INJECT_BEHAVIORS:
+                raise ValueError(
+                    f"FieldCacheRule.inject must be a FieldCacheInjection or one of "
+                    f"{sorted(_INJECT_BEHAVIORS)}, not {self.inject!r}"
+                )
+            object.__setattr__(
+                self,
+                "inject",
+                FieldCacheInjection(
+                    target="request",
+                    path="",
+                    when_missing_only=_INJECT_BEHAVIORS[behavior],
+                ),
+            )
         if not self.name or any(char in self.name for char in "/\\:"):
             raise ValueError("FieldCacheRule.name must be non-empty and filesystem-safe")
         if self.cache_key is not None and (

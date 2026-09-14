@@ -27,6 +27,10 @@ class NativeProviderContext:
     protocol_name: str
     endpoint: str
     operation: str = "chat"
+    # The declared provider plugin (G8): capability declarations — the
+    # effort vocabulary, model_rules toggles, param tables — resolve from
+    # it where the executor knows provider + model + wire together.
+    provider_plugin: Optional[Any] = None
     # Resolved transport profile (steers param-rule tables and per-profile
     # adapter config; None for single-face providers).
     profile: Optional[str] = None

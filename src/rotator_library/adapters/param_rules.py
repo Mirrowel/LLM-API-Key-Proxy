@@ -39,18 +39,20 @@ The capability table (``model_rules``) is an ORDERED tuple of rows, a
 top-to-bottom rule cascade::
 
     model_rules = (
-        {"match": "*", "strip": ["logit_bias"], "effort_map": {"low": "none"}},
-        {"match": "reasoner-*", "strip": ["logprobs"], "effort_map": {"low": "high"}},
+        {"match": "*", "strip": ["logit_bias"], "effort_accept": ["off", "low", "high"]},
+        {"match": "reasoner-*", "strip": ["logprobs"], "effort_accept": ["off", "high"], "toggle": True},
         {"match": "gpt-5-mini", "allow": ["openai_chat"], "deny": ["responses"]},
     )
 
     ``match``      fnmatch wildcard on the model id, case-insensitive;
                    ``*`` is the provider-default row.
     row content    the param_rules vocabulary inline (strip, clamp, map,
-                   rename, strip_override) plus ``effort_map`` (sugar that
-                   compiles to a map on ``reasoning_effort``) and
-                   ``allow``/``deny`` (per-model face limiting, enforced by
-                   the provider's protocol resolution — not a param rule).
+                   rename, strip_override) plus ``effort_accept`` (the
+                   accepted reasoning-effort vocabulary the ladder folds
+                   into), ``toggle`` (the OFF control rides the chat
+                   wire's thinking toggle) and ``allow``/``deny``
+                   (per-model face limiting, enforced by the provider's
+                   protocol resolution — not a param rule).
     resolution     rows matching the model apply in order; LATER rows
                    override conflicting keys, non-conflicting keys inherit
                    (CSS cascade). JSON runtime ``model_rules`` rows append
@@ -68,8 +70,9 @@ from .base import AdapterContext, PayloadAdapter
 
 logger = logging.getLogger("rotator_library.adapters")
 
-# Row keys that never compile into param-rule tables.
-_ROW_STRUCTURE_KEYS = frozenset({"match", "allow", "deny", "effort_map"})
+# Row keys that never compile into param-rule tables (capability
+# declarations consumed by the effort system and the face limiter).
+_ROW_STRUCTURE_KEYS = frozenset({"match", "allow", "deny", "effort_accept", "toggle"})
 _ROW_TABLE_KEYS = frozenset({"strip", "clamp", "map", "rename", "strip_override"})
 
 
@@ -115,9 +118,9 @@ def resolve_model_rules(rows: Any, model: str, provider: str = "") -> Dict[str, 
     """Resolve the capability table for one model (CSS cascade).
 
     Rows matching the model id apply top-to-bottom: later rows override
-    conflicting keys, non-conflicting keys inherit. ``effort_map`` compiles
-    to a ``map`` entry on ``reasoning_effort`` (an explicit ``map`` on the
-    same knob wins — sugar never beats a direct declaration).
+    conflicting keys, non-conflicting keys inherit. Capability keys
+    (``effort_accept``, ``toggle``, ``allow``/``deny``) resolve in the
+    same cascade; param-rule tables consume what remains.
     """
 
     if not rows or not model:
@@ -132,13 +135,6 @@ def resolve_model_rules(rows: Any, model: str, provider: str = "") -> Dict[str, 
             if key == "match":
                 continue
             merged[key] = value
-    effort_map = merged.pop("effort_map", None)
-    if effort_map is not None:
-        if not isinstance(effort_map, Mapping):
-            raise ValueError("model_rules effort_map must be an object")
-        compiled = {"reasoning_effort": dict(effort_map)}
-        explicit = merged.get("map")
-        merged["map"] = _deep_merge(compiled, explicit, "map") if isinstance(explicit, Mapping) else compiled
     return merged
 
 

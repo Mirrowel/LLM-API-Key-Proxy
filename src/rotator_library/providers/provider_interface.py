@@ -388,10 +388,12 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     # non-conflicting keys inherit). Each row is
     # ``{"match": <fnmatch wildcard on the model id, case-insensitive>, ...}``
     # with the param_rules vocabulary inline (strip, clamp, map, rename,
-    # strip_override), ``effort_map`` (sugar compiling to a map on
-    # reasoning_effort), and ``allow``/``deny`` protocol lists (per-model
-    # face limiting — a face outside allow, or in deny, is refused with an
-    # error naming the row). ``*`` is the provider-default row. JSON
+    # strip_override), ``effort_accept`` (the accepted reasoning-effort
+    # vocabulary the ladder normalizes into) and ``toggle`` (the OFF
+    # control rides the chat wire's thinking toggle), and ``allow``/``deny``
+    # protocol lists (per-model face limiting — a face outside allow, or in
+    # deny, is refused with an error naming the row). ``*`` is the
+    # provider-default row. JSON
     # runtime config ``model_rules`` rows append after these (config
     # overrides code). Supersedes ``model_param_rules`` (kept as a bridge).
     model_rules: Tuple[Dict[str, Any], ...] = ()

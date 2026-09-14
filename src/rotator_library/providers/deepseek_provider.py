@@ -13,11 +13,12 @@ field-addressed field-cache rule owns reasoning-content preservation.
 Everything this provider needs is a declaration:
 
 - ``model_rules``: the ``*`` row renames ``max_completion_tokens`` →
-  ``max_tokens`` for every model; the V4 wildcard rows carry the official
-  reasoning-effort mapping. The wildcards intentionally cover the dated
-  snapshot ids (``deepseek-v4-pro-0813``, ...) the exact-id
-  ``model_param_rules`` table could not — a capability declared once per
-  family, not once per release.
+  ``max_tokens`` for every model; the provider-level
+  ``reasoning_effort_accept`` declares the full accepted vocabulary and
+  the old V4 snapshot rows (``-0813``-era) shrink it to the official
+  {off, low, high, max} set — the ladder then folds ``medium`` up to
+  ``high`` for them. The OFF control rides the chat wire's thinking
+  toggle (``toggle``), declared provider-wide and on the old rows.
 - ``field_cache_rules``: one rule addressing ``field="reasoning"``. The
   engine resolves extraction (response + stream siblings via
   ``sources``), injection, and tool-call-id correlation from the protocol
@@ -26,19 +27,16 @@ Everything this provider needs is a declaration:
   day it extracts reasoning there. DeepSeek is the one provider where
   ALL history is the default scope (mode ``all`` — tools present demands
   reasoning on every turn); a miss injects the documented placeholder
-  with an engine warning.
+  with an engine warning. The cache key derives from provider+field and
+  the store's 3-day inactivity default owns retention (no rule TTL).
 """
 
 from __future__ import annotations
 
-from ..field_cache import FieldCacheInjection, FieldCacheRule
+from ..field_cache import FieldCacheRule
 from .provider_interface import ProviderInterface
 
 REASONING_PLACEHOLDER = "Reasoning content unavailable."
-
-# Reasoning-content retention window (7 days, matching the retired disk
-# cache's TTL for the same state).
-REASONING_TTL_SECONDS = 604800
 
 
 class DeepseekProvider(ProviderInterface):
@@ -75,36 +73,29 @@ class DeepseekProvider(ProviderInterface):
     # that a declaration could not express).
     adapter_names = ("param_rules",)
 
-    # Official {low, high, max} effort vocabulary for the V4 family.
-    # ``deepseek-flash`` is a V4 alias and speaks the same table. Values
-    # absent from a model's table pass through unchanged; when the client
-    # sends NOTHING, nothing is injected — the server default (on/high)
-    # applies. The wildcards also cover dated snapshot ids (-0813,
-    # -0731, ...) — an intentional improvement over the exact-id table.
+    # Provider-level accepted reasoning-effort vocabulary (off is the
+    # thinking toggle on the chat wire). When the client sends NOTHING,
+    # nothing is injected — the server default applies. The old V4
+    # snapshot rows (``-0813``-era) shrink the set to the official
+    # {off, low, high, max}; the ladder folds ``medium`` up to ``high``
+    # there.
+    reasoning_effort_accept = ("off", "low", "medium", "high", "max")
+    reasoning_effort_toggle = True
+
     model_rules = (
         {
             "match": "*",
             "rename": {"max_completion_tokens": "max_tokens"},
         },
         {
-            "match": "deepseek-v4*",
-            "effort_map": {
-                "low": "low",
-                "medium": "high",
-                "high": "high",
-                "xhigh": "high",
-                "max": "max",
-            },
+            "match": "deepseek-v4-pro-08*",
+            "effort_accept": ["off", "low", "high", "max"],
+            "toggle": True,
         },
         {
-            "match": "deepseek-flash",
-            "effort_map": {
-                "low": "low",
-                "medium": "high",
-                "high": "high",
-                "xhigh": "high",
-                "max": "max",
-            },
+            "match": "deepseek-v4-flash-08*",
+            "effort_accept": ["off", "low", "high", "max"],
+            "toggle": True,
         },
     )
 
@@ -113,17 +104,17 @@ class DeepseekProvider(ProviderInterface):
     # the engine from ``sources``) share one store, correlate per
     # occurrence by tool-call id first and content sha second (paths from
     # the protocol registry), and re-inject only where history is missing
-    # the field. A miss injects the documented placeholder.
+    # the field. A miss injects the documented placeholder. The cache key
+    # auto-derives (provider:field); retention is the store's 3-day
+    # inactivity default — no rule TTL.
     field_cache_rules = (
         FieldCacheRule(
             name="reasoning",
             field="reasoning",
             sources=("response", "stream_event"),
-            cache_key="deepseek_reasoning",
             mode="all",
             placeholder=REASONING_PLACEHOLDER,
-            ttl_seconds=REASONING_TTL_SECONDS,
-            inject=FieldCacheInjection(target="request", path="", when_missing_only=True),
+            inject="auto",
         ),
     )
 

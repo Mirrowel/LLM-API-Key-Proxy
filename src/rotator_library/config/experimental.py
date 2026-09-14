@@ -957,7 +957,18 @@ def _configured_quota_groups(value: Any) -> dict[str, list[str]]:
 
 
 _MODEL_RULE_ROW_KEYS = frozenset(
-    {"match", "strip", "clamp", "map", "rename", "strip_override", "effort_map", "allow", "deny"}
+    {
+        "match",
+        "strip",
+        "clamp",
+        "map",
+        "rename",
+        "strip_override",
+        "effort_accept",
+        "toggle",
+        "allow",
+        "deny",
+    }
 )
 
 
@@ -966,7 +977,8 @@ def _configured_model_rules(value: Any) -> tuple[dict[str, Any], ...]:
 
     Shape mirrors the class declaration: an ordered list of rows, each
     with a non-empty ``match`` wildcard and the param-rule vocabulary
-    inline (plus ``effort_map`` sugar and ``allow``/``deny`` face lists).
+    inline (plus the reasoning-effort capability keys and ``allow``/
+    ``deny`` face lists).
     """
 
     if value in (None, [], ()):
@@ -1015,9 +1027,16 @@ def _validate_model_rule_row(row: Mapping[str, Any]) -> None:
     maps = row.get("map")
     if "map" in row and (not isinstance(maps, Mapping) or not all(isinstance(table, Mapping) for table in maps.values())):
         raise ExperimentalConfigError("providers.model_rules map must map parameters to value tables")
-    effort = row.get("effort_map")
-    if "effort_map" in row and (not isinstance(effort, Mapping) or not all(isinstance(item, str) for item in effort.values())):
-        raise ExperimentalConfigError("providers.model_rules effort_map must map effort values to strings")
+    effort_accept = row.get("effort_accept")
+    if "effort_accept" in row and (
+        not isinstance(effort_accept, list)
+        or not effort_accept
+        or not all(isinstance(item, str) and item.strip() for item in effort_accept)
+    ):
+        raise ExperimentalConfigError("providers.model_rules effort_accept must be a non-empty string array")
+    toggle = row.get("toggle")
+    if "toggle" in row and not isinstance(toggle, bool):
+        raise ExperimentalConfigError("providers.model_rules toggle must be a boolean")
     rename = row.get("rename")
     if "rename" in row and (
         not isinstance(rename, Mapping)

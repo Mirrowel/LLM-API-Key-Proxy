@@ -486,8 +486,11 @@ def format_reasoning_controls(
 
         if effort is None:
             return None, False
-        if effort == "none":
-            return effort, False
+        if effort in {"none", "off"}:
+            # The canonical off-group normalizes to the protocol-family off
+            # spelling (Chat/Responses: "none"); Anthropic/Gemini take their
+            # disabled constructs before this helper is consulted.
+            return "none", False
         if effort not in _EFFORT_TO_BUDGET_TOKENS:
             if _is_effort_native(target_protocol):
                 # Same vocabulary (current docs: none/minimal/low/medium/
@@ -594,8 +597,8 @@ def format_reasoning_controls(
                 config["display"] = normalized_display
             emissions["thinking"] = config
 
-        disabled = enabled is False or effort == "none"
-        if disabled and (budget is not None or effort not in (None, "none")):
+        disabled = enabled is False or effort in {"none", "off"}
+        if disabled and (budget is not None or effort not in (None, "none", "off")):
             _warn(
                 "reasoning_control_dropped",
                 "reasoning disabled wins; budget/effort control discarded",
@@ -696,7 +699,7 @@ def format_reasoning_controls(
                 emissions["reasoning"] = native
     elif target_protocol == "gemini":
         thinking_config: dict[str, Any] = {}
-        if enabled is False or effort == "none":
+        if enabled is False or effort in {"none", "off"}:
             # thinkingBudget: 0 is Gemini's off-switch — model-dependent
             # (thinking can only be disabled on some models), so the
             # emission is recorded, never silent. includeThoughts is
@@ -737,7 +740,7 @@ def format_reasoning_controls(
                 "reasoning.enabled",
             )
         _warn_budget_discarded()
-        if not (enabled is False or effort == "none"):
+        if not (enabled is False or effort in {"none", "off"}):
             if include_thoughts is not None:
                 thinking_config["includeThoughts"] = bool(include_thoughts)
             elif summary is not None:

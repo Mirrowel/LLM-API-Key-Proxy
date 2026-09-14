@@ -1049,6 +1049,7 @@ class RequestExecutor:
             endpoint=endpoint,
             operation=operation,
             profile=profile,
+            provider_plugin=plugin,
             input_protocol_name=context.input_protocol_name,
             # The client protocol of the request is the client protocol of the
             # response (D1); native streams yield neutral events that the

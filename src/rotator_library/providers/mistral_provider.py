@@ -18,12 +18,15 @@ is declaration:
   ``tool_choice: "required"`` → ``"any"`` (Mistral's spelling). The
   ``mistral-small*``/``mistral-medium*`` rows carry the reasoning
   capability: ``strip_override`` REPLACES the provider strip list there
-  (re-admitting ``reasoning_effort`` — terminal, never a union), and the
-  effort table folds the wider official vocabulary onto the spec enum
-  ``high`` (``none`` passes through). When the client sends NOTHING,
-  nothing is injected — the server default (reasoning off) applies. The
-  wildcards cover every dated variant of the two reasoning families —
-  the exact-id constant list is dead.
+  (re-admitting ``reasoning_effort`` — terminal, never a union), and
+  ``effort_accept`` declares the spec vocabulary {off, high} the ladder
+  folds into (``medium`` lands on ``high`` by distance; off passes
+  through as the wire's ``none``). The protocol base (the chat family)
+  is the provider default — no provider-level attribute is declared.
+  When the client sends NOTHING, nothing is injected — the server
+  default (reasoning off) applies. The wildcards cover every dated
+  variant of the two reasoning families — the exact-id constant list is
+  dead.
 - ``field_cache_rules`` preserves reasoning across turns with ONE
   field-addressed rule: response and stream siblings (expanded from
   ``sources``) share one store, and paths/injection/correlation resolve
@@ -33,25 +36,15 @@ is declaration:
   Injection is auto (``when_missing_only``) onto the message-level
   ``reasoning_content``; NO placeholder — Mistral has no documented
   400-on-missing contract, so a miss leaves the message clean instead of
-  fabricating text.
+  fabricating text. The cache key auto-derives (provider:field).
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict
 
-from ..field_cache import FieldCacheInjection, FieldCacheRule
+from ..field_cache import FieldCacheRule
 from .provider_interface import ProviderInterface
-
-# Effort table for the reasoning families: the spec enum is high|none; the
-# wider official words fold to high. ``none`` is absent from the table and
-# therefore passes through unchanged.
-_MISTRAL_REASONING_EFFORT_MAP = {
-    "minimal": "high",
-    "low": "high",
-    "medium": "high",
-    "xhigh": "high",
-}
 
 
 class MistralProvider(ProviderInterface):
@@ -85,14 +78,15 @@ class MistralProvider(ProviderInterface):
         {
             "match": "mistral-small*",
             # Terminal: REPLACES the provider strip list for this family —
-            # reasoning_effort is allowed exactly here.
+            # reasoning_effort is allowed exactly here. The spec enum is
+            # {off, high}; the ladder folds the wider vocabulary in.
             "strip_override": ["logit_bias", "logprobs", "top_logprobs"],
-            "effort_map": dict(_MISTRAL_REASONING_EFFORT_MAP),
+            "effort_accept": ["off", "high"],
         },
         {
             "match": "mistral-medium*",
             "strip_override": ["logit_bias", "logprobs", "top_logprobs"],
-            "effort_map": dict(_MISTRAL_REASONING_EFFORT_MAP),
+            "effort_accept": ["off", "high"],
         },
     )
 
@@ -102,13 +96,13 @@ class MistralProvider(ProviderInterface):
             name="reasoning",
             field="reasoning",
             sources=("response", "stream_event"),
-            cache_key="mistral_reasoning",
             # mode intentionally UNDECLARED: the global default "turn" is
             # the declared behavior — no doc requirement beyond the
             # current turn, so the narrowest scope applies.
             # No placeholder: Mistral has no 400-on-missing contract for
             # absent reasoning_content — a miss leaves the message clean.
-            inject=FieldCacheInjection(target="request", path="", when_missing_only=True),
+            # The cache key auto-derives (provider:field).
+            inject="auto",
         ),
     )
 

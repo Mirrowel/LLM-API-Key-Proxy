@@ -2,8 +2,9 @@
 # Copyright (c) 2026 Mirrowel
 
 """The model_rules capability table (G8): an ordered cascade replacing
-model_param_rules — CSS-style inheritance/override per row key, effort_map
-sugar, per-model face limiting, and JSON-config merging.
+model_param_rules — CSS-style inheritance/override per row key, the
+effort_accept/toggle capability keys, per-model face limiting, and
+JSON-config merging.
 """
 
 from __future__ import annotations
@@ -56,40 +57,48 @@ def test_cascade_matches_are_case_insensitive_and_prefix_aware():
     assert rules["strip"] == ["logprobs", "tool_choice"]
 
 
-def test_effort_map_sugar_compiles_to_reasoning_effort_map():
+def test_effort_capability_keys_follow_the_cascade():
+    from rotator_library.adapters.param_rules import resolve_model_rules
+
     class EffortPlugin(FakePlugin):
-        model_rules = ({"match": "*", "effort_map": {"low": "none", "medium": "high"}},)
-
-    rules = _declared(EffortPlugin(), "any-model")
-    assert rules["map"]["reasoning_effort"] == {"low": "none", "medium": "high"}
-    assert "effort_map" not in rules
-
-    # Explicit map on the same knob beats the sugar.
-    class ExplicitPlugin(FakePlugin):
         model_rules = (
-            {"match": "*", "effort_map": {"low": "none"}, "map": {"reasoning_effort": {"low": "keep"}}},
+            {"match": "*", "effort_accept": ["off", "low", "medium", "high", "max"], "toggle": True},
+            {"match": "old-*", "effort_accept": ["off", "low", "high", "max"]},
         )
 
-    merged = _declared(ExplicitPlugin(), "any-model")
-    assert merged["map"]["reasoning_effort"] == {"low": "keep"}
+    base = resolve_model_rules(EffortPlugin.model_rules, "any-model")
+    assert base["effort_accept"] == ["off", "low", "medium", "high", "max"]
+    assert base["toggle"] is True
+
+    # Later rows override the conflicting key; non-conflicting keys inherit.
+    old = resolve_model_rules(EffortPlugin.model_rules, "old-snapshot")
+    assert old["effort_accept"] == ["off", "low", "high", "max"]
+    assert old["toggle"] is True
 
 
-def test_effort_map_applies_on_the_wire():
+def test_capability_keys_never_compile_into_wire_tables():
+    """effort_accept/toggle are declarations the effort system consumes —
+    the param_rules adapter never sees them and never folds the word (the
+    ladder owns that)."""
+
     from rotator_library.adapters.base import AdapterContext
     from rotator_library.adapters.param_rules import ParamRulesAdapter
 
     class WirePlugin(FakePlugin):
-        model_rules = ({"match": "*", "effort_map": {"medium": "high"}},)
+        model_rules = ({"match": "*", "effort_accept": ["off", "high"], "toggle": True},)
+
+    rules = _declared(WirePlugin(), "m")
+    assert "effort_accept" not in rules and "toggle" not in rules
 
     adapter = ParamRulesAdapter()
     context = AdapterContext(
         provider="fake",
         model="m",
-        adapter_config={"param_rules": _declared(WirePlugin(), "m")},
+        adapter_config={"param_rules": rules},
         metadata={},
     )
     result = asyncio.run(adapter.transform_request({"reasoning_effort": "medium"}, context))
-    assert result["reasoning_effort"] == "high"
+    assert result["reasoning_effort"] == "medium"
 
 
 def test_no_rows_is_identity():
@@ -129,10 +138,20 @@ def test_json_schema_accepts_and_validates_model_rules():
     )
 
     config = load_config_from_mapping(
-        {"providers": {"fake": {"model_rules": [{"match": "*", "effort_map": {"low": "none"}}]}}}
+        {
+            "providers": {
+                "fake": {
+                    "model_rules": [
+                        {"match": "*", "effort_accept": ["off", "low", "high"], "toggle": True}
+                    ]
+                }
+            }
+        }
     )
     runtime_config = get_provider_runtime_config("fake", config=config)
-    assert runtime_config.model_rules == ({"match": "*", "effort_map": {"low": "none"}},)
+    assert runtime_config.model_rules == (
+        {"match": "*", "effort_accept": ["off", "low", "high"], "toggle": True},
+    )
 
     try:
         load_config_from_mapping(
@@ -151,6 +170,18 @@ def test_json_schema_accepts_and_validates_model_rules():
         assert "unsupported keys" in str(exc)
     else:
         raise AssertionError("unknown model_rules row keys must fail")
+
+    for malformed in (
+        {"match": "*", "effort_accept": []},
+        {"match": "*", "effort_accept": "high"},
+        {"match": "*", "toggle": "yes"},
+    ):
+        try:
+            load_config_from_mapping({"providers": {"fake": {"model_rules": [malformed]}}})
+        except ExperimentalConfigError:
+            pass
+        else:
+            raise AssertionError(f"malformed capability row must fail: {malformed!r}")
 
 
 def test_allow_deny_refuse_and_admit_faces():
@@ -234,14 +265,18 @@ def test_runtime_json_rows_feed_face_limiting():
 
 
 def test_model_param_rules_bridge_keeps_working():
+    from rotator_library.adapters.param_rules import resolve_model_rules
+
     class BridgePlugin(FakePlugin):
         model_param_rules = {"legacy": {"map": {"reasoning_effort": {"low": "high"}}}}
-        model_rules = ({"match": "modern", "effort_map": {"low": "none"}},)
+        model_rules = ({"match": "modern", "effort_accept": ["off", "high"]},)
 
     # Legacy mapping still resolves for its models...
     legacy = _declared(BridgePlugin(), "legacy")
     assert legacy["map"]["reasoning_effort"] == {"low": "high"}
     assert legacy["strip"] == ["logprobs"]
-    # ...and the capability table governs its own models.
+    # ...and the capability table governs its own models (its keys are not
+    # wire tables; the effort system consumes them).
     modern = _declared(BridgePlugin(), "modern")
-    assert modern["map"]["reasoning_effort"] == {"low": "none"}
+    assert "map" not in modern
+    assert resolve_model_rules(BridgePlugin.model_rules, "modern")["effort_accept"] == ["off", "high"]

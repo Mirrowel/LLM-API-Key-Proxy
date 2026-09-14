@@ -124,10 +124,19 @@ def build_cache_key(rule: FieldCacheRule, context: FieldCacheContext) -> Optiona
     provider+model terms are ALWAYS part of the key even when a raw plugin
     rule declares a narrower scope — a ``scope=("session",)`` rule must
     never share one key across providers (that reopens the cross-provider
-    leak the compatibility classes exist to prevent).
+    leak the compatibility classes exist to prevent). An unset cache_key
+    auto-derives as ``{provider}:{field}`` for field-addressed rules and
+    falls back to the rule name otherwise.
     """
 
-    parts = [f"rule={_safe_scope_value(rule.cache_key or rule.name)}"]
+    scope_key = rule.cache_key
+    if scope_key is None:
+        # Unset cache keys auto-derive from the rule's field and the
+        # context's provider (ONE derived identity per field per provider);
+        # path rules without a field fall back to the rule name.
+        provider_scope = context.value_for_scope("provider")
+        scope_key = f"{provider_scope}:{rule.field}" if rule.field and provider_scope else rule.name
+    parts = [f"rule={_safe_scope_value(scope_key)}"]
     provider_value = context.value_for_scope("provider")
     model_value = context.value_for_scope("model")
     if not provider_value or not model_value:
@@ -196,9 +205,11 @@ class FieldCacheEngine:
                         source=source,  # type: ignore[arg-type]
                         sources=None,
                         name=rule.name if len(unique) == 1 else f"{rule.name}.{source}",
-                        # Twins share one store entry: the shared cache key
-                        # is the declared key or the base rule name.
-                        cache_key=rule.cache_key or rule.name,
+                        # Twins share one store entry: an explicit key is
+                        # kept, a field rule derives the same key per twin
+                        # (provider:field), and a plain path rule falls
+                        # back to the shared base rule name.
+                        cache_key=rule.cache_key or (None if rule.field else rule.name),
                     )
                 )
         return tuple(expanded)

@@ -36,7 +36,10 @@ def _rule():
 
     (rule,) = _plugin().field_cache_rules
     assert rule.field == "reasoning"
-    assert rule.cache_key == "deepseek_reasoning"
+    # No declared key/TTL: the engine derives provider:field and the
+    # store's 3-day inactivity default owns retention.
+    assert rule.cache_key is None
+    assert rule.ttl_seconds is None
     return rule
 
 
@@ -153,55 +156,65 @@ async def test_max_completion_tokens_renamed_via_declaration() -> None:
     assert "max_completion_tokens" not in result
 
 
-@pytest.mark.asyncio
+def test_capability_declarations_replace_the_effort_map() -> None:
+    """The model_rules rows carry effort_accept/toggle; no vocabulary map
+    survives anywhere in the declaration."""
+
+    plugin = _plugin()
+    assert plugin.reasoning_effort_accept == ("off", "low", "medium", "high", "max")
+    assert plugin.reasoning_effort_toggle is True
+    assert tuple(row["match"] for row in plugin.model_rules) == (
+        "*",
+        "deepseek-v4-pro-08*",
+        "deepseek-v4-flash-08*",
+    )
+    assert not any("effort_map" in row for row in plugin.model_rules)
+    for row in plugin.model_rules[1:]:
+        assert row["effort_accept"] == ["off", "low", "high", "max"]
+        assert row["toggle"] is True
+
+
 @pytest.mark.parametrize(
-    ("effort", "expected"),
+    ("model", "effort", "expected"),
     [
-        ("low", "low"),
-        ("medium", "high"),
-        ("high", "high"),
-        ("xhigh", "high"),
-        ("max", "max"),
+        # Current models: provider-level native vocabulary.
+        ("deepseek-v4-pro", "low", "low"),
+        ("deepseek-v4-pro", "medium", "medium"),
+        ("deepseek-v4-pro", "xhigh", "high"),
+        ("deepseek-v4-pro", "max", "max"),
+        # Dated -0813-era snapshots: {off, low, high, max}; the ladder
+        # folds medium UP to high (the official tie-up).
+        ("deepseek-v4-pro-0813", "medium", "high"),
+        ("deepseek-v4-flash-0813", "medium", "high"),
+        ("deepseek-v4-pro-0813", "xhigh", "high"),
+        ("deepseek-v4-pro-0813", "max", "max"),
+        # The flash alias is provider-level, not a dated snapshot.
+        ("deepseek-flash", "medium", "medium"),
+        ("deepseek-chat", "medium", "medium"),
     ],
 )
-async def test_per_model_effort_mapping(effort: str, expected: str) -> None:
-    for model in ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp"):
-        result = await _adapt(
-            {"model": model, "messages": [], "reasoning_effort": effort},
-            model,
-        )
-        assert result["reasoning_effort"] == expected, model
+def test_effort_normalization_rides_the_ladder(model: str, effort: str, expected: str) -> None:
+    from rotator_library.protocols.effort import normalize_effort, resolve_accepted_effort
 
-
-@pytest.mark.asyncio
-async def test_dated_snapshot_ids_match_the_wildcard() -> None:
-    """``deepseek-v4*`` covers the dated snapshot ids the exact-id table
-    could not — the intentional wildcard improvement."""
-    result = await _adapt(
-        {"model": "deepseek-v4-pro-0813", "messages": [], "reasoning_effort": "medium"},
-        "deepseek-v4-pro-0813",
+    accepted, source = resolve_accepted_effort(
+        _plugin(), model, protocol_family="openai_chat"
     )
-    assert result["reasoning_effort"] == "high"
+    assert source != "protocol_base"  # a real declaration decided
+    assert normalize_effort(effort, accepted)[0] == expected
 
 
-@pytest.mark.asyncio
-async def test_flash_alias_gets_the_v4_effort_map() -> None:
-    """deepseek-flash is a v4 alias: the envelope maps its effort too (the
-    exact-id remake left it unmapped)."""
-    result = await _adapt(
-        {"model": "deepseek-flash", "messages": [], "reasoning_effort": "medium"},
-        "deepseek-flash",
+def test_dated_snapshot_ids_match_the_wildcard() -> None:
+    """The ``deepseek-v4-*-08*`` rows shrink the dated -0813-era ids the
+    provider-level vocabulary; the ladder still yields the official fold."""
+
+    from rotator_library.protocols.effort import normalize_effort, resolve_accepted_effort
+
+    accepted, source = resolve_accepted_effort(
+        _plugin(), "deepseek-v4-pro-0813", protocol_family="openai_chat"
     )
-    assert result["reasoning_effort"] == "high"
-
-
-@pytest.mark.asyncio
-async def test_unknown_model_effort_is_unmapped() -> None:
-    result = await _adapt(
-        {"model": "deepseek-chat", "messages": [], "reasoning_effort": "medium"},
-        "deepseek-chat",
-    )
-    assert result["reasoning_effort"] == "medium"
+    assert accepted == ("off", "low", "high", "max")
+    assert source == "model_rules:deepseek-v4-pro-08*"
+    assert normalize_effort("medium", accepted)[0] == "high"
 
 
 @pytest.mark.asyncio
@@ -262,11 +275,18 @@ def test_field_addressed_rule_shape_and_twin_expansion() -> None:
     assert rule.sources == ("response", "stream_event")
     assert rule.mode == "all"
     assert rule.placeholder == "Reasoning content unavailable."
-    assert rule.ttl_seconds == 604800
+    assert rule.ttl_seconds is None
     assert rule.inject.when_missing_only is True
+    assert rule.inject.target == "request"
+    assert rule.inject.path == ""  # registry derivation owns the path
     assert build_cache_key(rule, context) is not None
-    # The shared-signature contract must hold for the expanded twins.
-    FieldCacheEngine([rule])
+    # The shared-signature contract must hold for the expanded twins and
+    # both twins auto-derive the SAME key (field + provider).
+    engine = FieldCacheEngine([rule])
+    assert all(twin.cache_key is None for twin in engine._expanded_rules)
+    assert build_cache_key(engine._expanded_rules[0], context) == build_cache_key(
+        engine._expanded_rules[1], context
+    )
     # Correlation (tool_call_id_path) and paths derive from the registry.
     from rotator_library.protocols.defaults import field_locations
 
@@ -300,6 +320,9 @@ async def test_reasoning_round_trip_all_history_default() -> None:
     reasoning_operation = next(op for op in operations if op.rule_name.startswith("reasoning"))
     assert reasoning_operation.hit is True
     assert reasoning_operation.changed is True
+    # The derivation is visible on the operation: the store key is the
+    # provider:field-derived identity shared by both twins.
+    assert reasoning_operation.cache_key == build_cache_key(rule, context)
     assert updated["messages"][1]["reasoning_content"] == "reasoning one"
     assert updated["messages"][4]["reasoning_content"] == "reasoning two"
     # when_missing_only: user/tool messages are never touched.

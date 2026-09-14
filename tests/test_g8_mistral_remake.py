@@ -68,20 +68,27 @@ def test_mistral_declaration_identity() -> None:
 
 def test_capability_cascade_covers_the_reasoning_families() -> None:
     """The wildcards replace the exact-id constant: every current reasoning
-    id (and any dated variant) resolves the strip_override + effort map."""
+    id (and any dated variant) resolves the strip_override plus the
+    ``effort_accept`` capability the ladder folds into."""
+    from rotator_library.protocols.effort import resolve_accepted_effort
+
     plugin = _plugin()
     assert tuple(row["match"] for row in plugin.model_rules) == (
         "*",
         "mistral-small*",
         "mistral-medium*",
     )
+    # no provider-level effort attribute: the protocol base is the default
+    assert not hasattr(plugin, "reasoning_effort_accept")
     # the legacy per-model tables are gone; the cascade replaces them
     assert not hasattr(plugin, "model_param_rules")
     assert not hasattr(plugin, "param_rules")
     for model in REASONING_MODELS + ("mistral-small-2411", "mistral-medium-2710"):
         rules = plugin.get_adapter_config(model)["mistral"]
         assert "reasoning_effort" not in rules["strip"], model
-        assert rules["map"]["reasoning_effort"]["medium"] == "high", model
+        accepted, source = resolve_accepted_effort(plugin, model, protocol_family="openai_chat")
+        assert accepted == ("off", "high"), model
+        assert source.startswith("model_rules:mistral-"), model
 
 
 def test_retired_handler_and_patterns_are_gone() -> None:
@@ -165,16 +172,36 @@ async def test_non_reasoning_model_strips_reasoning_effort() -> None:
         ("medium", "high"),
         ("xhigh", "high"),
         ("high", "high"),
-        ("none", "none"),
     ],
 )
-async def test_reasoning_model_effort_table(effort: str, expected: str) -> None:
+async def test_reasoning_effort_folds_by_the_ladder(effort: str, expected: str) -> None:
+    """The spec enum is {off, high}; the wider vocabulary folds to high by
+    ladder distance (the deleted _MISTRAL_REASONING_EFFORT_MAP's job)."""
+
+    from rotator_library.protocols.effort import normalize_effort, resolve_accepted_effort
+
+    plugin = _plugin()
     for model in REASONING_MODELS:
-        result = await _adapt(
-            {"model": model, "messages": [], "reasoning_effort": effort},
-            model,
+        accepted, _source = resolve_accepted_effort(
+            plugin, model, protocol_family="openai_chat"
         )
-        assert result["reasoning_effort"] == expected, model
+        assert normalize_effort(effort, accepted)[0] == expected, model
+
+
+async def test_reasoning_model_off_and_points_survive_the_adapter() -> None:
+    """The adapter no longer maps effort; the wire word survives (off as
+    ``none``) and the ladder folds ON words at the executor seam."""
+
+    result = await _adapt(
+        {"model": REASONING_MODEL, "messages": [], "reasoning_effort": "none"},
+        REASONING_MODEL,
+    )
+    assert result["reasoning_effort"] == "none"
+    result = await _adapt(
+        {"model": REASONING_MODEL, "messages": [], "reasoning_effort": "medium"},
+        REASONING_MODEL,
+    )
+    assert result["reasoning_effort"] == "medium"
 
 
 async def test_reasoning_model_still_strips_logit_bias_family() -> None:
@@ -189,7 +216,9 @@ async def test_reasoning_model_still_strips_logit_bias_family() -> None:
         },
         REASONING_MODEL,
     )
-    assert result["reasoning_effort"] == "high"
+    # strip_override re-admits reasoning_effort exactly on this family; the
+    # executor's effort system folds the word (medium -> high) later.
+    assert result["reasoning_effort"] == "medium"
     assert "logit_bias" not in result
     assert "logprobs" not in result
     assert "top_logprobs" not in result
@@ -433,7 +462,10 @@ def _rule():
 
     (rule,) = _plugin().field_cache_rules
     assert rule.field == "reasoning"
-    assert rule.cache_key == "mistral_reasoning"
+    # No declared key/TTL: the engine derives provider:field and the
+    # store's 3-day inactivity default owns retention.
+    assert rule.cache_key is None
+    assert rule.ttl_seconds is None
     return rule
 
 
@@ -483,9 +515,16 @@ def test_field_addressed_rule_shape_and_default_turn_mode() -> None:
     # no placeholder: no 400-on-missing contract to satisfy
     assert rule.placeholder is None
     assert rule.inject.when_missing_only is True
+    assert rule.inject.target == "request"
+    assert rule.inject.path == ""  # registry derivation owns the path
     assert build_cache_key(rule, context) is not None
-    # the shared-signature contract must hold for the expanded twins
-    FieldCacheEngine([rule])
+    # the shared-signature contract must hold for the expanded twins and
+    # both twins auto-derive the SAME provider:field key
+    engine = FieldCacheEngine([rule])
+    assert all(twin.cache_key is None for twin in engine._expanded_rules)
+    assert build_cache_key(engine._expanded_rules[0], context) == build_cache_key(
+        engine._expanded_rules[1], context
+    )
     # injection + correlation paths derive from the protocol registry
     from rotator_library.protocols.defaults import field_locations
 
@@ -516,6 +555,9 @@ async def test_reasoning_round_trip_current_turn_only() -> None:
     reasoning_operation = next(op for op in operations if op.rule_name.startswith("reasoning"))
     assert reasoning_operation.hit is True
     assert reasoning_operation.changed is True
+    # the derivation is visible on the operation: the store key is the
+    # provider:field-derived identity shared by both twins
+    assert reasoning_operation.cache_key == build_cache_key(rule, context)
     # mode=turn: only the latest region's assistant message is touched
     assert updated["messages"][3]["reasoning_content"] == "reasoning two"
     assert "reasoning_content" not in updated["messages"][1]
