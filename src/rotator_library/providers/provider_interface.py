@@ -496,7 +496,13 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
             return []
         if shape == "data_id":
             data = payload.get("data")
-            return [entry.get("id") for entry in data if isinstance(entry, dict) and entry.get("id")]
+            # Entries explicitly flagged inactive (e.g. Groq's deprecated
+            # models carrying active:false) stay out of the pool.
+            return [
+                entry.get("id")
+                for entry in data
+                if isinstance(entry, dict) and entry.get("id") and entry.get("active", True)
+            ]
         if shape == "models_name":
             data = payload.get("models")
             return [entry.get("name") for entry in data if isinstance(entry, dict) and entry.get("name")]
