@@ -124,7 +124,8 @@ def test_retired_custom_path_is_gone() -> None:
 
     plugin = _plugin()
     assert plugin.has_custom_logic() is False
-    assert plugin.adapter_names == ("param_rules",)
+    assert plugin.adapter_names == ()  # param engine is always-on, not declared
+    assert plugin.get_adapter_names("deepseek/deepseek-v4-flash") == ("param_rules",)
     assert not hasattr(plugin, "_get_reasoning_cache")
     # Listing is the inherited shared implementation, not provider code.
     assert "get_models" not in vars(DeepseekProvider)

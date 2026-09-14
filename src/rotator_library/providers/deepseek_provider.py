@@ -71,7 +71,6 @@ class DeepseekProvider(ProviderInterface):
     # The generic param_rules adapter enforces the capability cascade
     # below; no deepseek-specific adapter code exists (nothing remained
     # that a declaration could not express).
-    adapter_names = ("param_rules",)
 
     # Provider-level accepted reasoning-effort vocabulary (off is the
     # thinking toggle on the chat wire). When the client sends NOTHING,

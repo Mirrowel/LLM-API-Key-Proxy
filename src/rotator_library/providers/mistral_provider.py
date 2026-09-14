@@ -52,6 +52,9 @@ class MistralProvider(ProviderInterface):
 
     provider_env_name = "mistral"
 
+    # NOTE(for-removal): dies with the cost phase.
+    skip_cost_calculation = True
+
     # -- transport (the envelope) ---------------------------------------
     speaks = ("openai_chat",)
     native_streaming_supported = True
@@ -107,24 +110,6 @@ class MistralProvider(ProviderInterface):
     )
 
     # -- discovery -----------------------------------------------------------
-
-    def get_adapter_config(self, model: str = "") -> Dict[str, Dict[str, Any]]:
-        """Expose the resolved param-rule tables to the ``mistral`` adapter.
-
-        The generic hook fills the ``param_rules`` config key only for chains
-        that declare that adapter BY NAME; the mistral adapter extends the
-        engine instead, so its resolved capability cascade rides under the
-        adapter's own key.
-        """
-
-        config = super().get_adapter_config(model)
-        if "mistral" in self.get_adapter_names(model) and "mistral" not in config:
-            from ..adapters.param_rules import declared_param_rules
-
-            rules = declared_param_rules(self, model)
-            if rules:
-                config["mistral"] = rules
-        return config
 
     # Model listing is the shared, protocol-aware interface implementation
     # (openai_chat face, bearer auth inherited, /models route); a failed

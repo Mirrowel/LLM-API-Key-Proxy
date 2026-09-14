@@ -48,7 +48,7 @@ def test_provider_json_protocol_adapters_field_cache_and_quota_groups_are_wired(
     provider = ConfiguredProvider()
 
     assert provider.get_protocol_name("configured/gpt") == "openai_chat"
-    assert provider.get_adapter_names("configured/gpt") == ("model_override",)
+    assert provider.get_adapter_names("configured/gpt") == ("param_rules", "model_override")  # engine prepended
     assert provider.get_adapter_config("configured/gpt") == {"model_override": {"model": "upstream-model"}}
     assert provider.supports_native_streaming("configured/gpt", "chat") is True
     assert [rule.name for rule in provider.get_field_cache_rules("configured/gpt")] == ["state"]

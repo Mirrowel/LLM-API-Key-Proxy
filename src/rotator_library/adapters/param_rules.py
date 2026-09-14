@@ -283,10 +283,22 @@ def _resolve_rules(provider: str, model: str, config: Mapping[str, Any], *, prot
 
 
 class ParamRulesAdapter(PayloadAdapter):
-    """Apply declared strip/clamp/map/rename rules to a request payload."""
+    """Apply declared strip/clamp/map/rename rules to a request payload.
+
+    The enforcement arm of the capability cascade: consumes the tables
+    resolved by :func:`declared_param_rules` (protocol base → database
+    seam → provider code → model rows → config) and rewrites the
+    provider-bound payload accordingly. Wired as an always-on pipeline
+    stage — no provider declares it by name; no resolved rules means an
+    identity no-op.
+    """
 
     name = "param_rules"
     supported_stages: tuple[str, ...] = ("request",)
+    # Chain entries that build on this engine (e.g. the mistral adapter)
+    # set this so the interface's config fill feeds them their resolved
+    # tables under their own key — matched by consumption, not by name.
+    consumes_param_rules = True
 
     async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
         if not isinstance(payload, dict):

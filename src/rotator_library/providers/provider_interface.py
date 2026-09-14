@@ -641,42 +641,81 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
     def get_adapter_names(self, model: str = "") -> Tuple[str, ...]:
         """Return ordered adapter names for this provider/model.
 
-        The order is significant and is preserved by the adapter chain runner.
-        Providers can override this for model-specific quirks without mutating the
-        global adapter registry.
+        The order is significant and is preserved by the adapter chain
+        runner. Providers can override this for model-specific quirks
+        without mutating the global adapter registry.
+
+        The param-rule engine is ALWAYS present: it is prepended unless a
+        declared adapter already builds on it (an adapter whose class
+        sets ``consumes_param_rules`` — e.g. the mistral wire adapter
+        extends the engine for its think-chunk folding). Providers never
+        declare it by name; with no resolved rules it is an identity
+        no-op.
         """
 
         configured = self._get_runtime_config(model).adapter_names
-        return tuple(configured) if configured is not None else tuple(self.adapter_names)
+        declared = tuple(configured) if configured is not None else tuple(self.adapter_names)
+        if self._chain_has_param_consumer(declared):
+            return declared
+        if "param_rules" in declared:
+            return declared
+        return ("param_rules",) + declared
+
+    def _chain_has_param_consumer(self, declared: Tuple[str, ...]) -> bool:
+        """Whether any declared chain entry builds on the param engine."""
+
+        try:
+            from ..adapters.registry import get_adapter
+
+            for name in declared:
+                try:
+                    adapter_class = get_adapter(name)
+                except Exception:
+                    continue
+                if getattr(adapter_class, "consumes_param_rules", False):
+                    return True
+        except Exception:
+            return False
+        return False
 
     def get_adapter_config(self, model: str = "") -> Dict[str, Dict[str, Any]]:
         """Return adapter-specific config keyed by adapter name.
 
         Config is intentionally a plain dict so custom providers can define it in
-        env/JSON later without importing adapter classes. Phase 10 will add formal
-        config loading and validation.
+        env/JSON later without importing adapter classes.
 
-        The generic ``param_rules`` adapter (when declared) receives the
-        merged provider/model parameter-rule declarations so strip/clamp/
-        map/rename tables declared anywhere (class, JSON, per-model) take
-        effect without provider code.
+        Every chain entry whose adapter class declares
+        ``consumes_param_rules`` receives the merged provider/model
+        parameter-rule tables under its own key — matched by
+        consumption, not by adapter name, so wire adapters that extend
+        the engine (mistral) are fed exactly like the generic stage.
         """
 
         config = dict(self._get_runtime_config(model).adapter_config)
         adapter_names = self.get_adapter_names(model)
-        if "param_rules" in adapter_names and "param_rules" not in config:
-            from ..adapters.param_rules import declared_param_rules
+        from ..adapters.param_rules import declared_param_rules
 
-            runtime_rows = getattr(self._get_runtime_config(model), "model_rules", None) or ()
-            rules = declared_param_rules(
-                self,
-                model,
-                {"model_rules": list(runtime_rows)} if runtime_rows else None,
-            )
-            if rules:
-                # Resolved tables (provider+model merged) — the adapter's
-                # own resolution pass is idempotent over them.
-                config["param_rules"] = rules
+        runtime_rows = getattr(self._get_runtime_config(model), "model_rules", None) or ()
+        rules = declared_param_rules(
+            self,
+            model,
+            {"model_rules": list(runtime_rows)} if runtime_rows else None,
+        )
+        if rules:
+            for name in adapter_names:
+                if name in config:
+                    continue
+                try:
+                    from ..adapters.registry import get_adapter
+
+                    adapter_class = get_adapter(name)
+                except Exception:
+                    continue
+                if getattr(adapter_class, "consumes_param_rules", False):
+                    # Resolved tables (provider+model merged) — the
+                    # adapter's own resolution pass is idempotent over
+                    # them.
+                    config[name] = rules
         return config
 
     def get_hooks(self, model: str = "") -> Tuple[Any, ...]:

@@ -24,7 +24,7 @@ def test_provider_interface_plain_defaults_are_noop() -> None:
     provider = BareProvider()
 
     assert provider.get_protocol_name("model") is None
-    assert provider.get_adapter_names("model") == ()
+    assert provider.get_adapter_names("model") == ("param_rules",)  # always-on stage, identity without rules
     assert provider.get_adapter_config("model") == {}
     assert provider.get_field_cache_rules("model") == ()
 
@@ -33,7 +33,7 @@ def test_provider_interface_defaults_are_noop_for_protocol_stack() -> None:
     provider = DeclarationProvider()
 
     assert provider.get_protocol_name("model") == "openai_chat"
-    assert provider.get_adapter_names("model") == ("model_override", "suppress_developer_role")
+    assert provider.get_adapter_names("model") == ("param_rules", "model_override", "suppress_developer_role")
     assert provider.get_adapter_config("model") == {}
     assert provider.get_field_cache_rules("model")[0].name == "reasoning_content"
 

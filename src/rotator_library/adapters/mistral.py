@@ -115,6 +115,23 @@ class MistralAdapter(ParamRulesAdapter):
     supported_stages = ("request", "response", "stream_event")
 
     async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
+        """Rewrite the outgoing request payload.
+
+        Runs in two steps:
+
+        1. The inherited param engine applies the declared tables
+           (strip/clamp/map/rename from provider code, model rows, and
+           runtime config — resolved for this provider+model).
+        2. The Mistral-specific surgery, only when something needs it
+           (the early-return keeps healthy payloads untouched and
+           copy-free): replayed reasoning fields strip from every
+           history message (Mistral 422s unknown message fields — any
+           client that echoes our cached reasoning back would hard-fail
+           without this), and ``seed`` moves under
+           ``extra_body.random_seed`` because the target is nested and
+           the flat rename vocabulary cannot express it.
+        """
+
         updated = await super().transform_request(payload, context)
         if not isinstance(updated, dict):
             return updated
@@ -124,6 +141,7 @@ class MistralAdapter(ParamRulesAdapter):
             for message in messages
         )
         if not history_dirty and "seed" not in updated:
+            # Nothing to fix — hand the payload through untouched.
             return updated
         updated = deepcopy(updated)
         messages = updated.get("messages")
@@ -145,6 +163,17 @@ class MistralAdapter(ParamRulesAdapter):
         return updated
 
     async def transform_response(self, payload: Any, context: AdapterContext) -> Any:
+        """Fold think-chunk content on an assembled provider response.
+
+        Mistral's reasoning models return ``choices[N].message.content``
+        as a LIST of typed chunks (thinking + text) instead of a plain
+        string. Each choice's message is rewritten so
+        ``reasoning_content`` carries the concatenated thinking text and
+        ``content`` becomes the plain string — the chat-family spelling
+        every downstream consumer understands. Responses whose content
+        is already a string pass through untouched.
+        """
+
         if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
             return payload
         if not self._response_needs_fold(payload):
@@ -156,6 +185,17 @@ class MistralAdapter(ParamRulesAdapter):
         return updated
 
     async def transform_stream_event(self, payload: Any, context: AdapterContext) -> Any:
+        """Fold think-chunk content on ONE streamed event.
+
+        Two shapes arrive here depending on the seam: raw provider
+        chunks (plain dicts — the stream relay's parsed copy) and
+        neutral parsed events (objects with ``delta``/``message`` — the
+        executor's neutral-event path). Both get the same fold; the
+        neutral variant additionally moves thinking text into the
+        delta's reasoning BLOCKS so formatters and the field-cache
+        stream sibling see the canonical spelling.
+        """
+
         if isinstance(payload, dict):
             return self._convert_stream_chunk(payload)
         if hasattr(payload, "delta") or hasattr(payload, "message"):
