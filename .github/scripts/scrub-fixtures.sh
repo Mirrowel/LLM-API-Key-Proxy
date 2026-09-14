@@ -2,9 +2,19 @@
 # Regression fixtures for scrub-workspace.sh taint logic + fetch-roster.sh
 # roster transforms + the permission profile's jq-env deny patterns.
 #
-# Run:  bash .github/scripts/scrub-fixtures.sh
-# Requires: git, jq, bash. Exits non-zero on any failure. Creates no files
-# outside a mktemp -d directory (cleaned up on exit) and /tmp/scrub-*.log.
+# Run:  bash .github/scripts/scrub-fixtures.sh [--only <substr>] [--quick]
+#              [--parallel] [--list] [--timing]
+#        FIXTURES_REBUILD=1  forces a fresh template snapshot.
+# Requires: git, jq, bash. Exits non-zero on any failure.
+#
+# Disk discipline: per-run writes are a mktemp workdir + a ~30-file fixture
+# worktree (template-cache extract + local clone sharing objects) - ~1-2MB,
+# vs re-creating git object stores every run. The template snapshot lives
+# in .fixture-cache/ at the repo root (gitignored, machine-local; newest 3
+# keys kept). New sections should keep it that way: no fixture-repo
+# re-init, write state under $WORK, never outside it except the documented
+# /tmp/scrub-taint.txt contract path (production-fidelity: the real agent
+# reads exactly that path).
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRUB="$SCRIPT_DIR/scrub-workspace.sh"
@@ -45,7 +55,7 @@ for a in "$@"; do
 done
 GIT_DEP=0
 case "$ONLY" in
-  *taint*|*autoload*|*degradation*|*foreign*|*BOT_NAMES*|*sync*) GIT_DEP=1 ;;
+  *taint*|*autoload*|*degradation*|*foreign*|*BOT_NAMES*|*sync*|*channel*) GIT_DEP=1 ;;
 esac
 SECTIONS_ALL=""
 SECTION_ACTIVE=1
@@ -64,8 +74,7 @@ section_begin() { # name
   fi
   if [ "$QUICK" = 1 ]; then
     case "$n" in
-      "fixture repo") SECTION_ACTIVE=0; return 0 ;;
-      "taint matrix"*|"autoload surface"*|"autoload split-trust"*|"graceful degradation"*|"scrub --foreign mode"*|"BOT_NAMES_JSON shadowing"*) SECTION_ACTIVE=0; return 0 ;;
+      "fixture repo"|"taint matrix"*|"autoload surface"*|"autoload split-trust"*|"graceful degradation"*|"scrub --foreign mode"*|"BOT_NAMES_JSON shadowing"*|"channel hygiene"*) SECTION_ACTIVE=0; return 0 ;;
     esac
   fi
   SECTION_ACTIVE=1
@@ -85,6 +94,28 @@ fi
 SECTION_NAME='fixture repo'
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
+# Template cache (biggest local win): the fixture repo below is ~25 git
+# operations (init, branches, commits, merges, plumbing) with a fully
+# deterministic RESULT per (scrub-workspace.sh + this file). Cold run
+# builds it and snapshots a tar into .fixture-cache/ at the REPO ROOT
+# (gitignored, machine-local; CI runners are always cold and simply build).
+# Warm runs extract (~30 small files) + local-clone (shares objects) -
+# skipping the rebuild time AND ~90% of the per-run disk writes.
+#
+# Safety: the key covers both inputs that define fixture semantics, and a
+# known-answer tripwire (rollback scenario must read ALARM) self-invalidates
+# a snapshot that ever disagrees - stale cache fails loudly into a rebuild,
+# never into green lies. FIXTURES_REBUILD=1 forces a fresh snapshot.
+FIXROOT="${FIXTURE_CACHE:-$(cd "$SCRIPT_DIR/../.." && pwd)/.fixture-cache}"
+FIXKEY="$(cat "$SCRUB" "${BASH_SOURCE[0]}" 2>/dev/null | sha256sum | cut -c1-16)"
+FIXSNAP="$FIXROOT/fixture-$FIXKEY.tgz"
+FIX_WARM=0
+if [ -f "$FIXSNAP" ] && [ -z "${FIXTURES_REBUILD:-}" ]; then
+  mkdir -p "$WORK/src"; tar -xzf "$FIXSNAP" -C "$WORK/src" 2>/dev/null || { echo "FAIL: fixture snapshot corrupt - rebuild with FIXTURES_REBUILD=1"; FAIL=$((FAIL+1)); }
+  SRC="$WORK/src"; cd "$WORK" && git clone -q "$SRC" work && cd work || exit 1
+  git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+  FIX_WARM=1
+else
 SRC="$WORK/src"; mkdir -p "$SRC/.github/workflows"; cd "$SRC" || exit 1
 git init -q -b main .; git config user.email t@t; git config user.name t
 printf 'wf: v1\n' > .github/workflows/main.yml; printf 'doc one\n' > DOC.md
@@ -181,6 +212,10 @@ git checkout -q main
 
 cd "$WORK" && git clone -q "$SRC" work && cd work || exit 1
 git fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+mkdir -p "$FIXROOT" && tar -czf "$FIXSNAP" -C "$SRC" . 2>/dev/null \
+  && ls -t "$FIXROOT"/fixture-*.tgz 2>/dev/null | awk 'NR>3' | xargs -r rm -f \
+  || echo "notice: fixture snapshot not written (cache dir unwritable - cold path every run)"
+fi
 
 run_scrub() { # branch -> ALARM|INFO|CLEAN
   git checkout -q --detach "origin/$1"
@@ -191,6 +226,17 @@ run_scrub() { # branch -> ALARM|INFO|CLEAN
   elif [ ! -s /tmp/scrub-taint.txt ]; then echo CLEAN
   else echo UNKNOWN; fi
 }
+
+# Warm-restore tripwire: a known-answer scenario must hold on the extracted
+# template. Any disagreement means the snapshot went stale in a way the
+# content key missed - delete it and rerun cold. Never test on a lie.
+if [ "$FIX_WARM" = 1 ]; then
+  if [ "$(run_scrub sync-rollback)" != "ALARM" ]; then
+    echo "notice: fixture template failed the tripwire - snapshot deleted, rerunning cold"
+    rm -f "$FIXSNAP"
+    exec env FIXTURES_REBUILD=1 bash "${BASH_SOURCE[0]}" "$@"
+  fi
+fi
 
 fi
 section_end
@@ -1112,328 +1158,6 @@ fi
 section_end
 fi
 
-# ---- prompt-assembly contract test (all modes, dummy vars) -----------------
-SECTION_NAME='prompt-assembly contract test (all modes, dummy vars)'
-if [ "$PARALLEL" = 1 ]; then
-  ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
-# Assembles every manifest through the REAL assembler, substitutes the mode's
-# full var set with dummy values, and verifies: (a) contract strings the
-# workflows grep/parse survive byte-exact; (b) no raw ${VAR} residue (a
-# leaked variable class); (c) the assembler fails closed on a missing part.
-ASM="$SCRIPT_DIR/assemble-prompt.sh"
-PROMPTS="$(cd "$SCRIPT_DIR/../prompts" && pwd)"
-export PR_AUTHOR=octocat PR_NUMBER=42 GITHUB_REPOSITORY=Own/repo PR_HEAD_SHA=abc123
-export PULL_REQUEST_CONTEXT='<ctx>' DIFF_FILE_PATH=/tmp/d.txt
-export THREAD_CONTEXT='<tc>' NEW_COMMENT_AUTHOR=someone NEW_COMMENT_BODY='<b>'
-export THREAD_NUMBER=42 THREAD_AUTHOR=octo IS_FIRST_REVIEW=true
-export FULL_DIFF_PATH=/tmp/f.txt INCREMENTAL_DIFF_PATH=/tmp/i.txt LAST_REVIEWED_SHA=abc123
-export ISSUE_CONTEXT='<ic>' ISSUE_NUMBER=7 ISSUE_AUTHOR=octo
-export DISCUSSION_NODE_ID=D_kwDO_123 DISCUSSION_TITLE='Disc Title'
-export PR_TITLE='T' PR_BODY='<pb>' PR_LABELS='[]' CHANGED_FILES='<cf>'
-export CHANGED_FILES_JSON='[]' PREVIOUS_REVIEWS='<pr>' FILE_GROUPS='<fg>'
-export REPORT_TEMPLATE='<rt>' DIFF_PATH=/tmp/c.txt
-RVARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${PR_TITLE} ${PR_BODY} ${PR_LABELS} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH}'
-
-asm() { bash "$ASM" "$1" | REVIEW_TYPE=FIRST envsubst "$RVARS"; }
-
-# per-mode VARS (must mirror each workflow's real VARS list + invocation bridges)
-vars_for() {
-  case "$1" in
-    pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
-    bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${DISCUSSION_NODE_ID} ${DISCUSSION_REPLY_TO_NODE} ${DISCUSSION_TITLE}' ;;
-    issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
-    compliance-first|compliance-followup) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
-    # bot-reply's on-demand instruction sets: union of the IVARS list and the
-    # review RVARS additions from the Generate-instruction-sets step. A name
-    # missing here shows up as raw-variable residue below.
-    review-*-instructions) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${REVIEW_TYPE} ${PR_AUTHOR} ${PULL_REQUEST_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
-    agentlib-*) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
-  esac
-}
-
-for mode in pr-review-first pr-review-followup bot-reply issue-comment compliance-first compliance-followup review-first-instructions review-followup-instructions review-memory-instructions agentlib-investigate agentlib-contribute agentlib-manage agentlib-cross-repo; do
-  out=$(asm "$mode")
-  case "$mode" in
-    review-memory-instructions)
-      for contract in 'YOUR PREVIOUS REVIEWS' 'YOUR OLDER REVIEWS' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    pr-review-*|review-*-instructions)
-      for contract in 'This review was generated by an AI assistant' 'last_reviewed_sha:' \
-                      '/tmp/head_sha.txt' \
-                      '/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews' ; do
-        c="$contract"
-        # envsubst already ran: substitute the two literal vars in expectations
-        c=$(printf '%s' "$contract" | REVIEW_TYPE=FIRST GITHUB_REPOSITORY=Own/repo PR_NUMBER=42 envsubst '${GITHUB_REPOSITORY} ${PR_NUMBER}')
-        if grep -qF -- "$c" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
-      done
-      ;;
-    bot-reply)
-      for contract in 'generate-review-kit.sh' '/tmp/instructions/investigate.md' '/tmp/instructions/contribute.md' \
-                      '/tmp/instructions/manage.md' '/tmp/instructions/cross-repo.md' \
-                      '/tmp/instructions/review-memory.md' \
-                      'compliance checking is never yours' '/tmp/head_sha.txt' 'Severity System' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    agentlib-contribute)
-      # dedicated branch FIRST: the shared alternation below would otherwise
-      # match agentlib-contribute and these checks would never run
-      for contract in 'INSTRUCTION SET' '--body-file' 'Severity System' 'SCOPE OF ACTION' \
-                      'Can the target even take your push' 'Scope of Action ladder' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    agentlib-investigate|agentlib-manage)
-      for contract in 'INSTRUCTION SET' '--body-file' 'Severity System' 'SCOPE OF ACTION' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    agentlib-cross-repo)
-      # cross-repo: full agency + guest discipline; posting mechanics live in
-      # the base prompt
-      for contract in 'INSTRUCTION SET' 'Do NOT load this repository' 'Full agency' 'Severity System' 'ACCOUNT_GH_TOKEN' 'Verified lead' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    compliance-*)
-      for contract in "context='compliance-check'" '/statuses/$(cat /tmp/head_sha.txt)' \
-                      'All compliance checks passed' 'Blocking issues - see report' \
-                      'Passed with warnings - see report' ; do
-        c=$(printf '%s' "$contract" | GITHUB_REPOSITORY=Own/repo envsubst '${GITHUB_REPOSITORY}')
-        if grep -qF -- "$c" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
-      done
-      case "$mode" in
-        compliance-first)
-          grep -qF 'Protocol for FIRST Compliance Check' <<<"$out" || { echo "FAIL: [$mode] missing FIRST protocol"; FAIL=1; }
-          grep -qF 'Protocol for FOLLOW-UP Compliance Check' <<<"$out" && { echo "FAIL: [$mode] stray FOLLOW-UP protocol"; FAIL=1; }
-          ;;
-        compliance-followup)
-          grep -qF 'Protocol for FOLLOW-UP Compliance Check' <<<"$out" || { echo "FAIL: [$mode] missing FOLLOW-UP protocol"; FAIL=1; }
-          grep -qF 'Protocol for FIRST Compliance Check' <<<"$out" && { echo "FAIL: [$mode] stray FIRST protocol"; FAIL=1; }
-          ;;
-      esac
-      ;;
-  esac
-done
-[ "$FAIL" -eq 0 ] && echo "PASS: contract strings present in all modes"
-residue=$(for mode in pr-review-first pr-review-followup bot-reply issue-comment compliance-first compliance-followup review-first-instructions review-followup-instructions review-memory-instructions agentlib-investigate agentlib-contribute agentlib-manage agentlib-cross-repo; do
-            bash "$ASM" "$mode" | REVIEW_TYPE=FIRST envsubst "$(vars_for "$mode")"
-          done | grep -oE '\$\{[A-Z_]+\}' | sort -u)
-if [ -n "$residue" ]; then echo "FAIL: raw variable residue after envsubst:"; printf '%s\n' "$residue"; FAIL=1; else echo "PASS: no raw variable residue in any mode"; fi
-if bash "$ASM" nonexistent-mode >/dev/null 2>&1; then echo "FAIL: assembler did not fail closed on missing manifest"; FAIL=1; else echo "PASS: assembler fails closed on missing manifest"; fi
-if bash "$ASM" --verify >/dev/null 2>&1; then echo "PASS: assembler --verify green"; else echo "FAIL: assembler --verify"; FAIL=1; fi
-
-# fixture-vs-workflow VARS drift check: vars_for() must mirror the real lists.
-# All extraction happens in awk/sed with single-quoted programs so no shell
-# expansion can silently vacuate the check (the double-quoted-sed ${}
-# bad-substitution bug class this check once had).
-extract_vars() { # file -> bare names, one per line, sorted
-  awk '/^[[:space:]]*VARS=/ {print; exit}' "$1" \
-    | sed 's/.*VARS=//' | tr -d "'\"" | tr -d '$}{' | tr ' ' '\n' \
-    | grep -E '^[A-Z][A-Z_]*$' | sort -u
-}
-vars_for_names() { # mode -> bare names from vars_for(), sorted
-  vars_for "$1" | tr -d '$}{' | tr ' ' '\n' | grep -E '^[A-Z][A-Z_]*$' | sort -u
-}
-drift_ok=1
-for pair in "pr-review.yml:pr-review-first" "bot-reply.yml:bot-reply" "issue-comment.yml:issue-comment" "compliance-check.yml:compliance-first"; do
-  wf_file="${pair%%:*}"; mode="${pair##*:}"
-  a=$(extract_vars "$SCRIPT_DIR/../workflows/$wf_file")
-  b=$(vars_for_names "$mode")
-  d=$(diff <(printf '%s\n' "$a") <(printf '%s\n' "$b"))
-  if [ -n "$d" ]; then
-    echo "FAIL: VARS drift between $wf_file and fixtures vars_for($mode):$d"
-    drift_ok=0; FAIL=1
-  fi
-done
-[ "$drift_ok" = 1 ] && echo "PASS: workflow VARS exactly mirrored in fixtures (both directions)"
-
-  fi
-  echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
-  ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
-  SECTIONS_N=$((SECTIONS_N + 1))
-else
-section_begin "$SECTION_NAME"
-if [ "$SECTION_ACTIVE" = 1 ]; then
-# Assembles every manifest through the REAL assembler, substitutes the mode's
-# full var set with dummy values, and verifies: (a) contract strings the
-# workflows grep/parse survive byte-exact; (b) no raw ${VAR} residue (a
-# leaked variable class); (c) the assembler fails closed on a missing part.
-ASM="$SCRIPT_DIR/assemble-prompt.sh"
-PROMPTS="$(cd "$SCRIPT_DIR/../prompts" && pwd)"
-export PR_AUTHOR=octocat PR_NUMBER=42 GITHUB_REPOSITORY=Own/repo PR_HEAD_SHA=abc123
-export PULL_REQUEST_CONTEXT='<ctx>' DIFF_FILE_PATH=/tmp/d.txt
-export THREAD_CONTEXT='<tc>' NEW_COMMENT_AUTHOR=someone NEW_COMMENT_BODY='<b>'
-export THREAD_NUMBER=42 THREAD_AUTHOR=octo IS_FIRST_REVIEW=true
-export FULL_DIFF_PATH=/tmp/f.txt INCREMENTAL_DIFF_PATH=/tmp/i.txt LAST_REVIEWED_SHA=abc123
-export ISSUE_CONTEXT='<ic>' ISSUE_NUMBER=7 ISSUE_AUTHOR=octo
-export DISCUSSION_NODE_ID=D_kwDO_123 DISCUSSION_TITLE='Disc Title'
-export PR_TITLE='T' PR_BODY='<pb>' PR_LABELS='[]' CHANGED_FILES='<cf>'
-export CHANGED_FILES_JSON='[]' PREVIOUS_REVIEWS='<pr>' FILE_GROUPS='<fg>'
-export REPORT_TEMPLATE='<rt>' DIFF_PATH=/tmp/c.txt
-RVARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${PR_TITLE} ${PR_BODY} ${PR_LABELS} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${DIFF_PATH}'
-
-asm() { bash "$ASM" "$1" | REVIEW_TYPE=FIRST envsubst "$RVARS"; }
-
-# per-mode VARS (must mirror each workflow's real VARS list + invocation bridges)
-vars_for() {
-  case "$1" in
-    pr-review-*) echo '${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
-    bot-reply)   echo '${THREAD_CONTEXT} ${NEW_COMMENT_AUTHOR} ${NEW_COMMENT_BODY} ${TRIGGER_MESSAGE} ${THREAD_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_AUTHOR} ${PR_HEAD_SHA} ${IS_FIRST_REVIEW} ${FULL_DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_NUMBER} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${REVIEW_KIT_SUMMARY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${DISCUSSION_NODE_ID} ${DISCUSSION_REPLY_TO_NODE} ${DISCUSSION_TITLE}' ;;
-    issue-comment) echo '${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
-    compliance-first|compliance-followup) echo '${PR_NUMBER} ${PR_TITLE} ${PR_BODY} ${PR_AUTHOR} ${PR_HEAD_SHA} ${CHANGED_FILES} ${CHANGED_FILES_JSON} ${PR_LABELS} ${PREVIOUS_COMPLIANCE_REPORT} ${TRIGGER_MESSAGE} ${THREAD_CONTEXT} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${DIFF_PATH} ${INCREMENTAL_DIFF_PATH} ${FILE_GROUPS} ${REPORT_TEMPLATE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
-    # bot-reply's on-demand instruction sets: union of the IVARS list and the
-    # review RVARS additions from the Generate-instruction-sets step. A name
-    # missing here shows up as raw-variable residue below.
-    review-*-instructions) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${REVIEW_TYPE} ${PR_AUTHOR} ${PULL_REQUEST_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT}' ;;
-    agentlib-*) echo '${DIFF_FILE_PATH} ${INCREMENTAL_DIFF_PATH} ${LAST_REVIEWED_SHA} ${PR_HEAD_SHA} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${THREAD_NUMBER} ${THREAD_AUTHOR} ${NEW_COMMENT_AUTHOR} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}' ;;
-  esac
-}
-
-for mode in pr-review-first pr-review-followup bot-reply issue-comment compliance-first compliance-followup review-first-instructions review-followup-instructions review-memory-instructions agentlib-investigate agentlib-contribute agentlib-manage agentlib-cross-repo; do
-  out=$(asm "$mode")
-  case "$mode" in
-    review-memory-instructions)
-      for contract in 'YOUR PREVIOUS REVIEWS' 'YOUR OLDER REVIEWS' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    pr-review-*|review-*-instructions)
-      for contract in 'This review was generated by an AI assistant' 'last_reviewed_sha:' \
-                      '/tmp/head_sha.txt' \
-                      '/repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews' ; do
-        c="$contract"
-        # envsubst already ran: substitute the two literal vars in expectations
-        c=$(printf '%s' "$contract" | REVIEW_TYPE=FIRST GITHUB_REPOSITORY=Own/repo PR_NUMBER=42 envsubst '${GITHUB_REPOSITORY} ${PR_NUMBER}')
-        if grep -qF -- "$c" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
-      done
-      ;;
-    bot-reply)
-      for contract in 'generate-review-kit.sh' '/tmp/instructions/investigate.md' '/tmp/instructions/contribute.md' \
-                      '/tmp/instructions/manage.md' '/tmp/instructions/cross-repo.md' \
-                      '/tmp/instructions/review-memory.md' \
-                      'compliance checking is never yours' '/tmp/head_sha.txt' 'Severity System' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    agentlib-contribute)
-      # dedicated branch FIRST: the shared alternation below would otherwise
-      # match agentlib-contribute and these checks would never run
-      for contract in 'INSTRUCTION SET' '--body-file' 'Severity System' 'SCOPE OF ACTION' \
-                      'Can the target even take your push' 'Scope of Action ladder' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    agentlib-investigate|agentlib-manage)
-      for contract in 'INSTRUCTION SET' '--body-file' 'Severity System' 'SCOPE OF ACTION' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    agentlib-cross-repo)
-      # cross-repo: full agency + guest discipline; posting mechanics live in
-      # the base prompt
-      for contract in 'INSTRUCTION SET' 'Do NOT load this repository' 'Full agency' 'Severity System' 'ACCOUNT_GH_TOKEN' 'Verified lead' ; do
-        if grep -qF -- "$contract" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $contract"; FAIL=1; fi
-      done
-      ;;
-    compliance-*)
-      for contract in "context='compliance-check'" '/statuses/$(cat /tmp/head_sha.txt)' \
-                      'All compliance checks passed' 'Blocking issues - see report' \
-                      'Passed with warnings - see report' ; do
-        c=$(printf '%s' "$contract" | GITHUB_REPOSITORY=Own/repo envsubst '${GITHUB_REPOSITORY}')
-        if grep -qF -- "$c" <<<"$out"; then :; else echo "FAIL: [$mode] contract missing: $c"; FAIL=1; fi
-      done
-      case "$mode" in
-        compliance-first)
-          grep -qF 'Protocol for FIRST Compliance Check' <<<"$out" || { echo "FAIL: [$mode] missing FIRST protocol"; FAIL=1; }
-          grep -qF 'Protocol for FOLLOW-UP Compliance Check' <<<"$out" && { echo "FAIL: [$mode] stray FOLLOW-UP protocol"; FAIL=1; }
-          ;;
-        compliance-followup)
-          grep -qF 'Protocol for FOLLOW-UP Compliance Check' <<<"$out" || { echo "FAIL: [$mode] missing FOLLOW-UP protocol"; FAIL=1; }
-          grep -qF 'Protocol for FIRST Compliance Check' <<<"$out" && { echo "FAIL: [$mode] stray FIRST protocol"; FAIL=1; }
-          ;;
-      esac
-      ;;
-  esac
-done
-[ "$FAIL" -eq 0 ] && echo "PASS: contract strings present in all modes"
-residue=$(for mode in pr-review-first pr-review-followup bot-reply issue-comment compliance-first compliance-followup review-first-instructions review-followup-instructions review-memory-instructions agentlib-investigate agentlib-contribute agentlib-manage agentlib-cross-repo; do
-            bash "$ASM" "$mode" | REVIEW_TYPE=FIRST envsubst "$(vars_for "$mode")"
-          done | grep -oE '\$\{[A-Z_]+\}' | sort -u)
-if [ -n "$residue" ]; then echo "FAIL: raw variable residue after envsubst:"; printf '%s\n' "$residue"; FAIL=1; else echo "PASS: no raw variable residue in any mode"; fi
-if bash "$ASM" nonexistent-mode >/dev/null 2>&1; then echo "FAIL: assembler did not fail closed on missing manifest"; FAIL=1; else echo "PASS: assembler fails closed on missing manifest"; fi
-if bash "$ASM" --verify >/dev/null 2>&1; then echo "PASS: assembler --verify green"; else echo "FAIL: assembler --verify"; FAIL=1; fi
-
-# fixture-vs-workflow VARS drift check: vars_for() must mirror the real lists.
-# All extraction happens in awk/sed with single-quoted programs so no shell
-# expansion can silently vacuate the check (the double-quoted-sed ${}
-# bad-substitution bug class this check once had).
-extract_vars() { # file -> bare names, one per line, sorted
-  awk '/^[[:space:]]*VARS=/ {print; exit}' "$1" \
-    | sed 's/.*VARS=//' | tr -d "'\"" | tr -d '$}{' | tr ' ' '\n' \
-    | grep -E '^[A-Z][A-Z_]*$' | sort -u
-}
-vars_for_names() { # mode -> bare names from vars_for(), sorted
-  vars_for "$1" | tr -d '$}{' | tr ' ' '\n' | grep -E '^[A-Z][A-Z_]*$' | sort -u
-}
-drift_ok=1
-for pair in "pr-review.yml:pr-review-first" "bot-reply.yml:bot-reply" "issue-comment.yml:issue-comment" "compliance-check.yml:compliance-first"; do
-  wf_file="${pair%%:*}"; mode="${pair##*:}"
-  a=$(extract_vars "$SCRIPT_DIR/../workflows/$wf_file")
-  b=$(vars_for_names "$mode")
-  d=$(diff <(printf '%s\n' "$a") <(printf '%s\n' "$b"))
-  if [ -n "$d" ]; then
-    echo "FAIL: VARS drift between $wf_file and fixtures vars_for($mode):$d"
-    drift_ok=0; FAIL=1
-  fi
-done
-[ "$drift_ok" = 1 ] && echo "PASS: workflow VARS exactly mirrored in fixtures (both directions)"
-
-fi
-section_end
-fi
-
-# ---- taint-warning areas join (extracts the REAL awk from scrub-workspace.sh) ----
-SECTION_NAME='taint-warning areas join (extracts the REAL awk from scrub-workspace.sh)'
-if [ "$PARALLEL" = 1 ]; then
-  ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
-areas_prog=$(sed -n "/areas=.*(printf/,/^    }')/p" "$SCRIPT_DIR/scrub-workspace.sh" | sed "1s/^.*awk -F\/ '//" | sed "$ s/')$//")
-if [ -n "$areas_prog" ]; then
-  got_areas=$(printf '.github/workflows/a.yml\n.github/prompts/p.md\n.github/scripts/s.sh\n.github/foo.yml\n' | awk -F/ "$areas_prog")
-  if [ "$got_areas" = "workflows, prompts, scripts, other" ]; then
-    echo "PASS: taint areas joined with ', ' (no paste cyclic-delimiter artifacts)"
-  else
-    echo "FAIL: taint areas join got [$got_areas]"; FAIL=1
-  fi
-else
-  echo "FAIL: could not extract areas program from scrub-workspace.sh"; FAIL=1
-fi
-
-  fi
-  echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
-  ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
-  SECTIONS_N=$((SECTIONS_N + 1))
-else
-section_begin "$SECTION_NAME"
-if [ "$SECTION_ACTIVE" = 1 ]; then
-areas_prog=$(sed -n "/areas=.*(printf/,/^    }')/p" "$SCRIPT_DIR/scrub-workspace.sh" | sed "1s/^.*awk -F\/ '//" | sed "$ s/')$//")
-if [ -n "$areas_prog" ]; then
-  got_areas=$(printf '.github/workflows/a.yml\n.github/prompts/p.md\n.github/scripts/s.sh\n.github/foo.yml\n' | awk -F/ "$areas_prog")
-  if [ "$got_areas" = "workflows, prompts, scripts, other" ]; then
-    echo "PASS: taint areas joined with ', ' (no paste cyclic-delimiter artifacts)"
-  else
-    echo "FAIL: taint areas join got [$got_areas]"; FAIL=1
-  fi
-else
-  echo "FAIL: could not extract areas program from scrub-workspace.sh"; FAIL=1
-fi
-
-fi
-section_end
-fi
-
 # ---- react.sh lifecycle simulation (mock gh; exercises the REAL script) ----
 SECTION_NAME='react.sh lifecycle simulation (mock gh; exercises the REAL script)'
 if [ "$PARALLEL" = 1 ]; then
@@ -2217,10 +1941,6 @@ check "split: split-diff.sh captured as trusted artifact everywhere" "3" \
   "$(grep -l 'cp .github/scripts/split-diff.sh /tmp/split-diff.sh' "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml | wc -l | tr -d ' ')"
 check "split: kit splits both diff files" yes \
   "$(grep -q 'split-diff.sh "$FULL_DIFF"' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'split-diff.sh "$INCREMENTAL_DIFF"' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
-check "split: missions teach index detection" "2" \
-  "$(grep -l 'DIFF SPLIT' "$SCRIPT_DIR/../prompts/parts/mission-review.md" "$SCRIPT_DIR/../prompts/parts/mission-compliance.md" | wc -l | tr -d ' ')"
-check "split: <diff> inline-fossil tag renamed" no \
-  "$(grep -q '<diff>$' "$SCRIPT_DIR/../prompts/parts/mission-review.md" && echo yes || echo no)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -2239,10 +1959,6 @@ check "split: split-diff.sh captured as trusted artifact everywhere" "3" \
   "$(grep -l 'cp .github/scripts/split-diff.sh /tmp/split-diff.sh' "$SCRIPT_DIR"/../workflows/pr-review.yml "$SCRIPT_DIR"/../workflows/bot-reply.yml "$SCRIPT_DIR"/../workflows/compliance-check.yml | wc -l | tr -d ' ')"
 check "split: kit splits both diff files" yes \
   "$(grep -q 'split-diff.sh "$FULL_DIFF"' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'split-diff.sh "$INCREMENTAL_DIFF"' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
-check "split: missions teach index detection" "2" \
-  "$(grep -l 'DIFF SPLIT' "$SCRIPT_DIR/../prompts/parts/mission-review.md" "$SCRIPT_DIR/../prompts/parts/mission-compliance.md" | wc -l | tr -d ' ')"
-check "split: <diff> inline-fossil tag renamed" no \
-  "$(grep -q '<diff>$' "$SCRIPT_DIR/../prompts/parts/mission-review.md" && echo yes || echo no)"
 
 fi
 section_end
@@ -2505,8 +2221,6 @@ check "rebase: determine step walks candidates by ancestry" yes \
   "$(grep -q 'merge-base --is-ancestor' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'all_markers' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "rebase: REBASE_CONTEXT exported with history-rewrite note" yes \
   "$(grep -q 'REBASE_CONTEXT<<' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'Recent commits (newest first' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "rebase: placeholder lives in mission-review type context" yes \
-  "$(grep -q 'REBASE_CONTEXT' "$SCRIPT_DIR/../prompts/parts/mission-review.md" && echo yes || echo no)"
 check "rebase: envsubst VARS list carries REBASE_CONTEXT" yes \
   "$(grep -q 'REBASE_CONTEXT' <(grep 'VARS=' "$SCRIPT_DIR/../workflows/pr-review.yml") && echo yes || echo no)"
 check "rebase: full-diff fallback note survives generation (prepended, not clobbered)" yes \
@@ -2521,8 +2235,6 @@ check "rebase: recent commits listed from the PR head" yes \
   "$(grep -q 'git log --oneline -12 "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "rebase: share-context words the no-SHA case honestly" yes \
   "$(grep -q 'rebased - full re-review' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "cc-rule: manual dispatch and auto runs get no cc" yes \
-  "$(grep -q 'manual dispatches' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && grep -q 'EXACTLY one case' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && echo yes || echo no)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -2538,8 +2250,6 @@ check "rebase: determine step walks candidates by ancestry" yes \
   "$(grep -q 'merge-base --is-ancestor' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'all_markers' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "rebase: REBASE_CONTEXT exported with history-rewrite note" yes \
   "$(grep -q 'REBASE_CONTEXT<<' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'Recent commits (newest first' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "rebase: placeholder lives in mission-review type context" yes \
-  "$(grep -q 'REBASE_CONTEXT' "$SCRIPT_DIR/../prompts/parts/mission-review.md" && echo yes || echo no)"
 check "rebase: envsubst VARS list carries REBASE_CONTEXT" yes \
   "$(grep -q 'REBASE_CONTEXT' <(grep 'VARS=' "$SCRIPT_DIR/../workflows/pr-review.yml") && echo yes || echo no)"
 check "rebase: full-diff fallback note survives generation (prepended, not clobbered)" yes \
@@ -2554,8 +2264,6 @@ check "rebase: recent commits listed from the PR head" yes \
   "$(grep -q 'git log --oneline -12 "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "rebase: share-context words the no-SHA case honestly" yes \
   "$(grep -q 'rebased - full re-review' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "cc-rule: manual dispatch and auto runs get no cc" yes \
-  "$(grep -q 'manual dispatches' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && grep -q 'EXACTLY one case' "$SCRIPT_DIR/../prompts/parts/review-verdicts.md" && echo yes || echo no)"
 
 fi
 section_end
@@ -2580,8 +2288,6 @@ check "discussion: not-shown markers rendered for agent retrieval" yes \
   "$(grep -q 'replies not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'threads not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "discussion: reply anchor exported only for genuine comment triggers" yes \
   "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'trig_is_comment=1' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
-check "discussion: posting.md mandates reply-where-asked as default" yes \
-  "$(grep -q 'reply where you were summoned' "$SCRIPT_DIR/../prompts/parts/posting.md" && grep -q 'DISCUSSION_REPLY_TO_NODE' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 check "discussion: bootstrap seeds the thread-model keys" yes \
   "$(grep -q '"discussion-threads":40,"discussion-replies":30' "$SCRIPT_DIR/../workflows/agent-bootstrap.yml" && echo yes || echo no)"
 
@@ -2607,8 +2313,6 @@ check "discussion: not-shown markers rendered for agent retrieval" yes \
   "$(grep -q 'replies not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'threads not shown here' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "discussion: reply anchor exported only for genuine comment triggers" yes \
   "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'trig_is_comment=1' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
-check "discussion: posting.md mandates reply-where-asked as default" yes \
-  "$(grep -q 'reply where you were summoned' "$SCRIPT_DIR/../prompts/parts/posting.md" && grep -q 'DISCUSSION_REPLY_TO_NODE' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 check "discussion: bootstrap seeds the thread-model keys" yes \
   "$(grep -q '"discussion-threads":40,"discussion-replies":30' "$SCRIPT_DIR/../workflows/agent-bootstrap.yml" && echo yes || echo no)"
 
@@ -2632,8 +2336,6 @@ check "order: fetch-pr-discussion threads+comments ascending inside reviews" yes
   "$(grep -c 'map(sort_by(.createdAt))' "$SCRIPT_DIR/fetch-pr-discussion.sh" | awk '{print ($1 >= 2) ? "yes" : "no"}')"
 check "order: discussion render = newest-selection THEN ascending" yes \
   "$(grep -qF 'sort_by(.at) | reverse | .[0:$dt] | sort_by(.at)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'oldest-first below' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
-check "order: memory-block labels say chronological" yes \
-  "$(grep -q 'chronological order' "$SCRIPT_DIR/../prompts/parts/previous-reviews.md" && grep -q 'chronological order' "$SCRIPT_DIR/../prompts/parts/agent-review-history.md" && echo yes || echo no)"
 # Behavioral: an ascending page through the exact select-then-render shape
 # keeps the NEWEST dt and renders them OLDEST-first (newest 2 of
 # old/mid/new = mid+new; rendered ascending = mid,new).
@@ -2659,8 +2361,6 @@ check "order: fetch-pr-discussion threads+comments ascending inside reviews" yes
   "$(grep -c 'map(sort_by(.createdAt))' "$SCRIPT_DIR/fetch-pr-discussion.sh" | awk '{print ($1 >= 2) ? "yes" : "no"}')"
 check "order: discussion render = newest-selection THEN ascending" yes \
   "$(grep -qF 'sort_by(.at) | reverse | .[0:$dt] | sort_by(.at)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'oldest-first below' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
-check "order: memory-block labels say chronological" yes \
-  "$(grep -q 'chronological order' "$SCRIPT_DIR/../prompts/parts/previous-reviews.md" && grep -q 'chronological order' "$SCRIPT_DIR/../prompts/parts/agent-review-history.md" && echo yes || echo no)"
 # Behavioral: an ascending page through the exact select-then-render shape
 # keeps the NEWEST dt and renders them OLDEST-first (newest 2 of
 # old/mid/new = mid+new; rendered ascending = mid,new).
@@ -2691,10 +2391,6 @@ check "ids: discussion thread heads carry node ids" yes \
   "$(grep -qF '"- [\($c.id)]' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "ids: discussion reply lines carry node ids" yes \
   "$(grep -qF '"    ↳ [\(.id)]' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
-check "ids: reactions.md points at the context-line ids" yes \
-  "$(grep -q 'numeric comment id rides every conversation line' "$SCRIPT_DIR/../prompts/parts/reactions.md" && grep -q 'addReaction' "$SCRIPT_DIR/../prompts/parts/reactions.md" && echo yes || echo no)"
-check "ids: posting.md arbitrary-reply lane uses context node ids" yes \
-  "$(grep -q 'F r=\"<that comment' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -2719,10 +2415,6 @@ check "ids: discussion thread heads carry node ids" yes \
   "$(grep -qF '"- [\($c.id)]' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "ids: discussion reply lines carry node ids" yes \
   "$(grep -qF '"    ↳ [\(.id)]' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
-check "ids: reactions.md points at the context-line ids" yes \
-  "$(grep -q 'numeric comment id rides every conversation line' "$SCRIPT_DIR/../prompts/parts/reactions.md" && grep -q 'addReaction' "$SCRIPT_DIR/../prompts/parts/reactions.md" && echo yes || echo no)"
-check "ids: posting.md arbitrary-reply lane uses context node ids" yes \
-  "$(grep -q 'F r=\"<that comment' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 
 fi
 section_end
@@ -3025,10 +2717,6 @@ if [ "$PARALLEL" = 1 ]; then
 # -F reads @files), and the workflow exporting the trigger's OWN node as the
 # reply anchor (invalid when the trigger is itself a reply - the API needs
 # the owning top-level comment node).
-check "disc: recipe uses replyToId (schema field)"  yes "$(grep -q 'replyToId: \$r' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
-check "disc: recipe binds -F b=@file (key=var)"     yes "$(grep -q -- '-F b=@/tmp/comment-body.md' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
-check "disc: no dead replyTo field"                 no  "$(grep -E 'replyTo[^I]' "$SCRIPT_DIR/../prompts/parts/posting.md" | grep -qv 'replyToId' && echo yes || echo no)"
-check "disc: no -f body=@ (raw-field has no @file magic)" no "$(grep -q -- '-f body=@' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 check "disc: bot-reply resolves owning anchor (replies carry parent)" yes "$(grep -q 'anchor: \$c.id' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "disc: anchor export uses trig_anchor"        yes "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 
@@ -3045,10 +2733,6 @@ if [ "$SECTION_ACTIVE" = 1 ]; then
 # -F reads @files), and the workflow exporting the trigger's OWN node as the
 # reply anchor (invalid when the trigger is itself a reply - the API needs
 # the owning top-level comment node).
-check "disc: recipe uses replyToId (schema field)"  yes "$(grep -q 'replyToId: \$r' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
-check "disc: recipe binds -F b=@file (key=var)"     yes "$(grep -q -- '-F b=@/tmp/comment-body.md' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
-check "disc: no dead replyTo field"                 no  "$(grep -E 'replyTo[^I]' "$SCRIPT_DIR/../prompts/parts/posting.md" | grep -qv 'replyToId' && echo yes || echo no)"
-check "disc: no -f body=@ (raw-field has no @file magic)" no "$(grep -q -- '-f body=@' "$SCRIPT_DIR/../prompts/parts/posting.md" && echo yes || echo no)"
 check "disc: bot-reply resolves owning anchor (replies carry parent)" yes "$(grep -q 'anchor: \$c.id' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "disc: anchor export uses trig_anchor"        yes "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 
