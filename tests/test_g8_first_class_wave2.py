@@ -19,9 +19,15 @@ def test_chutes_declaration_and_listing():
     from rotator_library.providers import PROVIDER_PLUGINS
     from rotator_library.providers.chutes_provider import ChutesProvider
 
-    plugin = PROVIDER_PLUGINS["chutes"]
+    provider_class = PROVIDER_PLUGINS["chutes"]
+    plugin = provider_class()
     assert plugin.default_api_base == "https://llm.chutes.ai/v1"
     assert plugin.adapter_names == ("chutes",)
+    # The envelope declares the chat face; the custom listing (below) is
+    # the one genuinely provider-specific discovery rule.
+    assert plugin.speaks == ("openai_chat",)
+    assert plugin.get_protocol_name("m") == "openai_chat"
+    assert plugin.transport_profiles is None
 
     class _FakeResponse:
         def raise_for_status(self):
@@ -48,23 +54,42 @@ def test_chutes_declaration_and_listing():
 def test_nanogpt_declaration_and_profiles():
     from rotator_library.providers import PROVIDER_PLUGINS
 
-    plugin = PROVIDER_PLUGINS["nanogpt"]
-    profiles = plugin.transport_profiles
+    plugin = PROVIDER_PLUGINS["nanogpt"]()
+    profiles, default = plugin.get_declared_profiles()
     assert set(profiles) == {"chat", "responses", "subscription"}
-    assert profiles["subscription"]["base_url"] == "https://nano-gpt.com/api/subscription/v1"
     assert profiles["subscription"]["protocol"] == "openai_chat"
-    assert plugin.default_profile == "chat"
+    assert profiles["responses"]["protocol"] == "responses"
+    assert default == "chat"
     assert plugin.adapter_names == ("nanogpt",)
+    # The subscription pool's own base is a real override on the face —
+    # not the inert legacy ``base_url`` key the profile machinery ignored.
+    assert plugin.get_native_endpoint("m", "chat", profile="subscription") == (
+        "https://nano-gpt.com/api/subscription/v1/chat/completions"
+    )
+    assert plugin.get_native_endpoint("m", "chat") == (
+        "https://nano-gpt.com/api/v1/chat/completions"
+    )
+    assert plugin.transport_profiles is None
+    assert plugin.default_profile is None
 
 
 def test_openai_declaration_responses_first():
     from rotator_library.providers import PROVIDER_PLUGINS
 
-    plugin = PROVIDER_PLUGINS["openai"]
-    assert plugin.default_profile == "responses"
-    profiles = plugin.transport_profiles
-    assert profiles["responses"]["endpoint_paths"]["count_tokens"] == "/responses/input_tokens"
+    plugin = PROVIDER_PLUGINS["openai"]()
+    profiles, default = plugin.get_declared_profiles()
+    # Responses is the default face (first speaks entry) and the token
+    # counter's diverging route is the ONE real override on it.
+    assert default == "responses"
     assert profiles["chat"]["protocol"] == "openai_chat"
+    assert plugin.get_native_endpoint("m", "count_tokens") == (
+        "https://api.openai.com/v1/responses/input_tokens"
+    )
+    # The chat face is addressed explicitly, exactly as before.
+    assert plugin.get_native_endpoint("m", "chat", profile="chat") == (
+        "https://api.openai.com/v1/chat/completions"
+    )
+    assert plugin.get_native_endpoint("m", "chat") == "https://api.openai.com/v1/responses"
 
 
 def test_chutes_nanogpt_adapters():

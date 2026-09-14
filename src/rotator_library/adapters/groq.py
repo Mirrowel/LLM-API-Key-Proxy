@@ -1,66 +1,60 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-"""Groq wire adapters (chat-completions family)."""
+"""Groq wire adapter (chat-completions family).
+
+Parameter hygiene lives in the provider's ``model_rules`` cascade and runs
+through the always-on generic ``param_rules`` stage; this adapter owns only
+the pieces a flat declaration cannot express:
+
+- Request: ``reasoning_format: parsed`` is forced whenever tools or JSON
+  output are present (raw thinking alongside tools is a documented 400),
+  and ``include_reasoning`` — mutually exclusive with ``reasoning_format``
+  — is dropped in the same rewrite.
+- Response/stream: Groq's ``reasoning`` field is renamed to the
+  chat-family ``reasoning_content`` spelling, and the terminal
+  ``x_groq.usage`` payload is lifted into the standard ``usage`` slot.
+
+Everything else — the unsupported-knob strip list, the ``temperature``
+clamp, the ``n`` pin — is declared on the provider and enforced before
+this adapter ever sees the payload.
+"""
 
 from __future__ import annotations
 
-import logging
 from copy import deepcopy
 from typing import Any
 
 from .base import AdapterContext, PayloadAdapter
 
-logger = logging.getLogger("rotator_library.adapters")
-
 
 class GroqAdapter(PayloadAdapter):
     """Groq's OpenAI-compatible surface, made honest.
 
-    Request: strips knobs Groq hard-rejects (frequency/presence penalty,
-    logit_bias, logprobs families), clamps ``temperature`` 0 to the
-    float32-safe epsilon Groq requires, forces ``reasoning_format:
-    parsed`` when tools or JSON output are present (raw thinking plus
-    tools is a documented 400), and keeps ``n`` at 1.
-
-    Response/stream: renames Groq's ``reasoning`` fields to the
-    chat-family ``reasoning_content`` spelling the protocol layer speaks.
+    Request: conditional ``reasoning_format`` selection plus the
+    ``include_reasoning`` drop. Response/stream: reasoning-field rename
+    and ``x_groq.usage`` lifting.
     """
 
     name = "groq"
     aliases = ("groq_params", "groq_reasoning")
     supported_stages = ("request", "response", "stream_event")
 
-    _UNSUPPORTED = (
-        "frequency_penalty",
-        "presence_penalty",
-        "logit_bias",
-        "logprobs",
-        "top_logprobs",
-    )
-
     async def transform_request(self, payload: Any, context: AdapterContext) -> Any:
         if not isinstance(payload, dict):
             return payload
-        updated = deepcopy(payload)
-        for key in self._UNSUPPORTED:
-            if key in updated:
-                updated.pop(key)
-        temperature = updated.get("temperature")
-        if isinstance(temperature, (int, float)) and float(temperature) == 0.0:
-            updated["temperature"] = 1e-8
-        if updated.get("n") not in (None, 1):
-            updated["n"] = 1
-        needs_parsed = updated.get("tools") or (
-            isinstance(updated.get("response_format"), dict)
+        needs_parsed = payload.get("tools") or (
+            isinstance(payload.get("response_format"), dict)
         )
-        if needs_parsed:
-            # Explicit raw alongside tools is a documented 400 — parsed
-            # wins regardless of what the client asked for; and
-            # include_reasoning is mutually exclusive with
-            # reasoning_format, so it cannot ride along.
-            updated["reasoning_format"] = "parsed"
-            updated.pop("include_reasoning", None)
+        if not needs_parsed:
+            return payload
+        # Explicit raw alongside tools is a documented 400 — parsed wins
+        # regardless of what the client asked for; and include_reasoning
+        # is mutually exclusive with reasoning_format, so it cannot ride
+        # along.
+        updated = deepcopy(payload)
+        updated["reasoning_format"] = "parsed"
+        updated.pop("include_reasoning", None)
         return updated
 
     async def transform_response(self, payload: Any, context: AdapterContext) -> Any:

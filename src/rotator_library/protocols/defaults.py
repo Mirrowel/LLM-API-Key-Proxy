@@ -103,12 +103,16 @@ PROTOCOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "listing": _LISTING_OPENAI,
     },
     "gemini": {
+        # The Gemini API version segment is part of every route (the
+        # public surface is /v1beta/...); providers speaking this family
+        # normalize a version-bearing env base to match (see
+        # GeminiProvider.get_provider_api_base).
         "family": "gemini",
         "endpoint_paths": {
-            "generate": "/models/{model}:generateContent",
-            "stream_generate": "/models/{model}:streamGenerateContent?alt=sse",
-            "count_tokens": "/models/{model}:countTokens",
-            "models": "/models",
+            "generate": "/v1beta/models/{model}:generateContent",
+            "stream_generate": "/v1beta/models/{model}:streamGenerateContent?alt=sse",
+            "count_tokens": "/v1beta/models/{model}:countTokens",
+            "models": "/v1beta/models",
         },
         "auth": _AUTH_GOOG,
         "listing": _LISTING_GEMINI,

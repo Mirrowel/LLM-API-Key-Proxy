@@ -290,10 +290,12 @@ def test_single_protocol_providers_ignore_profiles() -> None:
     from rotator_library.providers import PROVIDER_PLUGINS
 
     # deepseek was the original pin but declares three faces since its G8
-    # remake; groq is the honest single-protocol example now.
+    # remake; groq is the honest single-protocol example now. The envelope
+    # expresses its one face as a one-entry speaks tuple.
     groq = PROVIDER_PLUGINS["groq"]()
-    assert groq.get_protocol_name("m") in ("openai_chat", "", None)
+    assert groq.get_protocol_name("m") == "openai_chat"
     assert groq.transport_profiles is None
+    assert groq.speaks == ("openai_chat",)
 
 
 def test_openai_declares_two_faces_with_matching_resolution() -> None:
@@ -304,12 +306,19 @@ def test_openai_declares_two_faces_with_matching_resolution() -> None:
     assert openai.get_protocol_name("m") == "responses"
     assert openai.get_native_endpoint(model="m", profile="chat").endswith("/chat/completions")
     assert openai.get_native_endpoint(model="m").endswith("/responses")
+    # speaks replaced the legacy two-profile declaration table.
+    assert openai.transport_profiles is None
+    assert openai.speaks[0][0] == "responses"
+    profiles, default = openai.get_declared_profiles()
+    assert default == "responses" and set(profiles) == {"responses", "chat"}
 
 
 def test_executor_rejects_explicit_profile_on_single_protocol_provider() -> None:
     """groq:responses/gpt-test must fail loudly (structured 400), not be
     silently served as chat. (openai now legitimately declares a responses
-    face, so it no longer belongs in this pin.)"""
+    face, so it no longer belongs in this pin.) The envelope makes the
+    single face a one-entry profile table, so the refusal names the
+    unknown profile against the known set."""
 
     from rotator_library.client.executor import RequestExecutor
     from rotator_library.core.errors import StructuredAPIResponseError
@@ -329,7 +338,7 @@ def test_executor_rejects_explicit_profile_on_single_protocol_provider() -> None
         input_protocol_name="openai_chat",
         execution_profile="responses",
     )
-    with pytest.raises(StructuredAPIResponseError, match="has no profiles"):
+    with pytest.raises(StructuredAPIResponseError, match="has no profile"):
         executor._build_native_provider_context(
             "openai", "groq/gpt-test", plugin, "sk-test", "cred-1", context, None
         )

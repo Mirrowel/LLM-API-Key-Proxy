@@ -372,8 +372,14 @@ class _FakeHTTP:
 
 def test_ollama_provider_endpoints_models_and_optional_auth() -> None:
     provider = PROVIDER_PLUGINS["ollama"]()
-    assert provider.protocol_name == "ollama"
+    # The envelope declares the native face; endpoints (including the
+    # /api/tags listing route) inherit from the protocol registry.
+    assert provider.speaks == ("ollama",)
+    assert provider.get_protocol_name() == "ollama"
+    assert provider.transport_profiles is None
+    assert provider.protocol_name is None
     assert provider.native_streaming_supported is True
+    assert provider.default_auth_mode == "none"
 
     assert provider.get_native_endpoint(operation="ollama_chat").endswith("/api/chat")
     assert provider.get_native_endpoint(operation="ollama_generate").endswith("/api/generate")
@@ -389,13 +395,27 @@ def test_ollama_provider_endpoints_models_and_optional_auth() -> None:
 
 
 async def test_ollama_provider_models_from_tags_shape() -> None:
+    """Shared listing: the descriptor's /api/tags route, ``models[].name``
+    shape, honest empty on failure (the hand-rolled lister is gone)."""
+
+    from rotator_library.providers.ollama_provider import OllamaProvider
+
     provider = PROVIDER_PLUGINS["ollama"]()
-    fake = _FakeHTTP({"models": [{"name": "llama3:latest"}, {"model": "qwen2"}]})
+    fake = _FakeHTTP(
+        {"models": [{"name": "llama3:latest", "model": "llama3:latest"}, {"name": "qwen2"}]}
+    )
 
     models = await provider.get_models("", fake)
 
     assert models == ["ollama/llama3:latest", "ollama/qwen2"]
     assert fake.calls[-1].endswith("/api/tags")
+    assert "get_models" not in vars(OllamaProvider)  # custom listing deleted
+
+    class _BrokenHTTP:
+        async def get(self, url, **kwargs):
+            raise RuntimeError("offline")
+
+    assert await provider.get_models("", _BrokenHTTP()) == []
 
 
 # ---------------------------------------------------------------------------

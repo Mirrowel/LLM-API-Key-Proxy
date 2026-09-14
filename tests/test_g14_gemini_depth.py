@@ -496,22 +496,43 @@ def test_provider_base_strips_version_and_profile_endpoints(monkeypatch) -> None
     monkeypatch.setenv("GEMINI_API_BASE", "https://mirror.example/v1beta")
     provider = GeminiProvider()
 
+    # The version-bearing env spelling normalizes to the same upstream
+    # URL as the versionless one (the registry paths own /v1beta).
     assert provider.get_native_endpoint("gemini-2.5-pro", "generate") == (
         "https://mirror.example/v1beta/models/gemini-2.5-pro:generateContent"
     )
     assert provider.get_native_endpoint("gemini-2.5-pro", "count_tokens") == (
         "https://mirror.example/v1beta/models/gemini-2.5-pro:countTokens"
     )
+    monkeypatch.setenv("GEMINI_API_BASE", "https://mirror.example")
+    assert provider.get_native_endpoint("gemini-2.5-pro", "generate") == (
+        "https://mirror.example/v1beta/models/gemini-2.5-pro:generateContent"
+    )
 
-    provider.transport_profiles = {
-        "custom": {"protocol": "gemini", "endpoint_paths": {"generate": "/custom/{model}:generate"}}
-    }
+    # A face declared through speaks resolves its overrides the same way.
+    monkeypatch.setattr(
+        GeminiProvider,
+        "speaks",
+        (
+            "gemini",
+            (
+                "custom",
+                "gemini",
+                {"endpoint_paths": {"generate": "/custom/{model}:generate"}},
+            ),
+        ),
+    )
     assert provider.get_native_endpoint("m", "generate", profile="custom") == "https://mirror.example/custom/m:generate"
     assert _strip_gemini_api_version("https://x.example/v1") == "https://x.example"
 
 
 @pytest.mark.asyncio
-async def test_provider_get_models_uses_configured_base_and_paginates(monkeypatch) -> None:
+async def test_provider_get_models_uses_configured_base_and_descriptor(monkeypatch) -> None:
+    """Listing is the shared, protocol-aware implementation: the
+    descriptor's /v1beta/models route on the version-normalized configured
+    base, x-goog auth, ``models[].name`` shape with the ``models/`` prefix
+    stripped. A live failure is an honest empty (no fallback list)."""
+
     monkeypatch.setenv("GEMINI_API_BASE", "https://mirror.example/v1beta")
     provider = GeminiProvider()
     calls: list[dict] = []
@@ -527,17 +548,30 @@ async def test_provider_get_models_uses_configured_base_and_paginates(monkeypatc
             return self._payload
 
     class _Client:
+        def __init__(self, error: bool = False):
+            self._error = error
+
         async def get(self, url, headers=None, params=None):
-            calls.append({"url": url, "params": dict(params or {})})
-            if params and params.get("pageToken"):
-                return _Response({"models": [{"name": "models/gemini-2.5-flash"}]})
-            return _Response({"models": [{"name": "models/gemini-2.5-pro"}], "nextPageToken": "tok"})
+            calls.append({"url": url, "headers": dict(headers or {}), "params": dict(params or {})})
+            if self._error:
+                raise RuntimeError("network down")
+            return _Response(
+                {
+                    "models": [
+                        {"name": "models/gemini-2.5-pro"},
+                        {"name": "models/gemini-2.5-flash"},
+                        {"no_name": True},
+                    ]
+                }
+            )
 
     models = await provider.get_models("key", _Client())
 
     assert models == ["gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash"]
-    assert all(call["url"] == "https://mirror.example/v1beta/models" for call in calls)
-    assert calls[1]["params"].get("pageToken") == "tok"
+    assert calls[0]["url"] == "https://mirror.example/v1beta/models"
+    assert calls[0]["headers"] == {"x-goog-api-key": "key"}
+    assert "get_models" not in vars(GeminiProvider)  # custom listing deleted
+    assert await provider.get_models("key", _Client(error=True)) == []
 
 
 # --------------------------------------------------------- discovery ingress

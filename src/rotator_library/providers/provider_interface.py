@@ -438,13 +438,29 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         if not available:
             protocol = self.get_protocol_name() or "openai_chat"
             available = (protocol,)
-        listing_protocol = getattr(self, "listing_profile", None) or resolve_listing_protocol(available)
+        # A declared ``listing_profile`` is a PROFILE name: resolve it to
+        # its protocol so the descriptor matches the face the endpoint
+        # builder addresses (a two-face provider's listing face may not be
+        # its default face). A bare protocol name survives the legacy path.
+        listing_profile = getattr(self, "listing_profile", None)
+        listing_protocol: Optional[str] = None
+        if listing_profile:
+            entry: Optional[Any] = profiles.get(listing_profile)
+            if entry is None and isinstance(self.transport_profiles, Mapping):
+                legacy_entry = self.transport_profiles.get(listing_profile)
+                entry = legacy_entry if isinstance(legacy_entry, Mapping) else None
+            if isinstance(entry, Mapping):
+                listing_protocol = str(entry.get("protocol") or entry.get("protocol_name") or "")
+            else:
+                listing_protocol = str(listing_profile)
+        if not listing_protocol:
+            listing_protocol = resolve_listing_protocol(available)
         if not listing_protocol:
             return []
         descriptor = listing_descriptor(listing_protocol)
         if not descriptor:
             return []
-        endpoint = self.get_native_endpoint(operation="models", profile=getattr(self, "listing_profile", None))
+        endpoint = self.get_native_endpoint(operation="models", profile=listing_profile)
         headers = await self._listing_headers(api_key, listing_protocol)
         try:
             response = await client.get(endpoint, headers=headers)

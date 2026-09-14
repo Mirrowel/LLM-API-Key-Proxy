@@ -1,6 +1,25 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
+"""NanoGPT — OpenAI-compatible aggregator with two extra transport faces (G8 final).
+
+The ``speaks`` envelope declares the three faces over one credential:
+pay-as-you-go chat (the default), their OpenAI-compatible Responses
+surface, and the subscription pool, which lives on its own base and is
+addressed as ``nanogpt:subscription/model``. Everything each face shares
+with its protocol — endpoints, bearer auth, the ``/models`` listing and
+its ``data[].id`` shape — inherits; only the subscription base is a real
+override.
+
+The ``nanogpt`` adapter owns the genuinely custom wire handling (the
+``max_tokens`` spelling, reasoning-field normalization); the quota
+tracker, quota groups, usage windows, and background refresh job below
+are provider-owned state and stay untouched.
+
+Model listing is the shared, protocol-aware interface implementation; a
+failed listing is an honest empty.
+"""
+
 import httpx
 import logging
 import os
@@ -16,22 +35,30 @@ if not lib_logger.handlers:
 
 
 class NanoGPTProvider(NanoGptQuotaTracker, ProviderInterface):
-    """NanoGPT — OpenAI-compatible aggregator with a subscription face.
+    """NanoGPT — OpenAI-compatible aggregator with a subscription face."""
 
-    Pay-as-you-go is the default wire (``nano-gpt.com/api/v1``); the
-    ``subscription`` profile swaps to the subscription-included pool
-    (``/api/subscription/v1``) and a ``responses`` profile exposes their
-    Responses surface. Deposit exhaustion is a 402 (rotate, never retry);
-    subscription exhaustion is a 429 until reset. The ``nanogpt`` wire
-    adapter owns the length-parameter mapping and the reasoning-field
-    spelling.
-    """
+    # Deposit exhaustion is a 402 (rotate, never retry); subscription
+    # exhaustion is a 429 until reset. The ``nanogpt`` wire adapter owns
+    # the length-parameter mapping and the reasoning-field spelling.
 
-    protocol_name = "openai_chat"
+    # -- transport (the envelope) ---------------------------------------
+    # First entry is the default face. The subscription pool is a second
+    # openai_chat face with its own base override (the historical profile
+    # name ``subscription`` is preserved for addressing stability); the
+    # Responses face inherits its route from the protocol defaults.
+    speaks = (
+        ("chat", "openai_chat", {}),
+        "responses",
+        (
+            "subscription",
+            "openai_chat",
+            {"base": "https://nano-gpt.com/api/subscription/v1"},
+        ),
+    )
     native_streaming_supported = True
     default_api_base = "https://nano-gpt.com/api/v1"
-    default_profile = "chat"
     adapter_names = ("nanogpt",)
+    # NOTE(for-removal): dies with the cost phase.
     skip_cost_calculation = True
     provider_env_name = "nanogpt"
 
@@ -150,42 +177,6 @@ class NanoGPTProvider(NanoGptQuotaTracker, ProviderInterface):
             List of quota group names
         """
         return ["daily", "monthly"]
-
-    # =========================================================================
-    # MODEL DISCOVERY
-    # =========================================================================
-
-    transport_profiles = {
-        "chat": {"protocol": "openai_chat"},
-        "responses": {"protocol": "responses"},
-        "subscription": {
-            "protocol": "openai_chat",
-            "endpoint_paths": {
-                "chat": "/chat/completions",
-                "models": "/models",
-            },
-            "base_url": "https://nano-gpt.com/api/subscription/v1",
-        },
-    }
-
-    def _models_url(self) -> str:
-        return f"{self.get_provider_api_base()}/models"
-
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
-        try:
-            response = await client.get(
-                self._models_url(),
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            response.raise_for_status()
-            return [
-                f"nanogpt/{model['id']}"
-                for model in response.json().get("data", [])
-                if isinstance(model, dict) and model.get("id")
-            ]
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            lib_logger.error(f"Failed to fetch NanoGPT models: {e}")
-            return []
 
     def get_background_job_config(self) -> Optional[Dict[str, Any]]:
         """

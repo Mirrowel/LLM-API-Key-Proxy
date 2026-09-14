@@ -117,10 +117,14 @@ def test_gemini_provider_declares_two_faces() -> None:
     from rotator_library.providers.gemini_provider import GeminiProvider
 
     provider = GeminiProvider()
-    assert provider.default_profile == "native"
-    assert provider.transport_profiles["openai"]["protocol"] == "openai_chat"
+    profiles, default = provider.get_declared_profiles()
+    # The envelope declares both faces; native is the first (default).
+    assert default == "native"
+    assert profiles["openai"]["protocol"] == "openai_chat"
     assert provider.get_protocol_name("", profile="openai") == "openai_chat"
     assert provider.get_protocol_name("", profile="native") == "gemini"
+    assert provider.transport_profiles is None
+    assert provider.default_profile is None
     # operation + auth are per-face (the pre-G11 bugs)
     assert provider.get_native_operation("", stream=True, profile="openai") == "chat"
     assert provider.get_native_operation("", stream=True, profile="native") == "stream_generate"
@@ -130,6 +134,12 @@ def test_gemini_provider_declares_two_faces() -> None:
     assert headers_native == {"x-goog-api-key": "KEY"}
     endpoint = provider.get_native_endpoint("gemini-3-flash", "chat", profile="openai")
     assert endpoint.endswith("/v1beta/openai/chat/completions")
+    # The native face inherits the Google key header + the generate
+    # templates with no override at all.
+    assert provider.get_native_headers("KEY", profile="native") == {"x-goog-api-key": "KEY"}
+    assert provider.get_native_endpoint("gemini-3-flash", "generate", profile="native").endswith(
+        "/v1beta/models/gemini-3-flash:generateContent"
+    )
 
 
 def test_gemini_v1_ingress_removed_and_openai_face_routes_exist() -> None:

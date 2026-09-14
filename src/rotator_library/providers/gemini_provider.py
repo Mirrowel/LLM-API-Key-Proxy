@@ -1,10 +1,36 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-import httpx
+"""Gemini — two transport faces over one identity (G8 final).
+
+``speaks`` declares both faces and everything else inherits from the
+protocol registry:
+
+- ``native`` (the default face, first entry): the Gemini wire on
+  ``/v1beta/models/{model}:generateContent`` (and its
+  streamGenerateContent / countTokens siblings), authenticated with
+  ``x-goog-api-key``. The profile name ``native`` is preserved for
+  addressing stability (``gemini:native/model``).
+- ``openai``: Google's OpenAI-compatibility surface on
+  ``/v1beta/openai/...`` with Bearer auth — the only real overrides are
+  the compat routes and the auth mode, both declared on the face.
+
+The one piece of genuinely custom transport logic that remains is the
+BASE normalization: ``GEMINI_API_BASE`` is commonly configured WITH the
+version path (``.../v1beta``), while the endpoints own the version
+segment themselves — the override strips a trailing version so paths
+never double-append. Model listing is the shared, protocol-aware
+interface implementation (``models[].name`` shape, ``models/`` prefix
+stripped, ``/v1beta/models`` on the normalized base); a failed listing is
+an honest empty.
+"""
+
+from __future__ import annotations
+
 import logging
-from typing import List, Dict, Any, Optional
-from .provider_interface import ProviderInterface, declared_endpoint_path, render_endpoint_path
+from typing import Any, Dict, Optional
+
+from .provider_interface import ProviderInterface
 
 lib_logger = logging.getLogger("rotator_library")
 lib_logger.propagate = False  # Ensure this logger doesn't propagate to root
@@ -42,126 +68,46 @@ class GeminiProvider(ProviderInterface):
     third-party native surface).
     """
 
-    protocol_name = "gemini"
+    provider_env_name = "gemini"
+
+    # -- transport (the envelope) ---------------------------------------
+    # First entry is the default face. The native face inherits the
+    # x-goog auth + the /v1beta :generateContent/:streamGenerateContent/
+    # :countTokens templates from the protocol defaults; the compat face
+    # overrides only its real routes and auth mode.
+    speaks = (
+        ("native", "gemini", {}),
+        (
+            "openai",
+            "openai_chat",
+            {
+                "endpoint_paths": {
+                    "chat": "/v1beta/openai/chat/completions",
+                    "models": "/v1beta/openai/models",
+                },
+                "auth_mode": "bearer",
+            },
+        ),
+    )
     native_streaming_supported = True
     default_api_base = "https://generativelanguage.googleapis.com"
-    default_profile = "native"
-    transport_profiles: Dict[str, Dict[str, Any]] = {
-        "native": {"protocol": "gemini"},
-        "openai": {
-            # Google's OpenAI-compat surface: Bearer auth, chat-completions
-            # wire, no Responses endpoint exists on this face.
-            "protocol": "openai_chat",
-            "endpoint_paths": {
-                "chat": "/v1beta/openai/chat/completions",
-                "models": "/v1beta/openai/models",
-            },
-            "auth_mode": "bearer",
-        },
-    }
+    # Listing runs on the NATIVE face: its descriptor parses
+    # ``models[].name`` and strips the ``models/`` prefix, while the compat
+    # face's OpenAI-shaped ids would keep the prefix. The hint names the
+    # profile; the shared implementation resolves it to the protocol.
+    listing_profile = "native"
 
-    def get_protocol_name(self, model: str = "", profile: Optional[str] = None) -> str:
-        if profile and self.transport_profiles:
-            entry = self.transport_profiles.get(profile)
-            if isinstance(entry, dict) and entry.get("protocol"):
-                return str(entry["protocol"])
-        return self.protocol_name
+    def get_provider_api_base(self) -> Optional[str]:
+        """Version-normalized transport base (see ``_strip_gemini_api_version``).
 
-    def get_native_operation(
-        self,
-        model: str = "",
-        request=None,
-        stream: bool = False,
-        profile: Optional[str] = None,
-    ) -> str:
-        # Profile-aware (G11): the openai face speaks chat-completions
-        # vocabulary, not generateContent verbs.
-        if profile == "openai":
-            return "chat"
-        if profile and self.transport_profiles:
-            entry = self.transport_profiles.get(profile)
-            if isinstance(entry, dict) and str(entry.get("protocol")) != "gemini":
-                return "chat"
-        return "stream_generate" if stream else "generate"
-
-    def get_native_endpoint(self, model: str = "", operation: str = "chat", profile: Optional[str] = None) -> str:
-        base = _strip_gemini_api_version(self.get_provider_api_base() or self.default_api_base or "")
-        # File-based transport profiles may declare their own endpoint path
-        # (D13); a declared path wins over the conventional model-ridden ones.
-        entry: Optional[Any] = None
-        if profile and self.transport_profiles:
-            entry = self.transport_profiles.get(profile)
-        path = declared_endpoint_path(entry, operation)
-        if not path:
-            path = declared_endpoint_path(self._get_runtime_config(model), operation)
-        if path:
-            rendered = render_endpoint_path(
-                path,
-                model=self.normalize_native_model(model),
-                operation=operation,
-                provider=self._provider_config_key() or "",
-            )
-            if rendered.startswith(("http://", "https://")):
-                return rendered
-            return f"{base}/{rendered.lstrip('/')}"
-        if operation == "count_tokens":
-            # Token counting is its own action (never :generateContent).
-            return f"{base}/v1beta/models/{model}:countTokens"
-        action = "streamGenerateContent?alt=sse" if operation == "stream_generate" else "generateContent"
-        return f"{base}/v1beta/models/{model}:{action}"
-
-    def get_native_headers(
-        self,
-        credential_identifier: str,
-        model: str = "",
-        operation: str = "chat",
-        profile: Optional[str] = None,
-    ) -> Dict[str, str]:
-        # Per-face auth (G11): the compat surface takes Bearer; native keeps
-        # the Google key header.
-        if profile == "openai" or (
-            profile
-            and self.transport_profiles
-            and isinstance(self.transport_profiles.get(profile), dict)
-            and str(self.transport_profiles[profile].get("protocol")) != "gemini"
-        ):
-            return {"Authorization": f"Bearer {credential_identifier}"}
-        return {"x-goog-api-key": credential_identifier}
-
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
+        The inherited endpoint builder composes base + registry path; the
+        registry paths carry ``/v1beta``, so a base configured WITH the
+        version (the common GEMINI_API_BASE spelling) is stripped here —
+        both spellings now resolve to the same upstream URL.
         """
-        Fetches the list of available models from the Google Gemini API.
 
-        Uses the provider's configured base (never the hardcoded public URL) so
-        proxies/mirrors are honored, and paginates via ``nextPageToken``.
-        """
-        base = _strip_gemini_api_version(self.get_provider_api_base() or self.default_api_base or "")
-        try:
-            models: List[str] = []
-            page_token: Optional[str] = None
-            while True:
-                params: Dict[str, Any] = {"pageSize": 1000}
-                if page_token:
-                    params["pageToken"] = page_token
-                response = await client.get(
-                    f"{base}/v1beta/models",
-                    headers={"x-goog-api-key": api_key},
-                    params=params,
-                )
-                response.raise_for_status()
-                payload = response.json()
-                for model in payload.get("models", []) or []:
-                    name = model.get("name") if isinstance(model, dict) else model
-                    normalized = str(name or "").replace("models/", "")
-                    if normalized:
-                        models.append(f"gemini/{normalized}")
-                page_token = payload.get("nextPageToken") if isinstance(payload, dict) else None
-                if not page_token:
-                    break
-            return models
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            lib_logger.error(f"Failed to fetch Gemini models: {e}")
-            return []
+        base = super().get_provider_api_base()
+        return _strip_gemini_api_version(base) if base else base
 
     # =========================================================================
     # SAFETY SETTINGS (REMOVED)

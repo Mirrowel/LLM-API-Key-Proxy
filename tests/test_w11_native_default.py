@@ -73,7 +73,10 @@ def test_deepseek_g8_remake_retired_the_custom_path() -> None:
 def test_declared_endpoints_are_absolute_and_protocol_shaped(provider: str) -> None:
     plugin = _plugin(provider)
     protocol = plugin.get_protocol_name("m")
-    endpoint = plugin.get_native_endpoint(model="test-model", operation="chat")
+    # The operation comes from the protocol's own vocabulary (the envelope
+    # maps gemini to generate/stream_generate, responses to responses, ...).
+    operation = plugin.get_native_operation("test-model", None, stream=False)
+    endpoint = plugin.get_native_endpoint(model="test-model", operation=operation)
     assert endpoint.startswith("https://")
     if protocol == "openai_chat":
         assert endpoint.endswith("/chat/completions")
