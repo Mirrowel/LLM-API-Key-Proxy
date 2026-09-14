@@ -340,18 +340,14 @@ class ProviderTransforms:
         model: str,
         provider: str,
     ) -> Optional[str]:
-        """
-        Handle thinking parameter for NVIDIA NIM.
+        """Handle thinking parameter for NVIDIA NIM.
 
-        Delegates to provider plugin's handle_thinking_parameter method.
+        Retired with the G8 remake: the per-family capability matrix is
+        declared on the provider (model_rules rows consumed by the
+        always-on param engine and the reasoning emission), which runs
+        on the native path this LiteLLM-era transform never reached.
+        Kept as an explicit no-op so the registry entry stays honest.
         """
-        if provider != "nvidia_nim":
-            return None
-
-        plugin = self._get_plugin_instance(provider)
-        if plugin and hasattr(plugin, "handle_thinking_parameter"):
-            plugin.handle_thinking_parameter(kwargs, model)
-            return "nvidia_nim: handled thinking parameter"
         return None
 
     def _transform_dedaluslabs_tool_choice(

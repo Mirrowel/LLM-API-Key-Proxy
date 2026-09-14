@@ -1,192 +1,155 @@
 # SPDX-License-Identifier: LGPL-3.0-only
 # Copyright (c) 2026 Mirrowel
 
-import httpx
-import logging
-from typing import List, Dict, Any
-from .provider_interface import ProviderInterface
+"""NVIDIA NIM — a first-class declared provider (G8 remake).
 
-lib_logger = logging.getLogger("rotator_library")
-lib_logger.propagate = False  # Ensure this logger doesn't propagate to root
-if not lib_logger.handlers:
-    lib_logger.addHandler(logging.NullHandler())
+One transport face (openai_chat on ``integrate.api.nvidia.com``) and
+the hardest per-model capability surface in the tree: NVIDIA hosts
+many families on shared infrastructure, and every family spells its
+thinking controls DIFFERENTLY — top-level ``reasoning_effort`` on
+some, ``chat_template_kwargs`` booleans on others, nothing at all on
+the plain ones. The capability matrix below is grounded in the hosted
+API docs and live probes (deliberate invalid values read back the
+real vocabularies from the 400s; the heavy reasoners that hang on
+probes are doc-backed and marked).
+
+Three tiers, all declared — no provider code:
+
+- Top-level-effort families declare ``effort_accept`` and the ladder
+  folds everything else (with a visible note per fold).
+- Chat-template families declare a ``toggle_field``; the emission
+  writes the boolean into ``chat_template_kwargs`` and the top-level
+  word never rides.
+- Plain families strip the effort word entirely.
+
+Unknown models (the catalog moves — 81 ids today, retirements weekly)
+honestly fall to the protocol base vocabulary with visible notes
+rather than fabricated mappings: we map what the docs prove, per the
+"only some" ruling. The legacy hand-coded handler — five family
+branches in ``extra_body`` shapes that the native path never ran — is
+gone; every row below replaces it on the live path.
+"""
+
+from __future__ import annotations
+
+from .provider_interface import ProviderInterface
 
 
 class NvidiaProvider(ProviderInterface):
+    """NVIDIA's hosted NIM API over the chat-completions face."""
+
     # Registry registers this module as `nvidia_nim`; JSON config sections
     # address the same identity (one key everywhere).
     config_key_alias = "nvidia_nim"
-    protocol_name = "openai_chat"
+
+    # -- transport (the envelope) ---------------------------------------
+    speaks = ("openai_chat",)
     native_streaming_supported = True
     default_api_base = "https://integrate.api.nvidia.com/v1"
 
+    # NOTE(for-removal with the cost phase): NIM pricing is not wired.
     skip_cost_calculation = True
-    """
-    Provider implementation for the NVIDIA API.
-    """
 
-    async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
-        """
-        Fetches the list of available models from the NVIDIA API.
-        """
-        try:
-            response = await client.get(
-                f"{self.get_provider_api_base()}/models",
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            response.raise_for_status()
-            models = [
-                f"nvidia_nim/{model['id']}" for model in response.json().get("data", [])
-            ]
-            return models
-        except (httpx.RequestError, httpx.HTTPStatusError) as e:
-            lib_logger.error(f"Failed to fetch NVIDIA models: {e}")
-            return []
+    # -- payload shaping: the capability matrix -------------------------
+    # Cascade order matters: general rows first, narrower rows later —
+    # a later matching row overrides conflicting keys and inherits the
+    # rest (CSS cascade). off_word is the family's own OFF spelling on
+    # the wire (nvidia families use "none", not "off").
+    model_rules = (
+        # Kimi K2.x (LIVE catalog: kimi-k2.6): thinking boolean inside
+        # chat_template_kwargs; no effort word on the wire at all.
+        {
+            "match": "*kimi-k2*",
+            "effort_accept": ["off", "low", "high"],
+            "toggle_field": "chat_template_kwargs.thinking",
+            "toggle_on": True,
+            "toggle_off": False,
+        },
+        # Kimi K3: top-level effort, ALWAYS-ON thinking (no off value —
+        # an OFF request drops the control with a note rather than
+        # fabricating "none", which the model rejects).
+        {
+            "match": "*kimi-k3*",
+            "effort_accept": ["low", "high", "max"],
+        },
+        # DeepSeek V4 (LIVE: v4-flash-0731, v4-pro): top-level effort
+        # none|high|max; the service translates it server-side into the
+        # model's chat_template_kwargs.
+        {
+            "match": "*deepseek-v4*",
+            "effort_accept": ["off", "high", "max"],
+            "off_word": "none",
+        },
+        # GLM 5.x: top-level effort, always-on thinking. 5.2 accepts a
+        # narrower vocabulary than 5.3 — the later row tightens it.
+        {
+            "match": "*glm-5.3*",
+            "effort_accept": ["low", "high", "max"],
+        },
+        {
+            "match": "*glm-5.2*",
+            "effort_accept": ["high", "max"],
+        },
+        # GPT-OSS (LIVE: gpt-oss-20b): live-confirmed low|medium|high —
+        # no off value documented; OFF drops with a note.
+        {
+            "match": "*gpt-oss*",
+            "effort_accept": ["low", "medium", "high"],
+        },
+        # Muse Glimmer: LIVE-probed full seven-rung vocabulary (the 400
+        # on an invalid value listed every accepted word).
+        {
+            "match": "*muse-glimmer*",
+            "effort_accept": [
+                "off",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ],
+            "off_word": "none",
+        },
+        # Nemotron 3 Ultra: none|medium|high plus a reasoning budget
+        # (-1 disables; clamped to the documented range).
+        {
+            "match": "*nemotron-3-ultra*",
+            "effort_accept": ["off", "medium", "high"],
+            "off_word": "none",
+            "clamp": {"reasoning_budget": [-1, 32768]},
+        },
+        # Mistral medium (docs; not in the live catalog today): the
+        # none|high subset — the ladder folds everything else up.
+        {
+            "match": "*mistral-medium*",
+            "effort_accept": ["off", "high"],
+            "off_word": "none",
+        },
+        # DiffusionGemma / Qwen 3.5: enable_thinking boolean inside the
+        # chat template — toggle-only families.
+        {
+            "match": "*diffusiongemma*",
+            "toggle_field": "chat_template_kwargs.enable_thinking",
+        },
+        {
+            "match": "*qwen3.5*",
+            "toggle_field": "chat_template_kwargs.enable_thinking",
+        },
+        # Plain families (llama, step, the legacy smalls): no thinking
+        # controls exist — the effort word strips instead of riding to
+        # a vLLM 400.
+        {
+            "match": "*llama*",
+            "strip": ["reasoning_effort"],
+        },
+        {
+            "match": "*step-*",
+            "strip": ["reasoning_effort"],
+        },
+    )
 
-    V3_MODEL_PREFIXES = [
-        "deepseek-ai/deepseek-v3.1",
-    ]
-    V3_MODEL_EXACT = [
-        "deepseek-ai/deepseek-v3.2",
-    ]
-    V4_MODEL_EXACT = [
-        "deepseek-ai/deepseek-v4-pro",
-        "deepseek-ai/deepseek-v4-flash",
-    ]
-    MISTRAL_MODEL_PATTERNS = [
-        "mistral-medium-3.5",
-        "mistral-small-4",
-    ]
-    KIMI_K2_MODEL_PATTERNS = [
-        "kimi-k2.",
-    ]
-    DIFFUSION_GEMMA_MODEL_EXACT = [
-        "google/diffusiongemma-26b-a4b-it",
-    ]
-
-    V4_EFFORT_MAP = {
-        "low": "high",
-        "medium": "high",
-        "high": "max",
-        "max": "max",
-    }
-    DISABLE_VALUES = {"none", "disable", "disabled", "off"}
-
-    def _is_v3_deepseek(self, model_name: str) -> bool:
-        if model_name in self.V3_MODEL_EXACT:
-            return True
-        return any(model_name.startswith(p) for p in self.V3_MODEL_PREFIXES)
-
-    def _is_v4_deepseek(self, model_name: str) -> bool:
-        return model_name in self.V4_MODEL_EXACT
-
-    def _is_mistral_reasoning(self, model_name: str) -> bool:
-        return any(p in model_name for p in self.MISTRAL_MODEL_PATTERNS)
-
-    def _is_kimi_k2(self, model_name: str) -> bool:
-        return any(p in model_name for p in self.KIMI_K2_MODEL_PATTERNS)
-
-    def _is_diffusion_gemma(self, model_name: str) -> bool:
-        return model_name in self.DIFFUSION_GEMMA_MODEL_EXACT
-
-    def handle_thinking_parameter(self, payload: Dict[str, Any], model: str):
-        """
-        Configures thinking and reasoning_effort for supported NVIDIA models.
-
-        DeepSeek V3.x: only thinking=True/False in chat_template_kwargs.
-        DeepSeek V4: thinking + mapped reasoning_effort (high/max).
-        Mistral: reasoning_effort="high" via extra_body (LiteLLM drops unsupported top-level params).
-        DiffusionGemma: enable_thinking=True/False in top-level chat_template_kwargs.
-        Incoming reasoning_effort of none/disable/disabled/off disables thinking/effort.
-        """
-        model_name = model.split("/", 1)[1] if "/" in model else model
-
-        is_v3 = self._is_v3_deepseek(model_name)
-        is_v4 = self._is_v4_deepseek(model_name)
-        is_mistral = self._is_mistral_reasoning(model_name)
-        is_kimi = self._is_kimi_k2(model_name)
-        is_diffusion_gemma = self._is_diffusion_gemma(model_name)
-
-        if (
-            not is_v3
-            and not is_v4
-            and not is_mistral
-            and not is_kimi
-            and not is_diffusion_gemma
-        ):
-            return
-
-        reasoning_effort = payload.get("reasoning_effort")
-
-        is_disabled = (
-            isinstance(reasoning_effort, str)
-            and reasoning_effort.lower() in self.DISABLE_VALUES
-        )
-
-        if is_diffusion_gemma:
-            payload.pop("reasoning_effort", None)
-            template_kwargs = payload.get("chat_template_kwargs")
-            if not isinstance(template_kwargs, dict):
-                template_kwargs = {}
-                payload["chat_template_kwargs"] = template_kwargs
-            template_kwargs["enable_thinking"] = not is_disabled
-            lib_logger.info(
-                f"NVIDIA: DiffusionGemma '{model_name}' — "
-                f"enable_thinking={not is_disabled}"
-            )
-            return
-
-        if is_kimi:
-            payload.pop("reasoning_effort", None)
-            thinking = not is_disabled
-            payload["chat_template_kwargs"] = {"thinking": thinking}
-            state = "True" if thinking else f"DISABLED (reasoning_effort='{reasoning_effort}')"
-            lib_logger.info(f"NVIDIA: Kimi K2 '{model_name}' — thinking={state}")
-            return
-
-        if is_mistral:
-            payload.pop("reasoning_effort", None)
-            if is_disabled:
-                lib_logger.info(
-                    f"NVIDIA: Mistral '{model_name}' — reasoning effort DISABLED "
-                    f"(reasoning_effort='{reasoning_effort}')"
-                )
-                return
-            if "extra_body" not in payload:
-                payload["extra_body"] = {}
-            payload["extra_body"]["reasoning_effort"] = "high"
-            lib_logger.info(
-                f"NVIDIA: Mistral '{model_name}' — reasoning_effort='high' (via extra_body)"
-            )
-            return
-
-        if "extra_body" not in payload:
-            payload["extra_body"] = {}
-        if "chat_template_kwargs" not in payload["extra_body"]:
-            payload["extra_body"]["chat_template_kwargs"] = {}
-
-        kwargs = payload["extra_body"]["chat_template_kwargs"]
-
-        if is_disabled:
-            payload.pop("reasoning_effort", None)
-            kwargs["thinking"] = False
-            lib_logger.info(
-                f"NVIDIA: DeepSeek '{model_name}' — thinking DISABLED "
-                f"(reasoning_effort='{reasoning_effort}')"
-            )
-            return
-
-        kwargs["thinking"] = True
-
-        if is_v3:
-            lib_logger.info(f"NVIDIA: DeepSeek V3 '{model_name}' — thinking=True")
-        else:
-            effort_key = (
-                reasoning_effort.lower() if isinstance(reasoning_effort, str) else None
-            )
-            mapped = self.V4_EFFORT_MAP.get(effort_key, "max")
-            kwargs["reasoning_effort"] = mapped
-            lib_logger.info(
-                f"NVIDIA: DeepSeek V4 '{model_name}' — thinking=True, "
-                f"reasoning_effort='{mapped}' (input: '{reasoning_effort}')"
-            )
+    # -- discovery -----------------------------------------------------------
+    # Model listing is the shared, protocol-aware interface implementation
+    # (the LIVE catalog — 81 ids at research time; listed ≠ deployed, so
+    # an unentitled model 404s at request time and rotates honestly).

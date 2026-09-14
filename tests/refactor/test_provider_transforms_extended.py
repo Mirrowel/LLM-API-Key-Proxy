@@ -25,9 +25,10 @@ def test_gemini_safety_injection_removed():
 
 
 def test_thinking_transform_remains_for_nvidia_only():
-    # Gemini's legacy thinking handler + wiring were removed (G8 final): the
-    # native path emits real thinking controls and the LiteLLM fallback
-    # degrades to model-default thinking. NVIDIA keeps its delegation.
+    # Both legacy thinking handlers + wiring are gone (G8): the native
+    # path emits real thinking controls via the declared capability
+    # matrix, and the LiteLLM-era transform registry entries are honest
+    # no-ops.
     transforms = ProviderTransforms(
         provider_plugins={"gemini": ThinkingProvider, "nvidia_nim": ThinkingProvider}
     )
@@ -38,6 +39,8 @@ def test_thinking_transform_remains_for_nvidia_only():
     result = transforms.apply_sync("gemini", "gemini-1.5-pro", payload)
     assert "thinking_handled" not in result
 
-    payload = {}
+    # nvidia's transform is now an explicit no-op: the capability rows
+    # own thinking on the native path this registry never reached.
+    payload = {"reasoning_effort": "high"}
     result = transforms.apply_sync("nvidia_nim", "nvidia/test", payload)
-    assert result["thinking_handled"] is True
+    assert result == {"reasoning_effort": "high"}

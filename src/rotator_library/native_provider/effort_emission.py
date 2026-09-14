@@ -215,6 +215,7 @@ def resolve_reasoning_targets(
             ("toggle_field", "reasoning_toggle_field"),
             ("toggle_on", "reasoning_toggle_on"),
             ("toggle_off", "reasoning_toggle_off"),
+            ("off_word", "reasoning_effort_off_word"),
         ):
             value = getattr(provider_plugin, attr, None)
             if value is not None:
@@ -234,7 +235,7 @@ def resolve_reasoning_targets(
                 continue
             if "toggle_field" in row and "effort_field" not in row:
                 row_declared_toggle = True
-            for key in ("effort_field", "toggle_field", "toggle_on", "toggle_off"):
+            for key in ("effort_field", "toggle_field", "toggle_on", "toggle_off", "off_word"):
                 if key in row:
                     targets[key] = row[key]
             if row.get("toggle") is True:
@@ -244,7 +245,7 @@ def resolve_reasoning_targets(
         if row_declared_toggle:
             targets["toggle_only"] = True
     if isinstance(runtime_config, Mapping):
-        for key in ("effort_field", "toggle_field", "toggle_on", "toggle_off"):
+        for key in ("effort_field", "toggle_field", "toggle_on", "toggle_off", "off_word"):
             if key in runtime_config:
                 targets[key] = runtime_config[key]
     return targets
@@ -303,10 +304,10 @@ def apply_reasoning_emission(
             _set_dotted(payload, toggle_field, targets.get("toggle_off", False))
             return True
         if effort_field == "reasoning_effort":
-            # No toggle target: the wire keeps its own off spelling
-            # (e.g. ``reasoning_effort: "none"`` on surfaces that
-            # accept it).
-            payload["reasoning_effort"] = value
+            # No toggle target: the wire keeps its own off spelling —
+            # the family's declared ``off_word`` (e.g. nvidia's
+            # ``none``) when one exists, else the client's own word.
+            payload["reasoning_effort"] = targets.get("off_word", value)
         return True
     if effort_field == "reasoning_effort":
         payload["reasoning_effort"] = value
