@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .canonical import (
@@ -123,7 +123,7 @@ class OllamaProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": unified_request.model}
         if unified_request.stream or unified_request.metadata.get("has_stream"):
             payload["stream"] = unified_request.stream
@@ -177,7 +177,7 @@ class OllamaProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in response.items() if k not in _RESPONSE_HANDLED_KEYS},
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         """Format a unified response back to an Ollama response shape.
 
         Ollama responses are often mutated by adapters after parsing. Do not

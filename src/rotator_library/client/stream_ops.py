@@ -470,6 +470,17 @@ class NeutralStreamPipeline:
         formatter = SSEStreamFormatter()
         monitor = StreamMonitor(clock=time.monotonic)
         state = stream_format_state(self.protocol_context, self.client_protocol_name)
+        # G8: resolve the executing provider/model capability record ONCE per
+        # stream (the pipeline knows plugin + model) so capability-gated stream
+        # emissions (Gemini tool ids, thought-signature strictness) honor the
+        # model's declarations; empty record/None = undeclared behavior.
+        from ..native_provider.effort_emission import resolve_request_capabilities
+
+        state.capabilities = resolve_request_capabilities(
+            self.provider_plugin,
+            self.model,
+            protocol_name=self.protocol_context.provider_protocol or self.client_protocol_name,
+        )
         # G4: the client's own usage-frame preference reaches the formatter
         # state (None preserves legacy always-emit behavior).
         state.include_usage = self.client_include_usage

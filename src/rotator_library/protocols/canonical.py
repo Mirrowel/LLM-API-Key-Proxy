@@ -13,7 +13,7 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import time
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from .types import (
     ContentBlock,
@@ -398,6 +398,43 @@ def _is_effort_native(protocol: str) -> bool:
 
 _EFFORT_NATIVE_PROTOCOLS = {"openai_chat", "responses"}
 
+# Gemini's documented thinkingLevel vocabulary (the four level spellings the
+# API accepts). This is NOT a second declaration surface: models declare
+# ``effort_accept`` and the effort chain folds incoming words into it before
+# any build runs — this set only says which canonical words have a LEVEL
+# spelling on the wire at all. A model declaring ``thinking_dialect: "budget"``
+# never reaches it (the budget-only branch below).
+_GEMINI_THINKING_LEVEL_WORDS = frozenset({"minimal", "low", "medium", "high"})
+
+
+def _declared_capability(capabilities: Any, key: str) -> Any:
+    """Read one declared capability key (None when undeclared).
+
+    Undeclared must stay distinguishable from declared-false: every consumer
+    keeps its pre-declaration behavior for None, so callers gate with
+    ``is False`` / ``is not False`` rather than truthiness.
+    """
+
+    if isinstance(capabilities, Mapping):
+        return capabilities.get(key)
+    return None
+
+
+def _declared_budget_range(capabilities: Any) -> Optional[tuple[int, int]]:
+    """The declared ``thinking_budget_range`` as (min, max), or None.
+
+    Malformed declarations degrade to None (the same "undeclared" state)
+    rather than crashing a build over a table typo.
+    """
+
+    declared = _declared_capability(capabilities, "thinking_budget_range")
+    if isinstance(declared, (list, tuple)) and len(declared) == 2:
+        try:
+            return int(declared[0]), int(declared[1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
 
 def budget_tokens_from_effort(effort: str) -> int:
     """Map a reasoning-effort label to a budget-token approximation."""
@@ -425,6 +462,7 @@ def format_reasoning_controls(
     reasoning: Any,
     target_protocol: str,
     request: UnifiedRequest,
+    capabilities: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Map canonical reasoning controls to a target protocol (D7 level 3).
 
@@ -435,6 +473,15 @@ def format_reasoning_controls(
     Every inference (effort <-> budget) is deterministic via the documented
     table and recorded as a warning; every drop is recorded — nothing silent
     (defect 7). Responses gets a normalized native dict — never foreign keys.
+
+    ``capabilities`` is the resolved per-model capability record (G8 gemini
+    split), threaded by the execution seam; the Gemini branch reads
+    ``thinking_dialect`` (budget-only models never receive thinkingLevel),
+    ``thinking_budget_range`` (the table approximation clamps to declared
+    bounds, disclosed) and ``effort_accept`` (a declared OFF makes
+    ``thinkingBudget=0`` exact — the model-dependence warning is then
+    suppressed). ``None``/absent keys = undeclared = exactly the previous
+    behavior.
     """
 
     emissions: dict[str, Any] = {}
@@ -698,24 +745,45 @@ def format_reasoning_controls(
                 # onto the Responses wire (no hybrid payloads).
                 emissions["reasoning"] = native
     elif target_protocol == "gemini":
+        # G8 capability record (every key optional; None = undeclared = the
+        # pre-declaration behavior):
+        # - thinking_dialect "budget": the model speaks thinkingBudget only —
+        #   an effort word NEVER becomes thinkingLevel (the 2.5 family);
+        # - thinking_budget_range [min, max]: the deterministic table's
+        #   approximation clamps to the documented model bounds (disclosed);
+        # - effort_accept: when OFF is declared accepted, thinkingBudget=0 is
+        #   an exact control and the "model-dependent" caveat is suppressed.
+        budget_only = str(_declared_capability(capabilities, "thinking_dialect") or "").strip().lower() == "budget"
+        declared_range = _declared_budget_range(capabilities)
+        declared_accept = _declared_capability(capabilities, "effort_accept")
+        if isinstance(declared_accept, str):
+            # A single-word declaration is legal shorthand, never an iterable
+            # of characters.
+            declared_accept = (declared_accept,)
+        off_accepted = declared_accept is not None and "off" in {
+            str(rung).strip().lower() for rung in declared_accept or ()
+        }
         thinking_config: dict[str, Any] = {}
         if enabled is False or effort in {"none", "off"}:
             # thinkingBudget: 0 is Gemini's off-switch — model-dependent
             # (thinking can only be disabled on some models), so the
-            # emission is recorded, never silent. includeThoughts is
-            # forced off: the API rejects it alongside disabled thinking.
+            # emission is recorded, never silent — UNLESS the model's
+            # declaration accepts OFF (then the switch is exact).
+            # includeThoughts is forced off: the API rejects it alongside
+            # disabled thinking.
             thinking_config["thinkingBudget"] = 0
             thinking_config["includeThoughts"] = False
-            _warn(
-                "reasoning_disabled_model_dependent",
-                "thinkingBudget=0 disables thinking only on models that support disabling; verify the target model",
-                "reasoning.enabled",
-            )
+            if not off_accepted:
+                _warn(
+                    "reasoning_disabled_model_dependent",
+                    "thinkingBudget=0 disables thinking only on models that support disabling; verify the target model",
+                    "reasoning.enabled",
+                )
         elif budget is not None and effort is None:
             thinking_config["thinkingBudget"] = budget
         elif effort is not None:
             value, coerced = _effort_or_approximation()
-            if str(value).lower() in {"minimal", "low", "medium", "high"}:
+            if not budget_only and str(value).lower() in _GEMINI_THINKING_LEVEL_WORDS:
                 # thinkingLevel is the native lever — in-vocabulary efforts
                 # map EXACTLY (no budget approximation needed). Case follows
                 # the Gemini API REST reference examples (lowercase JSON
@@ -723,6 +791,16 @@ def format_reasoning_controls(
                 thinking_config["thinkingLevel"] = str(value).lower()
             else:
                 approximated = budget_tokens_from_effort(value)
+                if declared_range is not None:
+                    low, high = declared_range
+                    if approximated < low or approximated > high:
+                        clamped = min(max(approximated, low), high)
+                        _warn(
+                            "reasoning_budget_coerced",
+                            f"reasoning budget approximation {approximated} is outside the model's declared range [{low}, {high}]; clamped to {clamped}",
+                            "reasoning.effort",
+                        )
+                        approximated = clamped
                 thinking_config["thinkingBudget"] = approximated
                 if not coerced:
                     _warn(

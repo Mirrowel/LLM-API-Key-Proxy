@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping, Optional
 
 from .canonical import (
     STOP_REASON_ERROR,
@@ -45,17 +45,74 @@ _RESPONSE_MODALITIES: dict[str, set[str]] = {
     "ollama": {"text"},
 }
 
+# G8 hosted-tool identity on the Gemini wire: folded identity -> native
+# single-key envelope. Mirrors the gemini formatter's mapping (retrieval is
+# ordered BEFORE search so the prefix never folds it). A row's declared
+# ``hosted_tools`` limits which of these a model actually serves.
+_GEMINI_HOSTED_ENVELOPES: tuple[tuple[str, str], ...] = (
+    ("websearch", "googleSearch"),
+    ("enterprisewebsearch", "enterpriseWebSearch"),
+    ("exaaisearch", "exaAiSearch"),
+    ("parallelaisearch", "parallelAiSearch"),
+    ("googlesearchretrieval", "googleSearchRetrieval"),
+    ("googlesearch", "googleSearch"),
+    ("codeexecution", "codeExecution"),
+    ("urlcontext", "urlContext"),
+    ("googlemaps", "googleMaps"),
+    ("filesearch", "fileSearch"),
+    ("computeruse", "computerUse"),
+    ("mcpservers", "mcpServers"),
+)
+
+
+def _gemini_hosted_envelope(server_type: str) -> Optional[str]:
+    """Map a hosted-tool identity to its Gemini native envelope name."""
+
+    folded = str(server_type or "").lower().replace("_", "")
+    for prefix, native in _GEMINI_HOSTED_ENVELOPES:
+        if folded.startswith(prefix):
+            return native
+    return None
+
+
+def _declared_modalities(capabilities: Optional[Mapping[str, Any]], wire_protocol: str) -> set[str]:
+    """The accepted response modalities for a target (G8).
+
+    Undeclared keeps the protocol table exactly; a declared
+    ``output_modalities`` narrows to the {"text"} base and widens it with the
+    declared list (text parts exist on every Gemini surface — the base is the
+    always-representable floor).
+    """
+
+    allowed = set(_RESPONSE_MODALITIES.get(wire_protocol, {"text"}))
+    if isinstance(capabilities, Mapping):
+        declared = capabilities.get("output_modalities")
+        if declared is not None:
+            if isinstance(declared, str):
+                # A single-modality declaration is legal shorthand, never an
+                # iterable of characters.
+                declared = [declared]
+            allowed = {"text"} | {str(value).strip().lower() for value in declared}
+    return allowed
+
 
 def validate_generative_request(
     request: UnifiedRequest,
     target_protocol: str,
     context: ProtocolContext | None,
+    capabilities: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Reject meaning-changing cross-protocol losses before provider transport.
 
     Same-protocol requests may retain future native content through their raw
     payload. Cross-protocol requests must use a known canonical meaning so a
     source-native object can never be emitted as a malformed foreign object.
+
+    ``capabilities`` is the resolved per-model capability record (G8 gemini
+    split) threaded by the execution seam: it narrows/widens the Gemini
+    response-modality table via ``output_modalities`` and limits the hosted
+    tool allowlist via ``hosted_tools``. ``None``/absent keys = undeclared =
+    exactly the previous behavior.
     """
 
     # G11: wire-level dispatch is FAMILY-level — sibling variants of one
@@ -213,8 +270,10 @@ def validate_generative_request(
         )
     # G14 (#28.8): an output modality the target cannot produce is a
     # disclosed downgrade, not a request-killing 400 — the request still
-    # goes, producing what the target CAN produce.
-    unsupported_modalities = set(request.modalities) - _RESPONSE_MODALITIES.get(wire_protocol, {"text"})
+    # goes, producing what the target CAN produce. G8: a declared
+    # output_modalities row narrows the protocol default to {"text"} and
+    # widens it with the model's own list.
+    unsupported_modalities = set(request.modalities) - _declared_modalities(capabilities, wire_protocol)
     if unsupported_modalities:
         request.modalities = [m for m in request.modalities if m not in unsupported_modalities]
         add_conversion_warning(
@@ -301,48 +360,50 @@ def validate_generative_request(
         # maps web_search server tools onto googleSearch; other hosted
         # families (bash, text_editor, computer) have no Gemini home.
         supported_tool_types = {"function", "server", "web_search"}
-        for tool in request.tools:
-            if tool.type == "server":
+        declared_hosted = capabilities.get("hosted_tools") if isinstance(capabilities, Mapping) else None
+        if isinstance(declared_hosted, str):
+            # A single-tool declaration is legal shorthand, never an
+            # iterable of characters.
+            declared_hosted = [declared_hosted]
+        declared_envelopes = (
+            {_gemini_hosted_envelope(name) or str(name) for name in declared_hosted}
+            if declared_hosted is not None
+            else None
+        )
+        dropped_hosted: list[int] = []
+        for tool_index, tool in enumerate(request.tools):
+            if tool.type == "web_search":
+                # A foreign Responses hosted search maps onto googleSearch;
+                # it participates in the declared-hosted limit exactly like
+                # a server-typed tool does.
+                envelope = "googleSearch"
+            elif tool.type == "server":
                 server_type = str(tool.extra.get("server_tool_type") or tool.extra.get("gemini_hosted_tool") or "")
-                if not server_type.startswith(
-                    (
-                        "web_search",
-                        "googleSearch",
-                        "google_search",
-                        "codeExecution",
-                        "code_execution",
-                        "urlContext",
-                        "url_context",
-                        "googleMaps",
-                        "google_maps",
-                        "fileSearch",
-                        "file_search",
-                        "googleSearchRetrieval",
-                        "google_search_retrieval",
-                        # G14: newer hosted union members are Gemini-native
-                        # (representable at the target) — mapped by identity
-                        # envelope, never fabricated as a function.
-                        "computerUse",
-                        "computer_use",
-                        "mcpServers",
-                        "mcp_servers",
-                        "enterpriseWebSearch",
-                        "enterprise_web_search",
-                        "exaAiSearch",
-                        "exa_ai_search",
-                        "parallelAiSearch",
-                        "parallel_ai_search",
-                    )
-                ):
+                envelope = _gemini_hosted_envelope(server_type)
+                if envelope is None:
                     raise ProtocolError(
                         f"Cannot safely translate hosted tool '{server_type or tool.name}' into {target_protocol}",
                         protocol=target_protocol,
                         pass_name="validate_request",
                         payload={"tool_type": tool.type, "tool_name": tool.name},
                     )
-            elif tool.type == "web_search":
-                # Responses hosted web_search maps onto googleSearch too.
+            else:
                 continue
+            if declared_envelopes is not None and envelope not in declared_envelopes:
+                # G8: the full union stays representable, but the model's row
+                # does not declare this tool — dropping it (disclosed) is
+                # honest; passing it silently would be a guaranteed 400.
+                dropped_hosted.append(tool_index)
+                add_conversion_warning(
+                    request,
+                    code="unsupported_optional_control",
+                    message=f"hosted tool {envelope!r} is not declared available on this model; dropped",
+                    field=f"tools[{tool_index}]",
+                    target_protocol=target_protocol,
+                )
+        if dropped_hosted:
+            dropped_set = set(dropped_hosted)
+            request.tools = [tool for index, tool in enumerate(request.tools) if index not in dropped_set]
     else:
         supported_tool_types = {"function"}
     for tool_index, tool in enumerate(request.tools):

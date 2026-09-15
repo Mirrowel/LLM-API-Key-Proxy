@@ -27,7 +27,7 @@ openai_chat wire has the toggle construct (Responses keeps its native
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ..protocols.canonical import add_conversion_warning, family_wire_name
 from ..protocols.effort import (
@@ -35,6 +35,7 @@ from ..protocols.effort import (
     normalize_effort,
     resolve_accepted_effort,
     resolve_effort_toggle,
+    resolve_model_capabilities,
 )
 
 _NOTE_CODE = "reasoning_effort_normalized"
@@ -75,6 +76,45 @@ def _record_note(unified_request: Any, note: str, protocol_name: str) -> None:
         field=_NOTE_FIELD,
         target_protocol=protocol_name,
     )
+
+
+def resolve_request_capabilities(
+    provider_plugin: Any = None,
+    model: str = "",
+    *,
+    protocol_name: str = "",
+    runtime_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Resolve the ONCE-per-request capability record for protocol consumers (G8).
+
+    The native build/format seam is the one place provider plugin + model +
+    executing wire are known together, so it resolves the declared capability
+    record here and threads it down. The record is
+    :func:`protocols.effort.resolve_model_capabilities` (thinking dialect,
+    budget bounds, tool-call ids, signature strictness, output modalities,
+    hosted tools, candidate ceiling) plus ``effort_accept`` carrying the
+    acceptance chain's resolved vocabulary when — and only when — some layer
+    actually declared one (the protocol base is a floor, not a declaration).
+
+    Consumers read their key and keep TODAY's behavior when it is absent;
+    an empty record therefore means "undeclared" everywhere and ``None`` at
+    the consumer call sites is exactly equivalent for the empty case.
+    """
+
+    capabilities = resolve_model_capabilities(provider_plugin, model)
+    accepted, source = resolve_accepted_effort(
+        provider_plugin,
+        model,
+        runtime_config=runtime_config,
+        protocol_family=family_wire_name(protocol_name or "openai_chat"),
+    )
+    if source != "protocol_base" and accepted:
+        # The resolved acceptance rides the record so the protocol consumers
+        # (canonical's OFF handling) can tell "off is a declared capability"
+        # from "nothing declared"; the key name matches the model_rules row
+        # vocabulary on purpose.
+        capabilities["effort_accept"] = tuple(accepted)
+    return capabilities
 
 
 def normalize_request_effort(

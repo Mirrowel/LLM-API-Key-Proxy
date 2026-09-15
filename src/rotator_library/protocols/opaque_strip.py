@@ -20,7 +20,7 @@ it for free.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping, Optional
 
 # Opaque carriers per wire protocol. Keys are raw payload field names —
 # these walk the UNPARSED client wire, so they speak protocol dialect,
@@ -35,12 +35,23 @@ def payload_carries_opaque_state(payload: Any, protocol_name: str) -> bool:
     return strip_foreign_opaque_state(payload, protocol_name, mutate=False) is not None
 
 
-def strip_foreign_opaque_state(payload: Any, protocol_name: str, *, mutate: bool = True) -> list[str] | None:
+def strip_foreign_opaque_state(
+    payload: Any,
+    protocol_name: str,
+    *,
+    mutate: bool = True,
+    capabilities: Optional[Mapping[str, Any]] = None,
+) -> list[str] | None:
     """Strip foreign opaque state from a raw wire payload.
 
     Returns the list of removed field descriptors (protocol-shaped
     strings for the trace overlay), or ``None`` when nothing was carried.
     With ``mutate=False`` this only detects (for the reactive retry path).
+
+    ``capabilities`` is the resolved per-model capability record (G8 gemini
+    split) for the EXECUTING provider; the Gemini strip reads
+    ``requires_thought_signatures`` to decide sentinel strictness (None =
+    undeclared = the conservative sibling-signed heuristic).
     """
 
     if not isinstance(payload, dict):
@@ -48,7 +59,7 @@ def strip_foreign_opaque_state(payload: Any, protocol_name: str, *, mutate: bool
     if protocol_name == "anthropic_messages":
         return _strip_anthropic(payload, mutate=mutate)
     if protocol_name == "gemini":
-        return _strip_gemini(payload, mutate=mutate)
+        return _strip_gemini(payload, mutate=mutate, capabilities=capabilities)
     if protocol_name == "openai_chat":
         return _strip_chat(payload, mutate=mutate)
     from .canonical import family_wire_name as _family
@@ -88,11 +99,18 @@ _GEMINI_SKIP_SENTINEL = "skip_thought_signature_validator"
 _GEMINI_FUNCTION_CALL_KEYS = ("functionCall", "function_call")
 
 
-def _strip_gemini(payload: dict, *, mutate: bool) -> list[str] | None:
+def _strip_gemini(payload: dict, *, mutate: bool, capabilities: Optional[Mapping[str, Any]] = None) -> list[str] | None:
     stripped: list[str] = []
     contents = payload.get("contents")
     if not isinstance(contents, list):
         return None
+    # G8: a declared requires_thought_signatures=false suppresses the sentinel
+    # outright (the 2.x family ignores it); declared true makes it strict
+    # (every unsigned function-call part gets it); None (undeclared) keeps the
+    # conservative sibling-signed heuristic below.
+    strict: Optional[bool] = None
+    if isinstance(capabilities, Mapping) and capabilities.get("requires_thought_signatures") is not None:
+        strict = bool(capabilities["requires_thought_signatures"])
     for c_position, content in enumerate(contents):
         parts = content.get("parts") if isinstance(content, dict) else None
         if not isinstance(parts, list):
@@ -116,10 +134,15 @@ def _strip_gemini(payload: dict, *, mutate: bool) -> list[str] | None:
                     stripped.append(f"contents[{c_position}].parts[{p_position}].{key}")
                     if mutate:
                         part.pop(key, None)
-            if is_function_call and any(other != p_position for other in signed_calls):
-                # Conservative: the sentinel never appears unless another call
-                # in THIS turn was signed. Gated on the sibling-signed condition
-                # so an all-unsigned conversation is untouched.
+            if (
+                is_function_call
+                and strict is not False
+                and (strict is True or any(other != p_position for other in signed_calls))
+            ):
+                # Sentinel, declared-then-heuristic: declared true = the model
+                # rejects unsigned calls outright; undeclared = conservative
+                # (never unless another call in THIS turn was signed);
+                # declared false = never.
                 stripped.append(
                     f"contents[{c_position}].parts[{p_position}].thoughtSignature=sentinel"
                 )

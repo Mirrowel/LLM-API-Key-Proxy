@@ -72,7 +72,25 @@ logger = logging.getLogger("rotator_library.adapters")
 
 # Row keys that never compile into param-rule tables (capability
 # declarations consumed by the effort system and the face limiter).
-_ROW_STRUCTURE_KEYS = frozenset({"match", "allow", "deny", "effort_accept", "toggle"})
+_ROW_STRUCTURE_KEYS = frozenset(
+    {
+        "match",
+        "allow",
+        "deny",
+        "effort_accept",
+        "toggle",
+        # Capability vocabulary (the gemini split, G8): per-model
+        # knowledge the protocols consume through the resolved
+        # capability record instead of hardcoding.
+        "thinking_dialect",  # "level" | "budget" — which thinking knob the model speaks
+        "thinking_budget_range",  # [min, max] — documented budget bounds
+        "tool_call_ids",  # functionCall.id emitted + echoed (3.x family)
+        "requires_thought_signatures",  # missing signature on a call part is a 400
+        "output_modalities",  # e.g. ["text"] / ["image", "text"] / ["audio"]
+        "hosted_tools",  # available hosted tool names (googleSearch, ...)
+        "max_candidates",  # candidateCount ceiling (per-model 400 otherwise)
+    }
+)
 _ROW_TABLE_KEYS = frozenset({"strip", "clamp", "map", "rename", "strip_override"})
 
 

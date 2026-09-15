@@ -70,6 +70,130 @@ class GeminiProvider(ProviderInterface):
 
     provider_env_name = "gemini"
 
+    # -- declared model capabilities (G8 gemini split) ------------------
+    #
+    # TEMPORARY backfill table: until the model-DB resolver phase lands, the
+    # protocol-vs-provider split keeps the Gemini models' documented facts in
+    # these rows so the protocol builders no longer hardcode model lists.
+    # Sources: the Google AI Studio / Vertex model cards for the 2026 lineup
+    # (thinkingLevel vocabularies, thinkingBudget ranges, 3.x thought
+    # signature requirements, response modalities, hosted tools).
+    #
+    # Cascade: general family rows first, narrower rows later (later wins),
+    # exactly like param tables. Keys are read by the protocol consumers
+    # through the resolved record; undeclared keys keep today's behavior.
+    model_rules = (
+        # ---- Gemini 3.x text family: level dialect, ids + signatures
+        # required (unsigned function calls are rejected), text output, the
+        # three standard hosted tools. The 3-pro-preview row below this
+        # general default was first; the model is announced for shutdown
+        # 2026-03 — the row (and the general override) stays so
+        # conversations still addressing it keep resolving.
+        {
+            "match": "*gemini-3*flash*",
+            "effort_accept": ["minimal", "low", "medium", "high"],
+            "thinking_dialect": "level",
+            "tool_call_ids": True,
+            "requires_thought_signatures": True,
+            "output_modalities": ["text"],
+            "hosted_tools": ["googleSearch", "codeExecution", "urlContext"],
+        },
+        {
+            "match": "*gemini-3*pro*",
+            "effort_accept": ["low", "high"],
+            "thinking_dialect": "level",
+            "tool_call_ids": True,
+            "requires_thought_signatures": True,
+            "output_modalities": ["text"],
+            "hosted_tools": ["googleSearch", "codeExecution", "urlContext"],
+        },
+        # 3.1-pro adds the medium rung.
+        {"match": "*gemini-3.1-pro*", "effort_accept": ["low", "medium", "high"]},
+        # 3.7/3.8 flash dropped the minimal rung (level dialect keeps the
+        # rest of the family row; only the vocabulary narrows).
+        {"match": "*gemini-3.7-flash*", "effort_accept": ["low", "medium", "high"]},
+        {"match": "*gemini-3.8-flash*", "effort_accept": ["low", "medium", "high"]},
+        # The lite rows pin their family vocabulary explicitly.
+        {
+            "match": "*gemini-3.5-flash-lite*",
+            "effort_accept": ["minimal", "low", "medium", "high"],
+            "thinking_dialect": "level",
+            "tool_call_ids": True,
+            "requires_thought_signatures": True,
+            "output_modalities": ["text"],
+            "hosted_tools": ["googleSearch", "codeExecution", "urlContext"],
+        },
+        {
+            "match": "*gemini-3.1-flash-lite*",
+            "effort_accept": ["minimal", "low", "medium", "high"],
+            "thinking_dialect": "level",
+            "tool_call_ids": True,
+            "requires_thought_signatures": True,
+            "output_modalities": ["text"],
+            "hosted_tools": ["googleSearch", "codeExecution", "urlContext"],
+        },
+        # ---- Gemini 3.x image models: image+text out. Only the pro image
+        # model keeps googleSearch; the lite variant is text-only with a
+        # minimal/high level vocabulary and no hosted tools. These rows must
+        # stay below the general 3.x rows they narrow.
+        {
+            "match": "*gemini-3.1-flash-image*",
+            "output_modalities": ["image", "text"],
+            "hosted_tools": [],
+        },
+        {
+            "match": "*gemini-3.1-flash-image-lite*",
+            "output_modalities": ["text"],
+            "hosted_tools": [],
+            "thinking_dialect": "level",
+            "effort_accept": ["minimal", "high"],
+        },
+        {
+            "match": "*gemini-3-pro-image*",
+            "output_modalities": ["image", "text"],
+            "hosted_tools": ["googleSearch"],
+        },
+        # ---- Gemini 2.5 family: budget dialect (2.x never speaks
+        # thinkingLevel), no tool-call ids, signatures never required.
+        # 2.5-pro cannot disable thinking (no off in its vocabulary).
+        {
+            "match": "*gemini-2.5-pro*",
+            "thinking_dialect": "budget",
+            "thinking_budget_range": [128, 32768],
+            "effort_accept": ["minimal", "low", "medium", "high"],
+            "tool_call_ids": False,
+            "requires_thought_signatures": False,
+            "output_modalities": ["text"],
+            "hosted_tools": ["googleSearch", "codeExecution", "urlContext"],
+        },
+        # 2.5-flash can disable thinking: OFF rides thinkingBudget=0, and the
+        # declared acceptance makes that exact (no model-dependence caveat).
+        {
+            "match": "*gemini-2.5-flash*",
+            "thinking_dialect": "budget",
+            "thinking_budget_range": [0, 24576],
+            "effort_accept": ["off", "minimal", "low", "medium", "high"],
+            "tool_call_ids": False,
+            "requires_thought_signatures": False,
+            "output_modalities": ["text"],
+            "hosted_tools": ["googleSearch", "codeExecution", "urlContext"],
+        },
+        # 2.5-flash-lite narrows the budget floor (512) — the flash row's
+        # OFF acceptance is dropped with it: thinkingBudget=0 is not legal
+        # below the declared floor.
+        {
+            "match": "*gemini-2.5-flash-lite*",
+            "thinking_budget_range": [512, 24576],
+            "effort_accept": ["minimal", "low", "medium", "high"],
+        },
+        # 2.5-flash-image: image+text output, no thinking controls declared.
+        {"match": "*gemini-2.5-flash-image*", "output_modalities": ["image", "text"]},
+        # ---- TTS models: audio output only.
+        {"match": "*gemini-2.5-flash-preview-tts*", "output_modalities": ["audio"]},
+        {"match": "*gemini-2.5-pro-preview-tts*", "output_modalities": ["audio"]},
+        {"match": "*gemini-3.1-flash-tts-preview*", "output_modalities": ["audio"]},
+    )
+
     # -- transport (the envelope) ---------------------------------------
     # First entry is the default face. The native face inherits the
     # x-goog auth + the /v1beta :generateContent/:streamGenerateContent/

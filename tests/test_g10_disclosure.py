@@ -533,8 +533,12 @@ def test_native_stream_strips_foreign_opaque_state_and_records_overlay(tmp_path,
     )
     calls: dict = {}
 
-    def fake_strip(payload, protocol_name, *, mutate=True):
+    # G8 migration: the strip seam now receives the resolved capability
+    # record (undeclared plugin = empty record) — the fake mirrors the real
+    # signature so the threading stays pinned.
+    def fake_strip(payload, protocol_name, *, mutate=True, capabilities=None):
         calls["protocol"] = protocol_name
+        calls["capabilities"] = capabilities
         return ["messages[0].extra_content.google.thought_signature"]
 
     monkeypatch.setattr(opaque_strip, "strip_foreign_opaque_state", fake_strip)
@@ -549,5 +553,6 @@ def test_native_stream_strips_foreign_opaque_state_and_records_overlay(tmp_path,
 
     asyncio.run(_drive())
     assert calls.get("protocol") == "openai_chat"
+    assert calls.get("capabilities") == {}
     overlays = [event.value for event in logger._record.change_log if event.code == "overlay"]
     assert any(value and value.get("kind") == "foreign_bound_state_stripped" for value in overlays)

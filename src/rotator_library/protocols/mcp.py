@@ -12,7 +12,7 @@ logging and routing.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .operation import OPERATION_MCP
@@ -51,7 +51,7 @@ class MCPProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> Any:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> Any:
         if unified_request.metadata.get("batch"):
             return deepcopy(unified_request.input or [])
         payload = {
@@ -85,7 +85,7 @@ class MCPProtocol(ProtocolAdapter):
             extra=extra,
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> Any:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> Any:
         if unified_response.metadata.get("batch"):
             return deepcopy(unified_response.data)
         payload = {"jsonrpc": unified_response.metadata.get("jsonrpc", "2.0")}

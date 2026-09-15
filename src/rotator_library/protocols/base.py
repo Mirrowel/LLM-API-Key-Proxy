@@ -11,7 +11,7 @@ service uses an almost-standard protocol with provider-specific quirks.
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Optional
 
 from .operation import OPERATION_UNKNOWN, normalize_operation
 from .types import (
@@ -84,12 +84,17 @@ class ProtocolAdapter:
             },
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         """Build a provider request from a unified request.
 
         The base implementation returns the original raw dict when present. This
         keeps fallback providers safe and gives custom protocol subclasses a
         predictable starting point.
+
+        ``capabilities`` is the resolved per-model capability record (G8);
+        protocols that declare nothing consume none of it — the parameter is
+        part of the ONE threaded seam so the executor never has to know which
+        protocol consumes which key.
         """
 
         if isinstance(unified_request.raw, dict):
@@ -127,8 +132,12 @@ class ProtocolAdapter:
             extra=deepcopy(response) if isinstance(response, dict) else {},
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
-        """Format a unified response for a client protocol."""
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        """Format a unified response for a client protocol.
+
+        ``capabilities`` rides the same G8 seam as ``build_request``;
+        protocols without capability-sensitive response shaping ignore it.
+        """
 
         if isinstance(unified_response.raw, dict):
             return deepcopy(unified_response.raw)

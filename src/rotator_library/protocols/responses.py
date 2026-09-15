@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Iterable, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .canonical import (
@@ -155,7 +155,7 @@ class ResponsesWireAdapter(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         validate_generative_request(unified_request, self.name, context)
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
@@ -264,7 +264,7 @@ class ResponsesWireAdapter(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"id", "object", "created_at", "model", "output", "usage", "status"}},
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         disclose_response_drops(unified_response, self.name)
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)

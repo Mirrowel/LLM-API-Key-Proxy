@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 import json
 import time
 import uuid
-from typing import Any
+from typing import Any, Mapping
 
 from .canonical import (
     STOP_REASON_UNKNOWN,
@@ -132,6 +132,11 @@ class StreamFormatState:
     # a relayed stream keeps the formatter warm so mid-stream disengage
     # continues from live state instead of a virgin one.
     observe_only: bool = False
+    # G8 resolved capability record for the executing provider/model (the
+    # seam sets it once per stream; None = undeclared = every gate below
+    # keeps its pre-declaration heuristic). Survives attempt resets — it
+    # describes the model, not the attempt.
+    capabilities: Any = None
 
     def reset_for_attempt(self) -> None:
         """Rotation survival contract (G13 D1).
@@ -1161,6 +1166,19 @@ def _gemini_skip_signature_sentinel() -> dict[str, Any]:
     return {"thoughtSignature": "skip_thought_signature_validator"}
 
 
+def _capability_flag(capabilities: Any, key: str) -> bool | None:
+    """Read a declared boolean capability (None = undeclared).
+
+    G8: undeclared stays distinguishable from declared-false so the sentinel
+    and tool-id gates below preserve their pre-declaration behavior exactly
+    when no row declares anything.
+    """
+
+    if isinstance(capabilities, Mapping) and capabilities.get(key) is not None:
+        return bool(capabilities[key])
+    return None
+
+
 def _gemini_function_call_part(
     key: str,
     arguments: Any,
@@ -1174,22 +1192,30 @@ def _gemini_function_call_part(
         "args": arguments,
     }
     tool_id = state.tool_ids.get(key)
-    if tool_id:
-        # `id` is Gemini-3+ only; synthetic ids are filtered at record time.
+    if tool_id and _capability_flag(state.capabilities, "tool_call_ids") is not False:
+        # `id` is Gemini-3+ only; synthetic ids are filtered at record time,
+        # and a declared tool_call_ids=false forbids the emission outright.
         function_call["id"] = tool_id
     signature = state.tool_signatures.get(key)
+    strict_signatures = _capability_flag(state.capabilities, "requires_thought_signatures")
     if signature and _may_emit_opaque(state, event):
         function_call_payload = {"functionCall": function_call}
         function_call_payload["thoughtSignature"] = signature
         return function_call_payload
     source = (getattr(event, "source_protocol", None) if event is not None else None) or state.source_protocol
-    if (
-        not signature
-        and source == "gemini"
-        and any(other_key != key for other_key in state.tool_signatures)
+    if strict_signatures is not False and (
+        strict_signatures is True
+        or (
+            not signature
+            and source == "gemini"
+            and any(other_key != key for other_key in state.tool_signatures)
+        )
     ):
-        # Conservative: only when signatures were known to be in play for the
-        # conversation, never fabricated for an all-unsigned stream.
+        # Sentinel, declared-then-heuristic: declared true = the model rejects
+        # unsigned calls outright; undeclared = the conservative sibling rule
+        # (only when signatures were known to be in play for the
+        # conversation, never fabricated for an all-unsigned stream);
+        # declared false = never (2.x ignores it).
         function_call_payload = {"functionCall": function_call}
         function_call_payload.update(_gemini_skip_signature_sentinel())
         return function_call_payload

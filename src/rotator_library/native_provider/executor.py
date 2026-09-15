@@ -42,7 +42,12 @@ from ..transform_trace import REDACTED
 from ..usage.accounting import extract_usage_record
 from ..usage.costs import CostCalculator
 from .context import NativeProviderContext
-from .effort_emission import apply_reasoning_emission, normalize_request_effort, normalize_wire_effort
+from .effort_emission import (
+    apply_reasoning_emission,
+    normalize_request_effort,
+    normalize_wire_effort,
+    resolve_request_capabilities,
+)
 from .http import NativeHTTPTransport
 from .streaming import stream_event_payload
 
@@ -90,6 +95,25 @@ class NativeProviderExecutor:
 
     def __init__(self, *, field_cache_store: Any = None) -> None:
         self.field_cache_store = field_cache_store or InMemoryFieldCacheStore()
+
+    @staticmethod
+    def _request_capabilities(context: NativeProviderContext, protocol_name: str) -> Dict[str, Any]:
+        """Resolve the once-per-request capability record (G8 gemini split).
+
+        THE threading seam: this executor is the one place provider plugin +
+        model + executing wire are known together, so the declared record
+        (thinking dialect, budget bounds, tool-call ids, signature strictness,
+        output modalities, hosted tools, candidate ceiling, resolved effort
+        vocabulary) is resolved ONCE here and passed down into the protocol
+        builders/formatters/validators. An empty record means undeclared —
+        every consumer then keeps today's behavior exactly.
+        """
+
+        return resolve_request_capabilities(
+            context.provider_plugin,
+            context.model,
+            protocol_name=protocol_name,
+        )
 
     # -- G2 hookable pipeline ------------------------------------------------
 
@@ -216,6 +240,7 @@ class NativeProviderExecutor:
             # payload is the transport basis — no canonical rebuild can strip
             # source-native fields. Every deviation is a traced overlay.
             # Family-aware (G11): sibling variants are the same wire.
+            capabilities = self._request_capabilities(context, provider_protocol.name)
             same_protocol = family_wire_name(input_protocol.name) == family_wire_name(provider_protocol.name)
             raw_wire = context.raw_client_request if same_protocol and isinstance(context.raw_client_request, dict) else None
             overlays: list[dict[str, Any]] = []
@@ -237,7 +262,7 @@ class NativeProviderExecutor:
                     if input_provider and input_provider != context.provider:
                         from ..protocols.opaque_strip import strip_foreign_opaque_state
 
-                        stripped_fields = strip_foreign_opaque_state(provider_request, input_protocol.name)
+                        stripped_fields = strip_foreign_opaque_state(provider_request, input_protocol.name, capabilities=capabilities)
                         if stripped_fields:
                             overlays.append({
                                 "kind": "foreign_bound_state_stripped",
@@ -257,7 +282,7 @@ class NativeProviderExecutor:
                         model=context.model,
                         protocol_name=provider_protocol.name,
                     )
-                    provider_request = provider_protocol.build_request(unified_request, provider_context)
+                    provider_request = provider_protocol.build_request(unified_request, provider_context, capabilities=capabilities)
                     overlays.append({"kind": "canonical_rebuild", "reason": "payload_divergence"})
             else:
                 normalize_request_effort(
@@ -266,7 +291,7 @@ class NativeProviderExecutor:
                     model=context.model,
                     protocol_name=provider_protocol.name,
                 )
-                provider_request = provider_protocol.build_request(unified_request, provider_context)
+                provider_request = provider_protocol.build_request(unified_request, provider_context, capabilities=capabilities)
                 if not same_protocol:
                     overlays.append({"kind": "canonical_rebuild", "reason": "cross_protocol"})
                 elif provider_state_compatible:
@@ -482,7 +507,7 @@ class NativeProviderExecutor:
                 client_response = deepcopy(raw_response)
                 self._trace(context, "raw_fast_path_response", client_response, direction="response", stage="protocol")
             else:
-                client_response = client_protocol.format_response(unified_response, response_context)
+                client_response = client_protocol.format_response(unified_response, response_context, capabilities=capabilities)
                 self._trace(context, "formatted_native_response", client_response, direction="response", stage="protocol")
             # G10 Phase B: conversion notes live in the change log — never
             # on the client payload, never on the console. This fires on
@@ -633,7 +658,8 @@ class NativeProviderExecutor:
                 model=context.model,
                 protocol_name=protocol.name,
             )
-            provider_request = protocol.build_request(unified_request, provider_context)
+            capabilities = self._request_capabilities(context, protocol.name)
+            provider_request = protocol.build_request(unified_request, provider_context, capabilities=capabilities)
             normalize_wire_effort(
                 provider_request,
                 unified_request=unified_request,
@@ -657,7 +683,7 @@ class NativeProviderExecutor:
             if input_provider and input_provider != context.provider:
                 from ..protocols.opaque_strip import strip_foreign_opaque_state
 
-                stripped_fields = strip_foreign_opaque_state(provider_request, input_protocol.name)
+                stripped_fields = strip_foreign_opaque_state(provider_request, input_protocol.name, capabilities=capabilities)
                 if stripped_fields:
                     overlays.append({
                         "kind": "foreign_bound_state_stripped",

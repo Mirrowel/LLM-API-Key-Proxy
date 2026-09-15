@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .operation import OPERATION_IMAGE_EDIT, OPERATION_IMAGE_GENERATION, OPERATION_IMAGE_VARIATION, normalize_operation
@@ -51,7 +51,7 @@ class OpenAIImagesProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {}
         if unified_request.model:
             payload["model"] = unified_request.model
@@ -74,7 +74,7 @@ class OpenAIImagesProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"model", "data"}},
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         payload = {"data": deepcopy(unified_response.data)}
         if unified_response.model:
             payload["model"] = unified_response.model

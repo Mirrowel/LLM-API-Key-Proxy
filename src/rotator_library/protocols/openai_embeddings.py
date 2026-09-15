@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .operation import OPERATION_EMBEDDINGS
@@ -69,7 +69,7 @@ class OpenAIEmbeddingsProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         payload = {"model": unified_request.model, "input": deepcopy(unified_request.input)}
         payload.update(deepcopy(unified_request.generation_params))
         payload.update(deepcopy(unified_request.extra))
@@ -86,7 +86,7 @@ class OpenAIEmbeddingsProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in response.items() if k not in {"model", "data", "usage"}},
         )
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         payload = {"object": "list", "data": deepcopy(unified_response.data)}
         if unified_response.model:
             payload["model"] = unified_response.model

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, ClassVar, Iterable
+from typing import Any, ClassVar, Iterable, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .canonical import (
@@ -128,6 +128,21 @@ def _drop_gemini_signatures(payload: dict[str, Any]) -> bool:
     return dropped
 
 
+def _capability_flag(capabilities: Optional[Mapping[str, Any]], key: str) -> Optional[bool]:
+    """Read a declared boolean capability (None = undeclared).
+
+    The gemini split (G8) threads the resolved per-model record down from the
+    execution seam. Undeclared must stay distinguishable from declared-false:
+    every gate below keeps its pre-declaration behavior for None (today's
+    synthetic-id filter, sibling-sentinel heuristic) and only declared-false
+    forbids the emission outright.
+    """
+
+    if isinstance(capabilities, Mapping) and capabilities.get(key) is not None:
+        return bool(capabilities[key])
+    return None
+
+
 class GeminiProtocol(ProtocolAdapter):
     """Adapter for Gemini ``generateContent`` and stream event shapes.
 
@@ -181,15 +196,20 @@ class GeminiProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
-        validate_generative_request(unified_request, self.name, context)
+    def build_request(
+        self,
+        unified_request: UnifiedRequest,
+        context: ProtocolContext | None = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
+        validate_generative_request(unified_request, self.name, context, capabilities=capabilities)
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
         payload: dict[str, Any] = {
             "contents": [
                 formatted
                 for formatted in (
-                    self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_request.warnings)
+                    self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_request.warnings, capabilities=capabilities)
                     for message in resolve_tool_result_names(deepcopy(conversation_messages(unified_request)), unified_request.warnings)
                 )
                 if formatted is not None
@@ -206,11 +226,12 @@ class GeminiProtocol(ProtocolAdapter):
                     instructions,
                     preserve_source=preserve_source,
                     emit_opaque_state=emit_opaque_state,
+                    capabilities=capabilities,
                 )
             }
         # D7 level 5: one systemInstruction field mandates the ordered merge.
         record_instruction_merge(unified_request, self.name)
-        generation_config, safety_settings, tool_config = self._format_generation_params(unified_request, preserve_source=preserve_source)
+        generation_config, safety_settings, tool_config = self._format_generation_params(unified_request, preserve_source=preserve_source, capabilities=capabilities)
         if generation_config:
             payload["generationConfig"] = deepcopy(generation_config)
         if safety_settings:
@@ -435,7 +456,12 @@ class GeminiProtocol(ProtocolAdapter):
             )
         return unified_response
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def format_response(
+        self,
+        unified_response: UnifiedResponse,
+        context: ProtocolContext | None = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
         disclose_response_drops(unified_response, self.name)
         if unified_response.operation == OPERATION_COUNT_TOKENS:
             usage = unified_response.usage
@@ -498,7 +524,7 @@ class GeminiProtocol(ProtocolAdapter):
         for index, message in enumerate(kept_messages):
             candidate: dict[str, Any] = {"index": message.index if message.index is not None else index}
             if message.content or message.reasoning or message.tool_calls:
-                formatted_candidate = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_response.warnings)
+                formatted_candidate = self._format_content(message, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=unified_response.warnings, capabilities=capabilities)
                 if formatted_candidate is not None:
                     candidate["content"] = formatted_candidate
             per_candidate_reason = message.stop_reason or unified_response.stop_reason
@@ -639,6 +665,7 @@ class GeminiProtocol(ProtocolAdapter):
         preserve_source: bool = True,
         emit_opaque_state: bool = True,
         warnings: list | None = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
         role = message.extra.get("gemini_role") if preserve_source else None
         role = role or ("model" if message.role in {"assistant", "model"} else "user")
@@ -652,6 +679,7 @@ class GeminiProtocol(ProtocolAdapter):
             preserve_source=preserve_source,
             emit_opaque_state=emit_opaque_state,
             warnings=warnings,
+            capabilities=capabilities,
         )
         if not parts and not preserve_source:
             # Every representable part dropped (e.g. file_id-only media):
@@ -765,12 +793,15 @@ class GeminiProtocol(ProtocolAdapter):
         preserve_source: bool = True,
         emit_opaque_state: bool = True,
         warnings: list | None = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
     ) -> list[dict[str, Any]]:
         block_list = list(blocks)
         # Sibling signatures decide whether a suppressed/absent signature must
         # be replaced by the documented skip sentinel (Gemini-3 validates
         # thought signatures on function-call parts). Conservative: the
-        # sentinel never appears unless another call in THIS turn carried one.
+        # sentinel never appears unless another call in THIS turn carried one
+        # — OR the model's capability record declares that it requires
+        # signatures (strict mode; declared-false never fabricates).
         tool_calls = [block.tool_call for block in block_list if block.tool_call is not None]
         parts = []
         for block in block_list:
@@ -784,10 +815,11 @@ class GeminiProtocol(ProtocolAdapter):
                         preserve_source=preserve_source,
                         emit_opaque_state=emit_opaque_state,
                         sibling_signatures=sibling_signatures,
+                        capabilities=capabilities,
                     )
                 )
             elif block.tool_result:
-                parts.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings))
+                parts.append(self._format_tool_result(block.tool_result, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings, capabilities=capabilities))
             elif block.type in {"image", "audio", "video", "file", "document"}:
                 part = _format_gemini_media(block, preserve_source=preserve_source, emit_opaque_state=emit_opaque_state, warnings=warnings)
                 if part is not None:
@@ -1006,7 +1038,15 @@ class GeminiProtocol(ProtocolAdapter):
         declaration["parameters"] = deepcopy(tool.input_schema)
         return {"functionDeclarations": [declaration]}
 
-    def _format_tool_call(self, call: ToolCall, *, preserve_source: bool, emit_opaque_state: bool = True, sibling_signatures: bool = False) -> dict[str, Any]:
+    def _format_tool_call(
+        self,
+        call: ToolCall,
+        *,
+        preserve_source: bool,
+        emit_opaque_state: bool = True,
+        sibling_signatures: bool = False,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
         payload = deepcopy(call.raw) if preserve_source and isinstance(call.raw, dict) else {}
         # Sanitize the raw replay down to the legal union-part shape.
         payload.pop("functionCall", None)
@@ -1015,25 +1055,39 @@ class GeminiProtocol(ProtocolAdapter):
         payload.pop("thought_signature", None)
         function_call = {"name": call.name or "", "args": tool_arguments_object(call.arguments)}
         # `id` is Gemini-3+ only; synthetic correlation ids never reach the
-        # wire (Gemini 2.x rejects them, pairing is name-based).
-        if call.id and not call.extra.get("synthetic_id"):
+        # wire (Gemini 2.x rejects them, pairing is name-based). A declared
+        # tool_call_ids=false forbids the emission outright (never emit, never
+        # echo); undeclared keeps the 3.x filter above.
+        if call.id and not call.extra.get("synthetic_id") and _capability_flag(capabilities, "tool_call_ids") is not False:
             function_call["id"] = call.id
         payload["functionCall"] = function_call
         signature = call.signature or (call.raw.get("thoughtSignature") if isinstance(call.raw, dict) else None) or (call.raw.get("thought_signature") if isinstance(call.raw, dict) else None)
+        strict_signatures = _capability_flag(capabilities, "requires_thought_signatures")
         if signature and emit_opaque_state:
             # D8: the signature replays with the call part for compatible
             # providers (Gemini 3 rejects unsigned first-per-step calls).
             payload["thoughtSignature"] = signature
-        elif preserve_source and sibling_signatures:
-            # D8 degrade: this call's bound signature is suppressed (foreign
-            # provider pair) or absent, but a sibling call in the same turn
-            # carried one. Gemini-3 validates every function-call part, so a
-            # bare unsigned call would be rejected — emit the documented
-            # skip sentinel. NEVER fabricated when no sibling was signed.
+        elif strict_signatures is not False and (strict_signatures is True or (preserve_source and sibling_signatures)):
+            # Sentinel emission, in declared-then-heuristic order:
+            # - declared true: the model rejects unsigned function-call parts
+            #   outright, so EVERY unsigned call gets the documented skip
+            #   sentinel (never fabricated text, never a bare 400);
+            # - undeclared (None): the conservative sibling heuristic — this
+            #   call's signature is suppressed (foreign provider pair) or
+            #   absent, but a sibling call in the same turn carried one;
+            # - declared false: no sentinel ever (the 2.x family ignores it).
             payload["thoughtSignature"] = "skip_thought_signature_validator"
         return payload
 
-    def _format_tool_result(self, result: ToolResult, *, preserve_source: bool, emit_opaque_state: bool = True, warnings: list | None = None) -> dict[str, Any]:
+    def _format_tool_result(
+        self,
+        result: ToolResult,
+        *,
+        preserve_source: bool,
+        emit_opaque_state: bool = True,
+        warnings: list | None = None,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> dict[str, Any]:
         payload = deepcopy(result.raw) if preserve_source and isinstance(result.raw, dict) else {}
         payload.pop("functionResponse", None)
         payload.pop("function_response", None)
@@ -1041,14 +1095,15 @@ class GeminiProtocol(ProtocolAdapter):
         response = {"name": result.name or result.tool_call_id or "", "response": tool_result_object(result_content)}
         # `id` is Gemini-3+ only and never fabricated: emit only when the
         # source wire carried one, or when a genuine foreign correlation id
-        # exists (never the name-derived fallback, never synthetics).
+        # exists (never the name-derived fallback, never synthetics). A
+        # declared tool_call_ids=false forbids the echo outright.
         had_wire_id = result.extra.get("had_function_response_id") is True
         genuine_foreign_id = (
             result.tool_call_id
             and result.tool_call_id != result.name
             and not result.extra.get("synthetic_tool_call_id")
         )
-        if had_wire_id or genuine_foreign_id:
+        if (had_wire_id or genuine_foreign_id) and _capability_flag(capabilities, "tool_call_ids") is not False:
             response["id"] = result.tool_call_id
         payload["functionResponse"] = response
         part_signature = result.extra.get("thought_signature")
@@ -1067,7 +1122,13 @@ class GeminiProtocol(ProtocolAdapter):
             )
         return payload
 
-    def _format_generation_params(self, request: UnifiedRequest, *, preserve_source: bool) -> tuple[dict[str, Any], list[Any], dict[str, Any]]:
+    def _format_generation_params(
+        self,
+        request: UnifiedRequest,
+        *,
+        preserve_source: bool,
+        capabilities: Optional[Mapping[str, Any]] = None,
+    ) -> tuple[dict[str, Any], list[Any], dict[str, Any]]:
         source = request.extensions.get(self.name, {}) if preserve_source else {}
         generation = deepcopy(source.get("generationConfig") or {})
         safety = deepcopy(source.get("safetySettings") or [])
@@ -1104,6 +1165,20 @@ class GeminiProtocol(ProtocolAdapter):
                         field="generationConfig.candidateCount",
                     )
                     value = 1
+                if wire == "candidateCount" and isinstance(value, int):
+                    # G8: a declared per-model ceiling clamps with disclosure
+                    # (undeclared keeps the client's value — today's
+                    # behavior; the stream clamp above is protocol-wide).
+                    max_candidates = capabilities.get("max_candidates") if isinstance(capabilities, Mapping) else None
+                    if isinstance(max_candidates, int) and value > max_candidates:
+                        add_conversion_warning(
+                            request,
+                            code="unsupported_optional_control",
+                            message=f"candidateCount={value} exceeds the model's declared maximum {max_candidates}; clamped",
+                            target_protocol=self.name,
+                            field="generationConfig.candidateCount",
+                        )
+                        value = max_candidates
                 generation[wire] = value
         thinking_config = generation.get("thinkingConfig") or generation.get("thinking_config")
         if preserve_source and isinstance(thinking_config, dict) and "thinkingBudget" in thinking_config and "thinkingLevel" in thinking_config:
@@ -1167,8 +1242,10 @@ class GeminiProtocol(ProtocolAdapter):
         reasoning = params.pop("reasoning", None)
         if not preserve_source:
             # Cross-protocol mapping only; same-protocol passthrough keeps
-            # the preserved original verbatim.
-            reasoning_emissions = format_reasoning_controls(reasoning, self.name, request)
+            # the preserved original verbatim. The capability record rides
+            # along so the formatter can honor the model's thinking dialect,
+            # declared budget bounds, and declared OFF acceptance.
+            reasoning_emissions = format_reasoning_controls(reasoning, self.name, request, capabilities=capabilities)
             generation.update(reasoning_emissions.get("generation_config", {}))
         tool_choice = params.pop("tool_choice", None)
         if tool_choice is not None:

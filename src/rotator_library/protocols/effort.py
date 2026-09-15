@@ -111,6 +111,48 @@ def normalize_effort(word: str, accepted: Iterable[str]) -> Tuple[Optional[str],
 _DB_RESOLVER: Any = None
 
 
+def resolve_model_capabilities(
+    provider_plugin: Any = None,
+    model: str = "",
+    *,
+    runtime_config: Any = None,
+) -> Dict[str, Any]:
+    """Resolve the per-model capability record for the protocols.
+
+    The gemini split (G8): provider/model knowledge — thinking dialect
+    and vocabulary, budget bounds, tool-call ids, signature strictness,
+    output modalities, hosted tools, candidate ceilings — is declared
+    in ``model_rules`` rows (cascade-resolved exactly like param
+    tables) and consumed by the protocol builders through this record
+    instead of hardcoding. An empty record means "undeclared": every
+    consumer keeps its current default behavior, so nothing changes
+    for providers that declare nothing (until the model database
+    resolver replaces the declarations).
+    """
+
+    record: Dict[str, Any] = {}
+    if provider_plugin is None:
+        return record
+    from ..adapters.param_rules import _model_match_candidates, _row_matches
+
+    rows = _model_rule_rows(provider_plugin, model)
+    for row in rows:
+        if not _row_matches(row, _model_match_candidates(model)):
+            continue
+        for key in (
+            "thinking_dialect",
+            "thinking_budget_range",
+            "tool_call_ids",
+            "requires_thought_signatures",
+            "output_modalities",
+            "hosted_tools",
+            "max_candidates",
+        ):
+            if key in row:
+                record[key] = row[key]
+    return record
+
+
 def register_effort_database_resolver(resolver: Any) -> None:
     """Register the models.dev-sourced capability resolver (future phase).
 

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Mapping, Optional
 
 from .base import ProtocolAdapter
 from .operation import OPERATION_AUDIO_TRANSCRIPTION, OPERATION_AUDIO_TRANSLATION, OPERATION_SPEECH, normalize_operation
@@ -51,7 +51,7 @@ class OpenAIAudioProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _CORE_FIELDS},
         )
 
-    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None) -> dict[str, Any]:
+    def build_request(self, unified_request: UnifiedRequest, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
         payload: dict[str, Any] = {"model": unified_request.model}
         if unified_request.operation == OPERATION_SPEECH:
             payload["input"] = deepcopy(unified_request.input)
@@ -64,7 +64,7 @@ class OpenAIAudioProtocol(ProtocolAdapter):
         payload.update(deepcopy(unified_request.extra))
         return payload
 
-    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None) -> Any:
+    def format_response(self, unified_response: UnifiedResponse, context: ProtocolContext | None = None, capabilities: Optional[Mapping[str, Any]] = None) -> Any:
         """Format audio responses without forcing binary/text payloads into JSON.
 
         Speech endpoints can return raw audio bytes while transcription endpoints
