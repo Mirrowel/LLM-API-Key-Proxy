@@ -1335,7 +1335,37 @@ export ACK_LOG="$MSIM_DIR/ack.log" DISPATCH_LOG="$MSIM_DIR/dispatch.log"
 notif() { printf '{"id":%s,"reason":"%s","repository":{"full_name":"%s","owner":{"login":"%s"}},"subject":{"type":"%s","url":"https://api.github.com/repos/%s/issues/%s","latest_comment_url":"%s"}}' "$1" "$2" "$3" "$4" "$5" "$3" "$6" "$7"; }
 mention_pipeline() { PATH="$MSIM_DIR:$PATH" GH_TOKEN=mock GITHUB_REPOSITORY=Home/platform HOME_OWNER=home \
   FOREIGN_MENTIONS_USERS="friend" BOT_NAMES_JSON='["mirrobot-agent","mirrobot-agent[bot]"]' \
+  GUEST_REPO_RULES="${SIM_RULES:-}" \
   bash "$SCRIPT_DIR/handle-mentions.sh" --payload "$1" >/dev/null 2>&1; }
+
+# K: PullRequest subjects derive the thread number from /pulls/N
+# (live-caught 2026-09-15: the opencode PR mention declined - PR subject
+# URLs use /pulls/, neither the /issues/N arm nor the comment URL matched)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+notif_pr() { printf '{"id":%s,"reason":"mention","repository":{"full_name":"Other/x","owner":{"login":"Other"}},"subject":{"type":"PullRequest","url":"https://api.github.com/repos/Other/x/pulls/%s","latest_comment_url":"https://api.github.com/repos/Other/x/issues/comments/%s"}}' "$1" "$2" "$3"; }
+mention_pipeline "[$(notif_pr 15 48908 501)]"
+check "mentions: PullRequest subject derives number from /pulls/N" yes "$(grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && grep -q 'threadNumber=48908' "$DISPATCH_LOG" && echo yes || echo no)"
+
+# L-Q: guest repo rules semantics (mirrors worker guestAllowed exactly)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="Other/x:deny" mention_pipeline "[$(notif 21 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: GUEST_REPO_RULES exact deny skips" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="other/*:deny" mention_pipeline "[$(notif 22 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: wildcard deny skips (case-insensitive)" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="*/*:deny, Other/x:allow" mention_pipeline "[$(notif 23 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: last-match-wins allow override dispatches" yes "$(grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="garbage, Other/x:deny" mention_pipeline "[$(notif 24 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: malformed rule entry ignored, valid deny applies" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="Home/platform:allow" mention_pipeline "[$(notif 25 mention Home/platform Home Issue 7 '')]"
+check "mentions: platform repo hard-wired deny (rules cannot re-allow)" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="Foo/bar:deny" mention_pipeline "[$(notif 26 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: unrelated deny leaves default allow" yes "$(grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && echo yes || echo no)"
+SIM_RULES=""
 
 # A: reason filter (ci_activity acked, never dispatched)
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
@@ -1361,7 +1391,7 @@ check "mentions: discussion without mention token declined" yes "$( [ ! -s "$DIS
 # B: skip matrix - home-owner repo WITH platform is a no-op
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
 mention_pipeline "[$(notif 2 mention Home/platform Home Issue 7 '')]"
-check "mentions: home repo with platform skipped" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+check "mentions: platform repo skipped (local instance owns it)" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
 
 # C: home-owner repo WITHOUT platform + trusted summoner + token -> dispatched
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
@@ -1469,7 +1499,37 @@ export ACK_LOG="$MSIM_DIR/ack.log" DISPATCH_LOG="$MSIM_DIR/dispatch.log"
 notif() { printf '{"id":%s,"reason":"%s","repository":{"full_name":"%s","owner":{"login":"%s"}},"subject":{"type":"%s","url":"https://api.github.com/repos/%s/issues/%s","latest_comment_url":"%s"}}' "$1" "$2" "$3" "$4" "$5" "$3" "$6" "$7"; }
 mention_pipeline() { PATH="$MSIM_DIR:$PATH" GH_TOKEN=mock GITHUB_REPOSITORY=Home/platform HOME_OWNER=home \
   FOREIGN_MENTIONS_USERS="friend" BOT_NAMES_JSON='["mirrobot-agent","mirrobot-agent[bot]"]' \
+  GUEST_REPO_RULES="${SIM_RULES:-}" \
   bash "$SCRIPT_DIR/handle-mentions.sh" --payload "$1" >/dev/null 2>&1; }
+
+# K: PullRequest subjects derive the thread number from /pulls/N
+# (live-caught 2026-09-15: the opencode PR mention declined - PR subject
+# URLs use /pulls/, neither the /issues/N arm nor the comment URL matched)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+notif_pr() { printf '{"id":%s,"reason":"mention","repository":{"full_name":"Other/x","owner":{"login":"Other"}},"subject":{"type":"PullRequest","url":"https://api.github.com/repos/Other/x/pulls/%s","latest_comment_url":"https://api.github.com/repos/Other/x/issues/comments/%s"}}' "$1" "$2" "$3"; }
+mention_pipeline "[$(notif_pr 15 48908 501)]"
+check "mentions: PullRequest subject derives number from /pulls/N" yes "$(grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && grep -q 'threadNumber=48908' "$DISPATCH_LOG" && echo yes || echo no)"
+
+# L-Q: guest repo rules semantics (mirrors worker guestAllowed exactly)
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="Other/x:deny" mention_pipeline "[$(notif 21 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: GUEST_REPO_RULES exact deny skips" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="other/*:deny" mention_pipeline "[$(notif 22 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: wildcard deny skips (case-insensitive)" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="*/*:deny, Other/x:allow" mention_pipeline "[$(notif 23 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: last-match-wins allow override dispatches" yes "$(grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="garbage, Other/x:deny" mention_pipeline "[$(notif 24 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: malformed rule entry ignored, valid deny applies" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="Home/platform:allow" mention_pipeline "[$(notif 25 mention Home/platform Home Issue 7 '')]"
+check "mentions: platform repo hard-wired deny (rules cannot re-allow)" yes "$( [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+: > "$ACK_LOG"; : > "$DISPATCH_LOG"
+SIM_RULES="Foo/bar:deny" mention_pipeline "[$(notif 26 mention Other/x Other Issue 11 https://api.github.com/repos/Other/x/issues/comments/501)]"
+check "mentions: unrelated deny leaves default allow" yes "$(grep -q 'targetRepo=Other/x' "$DISPATCH_LOG" && echo yes || echo no)"
+SIM_RULES=""
 
 # A: reason filter (ci_activity acked, never dispatched)
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
@@ -1495,7 +1555,7 @@ check "mentions: discussion without mention token declined" yes "$( [ ! -s "$DIS
 # B: skip matrix - home-owner repo WITH platform is a no-op
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
 mention_pipeline "[$(notif 2 mention Home/platform Home Issue 7 '')]"
-check "mentions: home repo with platform skipped" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
+check "mentions: platform repo skipped (local instance owns it)" yes "$( [ -s "$ACK_LOG" ] && [ ! -s "$DISPATCH_LOG" ] && echo yes || echo no)"
 
 # C: home-owner repo WITHOUT platform + trusted summoner + token -> dispatched
 : > "$ACK_LOG"; : > "$DISPATCH_LOG"
@@ -1555,8 +1615,16 @@ SECTION_NAME='cross-repo workflow contracts (drift tripwires)'
 if [ "$PARALLEL" = 1 ]; then
   ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
 POLLWF="$SCRIPT_DIR/../workflows/mention-poller.yml"
+WORKERJS="$SCRIPT_DIR/../../tools/mention-worker/worker.js"
 check "poller: gated on FOREIGN_MENTIONS_ENABLED var"  yes "$(grep -q "vars.FOREIGN_MENTIONS_ENABLED == 'true'" "$POLLWF" && echo yes || echo no)"
 check "poller: repository_dispatch foreign-mention"    yes "$(grep -q 'foreign-mention' "$POLLWF" && echo yes || echo no)"
+# GUEST_REPO_RULES parity: both layers implement last-match-wins + the
+# platform-repo hard deny; the poller passes the variable through.
+check "poller: passes GUEST_REPO_RULES env"             yes "$(grep -q 'GUEST_REPO_RULES:' "$POLLWF" && echo yes || echo no)"
+if [ -f "$WORKERJS" ]; then
+  check "worker: guest rules last-match-wins engine"    yes "$(grep -q 'verdict = m\[2\]' "$WORKERJS" && echo yes || echo no)"
+  check "worker: platform repo hard-wired deny"         yes "$(grep -q 'guestAllowed' "$WORKERJS" && grep -q 'PLATFORM_REPO' "$WORKERJS" && echo yes || echo no)"
+fi
 # WORKER-FIRST contract: NO schedule trigger in the default file (idle
 # polling is the load the worker exists to avoid); the fallback recipe
 # stays documented in the header comment only.
@@ -1576,8 +1644,16 @@ else
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
 POLLWF="$SCRIPT_DIR/../workflows/mention-poller.yml"
+WORKERJS="$SCRIPT_DIR/../../tools/mention-worker/worker.js"
 check "poller: gated on FOREIGN_MENTIONS_ENABLED var"  yes "$(grep -q "vars.FOREIGN_MENTIONS_ENABLED == 'true'" "$POLLWF" && echo yes || echo no)"
 check "poller: repository_dispatch foreign-mention"    yes "$(grep -q 'foreign-mention' "$POLLWF" && echo yes || echo no)"
+# GUEST_REPO_RULES parity: both layers implement last-match-wins + the
+# platform-repo hard deny; the poller passes the variable through.
+check "poller: passes GUEST_REPO_RULES env"             yes "$(grep -q 'GUEST_REPO_RULES:' "$POLLWF" && echo yes || echo no)"
+if [ -f "$WORKERJS" ]; then
+  check "worker: guest rules last-match-wins engine"    yes "$(grep -q 'verdict = m\[2\]' "$WORKERJS" && echo yes || echo no)"
+  check "worker: platform repo hard-wired deny"         yes "$(grep -q 'guestAllowed' "$WORKERJS" && grep -q 'PLATFORM_REPO' "$WORKERJS" && echo yes || echo no)"
+fi
 # WORKER-FIRST contract: NO schedule trigger in the default file (idle
 # polling is the load the worker exists to avoid); the fallback recipe
 # stays documented in the header comment only.
