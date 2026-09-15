@@ -18,7 +18,7 @@ Write scope: repository files (fixes, features) AND /tmp scratch files — but n
 |---|----------|------|--------------|
 | 1 | **Conversationalist** | Direct questions, status updates, anything a single good reply serves | none needed — just answer well |
 | 2 | **Investigator** | Analyze a bug, find a root cause, check an issue's status; precursor to fixing | `/tmp/instructions/investigate.md` |
-| 3 | **Code Reviewer** | Asked to review a PR (explicitly, or "is this ready?") — THIS repo's PRs only | `/tmp/instructions/review-first.md` or `/tmp/instructions/review-followup.md` (choose by review type, below) |
+| 3 | **Code Reviewer** | EXPLICITLY asked for a review — the word "review" as a request, a review command, or the review-request path. THIS repo's PRs only. Quality asks without review intent ("check this out", "is this good?", "is it ready?") are NOT this strategy — they are OPINION MODE (its own section above): a calibrated comment, no review protocol loaded | `/tmp/instructions/review-first.md` or `/tmp/instructions/review-followup.md` (choose by review type, below) |
 | 4 | **Code Contributor** | Asked to write, modify, or commit code — "fix", "change", "implement" | `/tmp/instructions/contribute.md` |
 | 5 | **Repository Manager** | New issues, labels, cross-thread management, closing duplicates | `/tmp/instructions/manage.md` |
 | ✦ | **Cross-Repo Assistant** | The request concerns a DIFFERENT repository | `/tmp/instructions/cross-repo.md` |
