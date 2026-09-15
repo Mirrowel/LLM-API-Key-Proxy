@@ -17,7 +17,9 @@
 #   env in  : GH_TOKEN (required), GITHUB_REPOSITORY (required),
 #             BOT_NAMES_JSON (optional; default = this agent's identities),
 #             PREVIOUS_BOT_REVIEWS_COUNT (optional, default 1)
-#   files   : /tmp/kit/<pr>/... (diffs, head_sha.txt, context.env),
+#   files   : /tmp/kit/<pr>/... (diffs, head_sha.txt; context.env exists
+#            only transiently during generation and is deleted after the
+#            review-memory extraction),
 #             /tmp/instructions/review-{first,followup}.md + review-memory.md
 #             (kit writes these for the TARGET pr - re-run the kit to switch)
 #   stdout  : KIT RESULT summary (type + paths + sizes) - the caller reads
@@ -51,10 +53,20 @@ pr_json=$(gh api "/repos/$REPO/pulls/$PR" 2>/dev/null) || {
   exit 1
 }
 
-PR_HEAD_SHA=$(printf '%s' "$pr_json" | jq -r .headRefOid)
+# REST pulls payloads carry .head.sha; GraphQL carries .headRefOid. Accept
+# either (live-caught 2026-09-15: reading .headRefOid from REST silently
+# yielded "null" - the kit's head_sha.txt shipped a 5-byte null and the
+# PR context said "head: null" while home worked only because the workflow
+# wrote the root /tmp/head_sha.txt itself). A kit that cannot pin the head
+# SHA fails LOUDLY - never write a null marker downstream flows will trust.
+PR_HEAD_SHA=$(printf '%s' "$pr_json" | jq -r '.headRefOid // .head.sha // empty')
+if [ -z "$PR_HEAD_SHA" ] || [ "$PR_HEAD_SHA" = "null" ]; then
+  echo "KIT ERROR: could not resolve the PR head SHA for #$PR in $REPO - refusing to generate a kit with an unpinned head."
+  exit 1
+fi
 PR_BASE=$(printf '%s' "$pr_json" | jq -r '.base.ref')
 PR_AUTHOR=$(printf '%s' "$pr_json" | jq -r '.user.login')
-PR_TITLE=$(printf '%s' "$pr_json" | jq -r .title)
+PR_TITLE=$(printf '%s' "$pr_json" | jq -r '.title')
 printf '%s\n' "$PR_HEAD_SHA" > "$KIT_DIR/head_sha.txt"
 
 # --- review type: latest review by THIS agent carrying the marker ----------
@@ -189,6 +201,10 @@ fi
 if [ -f "$KIT_DIR/context.env" ]; then
   PREVIOUS_BOT_REVIEWS=$(extract_env_var "$KIT_DIR/context.env" PREVIOUS_BOT_REVIEWS)
   AGENT_REVIEW_HISTORY=$(extract_env_var "$KIT_DIR/context.env" AGENT_REVIEW_HISTORY)
+  # Byproduct hygiene (live-caught 2026-09-15: an agent curiosity-read
+  # context.env - it carries a duplicate thread dump and a misleading name;
+  # nothing needs it after this extraction). Delete immediately.
+  rm -f "$KIT_DIR/context.env"
 fi
 PREVIOUS_BOT_REVIEWS="${PREVIOUS_BOT_REVIEWS:-none}"
 AGENT_REVIEW_HISTORY="${AGENT_REVIEW_HISTORY:-none}"
