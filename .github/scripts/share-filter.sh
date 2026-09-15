@@ -97,6 +97,35 @@ BEGIN { captured = 0; booted = 0 }
       next
     }
   }
+  # Credential-shaped content redaction (defense in depth for the SHARE and
+  # the log: registered masks cover known values; these SHAPE rules catch
+  # anything credential-like that no mask anticipated - config/auth JSON
+  # leaves, token prefixes, oauth material). awk regex, no subprocesses.
+  line = $0
+  changed = 0
+  # (a) GitHub token family + known provider prefixes, anywhere in the line.
+  while (match(line, /(gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{16,}|x-access-token:[A-Za-z0-9_]{16,}|cr_[A-Za-z0-9]{16,}|sk-ant-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9_-]{16,}|xai-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{16,})/)) {
+    tok = substr(line, RSTART, RLENGTH)
+    if (length(tok) >= 8) printf "::add-mask::%s\n", tok
+    line = substr(line, 1, RSTART - 1) "[REDACTED]" substr(line, RSTART + RLENGTH)
+    changed = 1
+  }
+  # (b) Credential key/value pairs from echoed JSON: "apiKey": "cr_...",
+  # "key": "...", "refresh"/"access"/"token"/"secret"/"password": "...".
+  # Value must be >= 12 chars of token-ish material to avoid prose false
+  # positives.
+  while (match(line, /"[Aa]pi[_-]?[Kk]ey"|[Tt]oken"|[Ss]ecret"|[Pp]assword"|[Aa]uthorization"|[Cc]ookie"|[Rr]efresh"|[Cc]redential"/)) {
+    kstart = RSTART; kend = RSTART + RLENGTH
+    tail = substr(line, kend)
+    if (match(tail, /^[ \t]*:[ \t]*"[^"]{12,}"/)) {
+      val = substr(tail, RSTART, RLENGTH)
+      gsub(/^.*"|"$/, "", val)
+      if (length(val) >= 8) printf "::add-mask::%s\n", val
+      line = substr(line, 1, kend - 1) substr(line, kend, 1) "[REDACTED]" substr(tail, RSTART + RLENGTH)
+      changed = 1
+    } else break
+  }
+  if (changed) { print line; next }
   print
 }
 '

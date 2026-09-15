@@ -446,6 +446,31 @@ for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   check "pause: $wf job gated on AGENT_PAUSED"     yes "$(grep -q "vars.AGENT_PAUSED != 'true'" "$WFF" && echo yes || echo no)"
 done
 
+# ---- share-filter credential redaction (behavioral, live shapes) ----------
+# The 2026-09-15 incident class: credential-shaped content in tool output
+# riding public logs/shares. Shape rules must redact the GitHub token family,
+# provider key prefixes, and JSON key/value credential pairs, while leaving
+# prose and short values untouched.
+SF_TEST_OUT=$(mktemp)
+printf '%s\n' \
+  'remote: https://x-access-token:ghp_ABKvrGKye04I56xSuL3n1czBAEIho50@github.com/x' \
+  '"apiKey": "cr_abcdefghijklmnopqrstuvwxyz0123456789"' \
+  '"key": "cr_abcdefghijklmnopqrstuvwxyz0123"' \
+  '  "refresh": "verylongrefreshtokenvalue1234567890"' \
+  '  "apiKey": "zaikey.value12345678"' \
+  'the token" concept in prose stays' \
+  '  "key": "short"' \
+  | SHARE_LINK_PUBKEY="" bash "$SCRIPT_DIR/share-filter.sh" > "$SF_TEST_OUT" 2>/dev/null || true
+SF_BODY=$(grep -v '^::add-mask' "$SF_TEST_OUT")
+check "redact: ghp/x-access-token redacted"    yes "$(printf '%s' "$SF_BODY" | grep -q 'ghp_ABKvrGK' && echo no || echo yes)"
+check "redact: cr_ provider key pair redacted" yes "$(printf '%s' "$SF_BODY" | grep -q 'cr_abcdefghij' && echo no || echo yes)"
+check "redact: auth refresh pair redacted"     yes "$(printf '%s' "$SF_BODY" | grep -q 'verylongrefresh' && echo no || echo yes)"
+check "redact: dotted apiKey pair redacted"    yes "$(printf '%s' "$SF_BODY" | grep -q 'zaikey.value' && echo no || echo yes)"
+check "redact: [REDACTED] markers present"     yes "$(printf '%s' "$SF_BODY" | grep -q '\[REDACTED\]' && echo yes || echo no)"
+check "redact: prose passes through"           yes "$(printf '%s' "$SF_BODY" | grep -q 'concept in prose stays' && echo yes || echo no)"
+check "redact: short values untouched"         yes "$(printf '%s' "$SF_BODY" | grep -qF '"key": "short"' && echo yes || echo no)"
+rm -f "$SF_TEST_OUT"
+
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
   ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
@@ -503,6 +528,31 @@ for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   # Pause gate: the agent's brain skips visibly; rails (stub/gate) stay on.
   check "pause: $wf job gated on AGENT_PAUSED"     yes "$(grep -q "vars.AGENT_PAUSED != 'true'" "$WFF" && echo yes || echo no)"
 done
+
+# ---- share-filter credential redaction (behavioral, live shapes) ----------
+# The 2026-09-15 incident class: credential-shaped content in tool output
+# riding public logs/shares. Shape rules must redact the GitHub token family,
+# provider key prefixes, and JSON key/value credential pairs, while leaving
+# prose and short values untouched.
+SF_TEST_OUT=$(mktemp)
+printf '%s\n' \
+  'remote: https://x-access-token:ghp_ABKvrGKye04I56xSuL3n1czBAEIho50@github.com/x' \
+  '"apiKey": "cr_abcdefghijklmnopqrstuvwxyz0123456789"' \
+  '"key": "cr_abcdefghijklmnopqrstuvwxyz0123"' \
+  '  "refresh": "verylongrefreshtokenvalue1234567890"' \
+  '  "apiKey": "zaikey.value12345678"' \
+  'the token" concept in prose stays' \
+  '  "key": "short"' \
+  | SHARE_LINK_PUBKEY="" bash "$SCRIPT_DIR/share-filter.sh" > "$SF_TEST_OUT" 2>/dev/null || true
+SF_BODY=$(grep -v '^::add-mask' "$SF_TEST_OUT")
+check "redact: ghp/x-access-token redacted"    yes "$(printf '%s' "$SF_BODY" | grep -q 'ghp_ABKvrGK' && echo no || echo yes)"
+check "redact: cr_ provider key pair redacted" yes "$(printf '%s' "$SF_BODY" | grep -q 'cr_abcdefghij' && echo no || echo yes)"
+check "redact: auth refresh pair redacted"     yes "$(printf '%s' "$SF_BODY" | grep -q 'verylongrefresh' && echo no || echo yes)"
+check "redact: dotted apiKey pair redacted"    yes "$(printf '%s' "$SF_BODY" | grep -q 'zaikey.value' && echo no || echo yes)"
+check "redact: [REDACTED] markers present"     yes "$(printf '%s' "$SF_BODY" | grep -q '\[REDACTED\]' && echo yes || echo no)"
+check "redact: prose passes through"           yes "$(printf '%s' "$SF_BODY" | grep -q 'concept in prose stays' && echo yes || echo no)"
+check "redact: short values untouched"         yes "$(printf '%s' "$SF_BODY" | grep -qF '"key": "short"' && echo yes || echo no)"
+rm -f "$SF_TEST_OUT"
 
 fi
 section_end
@@ -1678,6 +1728,19 @@ check "home: PR scrub anchors at the PR base branch"   yes "$(grep -q -- '--anch
 # Guest pending-review hygiene + guest addendum on kit review sets.
 check "guest: clears pending bot reviews"              yes "$(grep -q 'Clear pending bot review' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" && echo yes || echo no)"
 check "guest: kit review sets get the guest addendum"  yes "$(grep -q 'GUEST SESSION ADDENDUM' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'REPO" != "\${GITHUB_REPOSITORY' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Token-leak class (live incident 2026-09-15: bot-setup's global insteadOf
+# embedded the PAT into every github.com URL git printed; git remote -v
+# surfaced it into a public share). The rewrite must never come back, and
+# auth goes through gh's credential helper instead.
+check "leak: no credential insteadOf in bot-setup"     yes "$(grep -q 'x-access-token:\${' "$ACTION" && echo no || echo yes)"
+check "leak: git auth via gh credential helper"        yes "$(grep -q "credential.https://github.com.helper '!gh auth git-credential'" "$ACTION" && echo yes || echo no)"
+# Preemptive masking covers auth.json (oauth refresh/access, provider keys)
+# in addition to the config.
+check "leak: auth.json credential leaves swept"        yes "$(grep -q 'auth.json' "$ACTION" && grep -q 'refresh' "$ACTION" && echo yes || echo no)"
+# Kit head-SHA guard: the null-head class (REST .headRefOid misread).
+check "kit: head SHA null guard"                       yes "$(grep -q 'headRefOid // .head.sha // empty' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'unpinned head' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Kit byproduct hygiene: context.env deleted after extraction.
+check "kit: context.env deleted after extraction"      yes "$(grep -A5 'extract_env_var "\$KIT_DIR/context.env" AGENT_REVIEW_HISTORY' "$SCRIPT_DIR/generate-review-kit.sh" | grep -q 'rm -f .\$KIT_DIR/context.env' && echo yes || echo no)"
 # GUEST_REPO_RULES parity: both layers implement last-match-wins + the
 # platform-repo hard deny; the poller passes the variable through.
 check "poller: passes GUEST_REPO_RULES env"             yes "$(grep -q 'GUEST_REPO_RULES:' "$POLLWF" && echo yes || echo no)"
@@ -1763,6 +1826,19 @@ check "home: PR scrub anchors at the PR base branch"   yes "$(grep -q -- '--anch
 # Guest pending-review hygiene + guest addendum on kit review sets.
 check "guest: clears pending bot reviews"              yes "$(grep -q 'Clear pending bot review' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" && echo yes || echo no)"
 check "guest: kit review sets get the guest addendum"  yes "$(grep -q 'GUEST SESSION ADDENDUM' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'REPO" != "\${GITHUB_REPOSITORY' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Token-leak class (live incident 2026-09-15: bot-setup's global insteadOf
+# embedded the PAT into every github.com URL git printed; git remote -v
+# surfaced it into a public share). The rewrite must never come back, and
+# auth goes through gh's credential helper instead.
+check "leak: no credential insteadOf in bot-setup"     yes "$(grep -q 'x-access-token:\${' "$ACTION" && echo no || echo yes)"
+check "leak: git auth via gh credential helper"        yes "$(grep -q "credential.https://github.com.helper '!gh auth git-credential'" "$ACTION" && echo yes || echo no)"
+# Preemptive masking covers auth.json (oauth refresh/access, provider keys)
+# in addition to the config.
+check "leak: auth.json credential leaves swept"        yes "$(grep -q 'auth.json' "$ACTION" && grep -q 'refresh' "$ACTION" && echo yes || echo no)"
+# Kit head-SHA guard: the null-head class (REST .headRefOid misread).
+check "kit: head SHA null guard"                       yes "$(grep -q 'headRefOid // .head.sha // empty' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'unpinned head' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Kit byproduct hygiene: context.env deleted after extraction.
+check "kit: context.env deleted after extraction"      yes "$(grep -A5 'extract_env_var "\$KIT_DIR/context.env" AGENT_REVIEW_HISTORY' "$SCRIPT_DIR/generate-review-kit.sh" | grep -q 'rm -f .\$KIT_DIR/context.env' && echo yes || echo no)"
 # GUEST_REPO_RULES parity: both layers implement last-match-wins + the
 # platform-repo hard deny; the poller passes the variable through.
 check "poller: passes GUEST_REPO_RULES env"             yes "$(grep -q 'GUEST_REPO_RULES:' "$POLLWF" && echo yes || echo no)"

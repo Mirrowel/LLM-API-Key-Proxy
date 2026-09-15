@@ -195,7 +195,15 @@ runs:
         fi
         git config --global user.name "$NAME"
         git config --global user.email "$EMAIL"
-        git config --global url."https://x-access-token:${TOKEN}@github.com/".insteadOf "https://github.com/"
+        # Git authentication WITHOUT credential materialization: gh's
+        # credential helper reads GH_TOKEN from the session environment on
+        # demand. The previous approach (a global url.<token>.insteadOf
+        # rewrite) embedded the token into every github.com URL git
+        # resolves or PRINTS - `git remote -v` in any session surfaced the
+        # raw PAT (live incident 2026-09-15: it rode a public share
+        # session). The helper keeps auth functional with nothing
+        # credential-shaped in any URL, config value, or printed output.
+        git config --global credential.https://github.com.helper '!gh auth git-credential'
 
     - name: Generate OpenCode Configuration
       shell: bash
@@ -403,7 +411,7 @@ runs:
           echo "Plugins materialized."
         fi
 
-        # --- MASK CREDENTIAL LEAVES (config-derived secrets) ---
+        # --- MASK CREDENTIAL LEAVES (config- and auth-derived secrets) ---
         # GitHub masks whole SECRET values automatically, but
         # OPENCODE_CONFIG_JSON is one blob: its inner leaves (provider
         # apiKeys, mcp header values, credential-bearing URLs) would echo
@@ -412,20 +420,30 @@ runs:
         # catches credential QUERY PARAMS with any prefix (e.g.
         # ?tavilyApiKey=...). GitHub ignores masks shorter than 8
         # characters, so short values cannot be registered and are skipped.
-        while IFS= read -r v; do
-          [ -z "$v" ] && continue
-          if [ "${#v}" -ge 8 ]; then
-            printf '::add-mask::%s\n' "$v"
-          fi
-        done < <(jq -r '
+        # auth.json (opencode's own credential store - oauth refresh/access
+        # tokens, provider "key" entries like cr_...) is swept with the same
+        # walker whenever it exists (live incident 2026-09-15: a token rode
+        # a public share because no mask covered its shape).
+        CRED_LEAF_WALK='
           [ (.. | objects | to_entries[]
-              | select(.key | test("(api[_-]?key|key|token|secret|password|authorization|cookie)"; "i"))
+              | select(.key | test("(api[_-]?key|key|token|secret|password|authorization|cookie|refresh|access|credential)"; "i"))
               | .value | strings | select(length >= 8))
             , (.. | strings
               | select(length >= 8)
               | select(test("https?://.+[?&].*(api[_-]?key|token|secret|password)=" ; "i")))
           ] | unique | .[]
-        ' ~/.config/opencode/opencode.json 2>/dev/null || true)
+        '
+        for cred_source in "$HOME/.config/opencode/opencode.json" \
+                           "$HOME/.local/share/opencode/auth.json" \
+                           "$HOME/.config/opencode/auth.json"; do
+          [ -f "$cred_source" ] || continue
+          while IFS= read -r v; do
+            [ -z "$v" ] && continue
+            if [ "${#v}" -ge 8 ]; then
+              printf '::add-mask::%s\n' "$v"
+            fi
+          done < <(jq -r "$CRED_LEAF_WALK" "$cred_source" 2>/dev/null || true)
+        done
         echo "Credential leaf masking applied."
 
     - name: Check for Python requirements file

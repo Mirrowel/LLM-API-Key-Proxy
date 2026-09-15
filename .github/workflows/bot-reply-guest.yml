@@ -872,7 +872,9 @@ jobs:
           bash /tmp/opencode-cleanup.sh now || true
           {
             echo "### Agent usage (this run)"
+            echo '```'
             opencode stats 2>/dev/null || "$HOME/.local/bin/opencode" stats 2>/dev/null || true
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Share link summary
