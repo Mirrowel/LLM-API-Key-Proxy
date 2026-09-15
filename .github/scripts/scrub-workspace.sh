@@ -28,7 +28,7 @@
 #
 # Auto-load surface (what opencode ingests at startup / directory entry):
 #   AGENTS.md, CLAUDE.md (any depth), .claude/, .opencode/,
-#   opencode.json, opencode.jsonc (any depth — project configs merge
+#   opencode.json, opencode.jsonc (ROOT ONLY — project configs merge
 #   additively over the global config and can re-allow denied permissions,
 #   define MCP servers, or pull remote instruction URLs).
 #   .agents/ (root) — opencode skill discovery scans .agents/skills/**/SKILL.md
@@ -341,13 +341,22 @@ keep_if_identical() {
 # Symlinks are enumerated too: a PR can commit AGENTS.md/opencode.json as a
 # symlink (git mode 120000) — opencode follows it when loading, so it must be
 # compared and removed exactly like a regular file.
+# opencode.json/jsonc are ROOT-ONLY here (find -maxdepth 1): they are project
+# configs, read from the worktree root and nowhere else — a same-named source
+# file deep in a package tree is ordinary content, not an auto-load surface
+# (live-caught 2026-09-15: opencode's own theme assets
+# packages/{tui,ui}/src/theme/*/opencode.json were quarantined as auto-load).
 while IFS= read -r -d '' f; do
   keep_if_identical "$f"
 done < <(find . -name .git -prune -o \( -type f -o -type l \) \
-  \( -name AGENTS.md -o -name CLAUDE.md -o -name opencode.json -o -name opencode.jsonc \
+  \( -name AGENTS.md -o -name CLAUDE.md \
   -o -name GEMINI.md -o -name CLAUDE.local.md \
   -o -name .cursorrules -o -name .windsurfrules -o -name .clinerules \) \
   -print0)
+while IFS= read -r -d '' f; do
+  keep_if_identical "$f"
+done < <(find . -maxdepth 1 -name .git -prune -o \( -type f -o -type l \) \
+  \( -name opencode.json -o -name opencode.jsonc \) -print0)
 
 # --- Auto-load directories: per-file comparison ------------------------------
 # Files inside .claude/, .agents/, .opencode/, and the Tier-2 harness dirs
@@ -412,6 +421,10 @@ if [ "$FOREIGN" = 1 ]; then
   # A guest repository's .github cannot execute for us (workflows run from
   # the HOME repo) — there is no trusted base to compare against and no
   # attack surface to alarm about. Skip the taint machinery entirely.
+  # taint MUST be initialized here: the downstream consumers read it under
+  # set -u (live-caught 2026-09-15: unbound read killed every guest run
+  # after the removal phase, surfacing as the confused-emoji reaction).
+  taint=""
   echo "scrub: taint check skipped (foreign repository - its .github cannot execute here)."
 elif [ -n "$ANCHOR" ]; then
   TAINT_BASE="$ANCHOR"
@@ -536,6 +549,8 @@ elif [ -n "$tree_diff" ]; then
     echo "ℹ .github discrepancy — EXPLAINED, benign: the workspace .github differs from the ${anchor} TIP only because this branch predates recent ${anchor}-side .github changes (stale base). No commit on this branch modifies .github; merging keeps ${anchor}'s versions of every file this branch never touched. Context, not an alarm. If in doubt, compare .github against ${anchor} directly."
   } | tee -a "$TAINT_FILE"
   echo "scrub: .github tree differs from ${anchor} tip (stale base; no branch-side .github commits) — explained note recorded for the agent."
+elif [ "$FOREIGN" = 1 ]; then
+  : # foreign mode: nothing to report - the skip notice above owns this case
 else
   echo "scrub: .github/ clean vs ${TAINT_BASE_DESC} (no branch-side commits touch it)."
 fi

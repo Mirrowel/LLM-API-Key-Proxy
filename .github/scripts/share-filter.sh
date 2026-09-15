@@ -52,6 +52,29 @@ awk -v url_out="$URL_OUT" -v ctx_out="$CTX_OUT" -v boot_out="$BOOT_OUT" \
 BEGIN { captured = 0; booted = 0 }
 {
   if (!booted) { printf "" > boot_out; booted = 1 }
+  # Model-header line ("> build <middot> <model>" / "> plan ...", possibly
+  # ANSI-colored): the model identifier is config-derived and must not
+  # surface in public logs. Mask the token wherever it appears, drop the
+  # header line itself entirely.
+  if (substr($0, 1, 2) == "> ") {
+    line = $0
+    esc = sprintf("%c", 27)
+    gsub(esc "\\[[0-9;]*m", "", line)
+    sub(/[\r ]+$/, "", line)
+    sep = " · "   # literal UTF-8 middle dot: byte-stable on mawk/MSYS, char-stable on gawk
+    si = index(line, sep)
+    if (si > 0) {
+      mode = substr(line, 3, si - 3)
+      model = substr(line, si + length(sep))
+      if ((mode == "build" || mode == "plan") && model != "") {
+        if (length(model) >= 8) {
+          printf "::add-mask::%s\n", model
+        }
+        next
+      }
+    }
+    line = $0
+  }
   if ($0 ~ /opncd\.ai\/share\//) {
     line = $0
     esc = sprintf("%c", 27)

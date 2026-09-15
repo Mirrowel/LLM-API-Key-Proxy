@@ -135,21 +135,42 @@ else
 fi
 
 DEFAULT_BRANCH=$(gh api "/repos/${GITHUB_REPOSITORY}" --jq .default_branch 2>/dev/null || echo main)
-PLATFORM_CHECK_CACHE=""
 
-platform_present() { # $1 = full repo name -> "true"/"false" (cached)
-  [ -n "$PLATFORM_CHECK_CACHE" ] || PLATFORM_CHECK_CACHE=" "
-  case "$PLATFORM_CHECK_CACHE" in
-    *"|$1=true|"*) echo true; return ;;
-    *"|$1=false|"*) echo false; return ;;
-  esac
-  if gh api "/repos/$1/contents/.github/workflows/bot-reply.yml" >/dev/null 2>&1; then
-    v=true
-  else
-    v=false
-  fi
-  PLATFORM_CHECK_CACHE="${PLATFORM_CHECK_CACHE}|$1=$v|"
-  echo "$v"
+# Guest repo rules (GUEST_REPO_RULES): ordered, comma-separated entries of
+# "<owner/repo glob>:deny|allow" - opencode-permission semantics: evaluate
+# in order, LAST MATCH WINS, default ALLOW. The platform repo itself is
+# hard-wired deny (the local instance always owns it; guest mode there is
+# always wrong) and cannot be re-allowed. Globs use shell case patterns
+# ('*' = within a segment, e.g. 'mirrowel/*', '*/*'); both sides are
+# lowercased (GitHub slugs are case-insensitive). Malformed entries are
+# logged and ignored per-entry - never a total lockout. The worker
+# prefilter runs the IDENTICAL semantics (parity is fixture-pinned).
+# Example: '*/*:deny, anomalyco/opencode:allow' - guest mode off everywhere
+# except that one repo.
+GUEST_RULES="${GUEST_REPO_RULES:-}"
+repo_allowed() { # $1 = full repo name -> 0 when guest mode may run there
+  local r_lc entry pat verdict
+  r_lc="$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')"
+  [ "$r_lc" = "${GITHUB_REPOSITORY,,}" ] && return 1  # platform repo: never guest
+  verdict="allow"
+  while IFS= read -r entry; do
+    [ -n "$entry" ] || continue
+    entry="${entry#"${entry%%[![:space:]]*}"}"; entry="${entry%"${entry##*[![:space:]]}"}"
+    [ -n "$entry" ] || continue
+    entry="$(printf '%s' "$entry" | tr 'A-Z' 'a-z')"
+    case "$entry" in
+      *:deny|*:allow) ;;
+      *)
+        log "guest-repo-rules: malformed entry ignored: '$entry'"
+        continue
+        ;;
+    esac
+    pat="${entry%:*}"
+    case "$r_lc" in
+      $pat) verdict="${entry##*:}" ;;
+    esac
+  done <<< "$(printf '%s' "$GUEST_RULES" | tr ',' '\n')"
+  [ "$verdict" = "allow" ]
 }
 
 mark_read() { # $1 = notification thread id
@@ -181,13 +202,10 @@ while read -r n; do
     *) mark_read "$id"; declined=$((declined + 1)); continue ;;
   esac
 
-  # 2. skip matrix — home-owner repos WITH the platform are handled locally
-  if [ "$owner" = "${HOME_OWNER,,}" ]; then
-    if [ "$(platform_present "$repo")" = true ]; then
-      log "skip $reason in $repo (home-owner repo with the platform - local instance owns it)"
-      mark_read "$id"; declined=$((declined + 1)); continue
-    fi
-    log "home-owner repo $repo has NO platform - handling here"
+  # 2. guest repo rules — denied repos are locally handled (or unwanted)
+  if ! repo_allowed "$repo"; then
+    log "skip $reason in $repo (GUEST_REPO_RULES deny - local instance owns it)"
+    mark_read "$id"; declined=$((declined + 1)); continue
   fi
 
   # 3. mark read BEFORE any dispatch (at-most-once)
@@ -253,7 +271,7 @@ while read -r n; do
       log "cap reached ($MAX_DISPATCH) - @$trig_author's $reason in $repo#$number skipped this run (already acked; re-mention to retry)."
       continue
     fi
-    if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+    if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply-guest.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
          -f "targetRepo=$repo" -f "threadNumber=$number" \
          -f "commentId=" -f "triggerKind=mention" -f "threadType=discussion"; then
       dispatched=$((dispatched + 1))
@@ -264,7 +282,14 @@ while read -r n; do
     fi
     continue
   fi
+  # Thread number from the subject URL: issues END in /issues/N, but PR
+  # subjects use /pulls/N (live-caught 2026-09-15: the opencode PR mention
+  # declined with "could not derive thread number" because neither the
+  # /issues/N arm nor the comment-id URL matched). The comment id (when the
+  # trigger is a comment) comes separately from latest_comment_url - the
+  # combined form ".../issues/comments/N" defeats a single digit pattern.
   number=$(printf '%s' "$subject_url" | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
+  [ -n "$number" ] || number=$(printf '%s' "$subject_url" | sed -n 's:.*/pulls/\([0-9][0-9]*\)$:\1:p')
   [ -n "$number" ] || number=$(printf '%s' "$latest_url" | sed -n 's:.*/issues/\([0-9][0-9]*\)$:\1:p')
   if [ -z "$number" ]; then
     log "decline: could not derive thread number for $repo ($subject_type)"
@@ -334,7 +359,7 @@ while read -r n; do
     log "cap reached ($MAX_DISPATCH) - @$trigger_author's $reason in $repo#$number skipped this run (already acked; re-mention to retry)."
     continue
   fi
-  if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+  if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply-guest.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
        -f "targetRepo=$repo" -f "threadNumber=$number" \
        -f "commentId=${comment_id:-}" -f "triggerKind=$kind"; then
     dispatched=$((dispatched + 1))

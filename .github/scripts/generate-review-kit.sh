@@ -26,9 +26,15 @@
 set -uo pipefail
 
 PR="${1:-}"
-REPO="${GITHUB_REPOSITORY:-}"
+# Repo resolution: KIT_REPO (guest sessions pass the FOREIGN repo) wins,
+# then GH_REPO (gh's own default-repo variable), then GITHUB_REPOSITORY
+# (home sessions). Never attempt to override GITHUB_REPOSITORY itself -
+# GitHub silently ignores assignments to GITHUB_* default variables
+# (live-caught 2026-09-15: the override LOOKED set in step env while the
+# process kept the home repo, killing every guest kit run).
+REPO="${KIT_REPO:-${GH_REPO:-${GITHUB_REPOSITORY:-}}}"
 if [ -z "$PR" ] || [ -z "$REPO" ] || [ -z "${GH_TOKEN:-}" ]; then
-  echo "KIT ERROR: usage: generate-review-kit.sh <pr_number> (needs GH_TOKEN and GITHUB_REPOSITORY in env)"
+  echo "KIT ERROR: usage: generate-review-kit.sh <pr_number> (needs GH_TOKEN and KIT_REPO or GITHUB_REPOSITORY in env)"
   exit 1
 fi
 case "$PR" in ''|*[!0-9]*) echo "KIT ERROR: PR number must be numeric, got '$PR'"; exit 1;; esac
@@ -127,11 +133,11 @@ git fetch origin "pull/$PR/head" >/dev/null 2>&1 || {
   exit 1
 }
 FULL_DIFF="$KIT_DIR/full_diff.patch"
-git diff "origin/$PR_BASE...FETCH_HEAD" > "$FULL_DIFF" 2>/dev/null || git diff "origin/$PR_BASE..FETCH_HEAD" > "$FULL_DIFF"
+git diff --full-index "origin/$PR_BASE...FETCH_HEAD" > "$FULL_DIFF" 2>/dev/null || git diff --full-index "origin/$PR_BASE..FETCH_HEAD" > "$FULL_DIFF"
 INCREMENTAL_DIFF=""
 if [ "$REVIEW_TYPE" = "FOLLOW-UP" ]; then
   INCREMENTAL_DIFF="$KIT_DIR/incremental_diff.patch"
-  if [ -n "$LAST_REVIEWED_SHA" ] && git diff "$LAST_REVIEWED_SHA..FETCH_HEAD" > "$INCREMENTAL_DIFF" 2>/dev/null; then
+  if [ -n "$LAST_REVIEWED_SHA" ] && git diff --full-index "$LAST_REVIEWED_SHA..FETCH_HEAD" > "$INCREMENTAL_DIFF" 2>/dev/null; then
     :
   else
     # No reachable anchor (rebase/force-push) or diff failure: the incremental
@@ -177,6 +183,7 @@ if [ -f /tmp/fetch-pr-discussion.sh ]; then
   rm -f "$KIT_DIR/context.env"
   GITHUB_ENV="$KIT_DIR/context.env" BOT_NAMES_JSON="$BOT_NAMES_JSON" \
     PREVIOUS_BOT_REVIEWS_COUNT="${PREVIOUS_BOT_REVIEWS_COUNT:-1}" \
+    QUERY_REPO="$REPO" \
     bash /tmp/fetch-pr-discussion.sh "$PR" >/dev/null 2>&1 || echo "KIT NOTE: discussion fetch degraded - review memory may be empty"
 fi
 if [ -f "$KIT_DIR/context.env" ]; then
@@ -216,6 +223,30 @@ if [ -f /tmp/assemble-prompt.sh ]; then
       PR_HEAD_SHA="$PR_HEAD_SHA" PREVIOUS_BOT_REVIEWS="$PREVIOUS_BOT_REVIEWS" AGENT_REVIEW_HISTORY="$AGENT_REVIEW_HISTORY" \
       PR_NUMBER="$PR" GITHUB_REPOSITORY="$REPO" PR_AUTHOR="$PR_AUTHOR" PULL_REQUEST_CONTEXT="$PULL_REQUEST_CONTEXT" \
       envsubst "$RVARS" > /tmp/instructions/review-followup.md
+  # GUEST ADDENDUM (kit-side, durable): the review instruction sets are
+  # assembled from the same manifests for BOTH lanes, so they carry home
+  # phrasing (scope-of-action ladder, APPROVE/REQUEST_CHANGES events).
+  # When this kit runs against a FOREIGN repo (any guest run, including an
+  # agent-initiated re-run), append the guest override so the two lanes can
+  # never disagree. Appended, never edited - the shared sets stay
+  # single-source (live-symmetry: the workflow used to do this; the kit
+  # doing it survives agent re-runs).
+  if [ "$REPO" != "${GITHUB_REPOSITORY:-}" ]; then
+    for rf in /tmp/instructions/review-first.md /tmp/instructions/review-followup.md; do
+      [ -f "$rf" ] || continue
+      printf '%s\n' "" "---" \
+        "## GUEST SESSION ADDENDUM (overrides anything above that conflicts)" "" \
+        "You are reviewing in a FOREIGN repository as a guest. Where this instruction" \
+        "set speaks of home concepts, the guest rules of your mission brief win:" \
+        "- Verdicts submit as COMMENT reviews (or a comment); APPROVE/REQUEST_CHANGES" \
+        "  are rejected by GitHub for non-collaborators - never attempt them." \
+        "- Never merge, never push, never open issues/PRs outside the two write keys." \
+        '- The "Scope of Action" ladder above describes HOME standing; abroad your' \
+        "  only authority anchors are the allowlist-verified summoner and your own" \
+        "  verified leads (per your mission's write-key 1)." \
+        "- gh defaults to this repository (GH_REPO); other repos need explicit --repo." >> "$rf"
+    done
+  fi
 else
   echo "KIT ERROR: /tmp/assemble-prompt.sh not present - trusted prompt artifacts missing"
   exit 1

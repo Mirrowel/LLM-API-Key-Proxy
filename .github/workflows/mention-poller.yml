@@ -117,6 +117,11 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           HOME_OWNER: ${{ github.repository_owner }}
           FOREIGN_MENTIONS_USERS: ${{ vars.FOREIGN_MENTIONS_USERS || '' }}
+          # Guest repo rules: ordered "<owner/repo glob>:deny|allow" list,
+          # last match wins, default allow; the platform repo is hard-wired
+          # deny. Empty = guest mode everywhere except the platform repo.
+          # Mirrors the worker prefilter exactly (parity is fixture-pinned).
+          GUEST_REPO_RULES: ${{ vars.GUEST_REPO_RULES || '' }}
           # Identity + triggers (resolved below by bot-config.sh): identities =
           # BOT_IDENTITIES variable (+) the /user-detected account login;
           # fallback only when both are absent. Trigger stems = BOT_TRIGGERS

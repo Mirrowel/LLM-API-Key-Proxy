@@ -18,8 +18,8 @@ inputs:
     description: 'Optional API key to apply to the provider inferred from opencode-model.'
     required: false
   opencode-model:
-    description: 'The main model to use, in provider/model format (e.g., openai/gpt-4o).'
-    required: true
+    description: 'The main model to use, in provider/model format (e.g., openai/gpt-4o). Optional when OPENCODE_CONFIG_JSON carries its own "model" field; one of the two is required.'
+    required: false
   opencode-fast-model:
     description: 'Optional: The fast model for smaller tasks.'
     required: false
@@ -35,7 +35,7 @@ inputs:
     required: false
     default: ''
   plugins-json:
-    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under ~/.mirrobot-plugins/ for referencing from the config secret plugin array (absolute path /home/runner/.mirrobot-plugins/<path>).'
+    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under $HOME/.mirrobot-plugins/ (on GitHub-hosted runners /home/runner/.mirrobot-plugins/) for referencing from the config secret plugin array.'
     required: false
     default: ''
   plugins-json-1:
@@ -275,7 +275,28 @@ runs:
         }
 
         # --- EXECUTION ---
-        configure_model "$MAIN_MODEL" "model"
+        # Model resolution: OPENCODE_MODEL (or the per-agent override) sets
+        # the config's model key when provided; otherwise the config secret's
+        # own "model" field satisfies the requirement (one of the two must
+        # exist). The API key is applied to the active model's provider only
+        # when the OPENCODE_API_KEY secret is provided - it is never required,
+        # the key can live inside the config itself.
+        if [ -n "$MAIN_MODEL" ]; then
+          configure_model "$MAIN_MODEL" "model"
+        else
+          config_model=$(jq -r '.model // "" | select(. != "")' <<< "$CONFIG" 2>/dev/null || true)
+          if [ -n "$config_model" ] && [[ "$config_model" == */* ]]; then
+            if [ -n "$DEFAULT_API_KEY" ]; then
+              CONFIG=$(jq \
+                --arg provider "${config_model%%/*}" \
+                --arg apiKey "$DEFAULT_API_KEY" \
+                '.provider[$provider].options.apiKey = $apiKey' <<< "$CONFIG")
+            fi
+          else
+            echo "::error::No model configured: set the OPENCODE_MODEL secret (provider/model) or put a \"model\" field (provider/model format) inside OPENCODE_CONFIG_JSON. One of the two is required."
+            exit 1
+          fi
+        fi
         if [ -n "$FAST_MODEL" ]; then
           configure_model "$FAST_MODEL" "small_model"
         fi
@@ -291,16 +312,25 @@ runs:
         if ! jq -e 'has("permission")' <<< "$CONFIG" >/dev/null 2>&1; then
           echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste the permission block from .github/actions/bot-setup/permissions.example.json into the secret."
         else
-          # Drift check: warn when the secret's permission block differs from
-          # the recommended example (e.g. after the example evolves but the
-          # secret was not refreshed). Comparison is PERMISSION-ONLY by
-          # design: the example is a full-config template (providers, mcp,
-          # plugin array) and divergence anywhere else is expected, never a
-          # warning. Informational only — the secret always wins; this just
-          # makes silent drift visible.
-          if ! diff <(jq -S . <<< "$CONFIG" | jq -S '.permission') \
-                     <(jq -S '.permission // empty' "${GITHUB_ACTION_PATH}/permissions.example.json") >/dev/null 2>&1; then
-            echo "::warning::OPENCODE_CONFIG_JSON permission block differs from the example in .github/actions/bot-setup/permissions.example.json. If intentional, update the example to match; otherwise refresh the secret's permission block from the example."
+          # Drift check (deny-subset semantics): the secret's permission
+          # block must carry every DENY the recommended example carries -
+          # operator additions and stricter flips are fine and silent; a
+          # missing or loosened example deny erodes the security core and
+          # gets a warning. The warning deliberately names NOTHING (run
+          # logs are public): no rules, no sections, no specifics - just
+          # the count. Compare against the example locally to see what.
+          mismatch=$(jq -n \
+            --argjson live "$CONFIG" \
+            --slurpfile ex "${GITHUB_ACTION_PATH}/permissions.example.json" '
+            ($ex[0].permission // {}) as $e | ($live.permission // {}) as $l |
+            [ ($e | to_entries[])
+              | select(.value | type == "object") as $sec
+              | (.value | to_entries[])
+              | select(.value == "deny")
+              | select(($l[$sec.key][.key] // "") != "deny") ]
+            | length')
+          if [ "${mismatch:-0}" -gt 0 ]; then
+            echo "::warning::OPENCODE_CONFIG_JSON permission block is missing or has loosened ${mismatch} security rule(s) from the recommended profile. Details are deliberately not logged (public run logs) - compare the secret against .github/actions/bot-setup/permissions.example.json and refresh it."
           fi
         fi
 
@@ -331,9 +361,13 @@ runs:
         # two plugins claiming one path is always a config mistake).
         # Reading this directory is permission-denied in the example profile
         # and the workflows delete it after opencode boots (config and
-        # plugins are read once at startup). Plugin content is not masked
-        # (operator decision) - protection is lifecycle + read-denies.
-        # Nothing about which plugins exist is logged.
+        # plugins are read once at startup). Plugin SOURCE is add-masked:
+        # the variable values ride env dumps of later steps, and without a
+        # registered mask the whole source (operator code) would print in
+        # public run logs (live-caught 2026-09-15).
+        for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
+          [ -n "$src" ] && printf "::add-mask::%s\n" "$src"
+        done
         ALL_PLUGINS='{}'
         for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
           [ -z "$(printf '%s' "$src" | tr -d '[:space:]')" ] && continue

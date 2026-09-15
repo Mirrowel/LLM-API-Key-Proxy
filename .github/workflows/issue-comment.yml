@@ -219,7 +219,7 @@ jobs:
           total_issue_comments=$(echo "$issue_data" | jq '((.comments // []) | length)')
           echo "Debug: total issue comments before filtering = $total_issue_comments"
           comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
-          if comments=$(echo "$issue_data" | jq -r --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login // "" | ascii_downcase) as $login | ($ignore_authors | split(",") | map(select(length > 0)) | index($login)) | not)) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+          if comments=$(echo "$issue_data" | jq -r --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login // "" | ascii_downcase) as $login | ($ignore_authors | split(",") | map(select(length > 0)) | index($login)) | not)) | "- [id " + ((.id // "?") | tostring) + "] " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
             filtered_comments=$(echo "$comments" | grep -c "^- " || true)
             filtered_comments=${filtered_comments//[^0-9]/}
             [ -z "$filtered_comments" ] && filtered_comments=0
@@ -240,7 +240,7 @@ jobs:
             else
               echo "::warning::jq returned no stderr for issue comment filter"
             fi
-            comments=$(echo "$issue_data" | jq -r 'if (((.comments // []) | length) > 0) then ((.comments[]?) | "- " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end')
+            comments=$(echo "$issue_data" | jq -r 'if (((.comments // []) | length) > 0) then ((.comments[]?) | "- [id " + ((.id // "?") | tostring) + "] " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end')
             excluded_comments=0
             echo "FILTER_ERROR_COMMENTS=true" >> $GITHUB_ENV
           fi
