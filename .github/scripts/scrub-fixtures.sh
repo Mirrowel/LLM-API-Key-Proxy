@@ -1728,9 +1728,14 @@ printf 'cfg\n' > opencode.json
 printf 'wf\n' > .github/workflows/x.yml 2>/dev/null || { mkdir -p .github/workflows; printf 'wf\n' > .github/workflows/x.yml; }
 git add -A; git commit -qm base >/dev/null
 FR_OUT=$(SCRUB_REMOVALS_FILE="$FR/rem.txt" SCRUB_QUARANTINE_DIR="$FR/quar" SCRUB_TAINT_FILE="$FR/taint.txt" \
-  bash "$SCRUB" --foreign 2>&1 || true)
+  bash "$SCRUB" --foreign 2>&1)
+FR_RC=$?
 FR_REMOVED=$(grep -c "scrub: removed" "$FR/rem.txt" 2>/dev/null || echo 0)
 check "foreign scrub: removes identical-to-main AGENTS.md" yes "$(grep -q "removed ./AGENTS.md" "$FR/rem.txt" && echo yes || echo no)"
+# exit-code assert: the unbound-$taint class (live 2026-09-15) crashed the
+# foreign path AFTER the removals this section greps for - green section,
+# dead production guest mode. The rc assert is the real health check.
+check "foreign scrub: exits 0 (unbound-var class guard)" yes "$([ "$FR_RC" = 0 ] && echo yes || echo "no(rc=$FR_RC)")"
 check "foreign scrub: removes all 4 auto-load surfaces"    yes "$( [ "$FR_REMOVED" = 4 ] && echo yes || echo "no($FR_REMOVED)")"
 check "foreign scrub: .github untouched (no taint abroad)" yes "$([ ! -e "$FR/taint.txt" ] && [ -e .github/workflows/x.yml ] && echo yes || echo no)"
 check "foreign scrub: quarantine preserved as data"        yes "$(printf '%s\n' "$FR_OUT" | grep -q "readable on demand" && echo yes || echo no)"

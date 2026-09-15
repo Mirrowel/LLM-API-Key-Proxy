@@ -412,6 +412,10 @@ if [ "$FOREIGN" = 1 ]; then
   # A guest repository's .github cannot execute for us (workflows run from
   # the HOME repo) — there is no trusted base to compare against and no
   # attack surface to alarm about. Skip the taint machinery entirely.
+  # taint MUST be initialized here: the downstream consumers read it under
+  # set -u (live-caught 2026-09-15: unbound read killed every guest run
+  # after the removal phase, surfacing as the confused-emoji reaction).
+  taint=""
   echo "scrub: taint check skipped (foreign repository - its .github cannot execute here)."
 elif [ -n "$ANCHOR" ]; then
   TAINT_BASE="$ANCHOR"
@@ -536,6 +540,8 @@ elif [ -n "$tree_diff" ]; then
     echo "ℹ .github discrepancy — EXPLAINED, benign: the workspace .github differs from the ${anchor} TIP only because this branch predates recent ${anchor}-side .github changes (stale base). No commit on this branch modifies .github; merging keeps ${anchor}'s versions of every file this branch never touched. Context, not an alarm. If in doubt, compare .github against ${anchor} directly."
   } | tee -a "$TAINT_FILE"
   echo "scrub: .github tree differs from ${anchor} tip (stale base; no branch-side .github commits) — explained note recorded for the agent."
+elif [ "$FOREIGN" = 1 ]; then
+  : # foreign mode: nothing to report - the skip notice above owns this case
 else
   echo "scrub: .github/ clean vs ${TAINT_BASE_DESC} (no branch-side commits touch it)."
 fi
