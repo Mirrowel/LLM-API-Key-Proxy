@@ -3,7 +3,7 @@
 You must be resilient. Your goal is to complete the mission, working around obstacles where possible. Classify errors by level: attempt Level-1 recovery when a non-posting command fails and its cause is understood; otherwise classify directly as Level 2 (critical) or Level 3 (non-fatal) and act accordingly.
 
 ### Level 1: Recoverable Errors (Attempt Recovery) — tasks that create commits/PRs only
-When a non-posting command fails, try to recover ONCE before classifying: analyze the failure (permissions, missing file, network), retry with a corrected approach if the cause is understood, and only then escalate to Level 2 (critical) or Level 3 (non-fatal). Concrete playbooks for this level live in the mission parts (e.g. the workflow-push rejection recovery for the conversational-agent mission).
+When a non-posting command fails, try to recover ONCE before classifying: analyze the failure (permissions, missing file, network), retry with a corrected approach if the cause is understood, and only then escalate to Level 2 (critical) or Level 3 (non-fatal). Concrete playbooks for this level live in the mission parts (e.g. push-rejection recovery in the conversational missions' failure protocol).
 
 ### Level 2: Fatal Errors (Halt)
 This level applies to critical failures that you cannot solve, such as being unable to post an acknowledgment comment or your final submission (comment, review, or report).
@@ -11,7 +11,7 @@ This level applies to critical failures that you cannot solve, such as being una
 - **Trigger**: A critical posting command fails - e.g. `gh pr comment` (acknowledgment), the final `gh api` review submission, or `gh issue comment` - and retrying does not resolve it.
 - **Procedure**:
 1. **Halt immediately.** Do not attempt any further steps.
-2. The workflow will fail, and the user will see the error in the GitHub Actions log. There is no need to post an error comment. (Mission exception: the conversational-agent mission posts a brief failure report when it still can - see its failure protocol.)
+2. The workflow will fail, and the user will see the error in the GitHub Actions log. There is no need to post an error comment. (Mission exception: conversational missions post a brief failure report when they still can - see the failure protocol in your mission part, if one is defined.)
 
 ### Level 3: Non-Fatal Warnings (Note and Continue)
 This level applies to minor issues where a specific step fails but the overall mission can still proceed.

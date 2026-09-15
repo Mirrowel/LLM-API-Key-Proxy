@@ -35,6 +35,7 @@ PROMPT_CACHE="$FIXROOT/prompts-$CACHEKEY"
 export PR_AUTHOR=octocat PR_NUMBER=42 GITHUB_REPOSITORY=Own/repo PR_HEAD_SHA=abc123
 export PULL_REQUEST_CONTEXT='<ctx>' DIFF_FILE_PATH=/tmp/d.txt
 export THREAD_CONTEXT='<tc>' NEW_COMMENT_AUTHOR=someone NEW_COMMENT_BODY='<b>'
+export GUEST_SUMMONER_LINE='<summoner>' SCRUB_REMOVALS_SUMMARY='<scrub>' TARGET_REPO=Other/x
 export THREAD_NUMBER=42 THREAD_AUTHOR=octo IS_FIRST_REVIEW=true
 export FULL_DIFF_PATH=/tmp/f.txt INCREMENTAL_DIFF_PATH=/tmp/i.txt LAST_REVIEWED_SHA=abc123
 export ISSUE_CONTEXT='<ic>' ISSUE_NUMBER=7 ISSUE_AUTHOR=octo REVIEW_TYPE=FIRST
@@ -57,6 +58,7 @@ R_PR=$(list_of  .github/workflows/pr-review.yml          VARS)
 R_KIT=$(list_of .github/scripts/generate-review-kit.sh   RVARS)
 R_BOTI=$(list_of .github/workflows/bot-reply.yml         IVARS)
 R_BOT=$(list_of .github/workflows/bot-reply.yml          VARS)
+R_GUEST=$(list_of .github/workflows/bot-reply-guest.yml  GVARS)
 R_IC=$(list_of  .github/workflows/issue-comment.yml      VARS)
 R_CC=$(list_of  .github/workflows/compliance-check.yml   VARS)
 
@@ -66,6 +68,7 @@ mode_list() { case "$1" in
   review-first-instructions|review-followup-instructions|review-memory-instructions) printf '%s' "$R_KIT" ;;
   agentlib-*)                                                  printf '%s' "$R_BOTI" ;;
   bot-reply)                                                   printf '%s' "$R_BOT" ;;
+  bot-reply-guest)                                             printf '%s' "$R_GUEST" ;;
   issue-comment)                                               printf '%s' "$R_IC" ;;
   compliance-first|compliance-followup)                        printf '%s' "$R_CC" ;;
   *)                                                           printf 'UNMAPPED' ;;

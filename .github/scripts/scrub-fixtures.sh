@@ -399,7 +399,7 @@ if [ "$PARALLEL" = 1 ]; then
 # of share-filter.sh (raw share URLs must never reach the public log), every
 # agent step must pass the SHARE_LINK_PUBKEY secret, and the summary step
 # must exist to surface the encrypted block on the run page.
-for wf in pr-review bot-reply compliance-check issue-comment; do
+for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   WFF="$SCRIPT_DIR/../workflows/$wf.yml"
   # The agent-key each workflow passes to bot-setup (per-agent model
   # resolution): it must be the workflow's OWN identity, never a copy-paste
@@ -409,6 +409,7 @@ for wf in pr-review bot-reply compliance-check issue-comment; do
     bot-reply)       AGENT_KEY="bot-reply" ;;
     compliance-check) AGENT_KEY="compliance-check" ;;
     issue-comment)   AGENT_KEY="issue-comment" ;;
+    bot-reply-guest) AGENT_KEY="bot-reply" ;;  # guest lane shares the conversational model key
   esac
   check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   # opencode prints the share link on STDERR (TUI/status channel): the
@@ -456,7 +457,7 @@ if [ "$SECTION_ACTIVE" = 1 ]; then
 # of share-filter.sh (raw share URLs must never reach the public log), every
 # agent step must pass the SHARE_LINK_PUBKEY secret, and the summary step
 # must exist to surface the encrypted block on the run page.
-for wf in pr-review bot-reply compliance-check issue-comment; do
+for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   WFF="$SCRIPT_DIR/../workflows/$wf.yml"
   # The agent-key each workflow passes to bot-setup (per-agent model
   # resolution): it must be the workflow's OWN identity, never a copy-paste
@@ -466,6 +467,7 @@ for wf in pr-review bot-reply compliance-check issue-comment; do
     bot-reply)       AGENT_KEY="bot-reply" ;;
     compliance-check) AGENT_KEY="compliance-check" ;;
     issue-comment)   AGENT_KEY="issue-comment" ;;
+    bot-reply-guest) AGENT_KEY="bot-reply" ;;  # guest lane shares the conversational model key
   esac
   check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   # opencode prints the share link on STDERR (TUI/status channel): the
@@ -1325,7 +1327,7 @@ case "$a" in
   *"issues/23"*) printf '{"user":{"login":"friend"},"body":"x","pull_request":{}}' ;;
   *"/notifications?all=false"*) exit 0 ;;   # poll mode never used in fixtures
   *"--method PATCH /notifications/threads/"*) echo "ACK $a" >> "$ACK_LOG"; exit 0 ;;
-  *"workflow run bot-reply.yml"*) echo "DISPATCH $a" >> "$DISPATCH_LOG"; exit 0 ;;
+  *"workflow run bot-reply-guest.yml"*) echo "DISPATCH $a" >> "$DISPATCH_LOG"; exit 0 ;;
 esac
 exit 0
 MOCKGH
@@ -1489,7 +1491,7 @@ case "$a" in
   *"issues/23"*) printf '{"user":{"login":"friend"},"body":"x","pull_request":{}}' ;;
   *"/notifications?all=false"*) exit 0 ;;   # poll mode never used in fixtures
   *"--method PATCH /notifications/threads/"*) echo "ACK $a" >> "$ACK_LOG"; exit 0 ;;
-  *"workflow run bot-reply.yml"*) echo "DISPATCH $a" >> "$DISPATCH_LOG"; exit 0 ;;
+  *"workflow run bot-reply-guest.yml"*) echo "DISPATCH $a" >> "$DISPATCH_LOG"; exit 0 ;;
 esac
 exit 0
 MOCKGH
@@ -1618,6 +1620,64 @@ POLLWF="$SCRIPT_DIR/../workflows/mention-poller.yml"
 WORKERJS="$SCRIPT_DIR/../../tools/mention-worker/worker.js"
 check "poller: gated on FOREIGN_MENTIONS_ENABLED var"  yes "$(grep -q "vars.FOREIGN_MENTIONS_ENABLED == 'true'" "$POLLWF" && echo yes || echo no)"
 check "poller: repository_dispatch foreign-mention"    yes "$(grep -q 'foreign-mention' "$POLLWF" && echo yes || echo no)"
+# GUEST LANE SPLIT (2026-09-15): guest sessions run bot-reply-guest.yml,
+# natively guest (no home/guest conditionals to drift). The home workflow
+# must never regain guest machinery; the guest workflow must carry the
+# platform-bug guards.
+BOTWF="$SCRIPT_DIR/../workflows/bot-reply.yml"
+GUESTWF="$SCRIPT_DIR/../workflows/bot-reply-guest.yml"
+check "guest lane: bot-reply-guest.yml exists"         yes "$([ -f "$GUESTWF" ] && echo yes || echo no)"
+check "home lane: bot-reply.yml has no guest machinery" yes "$(grep -qE 'targetRepo|TARGET_REPO|GUEST_SUMMONER' "$BOTWF" && echo no || echo yes)"
+if [ -f "$GUESTWF" ]; then
+  check "guest lane: kit runs against the foreign repo"   yes "$(grep -q 'KIT_REPO="$TARGET_REPO"' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: no GITHUB_REPOSITORY override"       yes "$(grep -q 'GITHUB_REPOSITORY: \${{ inputs.targetRepo' "$GUESTWF" && echo no || echo yes)"
+  check "guest lane: foreign scrub is --foreign"          yes "$(grep -q -- '--foreign' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: post-phase action restore step"      yes "$(grep -q 'Restore local action for post phase' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: assembles the guest manifest"        yes "$(grep -q 'assemble-prompt.sh bot-reply-guest' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: guest security brief"                yes "$(grep -q 'security-brief-guest.md' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: UNIFORM checkout - default branch arm" yes "$(grep -q 'guest-default' "$GUESTWF" && grep -q 'DEFAULT_SHA' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: no API-only/no-checkout escape hatch" yes "$(grep -q 'no foreign tree in the workspace' "$GUESTWF" && echo no || echo yes)"
+  check "guest lane: real scrub removal count exported"   yes "$(grep -q 'auto-load item(s) were removed' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: GH_REPO targets the foreign repo"    yes "$( [ "$(grep -c 'GH_REPO: \${{ env.TARGET_REPO }}' "$GUESTWF")" -ge 2 ] && echo yes || echo no)"
+  check "guest lane: share-link encryption env present"   yes "$(grep -q 'SHARE_LINK_PUBKEY' "$GUESTWF" && grep -q 'SHARE_CTX_THREAD' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: issue-body eyes branch"              yes "$(grep -q 'issues/\${THREAD_NUMBER}/reactions' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: PR linked issues + cross-refs"       yes "$(grep -q 'closingIssuesReferences' "$GUESTWF" && grep -q '<cross_references>' "$GUESTWF" && echo yes || echo no)"
+fi
+check "handle-mentions dispatches the guest lane"      yes "$(grep -q 'workflow run bot-reply-guest.yml' "$SCRIPT_DIR/handle-mentions.sh" && ! grep -q 'workflow run bot-reply.yml' "$SCRIPT_DIR/handle-mentions.sh" && echo yes || echo no)"
+check "kit: KIT_REPO override supported"               yes "$(grep -q 'KIT_REPO:-\${GH_REPO' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Kit review-memory repo qualification (live-caught: guest kits baked
+# review memory from the HOME repo's same-numbered PR).
+check "kit: review-memory fetch carries QUERY_REPO"    yes "$(grep -q 'QUERY_REPO="\$REPO"' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Stems-before-revalidation (both lanes): route-comment.sh falls back to
+# stock trigger words without BOT_TRIGGER_STEMS, silently skipping every run
+# of an operator with custom BOT_TRIGGERS.
+eval_before_route() { # file -> yes/no: bot-config eval precedes the first route-comment.sh INVOCATION
+  awk '/bash \/tmp\/bot-config\.sh --export|bash \.github\/scripts\/bot-config\.sh --export/{if(!e) e=NR} /bash \.github\/scripts\/route-comment\.sh/{if(!r) r=NR} END{print (e && (!r || e<r)) ? "yes" : "no"}' "$1"
+}
+check "stems: home resolve evaluates bot-config first"   yes "$(eval_before_route "$SCRIPT_DIR/../workflows/bot-reply.yml")"
+check "stems: guest resolve evaluates bot-config first"  yes "$(eval_before_route "$SCRIPT_DIR/../workflows/bot-reply-guest.yml")"
+# Guest REST mention check uses the shared cleaning script (fences/quotes
+# stripped), not a raw grep over the body.
+check "guest: REST mention check via route-comment.sh" yes "$(grep -q 'route-comment.sh "\$is_pr"' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" && echo yes || echo no)"
+# Home PR threads scrub (was issue-only wiring; the brief claimed scrubbing).
+check "home: PR-head sessions scrub the workspace"     yes "$(grep -q 'Scrub workspace (PR head)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+# Context-channel pins (live-caught 2026-09-15: the guest assembly had NO
+# thread-context block - the entire fetched THREAD_CONTEXT was exported and
+# never printed; the placeholder-coverage check cannot see exported-but-
+# unconsumed channels). Both conversational modes MUST print the wrapper.
+check "context: home prints the thread-context channel"  yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the thread-context channel" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the summoner request block" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q 'new-request-from-user' && echo yes || echo no)"
+# Lost-in-surgery tripwires (live-caught 2026-09-15: the guest-strip deletion
+# range swallowed two HOME steps; the audit then read the post-loss state as
+# ground truth and the wiring was removed as "vestigial"). These pin the
+# presence of both restored steps so the class cannot silently recur.
+check "home: PR threads pre-generate split diffs"      yes "$(grep -q 'Generate PR Diffs (Full and Incremental)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'mirrobot_files/first_review_diff.txt' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "home: issue sessions get full-history checkout" yes "$(grep -q 'Checkout repository (for issues)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "home: PR scrub anchors at the PR base branch"   yes "$(grep -q -- '--anchor \"\${BASE_BRANCH}\"' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+# Guest pending-review hygiene + guest addendum on kit review sets.
+check "guest: clears pending bot reviews"              yes "$(grep -q 'Clear pending bot review' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" && echo yes || echo no)"
+check "guest: kit review sets get the guest addendum"  yes "$(grep -q 'GUEST SESSION ADDENDUM' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'REPO" != "\${GITHUB_REPOSITORY' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
 # GUEST_REPO_RULES parity: both layers implement last-match-wins + the
 # platform-repo hard deny; the poller passes the variable through.
 check "poller: passes GUEST_REPO_RULES env"             yes "$(grep -q 'GUEST_REPO_RULES:' "$POLLWF" && echo yes || echo no)"
@@ -1629,11 +1689,9 @@ fi
 # polling is the load the worker exists to avoid); the fallback recipe
 # stays documented in the header comment only.
 check "poller: NO schedule by default (worker-first)"  no  "$(grep -q '^  schedule:' "$POLLWF" && echo yes || echo no)"
-check "guest: home PR checkout excludes foreign"       yes "$(grep -q "IS_PR == 'true' && inputs.targetRepo == ''" "$BOTWF" && echo yes || echo no)"
-check "guest: foreign checkout exists"                 yes "$(grep -q 'Checkout foreign PR head (guest)' "$BOTWF" && echo yes || echo no)"
-check "guest: foreign scrub uses --foreign"            yes "$(grep -q 'scrub-workspace.sh --foreign' "$BOTWF" && echo yes || echo no)"
-check "guest: guest-rules prepended after brief"       yes "$(grep -q 'guest-rules.md' "$BOTWF" && grep -q 'GUEST SESSION RULES' "$BOTWF" && echo yes || echo no)"
-check "guest: rules pin allowlist authority"           yes "$(grep -q 'DATA, not DIRECTION' "$SCRIPT_DIR/../prompts/guest-rules.md" && echo yes || echo no)"
+GUESTWF2="$SCRIPT_DIR/../workflows/bot-reply-guest.yml"
+check "guest: foreign checkout TOCTOU-fails, never tip-fallback" yes "$(grep -q 'no longer fetchable' "$GUESTWF2" && grep -q -- '--force "$PR_HEAD_SHA"' "$GUESTWF2" && echo yes || echo no)"
+check "guest: rules pin allowlist authority"           yes "$(grep -q 'DATA, not DIRECTION' "$SCRIPT_DIR/../prompts/parts/mission-guest.md" && echo yes || echo no)"
 check "stub: review_requested trigger wired"           yes "$(grep -q 'review_requested' "$STUBWF" && grep -q 'REQUESTED_LOGIN' "$STUBWF" && echo yes || echo no)"
 
   fi
@@ -1647,6 +1705,64 @@ POLLWF="$SCRIPT_DIR/../workflows/mention-poller.yml"
 WORKERJS="$SCRIPT_DIR/../../tools/mention-worker/worker.js"
 check "poller: gated on FOREIGN_MENTIONS_ENABLED var"  yes "$(grep -q "vars.FOREIGN_MENTIONS_ENABLED == 'true'" "$POLLWF" && echo yes || echo no)"
 check "poller: repository_dispatch foreign-mention"    yes "$(grep -q 'foreign-mention' "$POLLWF" && echo yes || echo no)"
+# GUEST LANE SPLIT (2026-09-15): guest sessions run bot-reply-guest.yml,
+# natively guest (no home/guest conditionals to drift). The home workflow
+# must never regain guest machinery; the guest workflow must carry the
+# platform-bug guards.
+BOTWF="$SCRIPT_DIR/../workflows/bot-reply.yml"
+GUESTWF="$SCRIPT_DIR/../workflows/bot-reply-guest.yml"
+check "guest lane: bot-reply-guest.yml exists"         yes "$([ -f "$GUESTWF" ] && echo yes || echo no)"
+check "home lane: bot-reply.yml has no guest machinery" yes "$(grep -qE 'targetRepo|TARGET_REPO|GUEST_SUMMONER' "$BOTWF" && echo no || echo yes)"
+if [ -f "$GUESTWF" ]; then
+  check "guest lane: kit runs against the foreign repo"   yes "$(grep -q 'KIT_REPO="$TARGET_REPO"' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: no GITHUB_REPOSITORY override"       yes "$(grep -q 'GITHUB_REPOSITORY: \${{ inputs.targetRepo' "$GUESTWF" && echo no || echo yes)"
+  check "guest lane: foreign scrub is --foreign"          yes "$(grep -q -- '--foreign' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: post-phase action restore step"      yes "$(grep -q 'Restore local action for post phase' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: assembles the guest manifest"        yes "$(grep -q 'assemble-prompt.sh bot-reply-guest' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: guest security brief"                yes "$(grep -q 'security-brief-guest.md' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: UNIFORM checkout - default branch arm" yes "$(grep -q 'guest-default' "$GUESTWF" && grep -q 'DEFAULT_SHA' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: no API-only/no-checkout escape hatch" yes "$(grep -q 'no foreign tree in the workspace' "$GUESTWF" && echo no || echo yes)"
+  check "guest lane: real scrub removal count exported"   yes "$(grep -q 'auto-load item(s) were removed' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: GH_REPO targets the foreign repo"    yes "$( [ "$(grep -c 'GH_REPO: \${{ env.TARGET_REPO }}' "$GUESTWF")" -ge 2 ] && echo yes || echo no)"
+  check "guest lane: share-link encryption env present"   yes "$(grep -q 'SHARE_LINK_PUBKEY' "$GUESTWF" && grep -q 'SHARE_CTX_THREAD' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: issue-body eyes branch"              yes "$(grep -q 'issues/\${THREAD_NUMBER}/reactions' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: PR linked issues + cross-refs"       yes "$(grep -q 'closingIssuesReferences' "$GUESTWF" && grep -q '<cross_references>' "$GUESTWF" && echo yes || echo no)"
+fi
+check "handle-mentions dispatches the guest lane"      yes "$(grep -q 'workflow run bot-reply-guest.yml' "$SCRIPT_DIR/handle-mentions.sh" && ! grep -q 'workflow run bot-reply.yml' "$SCRIPT_DIR/handle-mentions.sh" && echo yes || echo no)"
+check "kit: KIT_REPO override supported"               yes "$(grep -q 'KIT_REPO:-\${GH_REPO' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Kit review-memory repo qualification (live-caught: guest kits baked
+# review memory from the HOME repo's same-numbered PR).
+check "kit: review-memory fetch carries QUERY_REPO"    yes "$(grep -q 'QUERY_REPO="\$REPO"' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Stems-before-revalidation (both lanes): route-comment.sh falls back to
+# stock trigger words without BOT_TRIGGER_STEMS, silently skipping every run
+# of an operator with custom BOT_TRIGGERS.
+eval_before_route() { # file -> yes/no: bot-config eval precedes the first route-comment.sh INVOCATION
+  awk '/bash \/tmp\/bot-config\.sh --export|bash \.github\/scripts\/bot-config\.sh --export/{if(!e) e=NR} /bash \.github\/scripts\/route-comment\.sh/{if(!r) r=NR} END{print (e && (!r || e<r)) ? "yes" : "no"}' "$1"
+}
+check "stems: home resolve evaluates bot-config first"   yes "$(eval_before_route "$SCRIPT_DIR/../workflows/bot-reply.yml")"
+check "stems: guest resolve evaluates bot-config first"  yes "$(eval_before_route "$SCRIPT_DIR/../workflows/bot-reply-guest.yml")"
+# Guest REST mention check uses the shared cleaning script (fences/quotes
+# stripped), not a raw grep over the body.
+check "guest: REST mention check via route-comment.sh" yes "$(grep -q 'route-comment.sh "\$is_pr"' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" && echo yes || echo no)"
+# Home PR threads scrub (was issue-only wiring; the brief claimed scrubbing).
+check "home: PR-head sessions scrub the workspace"     yes "$(grep -q 'Scrub workspace (PR head)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+# Context-channel pins (live-caught 2026-09-15: the guest assembly had NO
+# thread-context block - the entire fetched THREAD_CONTEXT was exported and
+# never printed; the placeholder-coverage check cannot see exported-but-
+# unconsumed channels). Both conversational modes MUST print the wrapper.
+check "context: home prints the thread-context channel"  yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the thread-context channel" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the summoner request block" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q 'new-request-from-user' && echo yes || echo no)"
+# Lost-in-surgery tripwires (live-caught 2026-09-15: the guest-strip deletion
+# range swallowed two HOME steps; the audit then read the post-loss state as
+# ground truth and the wiring was removed as "vestigial"). These pin the
+# presence of both restored steps so the class cannot silently recur.
+check "home: PR threads pre-generate split diffs"      yes "$(grep -q 'Generate PR Diffs (Full and Incremental)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && grep -q 'mirrobot_files/first_review_diff.txt' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "home: issue sessions get full-history checkout" yes "$(grep -q 'Checkout repository (for issues)' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "home: PR scrub anchors at the PR base branch"   yes "$(grep -q -- '--anchor \"\${BASE_BRANCH}\"' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+# Guest pending-review hygiene + guest addendum on kit review sets.
+check "guest: clears pending bot reviews"              yes "$(grep -q 'Clear pending bot review' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" && echo yes || echo no)"
+check "guest: kit review sets get the guest addendum"  yes "$(grep -q 'GUEST SESSION ADDENDUM' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q 'REPO" != "\${GITHUB_REPOSITORY' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
 # GUEST_REPO_RULES parity: both layers implement last-match-wins + the
 # platform-repo hard deny; the poller passes the variable through.
 check "poller: passes GUEST_REPO_RULES env"             yes "$(grep -q 'GUEST_REPO_RULES:' "$POLLWF" && echo yes || echo no)"
@@ -1658,11 +1774,9 @@ fi
 # polling is the load the worker exists to avoid); the fallback recipe
 # stays documented in the header comment only.
 check "poller: NO schedule by default (worker-first)"  no  "$(grep -q '^  schedule:' "$POLLWF" && echo yes || echo no)"
-check "guest: home PR checkout excludes foreign"       yes "$(grep -q "IS_PR == 'true' && inputs.targetRepo == ''" "$BOTWF" && echo yes || echo no)"
-check "guest: foreign checkout exists"                 yes "$(grep -q 'Checkout foreign PR head (guest)' "$BOTWF" && echo yes || echo no)"
-check "guest: foreign scrub uses --foreign"            yes "$(grep -q 'scrub-workspace.sh --foreign' "$BOTWF" && echo yes || echo no)"
-check "guest: guest-rules prepended after brief"       yes "$(grep -q 'guest-rules.md' "$BOTWF" && grep -q 'GUEST SESSION RULES' "$BOTWF" && echo yes || echo no)"
-check "guest: rules pin allowlist authority"           yes "$(grep -q 'DATA, not DIRECTION' "$SCRIPT_DIR/../prompts/guest-rules.md" && echo yes || echo no)"
+GUESTWF2="$SCRIPT_DIR/../workflows/bot-reply-guest.yml"
+check "guest: foreign checkout TOCTOU-fails, never tip-fallback" yes "$(grep -q 'no longer fetchable' "$GUESTWF2" && grep -q -- '--force "$PR_HEAD_SHA"' "$GUESTWF2" && echo yes || echo no)"
+check "guest: rules pin allowlist authority"           yes "$(grep -q 'DATA, not DIRECTION' "$SCRIPT_DIR/../prompts/parts/mission-guest.md" && echo yes || echo no)"
 check "stub: review_requested trigger wired"           yes "$(grep -q 'review_requested' "$STUBWF" && grep -q 'REQUESTED_LOGIN' "$STUBWF" && echo yes || echo no)"
 
 fi
@@ -1725,6 +1839,8 @@ printf 'identical to main\n' > AGENTS.md
 printf 'ok\n' > .claude/skills/x/SKILL.md
 printf 'ok\n' > .agents/skills/y/SKILL.md
 printf 'cfg\n' > opencode.json
+mkdir -p packages/tui/src/theme/assets
+printf 'theme\n' > packages/tui/src/theme/assets/opencode.json
 printf 'wf\n' > .github/workflows/x.yml 2>/dev/null || { mkdir -p .github/workflows; printf 'wf\n' > .github/workflows/x.yml; }
 git add -A; git commit -qm base >/dev/null
 FR_OUT=$(SCRUB_REMOVALS_FILE="$FR/rem.txt" SCRUB_QUARANTINE_DIR="$FR/quar" SCRUB_TAINT_FILE="$FR/taint.txt" \
@@ -1737,6 +1853,10 @@ check "foreign scrub: removes identical-to-main AGENTS.md" yes "$(grep -q "remov
 # dead production guest mode. The rc assert is the real health check.
 check "foreign scrub: exits 0 (unbound-var class guard)" yes "$([ "$FR_RC" = 0 ] && echo yes || echo "no(rc=$FR_RC)")"
 check "foreign scrub: removes all 4 auto-load surfaces"    yes "$( [ "$FR_REMOVED" = 4 ] && echo yes || echo "no($FR_REMOVED)")"
+# Root-ONLY config match: a same-named source file deep in a package tree is
+# ordinary content, not an auto-load surface (live-caught: opencode's theme
+# assets packages/{tui,ui}/src/theme/*/opencode.json were quarantined).
+check "foreign scrub: nested opencode.json source file survives" yes "$([ -f packages/tui/src/theme/assets/opencode.json ] && echo yes || echo no)"
 check "foreign scrub: .github untouched (no taint abroad)" yes "$([ ! -e "$FR/taint.txt" ] && [ -e .github/workflows/x.yml ] && echo yes || echo no)"
 check "foreign scrub: quarantine preserved as data"        yes "$(printf '%s\n' "$FR_OUT" | grep -q "readable on demand" && echo yes || echo no)"
 cd "$SRC" || true
@@ -1762,7 +1882,7 @@ done
 if [ -z "$PY_BIN" ]; then
   echo "FAIL: strict YAML check - no working python with PyYAML found"; FAIL=1
 fi
-if [ -n "$PY_BIN" ] && "$PY_BIN" - "$SCRIPT_DIR" <<'PYEOF'
+if [ -n "$PY_BIN" ] && FIXTURE_BASH="${BASH:-bash}" "$PY_BIN" - "$SCRIPT_DIR" <<'PYEOF'
 import glob, os, sys
 import yaml
 
@@ -1794,6 +1914,40 @@ for f in files:
 if bad:
     sys.exit(1)
 print("strict-yaml: %d workflow/action files parse with no duplicate keys" % len(files))
+
+# Step-shell syntax: every run: block of every job gets bash -n. A YAML-valid
+# workflow can still carry broken shell (live-caught 2026-09-15: a surgery
+# dropped a closing fi - YAML fine, every dispatch red). The bash binary is
+# passed from the outer shell ($BASH) - python's own PATH lookup may miss it.
+import subprocess, tempfile, os
+bash = os.environ.get("FIXTURE_BASH") or "bash"
+if bash is None:
+    print("SKIP: step-shell check (no bash)")
+else:
+    sbad = 0
+    schecked = 0
+    for f in files:
+        if "/workflows/" not in f.replace(os.sep, "/"):
+            continue
+        with open(f, encoding="utf-8") as fh:
+            doc = yaml.load(fh, Loader=StrictLoader)
+        for jname, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                run = step.get("run")
+                if not run:
+                    continue
+                schecked += 1
+                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8", newline="\n") as tf:
+                    tf.write(run)
+                    tmp = tf.name
+                r = subprocess.run([bash, "-n", tmp], capture_output=True, text=True)
+                os.unlink(tmp)
+                if r.returncode != 0:
+                    print("SHELL SYNTAX: %s [%s/%s]: %s" % (os.path.relpath(f, root), jname, step.get("name", "?"), r.stderr.strip()[:200]))
+                    sbad += 1
+    if sbad:
+        sys.exit(1)
+    print("step-shell: %d run blocks pass bash -n" % schecked)
 PYEOF
 then
   echo "PASS: strict YAML (workflows + actions)"
@@ -1823,7 +1977,7 @@ done
 if [ -z "$PY_BIN" ]; then
   echo "FAIL: strict YAML check - no working python with PyYAML found"; FAIL=1
 fi
-if [ -n "$PY_BIN" ] && "$PY_BIN" - "$SCRIPT_DIR" <<'PYEOF'
+if [ -n "$PY_BIN" ] && FIXTURE_BASH="${BASH:-bash}" "$PY_BIN" - "$SCRIPT_DIR" <<'PYEOF'
 import glob, os, sys
 import yaml
 
@@ -1855,6 +2009,40 @@ for f in files:
 if bad:
     sys.exit(1)
 print("strict-yaml: %d workflow/action files parse with no duplicate keys" % len(files))
+
+# Step-shell syntax: every run: block of every job gets bash -n. A YAML-valid
+# workflow can still carry broken shell (live-caught 2026-09-15: a surgery
+# dropped a closing fi - YAML fine, every dispatch red). The bash binary is
+# passed from the outer shell ($BASH) - python's own PATH lookup may miss it.
+import subprocess, tempfile, os
+bash = os.environ.get("FIXTURE_BASH") or "bash"
+if bash is None:
+    print("SKIP: step-shell check (no bash)")
+else:
+    sbad = 0
+    schecked = 0
+    for f in files:
+        if "/workflows/" not in f.replace(os.sep, "/"):
+            continue
+        with open(f, encoding="utf-8") as fh:
+            doc = yaml.load(fh, Loader=StrictLoader)
+        for jname, job in (doc.get("jobs") or {}).items():
+            for step in job.get("steps") or []:
+                run = step.get("run")
+                if not run:
+                    continue
+                schecked += 1
+                with tempfile.NamedTemporaryFile("w", suffix=".sh", delete=False, encoding="utf-8", newline="\n") as tf:
+                    tf.write(run)
+                    tmp = tf.name
+                r = subprocess.run([bash, "-n", tmp], capture_output=True, text=True)
+                os.unlink(tmp)
+                if r.returncode != 0:
+                    print("SHELL SYNTAX: %s [%s/%s]: %s" % (os.path.relpath(f, root), jname, step.get("name", "?"), r.stderr.strip()[:200]))
+                    sbad += 1
+    if sbad:
+        sys.exit(1)
+    print("step-shell: %d run blocks pass bash -n" % schecked)
 PYEOF
 then
   echo "PASS: strict YAML (workflows + actions)"
@@ -1960,10 +2148,11 @@ fi
 
 # ---- guest checkout is SHA-pinned, no ref-tip fallback ---------------------
 SECTION_NAME='guest checkout is SHA-pinned, no ref-tip fallback'
+GUESTWF3="$SCRIPT_DIR/../workflows/bot-reply-guest.yml"
 if [ "$PARALLEL" = 1 ]; then
   ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
 check "guest: TOCTOU - checkout fails instead of falling back to tip" yes \
-  "$(grep -q 'force-pushed mid-run' "$BOTWF" && ! grep -q 'checkout --quiet --force pr-head' "$BOTWF" && echo yes || echo no)"
+  "$(grep -q 'force-pushed mid-run' "$GUESTWF3" && ! grep -q 'checkout --quiet --force pr-head' "$GUESTWF3" && echo yes || echo no)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -1973,7 +2162,7 @@ else
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
 check "guest: TOCTOU - checkout fails instead of falling back to tip" yes \
-  "$(grep -q 'force-pushed mid-run' "$BOTWF" && ! grep -q 'checkout --quiet --force pr-head' "$BOTWF" && echo yes || echo no)"
+  "$(grep -q 'force-pushed mid-run' "$GUESTWF3" && ! grep -q 'checkout --quiet --force pr-head' "$GUESTWF3" && echo yes || echo no)"
 
 fi
 section_end

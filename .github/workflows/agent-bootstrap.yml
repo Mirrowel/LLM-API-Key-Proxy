@@ -108,7 +108,7 @@ jobs:
           # state for every consumer - set them only when you have content.
           declare -A DEFAULTS=(
             [AGENT_PAUSED]="false"
-            [AGENT_PAUSED_PARTS_JSON]='{"pr-review":false,"bot-reply":false,"compliance-check":false,"issue-analysis":false}'
+            [AGENT_PAUSED_PARTS_JSON]='{"pr-review":false,"bot-reply":false,"bot-reply-guest":false,"compliance-check":false,"issue-analysis":false}'
             [AGENT_MODELS_JSON]='{"pr-review":{"model":"","fast":""},"bot-reply":{"model":"","fast":""},"compliance-check":{"model":"","fast":""},"issue-comment":{"model":"","fast":""}}'
             [BOT_IDENTITIES]="$IDENT_SEED"
             [BOT_TRIGGERS]="mirrobot, mirrobot-agent"

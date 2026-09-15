@@ -361,9 +361,13 @@ runs:
         # two plugins claiming one path is always a config mistake).
         # Reading this directory is permission-denied in the example profile
         # and the workflows delete it after opencode boots (config and
-        # plugins are read once at startup). Plugin content is not masked
-        # (operator decision) - protection is lifecycle + read-denies.
-        # Nothing about which plugins exist is logged.
+        # plugins are read once at startup). Plugin SOURCE is add-masked:
+        # the variable values ride env dumps of later steps, and without a
+        # registered mask the whole source (operator code) would print in
+        # public run logs (live-caught 2026-09-15).
+        for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
+          [ -n "$src" ] && printf "::add-mask::%s\n" "$src"
+        done
         ALL_PLUGINS='{}'
         for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
           [ -z "$(printf '%s' "$src" | tr -d '[:space:]')" ] && continue

@@ -161,7 +161,7 @@ repo_allowed() { # $1 = full repo name -> 0 when guest mode may run there
     case "$entry" in
       *:deny|*:allow) ;;
       *)
-        log "guest-rules: malformed entry ignored: '$entry'"
+        log "guest-repo-rules: malformed entry ignored: '$entry'"
         continue
         ;;
     esac
@@ -271,7 +271,7 @@ while read -r n; do
       log "cap reached ($MAX_DISPATCH) - @$trig_author's $reason in $repo#$number skipped this run (already acked; re-mention to retry)."
       continue
     fi
-    if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+    if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply-guest.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
          -f "targetRepo=$repo" -f "threadNumber=$number" \
          -f "commentId=" -f "triggerKind=mention" -f "threadType=discussion"; then
       dispatched=$((dispatched + 1))
@@ -359,7 +359,7 @@ while read -r n; do
     log "cap reached ($MAX_DISPATCH) - @$trigger_author's $reason in $repo#$number skipped this run (already acked; re-mention to retry)."
     continue
   fi
-  if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
+  if GH_TOKEN="${DISPATCH_GH_TOKEN:-$GH_TOKEN}" gh workflow run bot-reply-guest.yml --repo "$GITHUB_REPOSITORY" --ref "$DEFAULT_BRANCH" \
        -f "targetRepo=$repo" -f "threadNumber=$number" \
        -f "commentId=${comment_id:-}" -f "triggerKind=$kind"; then
     dispatched=$((dispatched + 1))

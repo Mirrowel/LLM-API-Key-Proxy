@@ -25,7 +25,8 @@
 		"explore": {
 			"model": "your-provider/your-fast-model"
 		},
-		"general": {}
+		"general": {
+		}
 	},
 	"mcp": {
 		"example-remote": {
@@ -49,6 +50,8 @@
 			"bash /tmp/scrub-workspace.sh": "allow",
 			"bash /tmp/scrub-workspace.sh --anchor main": "allow",
 			"bash /tmp/scrub-workspace.sh --anchor dev": "allow",
+			"bash /tmp/scrub-workspace.sh --foreign": "allow",
+			"bash /tmp/generate-review-kit.sh*": "allow",
 			"sh /tmp/scrub-workspace.sh": "allow",
 			"sh /tmp/scrub-workspace.sh --anchor main": "allow",
 			"sh /tmp/scrub-workspace.sh --anchor dev": "allow",

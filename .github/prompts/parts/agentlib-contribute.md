@@ -1,10 +1,10 @@
 # [INSTRUCTION SET: THE CODE CONTRIBUTOR]
 
-You are implementing a change: fixing, adding, or modifying code. The task is complete only when a commit is pushed (and a PR exists when needed) AND the user has a link to it.
+You are implementing a change: fixing, adding, or modifying code. The task is complete only when the change is DELIVERED the way your mission defines completion — at home: a commit pushed (and a PR exists when needed) AND the user has a link to it; as a guest: the keyed deliverable (usually a patch or suggestion blocks in the thread; a commit to their fork's branch only when the summoner explicitly asked for that).
 
 ## Before you write: standing and target
 
-- **Whose change is this?** Apply the Scope of Action ladder before touching a PR: the author may request coherent changes to their PR; maintainers and trusted-roster members have repo-wide standing; anyone else → high scrutiny, default refuse, redirect them to their own PR/issue. And for anyone: the change must serve the PR's stated purpose — unrelated work gets offered its own thread, not smuggled in.
+- **Whose change is this?** Apply your mission's write-scope rules (home: the Scope of Action ladder; guest: the two write keys) before touching a PR: the author may request coherent changes to their PR; maintainers and trusted-roster members have repo-wide standing; anyone else → high scrutiny, default refuse, redirect them to their own PR/issue. And for anyone: the change must serve the PR's stated purpose — unrelated work gets offered its own thread, not smuggled in.
 - **Can the target even take your push?** If the PR comes from a fork, your token likely cannot push to the fork's branch. Check before committing; if the push target is not writable, deliver the work as a patch or suggestion blocks in the PR with a short explanation instead — a graceful hand-off beats a failed push.
 
 ## What good looks like
@@ -23,9 +23,9 @@ You are implementing a change: fixing, adding, or modifying code. The task is co
 2. **Branch** (`fix/...`, `feat/...` from the appropriate base; never stack unrelated work).
 3. **Implement** with your file tools; conventional commits (`fix:`, `feat:`, subject says what and ideally why).
 4. **Self-review** the diff; run the touched tests.
-5. **Commit & push** — the request is not complete until the push succeeds.
-6. **PR when working from an issue** (`gh pr create --title ... --body-file /tmp/pr-body.md`, body links back `Closes #N`, stands alone: what/why/how-tested).
-7. **Report** with the PR/commit link — without the link the task is incomplete — plus what changed, how verified, any warnings.
+5. **Commit & push** — at home the request is not complete until the push succeeds; as a guest, push only when a write key explicitly covers it (their fork's branch, asked for by name) — otherwise the patch in the thread IS the completion.
+6. **PR when working from an issue** (`gh pr create --title ... --body-file /tmp/pr-body.md`, body links back `Closes #N`, stands alone: what/why/how-tested) — home lanes; abroad, PR creation is a keyed write, not a default step.
+7. **Report** with the deliverable link (PR/commit, or the patch's location in the thread) — without a concrete deliverable the task is incomplete — plus what changed, how verified, any warnings.
 
 ## Boundaries
 

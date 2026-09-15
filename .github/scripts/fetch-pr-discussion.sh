@@ -139,8 +139,12 @@ else
   FILTER_PATTERNS_JSON="$DEFAULT_FILTER_PATTERNS_JSON"
 fi
 
-repo_owner="${GITHUB_REPOSITORY%/*}"
-repo_name="${GITHUB_REPOSITORY#*/}"
+# QUERY_REPO: optional OWNER/NAME override for guest (foreign) PR threads -
+# same pattern as minimized-nodes.sh. Never override GITHUB_REPOSITORY itself
+# (GitHub ignores GITHUB_* assignments; live-caught 2026-09-15).
+repo_target="${QUERY_REPO:-${GITHUB_REPOSITORY}}"
+repo_owner="${repo_target%/*}"
+repo_name="${repo_target#*/}"
 
 GRAPHQL_QUERY='query($owner:String!, $name:String!, $number:Int!, $commentLimit:Int!, $reviewLimit:Int!, $threadLimit:Int!, $threadCommentLimit:Int!) {
   repository(owner: $owner, name: $name) {
