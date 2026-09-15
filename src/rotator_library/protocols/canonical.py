@@ -398,13 +398,17 @@ def _is_effort_native(protocol: str) -> bool:
 
 _EFFORT_NATIVE_PROTOCOLS = {"openai_chat", "responses"}
 
-# Gemini's documented thinkingLevel vocabulary (the four level spellings the
-# API accepts). This is NOT a second declaration surface: models declare
-# ``effort_accept`` and the effort chain folds incoming words into it before
-# any build runs — this set only says which canonical words have a LEVEL
-# spelling on the wire at all. A model declaring ``thinking_dialect: "budget"``
-# never reaches it (the budget-only branch below).
-_GEMINI_THINKING_LEVEL_WORDS = frozenset({"minimal", "low", "medium", "high"})
+# The gemini protocol's SPELLING table: which canonical effort words have a
+# thinkingLevel spelling on the wire. The protocol is a translator, not an
+# oracle — this says how to SPELL a word the declarations already accepted
+# (``effort_accept`` folded the incoming word before any build; a
+# ``thinking_dialect: "budget"`` model never reaches the level branch). For
+# an UNDECLARED model — a new Google release before a row lands, or any
+# non-Google model behind a gemini-shaped gateway — spelling-driven literal
+# translation is the protocol's honest job, disclosed once per request so
+# the maintainer knows a declaration (or a model-database row) would
+# tighten it.
+_GEMINI_LEVEL_SPELLINGS = frozenset({"minimal", "low", "medium", "high"})
 
 
 def _declared_capability(capabilities: Any, key: str) -> Any:
@@ -418,6 +422,24 @@ def _declared_capability(capabilities: Any, key: str) -> Any:
     if isinstance(capabilities, Mapping):
         return capabilities.get(key)
     return None
+
+
+def _dialect_undeclared(capabilities: Any) -> bool:
+    """Whether the model declared NO thinking capability at all.
+
+    The translator-not-oracle disclosure: a model with no thinking
+    declaration (a new release before a row lands, any non-Google model
+    behind a gemini-shaped gateway) is translated literally — correct by
+    construction, but the maintainer should know a declaration would
+    tighten dialect, vocabulary, and bounds.
+    """
+
+    if not isinstance(capabilities, Mapping):
+        return True
+    for key in ("thinking_dialect", "thinking_budget_range", "effort_accept"):
+        if capabilities.get(key) is not None:
+            return False
+    return True
 
 
 def _declared_budget_range(capabilities: Any) -> Optional[tuple[int, int]]:
@@ -783,12 +805,20 @@ def format_reasoning_controls(
             thinking_config["thinkingBudget"] = budget
         elif effort is not None:
             value, coerced = _effort_or_approximation()
-            if not budget_only and str(value).lower() in _GEMINI_THINKING_LEVEL_WORDS:
-                # thinkingLevel is the native lever — in-vocabulary efforts
-                # map EXACTLY (no budget approximation needed). Case follows
-                # the Gemini API REST reference examples (lowercase JSON
-                # strings; the parser accepts either case).
+            if not budget_only and str(value).lower() in _GEMINI_LEVEL_SPELLINGS:
+                # thinkingLevel is the native lever — a word with a level
+                # spelling maps EXACTLY (no budget approximation needed).
+                # Declared models arrive here pre-folded by effort_accept;
+                # undeclared models get literal translation, disclosed once.
+                # Case follows the Gemini API REST reference examples
+                # (lowercase JSON strings; the parser accepts either case).
                 thinking_config["thinkingLevel"] = str(value).lower()
+                if _dialect_undeclared(capabilities):
+                    _warn(
+                        "reasoning_undeclared_model",
+                        "model declares no thinking capability — translating reasoning controls literally; a model_rules row (or the model database) would tighten this",
+                        "reasoning.effort",
+                    )
             else:
                 approximated = budget_tokens_from_effort(value)
                 if declared_range is not None:
