@@ -31,15 +31,6 @@ console = Console()
 # Sentinel value for distinguishing "no pending change" from "pending change to None"
 _NOT_FOUND = object()
 
-# Import default OAuth port values from provider modules
-# These serve as the source of truth for default port values
-try:
-    from rotator_library.providers.gemini_auth_base import GeminiAuthBase
-
-    GEMINI_CLI_DEFAULT_OAUTH_PORT = GeminiAuthBase.CALLBACK_PORT
-except ImportError:
-    GEMINI_CLI_DEFAULT_OAUTH_PORT = 8085
-
 def clear_screen(subtitle: str = ""):
     """
     Cross-platform terminal clear with optional header.
@@ -493,59 +484,8 @@ class PriorityMultiplierManager:
 # PROVIDER-SPECIFIC SETTINGS DEFINITIONS
 # =============================================================================
 
-# Gemini CLI provider environment variables
-GEMINI_CLI_SETTINGS = {
-    "GEMINI_CLI_SIGNATURE_CACHE_TTL": {
-        "type": "int",
-        "default": 3600,
-        "description": "Memory cache TTL for thought signatures (seconds)",
-    },
-    "GEMINI_CLI_SIGNATURE_DISK_TTL": {
-        "type": "int",
-        "default": 86400,
-        "description": "Disk cache TTL for thought signatures (seconds)",
-    },
-    "GEMINI_CLI_PRESERVE_THOUGHT_SIGNATURES": {
-        "type": "bool",
-        "default": True,
-        "description": "Preserve thought signatures in client responses",
-    },
-    "GEMINI_CLI_ENABLE_SIGNATURE_CACHE": {
-        "type": "bool",
-        "default": True,
-        "description": "Enable signature caching for multi-turn conversations",
-    },
-    "GEMINI_CLI_GEMINI3_TOOL_FIX": {
-        "type": "bool",
-        "default": True,
-        "description": "Enable Gemini 3 tool hallucination prevention",
-    },
-    "GEMINI_CLI_GEMINI3_TOOL_PREFIX": {
-        "type": "str",
-        "default": "gemini3_",
-        "description": "Prefix added to tool names for Gemini 3 disambiguation",
-    },
-    "GEMINI_CLI_GEMINI3_DESCRIPTION_PROMPT": {
-        "type": "str",
-        "default": "\n\nSTRICT PARAMETERS: {params}.",
-        "description": "Template for strict parameter hints in tool descriptions",
-    },
-    "GEMINI_CLI_PROJECT_ID": {
-        "type": "str",
-        "default": "",
-        "description": "GCP Project ID for paid tier users (required for paid tiers)",
-    },
-    "GEMINI_CLI_OAUTH_PORT": {
-        "type": "int",
-        "default": GEMINI_CLI_DEFAULT_OAUTH_PORT,
-        "description": "Local port for OAuth callback server during authentication",
-    },
-}
-
 # Map provider names to their settings definitions
-PROVIDER_SETTINGS_MAP = {
-    "gemini_cli": GEMINI_CLI_SETTINGS,
-}
+PROVIDER_SETTINGS_MAP = {}
 
 
 class ProviderSettingsManager:
@@ -1407,7 +1347,7 @@ class SettingsTool:
             input("Press Enter to continue...")
 
     def manage_provider_settings(self):
-        """Manage provider-specific settings (Gemini CLI)"""
+        """Manage provider-specific settings."""
         while True:
             clear_screen()
 

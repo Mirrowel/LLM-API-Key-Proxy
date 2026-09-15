@@ -36,7 +36,8 @@ from .models import ModelResolver
 from .transforms import ProviderTransforms
 from .executor import RequestExecutor
 from .anthropic import AnthropicHandler
-from .scopes import ScopeManager
+from .gemini import GeminiHandler
+from .scopes import NO_AUTH_CREDENTIAL, ScopeManager
 from .model_discovery import ModelDiscoveryService
 from .usage_managers import UsageManagerRegistry
 from .request_builder import RequestContextBuilder
@@ -57,10 +58,51 @@ from ..failure_logger import configure_failure_logger
 # Import new usage package
 from ..usage import UsageManager as NewUsageManager
 
-if TYPE_CHECKING:
-    from ..anthropic_compat import AnthropicMessagesRequest, AnthropicCountTokensRequest
-
 lib_logger = logging.getLogger("rotator_library")
+
+
+def _resolve_session_persistence_settings(
+    enabled: Optional[bool],
+    flush_interval_seconds: Optional[float],
+) -> tuple[bool, float]:
+    """Resolve explicit session-persistence settings before environment defaults."""
+
+    if enabled is None:
+        enabled = os.getenv(
+            "SESSION_PERSISTENCE_ENABLED",
+            "false",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+    if flush_interval_seconds is None:
+        raw_flush_interval = os.getenv(
+            "SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS",
+            "5.0",
+        )
+        try:
+            flush_interval_seconds = max(0.0, float(raw_flush_interval))
+        except (TypeError, ValueError):
+            flush_interval_seconds = 5.0
+            lib_logger.warning(
+                "Invalid SESSION_PERSISTENCE_FLUSH_INTERVAL_SECONDS=%r; using 5.0",
+                raw_flush_interval,
+            )
+    return enabled, float(flush_interval_seconds)
+
+
+def _add_configured_no_auth_credentials(
+    credentials: Dict[str, List[str]],
+    provider_names: set[str],
+    *,
+    config: Any = None,
+) -> None:
+    """Give configured no-auth providers one internal rotation/accounting slot."""
+
+    from ..config.experimental import get_provider_runtime_config, load_experimental_config
+
+    active = config or load_experimental_config()
+    for provider in provider_names:
+        runtime = get_provider_runtime_config(provider, config=active)
+        if runtime.api_base and runtime.auth_mode == "none" and not credentials.get(provider):
+            credentials[provider] = [NO_AUTH_CREDENTIAL]
 
 
 class RotatingClient:
@@ -99,8 +141,8 @@ class RotatingClient:
         rotation_tolerance: float = DEFAULT_ROTATION_TOLERANCE,
         data_dir: Optional[Union[str, Path]] = None,
         session_stickiness_ttl_seconds: int = 3600,
-        session_persistence_enabled: bool = False,
-        session_persistence_flush_interval_seconds: float = 5.0,
+        session_persistence_enabled: Optional[bool] = None,
+        session_persistence_flush_interval_seconds: Optional[float] = None,
     ):
         """
         Initialize the RotatingClient.
@@ -109,6 +151,16 @@ class RotatingClient:
         """
         # Resolve data directory
         self.data_dir = Path(data_dir).resolve() if data_dir else get_default_root()
+        from ..config.experimental import load_experimental_config
+
+        self._experimental_config = load_experimental_config()
+        (
+            session_persistence_enabled,
+            session_persistence_flush_interval_seconds,
+        ) = _resolve_session_persistence_settings(
+            session_persistence_enabled,
+            session_persistence_flush_interval_seconds,
+        )
 
         # Configure logging
         configure_failure_logger(get_logs_dir(self.data_dir))
@@ -131,11 +183,6 @@ class RotatingClient:
         api_keys = {p: k for p, k in api_keys.items() if k}
         oauth_credentials = {p: c for p, c in oauth_credentials.items() if c}
 
-        if not api_keys and not oauth_credentials:
-            lib_logger.warning(
-                "No provider credentials configured. Client will be unable to make requests."
-            )
-
         # Discover OAuth credentials if not provided
         if oauth_credentials:
             self.oauth_credentials = oauth_credentials
@@ -151,6 +198,15 @@ class RotatingClient:
             self.all_credentials.setdefault(provider, []).extend(keys)
         for provider, paths in self.oauth_credentials.items():
             self.all_credentials.setdefault(provider, []).extend(paths)
+        _add_configured_no_auth_credentials(
+            self.all_credentials,
+            set(PROVIDER_PLUGINS),
+            config=self._experimental_config,
+        )
+        if not self.all_credentials:
+            lib_logger.warning(
+                "No provider credentials configured. Client will be unable to make requests."
+            )
 
         self.api_keys = api_keys
         self.oauth_providers = set(self.oauth_credentials.keys())
@@ -276,6 +332,7 @@ class RotatingClient:
             litellm_provider_params=self.litellm_provider_params,
             litellm_logger_fn=self._litellm_logger_fn,
             provider_instances=self._provider_instances,
+            experimental_config=self._experimental_config,
         )
 
         self._model_list_cache: Dict[str, List[str]] = {}
@@ -321,6 +378,7 @@ class RotatingClient:
 
         # Initialize Anthropic compatibility handler
         self._anthropic_handler = AnthropicHandler(self)
+        self._gemini_handler = GeminiHandler(self)
 
     @staticmethod
     def _normalize_mode_concurrency(values: Dict[str, Dict[str, int]]) -> None:
@@ -529,15 +587,43 @@ class RotatingClient:
             classifier, provider=provider, include_secrets=include_secrets
         )
 
+    async def agenerate(
+        self,
+        payload: Dict[str, Any],
+        *,
+        input_protocol: str,
+        request: Optional[Any] = None,
+        pre_request_callback: Optional[callable] = None,
+        **routing_kwargs: Any,
+    ) -> Union[Any, AsyncGenerator[str, None]]:
+        """Execute a generative request in the client's own wire protocol.
+
+        Provider selection is still driven by the request model and existing
+        routing controls. Providers receive only their declared native format;
+        the client response protocol equals the client request protocol (D1).
+        """
+
+        kwargs = dict(payload)
+        kwargs.update(routing_kwargs)
+        kwargs["_input_protocol"] = input_protocol
+        return await self.acompletion(
+            request=request,
+            pre_request_callback=pre_request_callback,
+            **kwargs,
+        )
+
     async def acompletion(
         self,
         request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Union[Any, AsyncGenerator[str, None]]:
+        request_context_callback = kwargs.pop("_request_context_callback", None)
         context = await self._request_builder.build_completion_context(
             request, pre_request_callback, kwargs
         )
+        if callable(request_context_callback):
+            request_context_callback(context)
         return await self._executor.execute(context)
 
     async def aembedding(
@@ -569,6 +655,37 @@ class RotatingClient:
             raise ValueError("Either 'text' or 'messages' must be provided")
 
         return base_count
+
+    async def gemini_generate(
+        self,
+        payload: Dict[str, Any],
+        *,
+        model: str,
+        raw_request: Optional[Any] = None,
+    ) -> Any:
+        """Execute a native Gemini client request through shared routing."""
+
+        return await self._gemini_handler.generate(payload, model=model, raw_request=raw_request)
+
+    async def gemini_stream_generate(
+        self,
+        payload: Dict[str, Any],
+        *,
+        model: str,
+        raw_request: Optional[Any] = None,
+    ) -> Any:
+        """Execute a Gemini streamGenerateContent request through shared routing."""
+
+        return await self._gemini_handler.stream_generate(
+            payload,
+            model=model,
+            raw_request=raw_request,
+        )
+
+    def gemini_count_tokens(self, payload: Dict[str, Any], *, model: str) -> Dict[str, int]:
+        """Return Gemini-compatible local token usage for a request."""
+
+        return self._gemini_handler.count_tokens(payload, model=model)
 
     def _model_cache_key(
         self,
@@ -674,7 +791,10 @@ class RotatingClient:
         if provider not in self._provider_instances:
             plugin_class = self._provider_plugins.get(provider)
             if plugin_class:
-                self._provider_instances[provider] = plugin_class()
+                instance = plugin_class()
+                if hasattr(instance, "bind_runtime_config"):
+                    instance.bind_runtime_config(self._experimental_config)
+                self._provider_instances[provider] = instance
             else:
                 return None
 
@@ -793,26 +913,17 @@ class RotatingClient:
 
     async def anthropic_messages(
         self,
-        request: "AnthropicMessagesRequest",
+        request: Dict[str, Any],
         raw_request: Optional[Any] = None,
-        pre_request_callback: Optional[callable] = None,
+        pre_request_callback: Optional[Any] = None,
     ) -> Any:
+        """Execute an Anthropic Messages request through the protocol runtime.
+
+        Accepts the raw /v1/messages payload (dict); the anthropic_messages
+        adapter owns validation and any conversion, and the response returns
+        in Anthropic Messages format (non-streaming dict or SSE generator).
         """
-        Handle Anthropic Messages API requests.
 
-        This method accepts requests in Anthropic's format, translates them to
-        OpenAI format internally, processes them through the existing acompletion
-        method, and returns responses in Anthropic's format.
-
-        Args:
-            request: An AnthropicMessagesRequest object
-            raw_request: Optional raw request object for disconnect checks
-            pre_request_callback: Optional async callback before each API request
-
-        Returns:
-            For non-streaming: dict in Anthropic Messages format
-            For streaming: AsyncGenerator yielding Anthropic SSE format strings
-        """
         return await self._anthropic_handler.messages(
             request=request,
             raw_request=raw_request,
@@ -821,18 +932,8 @@ class RotatingClient:
 
     async def anthropic_count_tokens(
         self,
-        request: "AnthropicCountTokensRequest",
+        request: Dict[str, Any],
     ) -> dict:
-        """
-        Handle Anthropic count_tokens API requests.
+        """Count tokens for an Anthropic Messages request locally."""
 
-        Counts the number of tokens that would be used by a Messages API request.
-        This is useful for estimating costs and managing context windows.
-
-        Args:
-            request: An AnthropicCountTokensRequest object
-
-        Returns:
-            Dict with input_tokens count in Anthropic format
-        """
         return await self._anthropic_handler.count_tokens(request=request)

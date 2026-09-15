@@ -52,11 +52,11 @@ from typing import (
 import httpx
 import litellm
 
-from .provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
+from ..provider_interface import ProviderInterface, UsageResetConfigDef, QuotaGroupMap
 from .antigravity_auth_base import AntigravityAuthBase
-from .provider_cache import ProviderCache
-from .utilities.antigravity_quota_tracker import AntigravityQuotaTracker
-from .utilities.gemini_shared_utils import (
+from ..provider_cache import ProviderCache
+from .antigravity_quota_tracker import AntigravityQuotaTracker
+from .gemini_shared_utils import (
     env_bool,
     env_int,
     inline_schema_refs,
@@ -70,16 +70,16 @@ from .utilities.gemini_shared_utils import (
     TIER_PRIORITIES,
     DEFAULT_TIER_PRIORITY,
 )
-from ..transaction_logger import AntigravityProviderLogger
-from .utilities.gemini_tool_handler import GeminiToolHandler
-from .utilities.gemini_credential_manager import GeminiCredentialManager
-from ..model_definitions import ModelDefinitions
-from ..timeout_config import TimeoutConfig
-from ..error_handler import EmptyResponseError, TransientQuotaError
-from ..utils.paths import get_logs_dir, get_cache_dir
+from ...transaction_logger import AntigravityProviderLogger
+from .gemini_tool_handler import GeminiToolHandler
+from .gemini_credential_manager import GeminiCredentialManager
+from ...model_definitions import ModelDefinitions
+from ...timeout_config import TimeoutConfig
+from ...error_handler import EmptyResponseError, TransientQuotaError
+from ...utils.paths import get_logs_dir, get_cache_dir
 
 if TYPE_CHECKING:
-    from ..usage import UsageManager
+    from ...usage import UsageManager
 
 
 # =============================================================================
@@ -1613,7 +1613,7 @@ class AntigravityProvider(
             email = self._get_credential_email(credential_path)
             if email:
                 try:
-                    from .utilities.device_profile import (
+                    from .device_profile import (
                         get_or_create_fingerprint,
                         build_fingerprint_headers,
                     )

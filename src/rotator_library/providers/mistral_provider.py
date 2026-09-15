@@ -16,6 +16,14 @@ class MistralProvider(ProviderInterface):
     """
     Provider implementation for the Mistral API.
     """
+    protocol_name = "openai_chat"
+    native_streaming_supported = True
+    default_api_base = "https://api.mistral.ai/v1"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        base = self.get_provider_api_base()
+        return f"{base}/chat/completions"
+
 
     MISTRAL_MODEL_PATTERNS = [
         "mistral-medium",

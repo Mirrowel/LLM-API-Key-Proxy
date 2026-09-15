@@ -42,9 +42,14 @@ def _make_client(tmp_path, **kwargs):
     )
 
 
-def test_default_completion_keeps_backward_compatible_global_pool(tmp_path):
+def test_default_completion_keeps_backward_compatible_global_pool(tmp_path, monkeypatch):
     captured = {}
     client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
+    # W11: openai is native-by-default; this fixture pins the LiteLLM
+    # backward-compat path, so the protocol declaration is disabled for it.
+    from rotator_library.providers import PROVIDER_PLUGINS
+
+    monkeypatch.setattr(PROVIDER_PLUGINS["openai"](), "protocol_name", None, raising=False)
 
     async def fake_acompletion(**kwargs):
         captured.update(kwargs)
@@ -147,12 +152,12 @@ def test_streaming_scoped_completion_resolves_secret_at_call_boundary(tmp_path):
         captured.update(kwargs)
         return fake_stream()
 
-    async def fake_wrap_stream(
-        self, stream, credential, model, request, cred_context, **kwargs
+    async def fake_pipeline_run(
+        self, event_source, *, usage_provider=None,
     ):
-        wrapped["credential"] = credential
-        wrapped["model"] = model
-        wrapped["stream"] = stream
+        wrapped["credential"] = getattr(self.cred_context, "stable_id", None)
+        wrapped["model"] = self.model
+        wrapped["stream"] = event_source
         yield "data: [DONE]\n\n"
 
     async def run_test():
@@ -163,8 +168,8 @@ def test_streaming_scoped_completion_resolves_secret_at_call_boundary(tmp_path):
                     fake_acompletion,
                 ),
                 patch(
-                    "rotator_library.client.executor.StreamingHandler.wrap_stream",
-                    fake_wrap_stream,
+                    "rotator_library.client.executor.NeutralStreamPipeline.run",
+                    fake_pipeline_run,
                 ),
             ):
                 stream = await client.acompletion(
@@ -186,7 +191,8 @@ def test_streaming_scoped_completion_resolves_secret_at_call_boundary(tmp_path):
     assert captured["api_key"] == "stream-secret"
     assert captured["stream"] is True
     assert captured["api_base"] == "https://stream.example/v1"
-    assert wrapped["credential"].startswith("private:")
+    # The stream layer sees the credential's stable identity, never the secret.
+    assert wrapped["credential"]
     assert wrapped["credential"] != "stream-secret"
 
 
@@ -608,6 +614,37 @@ def test_scoped_usage_manager_inherits_rotation_tolerance_and_reset_config(tmp_p
     run_async(run_test())
 
 
+def test_ad_hoc_private_bundles_never_share_usage_manager_state(tmp_path):
+    client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
+
+    async def run_test():
+        try:
+            first = await client._resolve_scope_for_provider(
+                "openai",
+                None,
+                {"openai": ["private-secret-a"]},
+                None,
+                True,
+            )
+            second = await client._resolve_scope_for_provider(
+                "openai",
+                None,
+                {"openai": ["private-secret-b"]},
+                None,
+                True,
+            )
+
+            assert first["usage_manager_key"] != second["usage_manager_key"]
+            assert first["classifier"].startswith("bundle:")
+            assert second["classifier"].startswith("bundle:")
+            assert first["usage_manager_key"] in client.usage_managers
+            assert second["usage_manager_key"] in client.usage_managers
+        finally:
+            await _close(client)
+
+    run_async(run_test())
+
+
 def test_model_discovery_cache_key_changes_with_scoped_credentials(tmp_path):
     seen = []
 
@@ -675,7 +712,8 @@ def test_usage_registry_scope_paths_do_not_depend_on_scope_manager_construction_
     run_async(run_test())
 
 
-def test_provider_config_override_routes_without_global_mutation(tmp_path):
+def test_provider_config_override_routes_without_global_mutation(tmp_path, monkeypatch):
+    monkeypatch.delenv("LOGFARE_API_BASE", raising=False)
     client = _make_client(tmp_path, api_keys={"openai": ["global-openai-key"]})
 
     try:

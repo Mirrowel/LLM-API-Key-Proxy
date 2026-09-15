@@ -41,7 +41,7 @@ class SequentialStrategy:
     def __init__(
         self,
         fallback_multiplier: int = 1,
-        sticky_entry_ttl_seconds: int = 3600,
+        sticky_entry_ttl_seconds: int = 300,
         max_sticky_entries: int = 10000,
     ):
         """
@@ -52,7 +52,7 @@ class SequentialStrategy:
                 when not explicitly configured
         """
         self.fallback_multiplier = fallback_multiplier
-        self.sticky_entry_ttl_seconds = max(1, sticky_entry_ttl_seconds)
+        self.sticky_entry_ttl_seconds = max(0, sticky_entry_ttl_seconds)
         self.max_sticky_entries = max(100, max_sticky_entries)
         # Track current "sticky" credential per model session or model-group fallback.
         self._current: Dict[tuple, _StickyEntry] = {}
@@ -126,7 +126,7 @@ class SequentialStrategy:
             )
 
         # Make it sticky
-        if selected:
+        if selected and self.sticky_entry_ttl_seconds > 0:
             self._current[key] = _StickyEntry(selected, now)
             self._trim_sticky()
             masked = (
@@ -204,10 +204,13 @@ class SequentialStrategy:
         """
         with self._lock:
             key = (provider, model_or_group, session_id or "__default__")
+            if self.sticky_entry_ttl_seconds <= 0:
+                self._current.pop(key, None)
+                return None
             entry = self._current.get(key)
             if not entry:
                 return None
-            if time.time() - entry.last_seen > self.sticky_entry_ttl_seconds:
+            if time.time() - entry.last_seen >= self.sticky_entry_ttl_seconds:
                 del self._current[key]
                 return None
             return entry.credential
@@ -215,10 +218,13 @@ class SequentialStrategy:
     def _prune_sticky(self, now: float) -> None:
         # Locking contract: callers must hold self._lock. This helper is kept
         # private so select/get_current can batch prune + selection atomically.
+        if self.sticky_entry_ttl_seconds <= 0:
+            self._current.clear()
+            return
         expired = [
             key
             for key, entry in self._current.items()
-            if now - entry.last_seen > self.sticky_entry_ttl_seconds
+            if now - entry.last_seen >= self.sticky_entry_ttl_seconds
         ]
         for key in expired:
             del self._current[key]

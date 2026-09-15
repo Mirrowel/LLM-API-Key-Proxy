@@ -212,7 +212,7 @@ class HookDispatcher:
         behavior for request counting, cooldowns, or exhaustion marking.
 
         Args:
-            provider: Provider name (e.g., "gemini_cli", "openai")
+            provider: Provider name (e.g., "openai", "anthropic")
             credential: Credential accessor (file path or API key)
             model: Model that was called (with provider prefix)
             success: Whether the request succeeded

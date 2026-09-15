@@ -5,7 +5,8 @@
 """
 Raw I/O Logger for the Proxy Layer.
 
-This logger captures the UNMODIFIED HTTP request and response at the proxy boundary.
+This logger captures HTTP request and response data at the proxy boundary while
+always redacting authentication headers.
 It is disabled by default and should only be enabled for debugging the proxy itself.
 
 Use this when you need to:
@@ -18,7 +19,7 @@ TransactionLogger in the rotator_library instead (enabled via --enable-request-l
 
 Directory structure:
     logs/raw_io/{YYYYMMDD_HHMMSS}_{request_id}/
-        request.json           # Unmodified incoming HTTP request
+        request.json           # Incoming request with auth headers redacted
         streaming_chunks.jsonl # If streaming mode
         final_response.json    # Unmodified outgoing HTTP response
         metadata.json          # Summary metadata
@@ -27,7 +28,7 @@ Directory structure:
 import json
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 import logging
@@ -52,8 +53,8 @@ class RawIOLogger:
     """
     Logs raw HTTP request/response at the proxy boundary.
 
-    This captures the EXACT data as received from and sent to the client,
-    without any transformations. Useful for debugging the proxy itself.
+    Payloads remain otherwise unchanged, but bearer credentials and cookies are
+    never persisted. Useful for debugging the proxy itself.
 
     DISABLED by default. Enable with --enable-raw-logging flag.
 
@@ -95,18 +96,38 @@ class RawIOLogger:
         self.streaming = body.get("stream", False)
         request_data = {
             "request_id": self.request_id,
-            "timestamp_utc": datetime.utcnow().isoformat(),
-            "headers": dict(headers),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "headers": self._redact_headers(headers),
             "body": body,
         }
         self._write_json("request.json", request_data)
+
+    @staticmethod
+    def _redact_headers(headers: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove transport credentials while preserving header structure."""
+
+        sensitive = {
+            "authorization",
+            "cookie",
+            "proxy-authorization",
+            "set-cookie",
+            "x-api-key",
+            "x-proxy-session-domain",
+        }
+        return {
+            key: "<redacted>" if str(key).lower() in sensitive else value
+            for key, value in headers.items()
+        }
 
     def log_stream_chunk(self, chunk: Dict[str, Any]):
         """Logs an individual chunk from a streaming response to a JSON Lines file."""
         if not self._dir_available:
             return
 
-        log_entry = {"timestamp_utc": datetime.utcnow().isoformat(), "chunk": chunk}
+        log_entry = {
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+            "chunk": chunk,
+        }
         content = json.dumps(log_entry, ensure_ascii=False) + "\n"
         safe_log_write(self.log_dir / "streaming_chunks.jsonl", content, logging)
 
@@ -119,10 +140,10 @@ class RawIOLogger:
 
         response_data = {
             "request_id": self.request_id,
-            "timestamp_utc": datetime.utcnow().isoformat(),
+            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "status_code": status_code,
             "duration_ms": round(duration_ms),
-            "headers": dict(headers) if headers else None,
+            "headers": self._redact_headers(headers) if headers else None,
             "body": body,
         }
         self._write_json("final_response.json", response_data)

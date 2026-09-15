@@ -3,11 +3,9 @@
 
 # src/rotator_library/provider_factory.py
 
-from .providers.gemini_auth_base import GeminiAuthBase
-
-PROVIDER_MAP = {
-    "gemini_cli": GeminiAuthBase,
-}
+# OAuth providers are intentionally opt-in here. Retired OAuth providers live in
+# providers/_retired and must not be imported by active startup paths.
+PROVIDER_MAP = {}
 
 def get_provider_auth_class(provider_name: str):
     """

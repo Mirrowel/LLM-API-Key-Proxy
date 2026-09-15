@@ -33,6 +33,14 @@ class FirmwareProvider(FirmwareQuotaTracker, ProviderInterface):
     """
     Provider implementation for the Firmware.ai API with quota tracking.
     """
+    protocol_name = "openai_chat"
+    native_streaming_supported = True
+    default_api_base = "https://app.firmware.ai/api/v1"
+
+    def get_native_endpoint(self, model: str = "", operation: str = "chat") -> str:
+        base = self.get_provider_api_base()
+        return f"{base}/chat/completions"
+
 
     # Quota groups for tracking 5-hour rolling window limits
     # Uses a virtual model "firmware/_quota" for credential-level quota tracking

@@ -81,7 +81,6 @@ NATIVE_PROVIDER_PRIORITY = [
 #
 PROVIDER_ALIASES = {
     "nvidia_nim": ["nvidia"],
-    "gemini_cli": ["google"],
     "gemini": ["google"],
 }
 
@@ -1115,7 +1114,6 @@ class ModelRegistry:
 
         Examples:
             nvidia_nim/mistralai/model -> nvidia/mistralai/model
-            gemini_cli/gemini-2.5-flash -> google/gemini-2.5-flash
             gemini/gemini-2.5-pro -> google/gemini-2.5-pro
         """
         parts = model_id.split("/")
@@ -1256,6 +1254,63 @@ class ModelRegistry:
             cache_creation_tokens,
         )
 
+    def estimate_cost(
+        self,
+        model_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> Dict[str, Any]:
+        """Estimate a cost with graceful degradation.
+
+        Tries the enriched registry first, then LiteLLM's model info, and
+        finally reports unknown pricing — never raises.
+        """
+
+        result: Dict[str, Any] = {
+            "cost": None,
+            "currency": "USD",
+            "pricing": {},
+            "source": None,
+        }
+        try:
+            cost = self.calculate_cost(
+                model_id,
+                prompt_tokens,
+                completion_tokens,
+                cache_read_tokens,
+                cache_creation_tokens,
+            )
+            if cost is not None:
+                result["cost"] = cost
+                result["pricing"] = self.get_cost_info(model_id) or {}
+                result["source"] = "model_info_service"
+                return result
+        except Exception:
+            pass
+
+        try:
+            import litellm
+
+            model_info = litellm.get_model_info(model_id)
+            input_cost = model_info.get("input_cost_per_token", 0)
+            output_cost = model_info.get("output_cost_per_token", 0)
+            if input_cost or output_cost:
+                result["cost"] = (prompt_tokens * input_cost) + (completion_tokens * output_cost)
+                result["pricing"] = {
+                    "input_cost_per_token": input_cost,
+                    "output_cost_per_token": output_cost,
+                }
+                result["source"] = "litellm_fallback"
+                return result
+        except Exception:
+            pass
+
+        result["source"] = "unknown"
+        result["error"] = "Pricing data not available for this model"
+        return result
+
     def enrich_model_list(self, model_ids: List[str]) -> List[Dict[str, Any]]:
         """Alias for enrich_models() - backward compatibility."""
         return self.enrich_models(model_ids)
@@ -1323,6 +1378,22 @@ class _CompatibilityWrapper:
         cache_creation_tokens: int = 0,
     ) -> Optional[float]:
         return self._reg.compute_cost(
+            model_id,
+            prompt_tokens,
+            completion_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+        )
+
+    def estimate_cost(
+        self,
+        model_id: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        cache_read_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+    ) -> Dict[str, Any]:
+        return self._reg.estimate_cost(
             model_id,
             prompt_tokens,
             completion_tokens,
