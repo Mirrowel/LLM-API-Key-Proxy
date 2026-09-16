@@ -1080,7 +1080,7 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         if operation == "models":
             return "/api/tags" if protocol == "ollama" else "/models"
         wire = family_wire_name(protocol or "")
-        if protocol == "gemini":
+        if protocol == "gemini" and operation not in ("embeddings", "embeddings_batch"):
             raise NotImplementedError(
                 "Gemini endpoints are model-ridden; declare endpoint_paths for gemini profiles"
             )
@@ -1091,6 +1091,11 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
                 "ollama_generate": "/api/generate",
                 "embeddings": "/api/embed",
             }
+        elif protocol == "gemini":
+            paths = {
+                "embeddings": "/v1beta/models/{model}:embedContent",
+                "embeddings_batch": "/v1beta/models/{model}:batchEmbedContents",
+            }
         elif protocol == "anthropic_messages":
             paths = {
                 "chat": "/v1/messages",
@@ -1100,7 +1105,10 @@ class ProviderInterface(ABC, metaclass=SingletonABCMeta):
         elif wire == "responses":
             paths = {"chat": "/responses", "responses": "/responses"}
         else:
-            paths = {"chat": "/chat/completions"}
+            # The openai-compatible convention: chat and embeddings on
+            # their standard paths (G9 — embeddings are an operation on
+            # the chat wire, not a separate transport).
+            paths = {"chat": "/chat/completions", "embeddings": "/embeddings"}
         path = paths.get(operation)
         if path is None:
             raise NotImplementedError(

@@ -16,6 +16,7 @@ from ..core.types import RequestContext
 from ..hooks.binding import make_pipeline_run
 from ..hooks.runner import run_slot
 from ..protocols import ProtocolContext, get_protocol
+from ..protocols.validation import validate_embeddings_request
 from ..routing import FallbackResolver, RoutingConfigError, load_routing_config_from_env
 from ..routing.model_args import apply_model_args_to_unified, split_model_args
 from ..routing.types import RouteTarget, RoutingDecision
@@ -501,20 +502,46 @@ class RequestContextBuilder:
         pre_request_callback: Optional[Callable],
         kwargs: Dict[str, Any],
     ) -> RequestContext:
-        # Same D13 grammar as completions: normalize addressing before any
-        # identity use. Embedding transport is single-protocol today, so a
-        # requested profile cannot be served — fail loud rather than silently
-        # dropping the operator's transport choice (fix-pass G7).
-        requested_profile = _normalize_profile_reference(kwargs)
-        if requested_profile:
-            raise ModelReferenceError(
-                f"Embedding requests do not support transport profiles "
-                f"(got profile {requested_profile!r}); remove the ':{requested_profile}' "
-                "segment from the model reference"
-            )
+        """Build an embeddings request context — the same treatment as
+        completion (G9): the payload is parsed by the openai_embeddings
+        protocol into canonical form, rides the full routing chain
+        (fallback groups, scoped targets), gets its transaction logger,
+        its pipeline run (operation="embeddings"), and the same hook
+        stages. Targets without an embeddings surface are skipped with a
+        warning — a mixed fallback group routes embeddings to whoever
+        can serve them.
+        """
         classifier, request_api_keys, request_providers, private, internal_session_hints = self._pop_scope_kwargs(
             kwargs
         )
+        parent_log_dir = kwargs.pop("_parent_log_dir", None)
+        input_protocol = get_protocol("openai_embeddings")
+        # R1 client entry — identical contract to completions: hook edits
+        # on the live payload are authoritative.
+        pipeline_run = make_pipeline_run(None, operation="embeddings", config=self._experimental_config)
+        entry_outcome = await run_slot(pipeline_run, "request_received", kwargs, direction="request", copy_payload=False)
+        if entry_outcome.modified and isinstance(entry_outcome.payload, dict):
+            edited = entry_outcome.payload
+            kwargs.clear()
+            kwargs.update(edited)
+            pipeline_run.record_overlay("request_received_edit", stage="request_received", direction="request")
+        # D13 grammar applies unchanged (profiles may serve embeddings).
+        requested_profile = _normalize_profile_reference(kwargs)
+        protocol_request = deepcopy(kwargs)
+        protocol_context = ProtocolContext(
+            source_protocol=input_protocol.name,
+            target_protocol=input_protocol.name,
+            input_protocol=input_protocol.name,
+            client_protocol=input_protocol.name,
+            metadata={"operation": "embeddings"},
+        )
+        unified_request = input_protocol.parse_request(protocol_request, protocol_context)
+        # G9 contract validation BEFORE any routing or credential work: a
+        # malformed embeddings payload is the client's 400 — it must never
+        # burn rotation attempts looking for a credential that cannot fix
+        # it. The route ladder renders the ProtocolError (a ValueError) as
+        # the openai-shaped invalid_request envelope (400).
+        validate_embeddings_request(unified_request, input_protocol.name)
         session_isolation_key = self._session_isolation_key(
             classifier,
             request_api_keys,
@@ -522,7 +549,14 @@ class RequestContextBuilder:
             private,
         )
         model = kwargs.get("model", "")
-        provider = self._provider_from_model(model)
+        clean_model, model_args = split_model_args(model)
+        if model_args:
+            kwargs["model"] = clean_model
+            if getattr(unified_request, "model", None):
+                unified_request.model = clean_model
+        routing_decision = self._resolve_routing_decision(clean_model)
+        routing_targets = routing_decision.targets if routing_decision else None
+        provider = routing_targets[0].provider if routing_targets else self._provider_from_model(model)
         if not provider:
             self._raise_no_provider(model)
 
@@ -536,36 +570,164 @@ class RequestContextBuilder:
         if not scope["credentials"]:
             self._raise_no_provider(model)
 
+        if routing_targets:
+            # Skip-and-record for BOTH no-credentials and no-embeddings-
+            # surface targets (D17 breaker shape): a mixed group routes
+            # embeddings to whoever can serve them.
+            scoped_targets = []
+            skipped: list[str] = []
+            for index, target in enumerate(routing_targets):
+                target_scope = scope if index == 0 else await self._resolve_scope_for_provider(
+                    target.provider,
+                    classifier,
+                    request_api_keys,
+                    request_providers,
+                    private,
+                )
+                reason = None
+                if not target_scope["credentials"]:
+                    reason = "no credentials"
+                else:
+                    target_plugin = self._get_provider_instance(target.provider) if self._get_provider_instance else None
+                    if target_plugin is not None:
+                        try:
+                            endpoint = target_plugin.get_native_endpoint(
+                                target.model if hasattr(target, "model") else clean_model,
+                                "embeddings",
+                                getattr(target, "profile", None),
+                            )
+                        except Exception:
+                            endpoint = None
+                        if not endpoint:
+                            reason = "no embeddings surface"
+                if reason:
+                    skipped.append(f"{target.prefixed_model} ({reason})")
+                    continue
+                scoped_targets.append(self._with_request_scope(target, target_scope))
+            if skipped:
+                logging.getLogger("rotator_library").warning(
+                    "Skipping %d fallback target(s) for embeddings: %s",
+                    len(skipped),
+                    ", ".join(skipped),
+                )
+            if not scoped_targets:
+                self._raise_no_provider(model)
+            routing_targets = tuple(scoped_targets)
+
+        resolved_model = self._model_resolver.resolve_model_id(routing_targets[0].prefixed_model if routing_targets else model, provider)
+        kwargs["model"] = resolved_model
+
+        transaction_logger = None
+        if self._get_enable_request_logging():
+            transaction_logger = TransactionLogger(
+                provider=provider,
+                model=resolved_model,
+                enabled=True,
+                parent_dir=parent_log_dir,
+            )
+            transaction_logger.log_request(kwargs)
+
         session = self._session_tracker.infer_session(
             kwargs,
             provider=provider,
-            model=model,
+            model=resolved_model,
             scope_key=session_isolation_key,
             hints=self._merge_session_hints(
                 internal_session_hints,
-                await self._get_session_hints(provider, model, kwargs),
+                await self._get_session_hints(
+                    provider,
+                    resolved_model,
+                    kwargs,
+                    unified_request=unified_request,
+                    input_protocol=input_protocol.name,
+                ),
             ),
             _trusted_isolation_key=True,
         )
+        if transaction_logger:
+            transaction_logger.set_trace_context(
+                session_id=session.session_id,
+                scope_key=scope["usage_manager_key"],
+                classifier=scope["classifier"],
+            )
+
+        from ..hooks.binding import resolve_hook_declarations as _resolve_decls
+
+        plugin = self._get_provider_instance(provider) if self._get_provider_instance else None
+        provider_class_hooks, provider_config_hooks, _ = _resolve_decls(
+            plugin, resolved_model, config=self._experimental_config, provider=provider
+        )
+        pipeline_run.enrich(
+            provider=provider,
+            model=resolved_model,
+            session_id=getattr(session, "session_id", "") or "",
+            scope_key=session_isolation_key or "",
+            classifier=scope.get("classifier") or "",
+            operation="embeddings",
+            class_hooks=provider_class_hooks,
+            config_hooks=provider_config_hooks,
+        )
+        await run_slot(
+            pipeline_run,
+            "routing_resolved",
+            {
+                "targets": [
+                    {
+                        "provider": target.provider,
+                        "model": target.prefixed_model,
+                        "protocol": target.protocol,
+                        "profile": target.profile,
+                        "execution": target.execution,
+                    }
+                    for target in (routing_targets or ())
+                ]
+            },
+            direction="request",
+        )
+        session_outcome = await run_slot(
+            pipeline_run,
+            "session_resolved",
+            {
+                "session_id": session.session_id,
+                "confidence": getattr(session, "confidence", None),
+            },
+            direction="request",
+        )
+        resolved_session_id = session.session_id
+        if session_outcome.modified and isinstance(session_outcome.payload, dict):
+            rewritten_session_id = session_outcome.payload.get("session_id")
+            if rewritten_session_id:
+                resolved_session_id = rewritten_session_id
 
         return RequestContext(
-            model=model,
+            model=resolved_model,
             provider=provider,
+            execution_profile=requested_profile,
             kwargs=kwargs,
             streaming=False,
             credentials=scope["credentials"],
             deadline=time.time() + self._get_global_timeout(),
-            session_id=session.session_id,
+            session_id=resolved_session_id,
             session_affinity_key=session.affinity_key,
             session_tracker=self._session_tracker,
             session_tracking_namespace=session.tracking_namespace,
             session_isolation_key=session_isolation_key,
             request=request,
             pre_request_callback=pre_request_callback,
+            transaction_logger=transaction_logger,
             usage_manager_key=scope["usage_manager_key"],
             provider_config=scope["provider_config"],
             credential_secrets=scope["credential_secrets"],
             classifier=scope["classifier"],
+            routing_targets=routing_targets,
+            routing_group_name=routing_decision.group_name if routing_decision else None,
+            input_protocol_name=input_protocol.name,
+            protocol_request=protocol_request,
+            unified_request=unified_request,
+            input_provider=provider,
+            requested_operation="embeddings",
+            routing_group=routing_decision.group if routing_decision else None,
+            pipeline_run=pipeline_run,
         )
 
 

@@ -50,7 +50,7 @@ from .config import (
 )
 
 if TYPE_CHECKING:
-    from .accounting import UsageRecord, extract_usage_record
+    from .accounting import UsageRecord, extract_embeddings_usage_record, extract_usage_record
     from .costs import CostBreakdown, CostCalculator, ModelPricing
     from .identity.registry import CredentialRegistry
     from .integration.api import UsageAPI
@@ -91,6 +91,7 @@ __all__ = [
     "UsageAPI",
     "UsageRecord",
     "extract_usage_record",
+    "extract_embeddings_usage_record",
     "CostBreakdown",
     "CostCalculator",
     "ModelPricing",
@@ -99,6 +100,7 @@ __all__ = [
 _LAZY_EXPORTS = {
     "UsageRecord": ".accounting",
     "extract_usage_record": ".accounting",
+    "extract_embeddings_usage_record": ".accounting",
     "CostBreakdown": ".costs",
     "CostCalculator": ".costs",
     "ModelPricing": ".costs",

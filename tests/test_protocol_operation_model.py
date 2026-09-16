@@ -64,7 +64,9 @@ def test_base_adapter_preserves_operation_fields() -> None:
 
 def test_protocols_advertise_supported_operations() -> None:
     assert get_protocol("openai_chat").supports_operation(OPERATION_CHAT)
-    assert not get_protocol("openai_chat").supports_operation(OPERATION_EMBEDDINGS)
+    # G9: embeddings ride the openai chat wire as an operation.
+    assert get_protocol("openai_chat").supports_operation(OPERATION_EMBEDDINGS)
+    assert not get_protocol("anthropic_messages").supports_operation(OPERATION_EMBEDDINGS)
     assert get_protocol("litellm_fallback").supports_operation(OPERATION_UNKNOWN)
 
 
@@ -106,5 +108,10 @@ def test_context_operation_helpers_reject_unsupported_operations() -> None:
     anthropic = get_protocol("anthropic_messages").parse_request({"model": "m", "messages": []}, context)
     gemini = get_protocol("gemini").parse_request({"contents": []}, context)
 
+    # Anthropic does not model embeddings: the context operation is ignored
+    # and the protocol default (messages) stands.
     assert anthropic.operation == OPERATION_MESSAGES
-    assert gemini.operation == OPERATION_CHAT
+    # G9: gemini DOES model embeddings as operations — the context operation
+    # is honored (the request body itself is malformed for embeddings, which
+    # the destination validation rejects at build time).
+    assert gemini.operation == OPERATION_EMBEDDINGS

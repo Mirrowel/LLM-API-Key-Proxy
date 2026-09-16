@@ -61,6 +61,10 @@ PROTOCOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "endpoint_paths": {
             "chat": "/chat/completions",
             "models": "/models",
+            # Embeddings ride the openai wire as an operation (G9): every
+            # openai-compatible provider that serves embeddings serves
+            # them HERE by convention.
+            "embeddings": "/embeddings",
         },
         "auth": _AUTH_BEARER,
         "listing": _LISTING_OPENAI,
@@ -113,6 +117,11 @@ PROTOCOL_DEFAULTS: Dict[str, Dict[str, Any]] = {
             "stream_generate": "/v1beta/models/{model}:streamGenerateContent?alt=sse",
             "count_tokens": "/v1beta/models/{model}:countTokens",
             "models": "/v1beta/models",
+            # Embeddings operations (G9): single + batch forms — the
+            # batch route serves clean array inputs (D3), the adapter
+            # fans out per-item when taskType/title differ.
+            "embeddings": "/v1beta/models/{model}:embedContent",
+            "embeddings_batch": "/v1beta/models/{model}:batchEmbedContents",
         },
         "auth": _AUTH_GOOG,
         "listing": _LISTING_GEMINI,

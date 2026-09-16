@@ -299,7 +299,7 @@ async def test_native_provider_executor_rejects_unsupported_operation_before_tra
         provider="native",
         model="gpt-test",
         protocol_name="openai_chat",
-        operation="embeddings",
+        operation="frobnicate",
         endpoint="https://example.test/chat",
     )
     client = FakeHTTPClient({"id": "should_not_call"})
@@ -563,7 +563,7 @@ async def test_native_provider_stream_rejects_unsupported_operation_before_trans
         provider="native",
         model="gpt-test",
         protocol_name="openai_chat",
-        operation="embeddings",
+        operation="frobnicate",
         endpoint="https://example.test/chat",
     )
     client = FakeHTTPClient({"id": "should_not_call"})

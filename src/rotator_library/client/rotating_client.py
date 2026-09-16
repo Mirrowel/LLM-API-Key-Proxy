@@ -643,12 +643,21 @@ class RotatingClient:
 
     async def aembedding(
         self,
-        request: Optional[Any] = None,
+        http_request: Optional[Any] = None,
         pre_request_callback: Optional[callable] = None,
         **kwargs,
     ) -> Any:
+        """Execute an embeddings request through the shared routing chain.
+
+        The transport context parameter is named ``http_request`` (never
+        ``request``) on purpose: embeddings payload fields spread into
+        ``**kwargs`` verbatim, so a client-supplied field literally named
+        "request" must pass through to the protocol adapters instead of
+        colliding with the transport kwarg.
+        """
+
         context = await self._request_builder.build_embedding_context(
-            request, pre_request_callback, kwargs
+            http_request, pre_request_callback, kwargs
         )
         return await self._executor.execute(context)
 

@@ -490,6 +490,116 @@ def validate_generative_request(
     _validate_tool_choice(request, target_protocol)
 
 
+# Canonical embeddings controls shared by the embeddings protocols. Every
+# name here has a first-class meaning on at least one wire; per-target
+# mapping/rejection happens in the adapters, never here.
+_EMBEDDINGS_DIMENSION_KEYS = ("dimensions", "output_dimensionality")
+_EMBEDDINGS_ENCODING_FORMATS = {"float", "base64"}
+
+
+def validate_embeddings_request(
+    request: UnifiedRequest,
+    target_protocol: str,
+    context: ProtocolContext | None = None,
+    capabilities: Optional[Mapping[str, Any]] = None,
+) -> None:
+    """Reject malformed embeddings requests before provider transport (G9).
+
+    Mirrors ``validate_generative_request``'s error contract: every failure
+    is a ``ProtocolError`` whose message names the field, so the route's
+    grounded ladder renders the client protocol's own 400 envelope — and
+    because this runs before any credential attempt (client contract at
+    builder time, destination contract in ``build_request``), rotation
+    never burns keys on a request no credential can fix.
+
+    Shape checks only (wire-neutral):
+    - ``model`` present;
+    - ``input`` present and non-empty — a non-empty string, a non-empty
+      array of strings, or token arrays whose items are well-formed
+      non-negative integers;
+    - ``dimensions`` (or its gemini spelling ``output_dimensionality``)
+      is a positive integer when present;
+    - ``encoding_format`` is ``float`` or ``base64`` when present.
+
+    Destination-specific losses (gemini's text-only content, the missing
+    base64 representation, per-item control uniformity) are NOT checked
+    here; adapters own those and disclose or reject them at build time.
+    """
+
+    def _fail(message: str, field: str, **payload: Any) -> None:
+        raise ProtocolError(
+            message,
+            protocol=target_protocol,
+            pass_name="validate_request",
+            payload={"field": field, **payload},
+        )
+
+    if not str(getattr(request, "model", "") or "").strip():
+        _fail("Embeddings requests require a model", "model")
+
+    value = getattr(request, "input", None)
+    if isinstance(value, str):
+        if not value.strip():
+            _fail("Embeddings input must be a non-empty string", "input")
+    elif isinstance(value, list):
+        if not value:
+            _fail("Embeddings input array must not be empty", "input")
+        if all(isinstance(item, str) for item in value):
+            for index, item in enumerate(value):
+                if not item.strip():
+                    _fail("Embeddings input items must be non-empty strings", "input", index=index)
+        else:
+            # Token input(s): a flat array of non-negative ints (ONE
+            # tokenized input) or an array of token arrays. Strings never
+            # mix with tokens on any wire.
+            has_flat_tokens = any(isinstance(item, int) and not isinstance(item, bool) for item in value)
+            has_token_arrays = any(isinstance(item, list) for item in value)
+            if has_flat_tokens and has_token_arrays:
+                _fail("Embeddings token inputs must not mix tokens and token arrays", "input")
+            for index, item in enumerate(value):
+                if isinstance(item, list):
+                    if not item:
+                        _fail("Embeddings token arrays must not be empty", "input", index=index)
+                    for token_index, token in enumerate(item):
+                        # bool is an int subclass — True must never pass as token 1.
+                        if isinstance(token, bool) or not isinstance(token, int) or token < 0:
+                            _fail(
+                                "Embeddings token arrays must contain non-negative integers",
+                                "input",
+                                index=index,
+                                token_index=token_index,
+                            )
+                elif isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                    _fail(
+                        "Embeddings input must be a string, an array of strings, or token arrays",
+                        "input",
+                        index=index,
+                    )
+    else:
+        _fail("Embeddings requests require an input (string or array)", "input")
+
+    params = getattr(request, "generation_params", None)
+    params = params if isinstance(params, dict) else {}
+    for key in _EMBEDDINGS_DIMENSION_KEYS:
+        dimensions = params.get(key)
+        if dimensions is None:
+            continue
+        if isinstance(dimensions, bool) or not isinstance(dimensions, int) or dimensions <= 0:
+            _fail("Embeddings dimensions must be a positive integer", key)
+        # One control, one home: a second spelling alongside it would be
+        # sent twice with contradictory values on a rebuild.
+        for other in _EMBEDDINGS_DIMENSION_KEYS:
+            if other != key and params.get(other) is not None:
+                _fail("Embeddings dimensions are declared twice (dimensions/output_dimensionality)", key)
+        break
+    encoding_format = params.get("encoding_format")
+    if encoding_format is not None and str(encoding_format).strip().lower() not in _EMBEDDINGS_ENCODING_FORMATS:
+        _fail(
+            "Embeddings encoding_format must be 'float' or 'base64'",
+            "encoding_format",
+        )
+
+
 def validate_generative_response(response: UnifiedResponse, target_protocol: str) -> None:
     """Reject failed provider responses that a target success envelope cannot express."""
 

@@ -286,52 +286,23 @@ def apply_temperature_override(request_data: dict[str, Any]) -> None:
 
 
 async def execute_embeddings(
-    batcher: Any,
     client: Any,
     payload: dict[str, Any],
     *,
     raw_request: Any = None,
 ) -> Any:
-    """Run an embeddings request, batching when the batcher is available."""
+    """Run an embeddings request.
 
-    if batcher is not None:
-        import asyncio
+    The payload rides VERBATIM (G9): no str -> [str] rewriting, no
+    per-item fan-out — the protocol adapters own every shape conversion
+    (gemini single vs batch selection included), so mutating the input
+    here would silently change what the destination sees. The retired
+    server-side batcher sent the first character of each input and
+    multiplied usage per item; native wire batching replaced it.
+    """
 
-        import litellm
-
-        inputs = payload.get("input", [])
-        if isinstance(inputs, str):
-            inputs = [inputs]
-
-        tasks = []
-        for single_input in inputs:
-            individual_request = payload.copy()
-            individual_request["input"] = single_input
-            tasks.append(batcher.add_request(individual_request))
-
-        results = await asyncio.gather(*tasks)
-
-        all_data = []
-        total_prompt_tokens = 0
-        total_tokens = 0
-        for i, result in enumerate(results):
-            result["data"][0]["index"] = i
-            all_data.extend(result["data"])
-            total_prompt_tokens += result["usage"]["prompt_tokens"]
-            total_tokens += result["usage"]["total_tokens"]
-
-        return litellm.EmbeddingResponse(
-            **{
-                "object": "list",
-                "model": results[0]["model"],
-                "data": all_data,
-                "usage": {
-                    "prompt_tokens": total_prompt_tokens,
-                    "total_tokens": total_tokens,
-                },
-            }
-        )
-
-    if isinstance(payload.get("input"), str):
-        payload["input"] = [payload["input"]]
-    return await client.aembedding(request=raw_request, **payload)
+    # ``http_request`` rides POSITIONALLY and is named to never collide: a
+    # client payload field called "request" passes through kwargs verbatim
+    # (the openai_embeddings parser discloses unknown options and replays
+    # them) instead of raising a duplicate-kwarg TypeError.
+    return await client.aembedding(raw_request, **payload)

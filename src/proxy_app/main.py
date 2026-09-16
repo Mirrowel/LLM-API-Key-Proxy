@@ -169,7 +169,6 @@ with _console.status("[dim]Initializing proxy core...", spinner="dots"):
     from rotator_library.credential_manager import CredentialManager
     from rotator_library.model_info_service import init_model_info_service
     from proxy_app.request_logger import log_request_to_console
-    from proxy_app.batch_manager import EmbeddingBatcher
     from proxy_app.detailed_logger import RawIOLogger
     from rotator_library.responses import ResponsesService, ResponsesServiceError
     from rotator_library.transaction_logger import TransactionLogger
@@ -372,7 +371,6 @@ logging.debug(f"Modules loaded in {_elapsed:.2f}s")
 load_dotenv(_root_dir / ".env")
 
 # --- Configuration ---
-USE_EMBEDDING_BATCHER = False
 ENABLE_REQUEST_LOGGING = args.enable_request_logging
 ENABLE_RAW_LOGGING = args.enable_raw_logging
 if ENABLE_REQUEST_LOGGING:
@@ -499,13 +497,7 @@ async def lifespan(app: FastAPI):
     os.environ["LITELLM_LOG"] = "ERROR"
     litellm.set_verbose = False
     litellm.drop_params = True
-    if USE_EMBEDDING_BATCHER:
-        batcher = EmbeddingBatcher(client=client)
-        app.state.embedding_batcher = batcher
-        logging.info("RotatingClient and EmbeddingBatcher initialized.")
-    else:
-        app.state.embedding_batcher = None
-        logging.info("RotatingClient initialized (EmbeddingBatcher disabled).")
+    logging.info("RotatingClient initialized.")
 
     # Start model info service in background (fetches pricing/capabilities data)
     # This runs asynchronously and doesn't block proxy startup
@@ -516,8 +508,6 @@ async def lifespan(app: FastAPI):
     yield
 
     await client.background_refresher.stop()  # Stop the background task on shutdown
-    if app.state.embedding_batcher:
-        await app.state.embedding_batcher.stop()
     responses_service = getattr(app.state, "responses_service", None)
     if responses_service:
         await responses_service.close()
@@ -545,10 +535,7 @@ async def lifespan(app: FastAPI):
     if hasattr(app.state, "model_info_service") and app.state.model_info_service:
         await app.state.model_info_service.stop()
 
-    if app.state.embedding_batcher:
-        logging.info("RotatingClient and EmbeddingBatcher closed.")
-    else:
-        logging.info("RotatingClient closed.")
+    logging.info("RotatingClient closed.")
 
 
 # --- FastAPI App Setup ---
@@ -572,11 +559,6 @@ api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 def get_rotating_client(request: Request) -> RotatingClient:
     """Dependency to get the rotating client instance from the app state."""
     return request.app.state.rotating_client
-
-
-def get_embedding_batcher(request: Request) -> EmbeddingBatcher:
-    """Dependency to get the embedding batcher instance from the app state."""
-    return request.app.state.embedding_batcher
 
 
 def get_responses_service(request: Request) -> ResponsesService:
@@ -1497,14 +1479,14 @@ async def gemini_openai_models(
 async def embeddings(
     request: Request,
     client: RotatingClient = Depends(get_rotating_client),
-    batcher: Optional[EmbeddingBatcher] = Depends(get_embedding_batcher),
     _=Depends(verify_api_key),
 ):
     """
     OpenAI-compatible endpoint for creating embeddings.
-    Supports two modes based on the USE_EMBEDDING_BATCHER flag:
-    - True: Uses a server-side batcher for high throughput.
-    - False: Passes requests directly to the provider.
+
+    Input arrays ride one request to the provider verbatim (G9: native
+    batch on the wire — gemini targets convert uniform arrays to
+    batchEmbedContents in the protocol layer).
     """
     try:
         request_data = await request.json()
@@ -1536,7 +1518,6 @@ async def embeddings(
             request_data=request_data,
         )
         response = await execute_embeddings(
-            batcher if USE_EMBEDDING_BATCHER else None,
             client,
             request_data,
             raw_request=request,
@@ -1549,6 +1530,11 @@ async def embeddings(
         raise e
     except Exception as e:
         logging.error(f"Embedding request failed: {e}")
+        # /v1/embeddings IS the openai-shaped face: the openai error ladder
+        # (grounded classifier -> 400 for request validation, 401/403/404/
+        # 409/413 as classified, 429 quota/rate, 502/503/504 server family)
+        # renders the official openai error object; gemini/ollama shapes
+        # would be wrong here.
         status, content = route_error_response(e, protocol="openai_chat")
         return JSONResponse(status_code=status, content=content)
 

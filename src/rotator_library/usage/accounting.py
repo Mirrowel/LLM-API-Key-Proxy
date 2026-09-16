@@ -110,6 +110,68 @@ def extract_usage_record(
     return _from_openai_like_usage(data, provider=provider, model=model, source=source)
 
 
+def extract_embeddings_usage_record(
+    response_or_usage: Any,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    source: str = "embeddings_response",
+) -> UsageRecord:
+    """Extract prompt-only usage for an embeddings response (G9).
+
+    Embeddings have no completion bucket on any wire, and the executor sees
+    the FINAL client-shaped payload — which may be any of the three client
+    protocols the proxy serves embeddings for. One extraction recognizes
+    them all and pins completion/reasoning to zero so a chat-shaped usage
+    envelope can never book phantom output tokens:
+
+    - openai usage: ``prompt_tokens`` / ``total_tokens`` (compat surfaces
+      may spell it ``input_tokens``);
+    - gemini usageMetadata: ``promptTokenCount`` / ``totalTokenCount``;
+    - ollama: ``prompt_eval_count`` (``prompt_eval_count_cached`` reads as
+      cache, never as completion).
+    """
+
+    usage = _unwrap_usage(response_or_usage)
+    data = _as_dict(usage) if usage is not None else {}
+    if not data:
+        return UsageRecord(provider=provider, model=model, source=source)
+    if isinstance(data.get("usageMetadata"), dict):
+        data = data["usageMetadata"]
+    prompt_tokens = _int(
+        data.get("prompt_tokens")
+        or data.get("input_tokens")
+        or data.get("promptTokenCount")
+        or data.get("prompt_eval_count")
+        or data.get("total_tokens")
+        or data.get("totalTokenCount")
+        or 0
+    )
+    cache_read = _int(
+        data.get("cache_read_tokens")
+        or data.get("cached_tokens")
+        or data.get("cachedContentTokenCount")
+        or data.get("prompt_eval_count_cached")
+        or 0
+    )
+    cost = _extract_cost(data)
+    return UsageRecord(
+        input_tokens=prompt_tokens,
+        completion_tokens=0,
+        reasoning_tokens=0,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=0,
+        raw_total_tokens=_int(data.get("total_tokens") or data.get("totalTokenCount") or prompt_tokens),
+        source=source,
+        provider=provider,
+        model=model,
+        provider_reported_cost=cost[0],
+        cost_currency=cost[1],
+        cost_source=cost[2],
+        metadata={"shape": "embeddings_prompt_only"},
+    )
+
+
 def _unwrap_usage(value: Any) -> Any:
     if value is None:
         return None

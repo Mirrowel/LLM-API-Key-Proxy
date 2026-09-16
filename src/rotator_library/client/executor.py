@@ -86,7 +86,7 @@ from ..field_cache.paths import FieldCachePathError, PathToken, parse_path
 from ..hooks.binding import make_pipeline_run, resolve_hook_declarations
 from ..hooks.runner import run_slot
 from ..transform_trace import REDACTED
-from ..usage.accounting import UsageRecord, extract_usage_record
+from ..usage.accounting import UsageRecord, extract_embeddings_usage_record, extract_usage_record
 from ..usage.costs import CostBreakdown, CostCalculator
 
 from .types import RetryState, AvailabilityStats
@@ -659,7 +659,7 @@ class RequestExecutor:
             _raise_for_structured_response_error(response)
             return self._format_execution_response(response, "openai_chat", context)
 
-        if execution == "native" or (execution == "auto" and _should_use_native_protocol(plugin, model, target, kwargs, stream=False, execution=execution)):
+        if execution == "native" or (execution == "auto" and _should_use_native_protocol(plugin, model, target, kwargs, stream=False, execution=execution, requested_operation=getattr(context, "requested_operation", "") or "")):
             native_context, native_request = self._build_native_provider_context(
                 provider,
                 model,
@@ -824,7 +824,12 @@ class RequestExecutor:
         context: Optional[RequestContext] = None,
         credential_id: Optional[str] = None,
     ) -> Any:
-        """Execute the existing LiteLLM request path."""
+        """Execute the existing LiteLLM request path.
+
+        Embeddings never touch the chat entrypoint (G9): the operation
+        switches to ``aembedding`` so an embeddings payload can never
+        land on /chat/completions.
+        """
 
         kwargs["api_key"] = (
             None if credential_secret == _NO_AUTH_CREDENTIAL else credential_secret
@@ -841,6 +846,8 @@ class RequestExecutor:
                 credential_id=credential_id,
                 metadata={"execution": "litellm", "provider": context.provider, "model": context.model},
             )
+        if getattr(context, "requested_operation", "") == "embeddings":
+            return await litellm.aembedding(**kwargs)
         return await litellm.acompletion(**kwargs)
 
     @staticmethod
@@ -956,6 +963,17 @@ class RequestExecutor:
         protocol_name = _provider_native_protocol(plugin, model, target, profile=profile)
         if not protocol_name:
             raise RoutingExecutionError(f"Provider {provider} has no native protocol declaration")
+        # G9: embeddings operations address openai-family providers through
+        # the dedicated openai_embeddings wire adapter. openai_chat cannot
+        # represent an embeddings body (no messages), so a canonical rebuild
+        # of an embeddings request must never route through the chat builder.
+        # The provider's own declarations still own endpoint, auth, and
+        # profile resolution; only the wire adapter name changes — and for a
+        # same-protocol openai embeddings client it changes to its OWN name,
+        # which is what keeps the D4 raw byte path available.
+        embeddings_requested = getattr(context, "requested_operation", "") or ""
+        if embeddings_requested in _EMBEDDING_REQUESTED_OPERATIONS:
+            protocol_name = _embeddings_wire_protocol(protocol_name)
         # D13 revision: single-protocol providers convert silently today —
         # surface the substitution as a terminal warning, once per distinct
         # substitution (same discipline as routing/profiles.resolve_profile).
@@ -997,7 +1015,20 @@ class RequestExecutor:
         # protocol vocabulary governs, not the default profile's. A
         # client-requested operation (G14: count_tokens) overrides the
         # stream-derived default when the provider's protocol declares it.
-        requested_operation = getattr(context, "requested_operation", "") or ""
+        # G9: a CROSS-protocol embeddings array upgrades to the target's
+        # dedicated batch operation (gemini :batchEmbedContents) so the
+        # endpoint and the built body agree; same-protocol clients keep
+        # their chosen endpoint (their choice IS the batching choice).
+        if embeddings_requested in _EMBEDDING_REQUESTED_OPERATIONS:
+            embeddings_requested = _effective_embeddings_operation(
+                plugin,
+                native_model,
+                profile,
+                context,
+                embeddings_requested,
+                protocol_name,
+            )
+        requested_operation = embeddings_requested
         if requested_operation:
             if not _supports_profile_operation(plugin, native_model, requested_operation, profile):
                 # G14: an operation the provider cannot serve natively is an
@@ -3070,12 +3101,26 @@ class RequestExecutor:
     ) -> tuple[UsageRecord, CostBreakdown]:
         """Normalize usage and advisory cost for one successful response."""
 
-        usage_record = extract_usage_record(
-            response,
-            provider=provider,
-            model=model,
-            source="executor_response",
-        )
+        if getattr(context, "requested_operation", "") == "embeddings":
+            # G9: embeddings are prompt-only — no completion bucket exists on
+            # any wire, and the client response shape varies by client
+            # protocol (openai usage / gemini usageMetadata / ollama
+            # prompt_eval_count). One embeddings extraction serves them all
+            # and pins completion/reasoning to 0 so a chat-shaped client
+            # envelope can never book phantom output tokens.
+            usage_record = extract_embeddings_usage_record(
+                response,
+                provider=provider,
+                model=model,
+                source="embeddings_response",
+            )
+        else:
+            usage_record = extract_usage_record(
+                response,
+                provider=provider,
+                model=model,
+                source="executor_response",
+            )
         plugin = self._get_plugin_instance(provider)
         cost_breakdown = CostCalculator(provider_plugin=plugin).calculate(
             usage_record,
@@ -3560,19 +3605,132 @@ def _declared_profile_protocol(plugin: Any, profile: str) -> Optional[str]:
     return None
 
 
-def _should_use_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], kwargs: Dict[str, Any], *, stream: bool, execution: str) -> bool:
-    """Return whether auto routing should use provider-native execution."""
+def _should_use_native_protocol(plugin: Any, model: str, target: Optional[RouteTarget], kwargs: Dict[str, Any], *, stream: bool, execution: str, requested_operation: str = "") -> bool:
+    """Return whether auto routing should use provider-native execution.
+
+    ``requested_operation`` (the context's own operation — "embeddings",
+    "count_tokens", …) WINS over derivation: the request defines what is
+    being asked; a provider supporting that operation natively executes
+    natively, one that does not falls out of the gate to the fallback.
+
+    Operation-aware faces (G9): a multi-face provider may serve the
+    requested operation on a NON-default face (embeddings ride the chat
+    face of a Responses-first provider). The default-face hook only answers
+    for the default dialect — when it refuses a requested operation, a
+    declared face that natively models the operation keeps the request
+    native and the context builder resolves the actual face.
+    """
 
     protocol_name = _provider_native_protocol(plugin, model, target)
     if not plugin or not protocol_name:
         return False
     native_model = _normalize_native_model(plugin, model, target.profile if target else None)
-    operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
+    if requested_operation:
+        operation = requested_operation
+    else:
+        operation = plugin.get_native_operation(native_model, None, stream=stream) if hasattr(plugin, "get_native_operation") else "chat"
     hook = getattr(plugin, "should_use_native_protocol", None)
     if callable(hook):
-        return bool(hook(model=native_model, operation=operation, stream=stream, execution=execution))
+        if bool(hook(model=native_model, operation=operation, stream=stream, execution=execution)):
+            return True
+        return bool(requested_operation) and _operation_declared_on_faces(plugin, operation)
     support = getattr(plugin, "supports_native_operation", None)
     return bool(support(native_model, operation) if callable(support) else True)
+
+
+def _operation_declared_on_faces(plugin: Any, operation: str) -> bool:
+    """Whether any declared provider face natively models the operation.
+
+    Reads the unified ``get_declared_profiles()`` view (speaks + legacy
+    transport profiles); a face whose registered protocol declares the
+    operation counts, regardless of which face is the default.
+    """
+
+    if not plugin or not operation:
+        return False
+    declared: Any = None
+    if hasattr(plugin, "get_declared_profiles"):
+        try:
+            declared, _default = plugin.get_declared_profiles()
+        except Exception:
+            declared = None
+    if not isinstance(declared, dict):
+        declared = getattr(plugin, "transport_profiles", None)
+    if not isinstance(declared, dict) or not declared:
+        return False
+    from ..protocols import get_protocol
+
+    for entry in declared.values():
+        if isinstance(entry, dict):
+            protocol = entry.get("protocol") or entry.get("protocol_name")
+        else:
+            protocol = entry
+        if not protocol:
+            continue
+        try:
+            if get_protocol(str(protocol)).supports_operation(operation):
+                return True
+        except KeyError:
+            continue
+    return False
+
+
+# The embeddings operations a context may request (G9). "embeddings" is the
+# single/simple form; "embeddings_batch" is the dedicated multi-input form
+# (gemini :batchEmbedContents).
+_EMBEDDING_REQUESTED_OPERATIONS = ("embeddings", "embeddings_batch")
+
+
+def _embeddings_wire_protocol(protocol_name: Optional[str]) -> Optional[str]:
+    """Wire adapter for an embeddings operation on an openai-family provider.
+
+    Embeddings live on the openai wire but are a different body shape from
+    chat (no messages): the dedicated ``openai_embeddings`` adapter builds
+    and parses them while the provider's declarations still own endpoints
+    and auth. Non-openai faces (gemini/ollama) model embeddings natively on
+    their own wire.
+    """
+
+    if not protocol_name or protocol_name == "openai_embeddings":
+        return protocol_name
+    from ..protocols.canonical import family_wire_name
+
+    if family_wire_name(protocol_name) == "openai_chat":
+        return "openai_embeddings"
+    return protocol_name
+
+
+def _effective_embeddings_operation(
+    plugin: Any,
+    native_model: str,
+    profile: Optional[str],
+    context: "RequestContext",
+    requested_operation: str,
+    wire_protocol_name: Optional[str],
+) -> str:
+    """Resolve the embeddings operation against the target's batch surface.
+
+    A CROSS-protocol array converted INTO a protocol with a dedicated batch
+    route must ride that route (the single endpoint carries one content);
+    same-protocol clients preserve their endpoint choice — their choice IS
+    the batching choice (raw passthrough). Protocols whose single route
+    accepts arrays (openai /embeddings, ollama /api/embed) never upgrade.
+    """
+
+    if requested_operation != "embeddings":
+        return requested_operation
+    unified = getattr(context, "unified_request", None)
+    value = getattr(unified, "input", None) if unified is not None else None
+    if not isinstance(value, list) or not value:
+        return requested_operation
+    if not _supports_profile_operation(plugin, native_model, "embeddings_batch", profile):
+        return requested_operation
+    from ..protocols.canonical import family_wire_name
+
+    source = getattr(unified, "source_protocol", None) or context.input_protocol_name
+    if family_wire_name(str(source or "")) == family_wire_name(str(wire_protocol_name or "")):
+        return requested_operation
+    return "embeddings_batch"
 
 
 def _strip_provider_prefix(model: str) -> str:

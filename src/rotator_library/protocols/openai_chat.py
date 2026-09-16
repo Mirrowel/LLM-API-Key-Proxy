@@ -123,7 +123,7 @@ class OpenAIChatProtocol(ProtocolAdapter):
         "chat_completions",
         "openai_chat_completions",
     )
-    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_CHAT,)
+    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_CHAT, "embeddings")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:

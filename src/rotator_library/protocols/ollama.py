@@ -195,7 +195,11 @@ class OllamaProtocol(ProtocolAdapter):
         elif operation == OPERATION_EMBEDDINGS:
             raw = unified_response.raw if isinstance(unified_response.raw, dict) else {}
             key = "embedding" if "embedding" in raw and "embeddings" not in raw else "embeddings"
-            payload[key] = deepcopy(unified_response.data)
+            # Ollama's wire carries bare vectors. Same-protocol data already
+            # is vectors; a cross-protocol source (openai list entries) is
+            # normalized to its vector so the ollama client sees its own
+            # shape instead of foreign dicts.
+            payload[key] = [_embedding_vector(entry) for entry in unified_response.data]
         else:
             payload["response"] = _ollama_response_text(unified_response)
         if "done" not in payload:
@@ -592,6 +596,17 @@ def _attach_completed_calls(message: UnifiedMessage, calls: list[ToolCall]) -> N
             continue
         message.tool_calls.append(call)
         message.content.append(ContentBlock(type="tool_call", tool_call=call))
+
+
+def _embedding_vector(entry: Any) -> Any:
+    """Vector out of a canonical embeddings entry (dict) or a bare vector."""
+
+    if isinstance(entry, dict):
+        if "embedding" in entry:
+            return deepcopy(entry["embedding"])
+        if "values" in entry:
+            return deepcopy(entry["values"])
+    return deepcopy(entry)
 
 
 def _ollama_response_text(response: UnifiedResponse) -> str:

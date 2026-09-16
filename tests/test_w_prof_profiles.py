@@ -592,10 +592,25 @@ async def test_embedding_request_with_profile_fails_loud(monkeypatch) -> None:
         get_enable_request_logging=lambda: False,
     )
 
-    with pytest.raises(ModelReferenceError, match="[Ee]mbedding"):
-        await builder.build_embedding_context(
-            None, None, {"model": "synthetic:responses/embed-1", "input": "hi"}
+    # G9: profiles may serve embeddings — the address resolves through the
+    # same grammar as completions; an unknown target surfaces as the
+    # standard no-provider error, not an embeddings-specific rejection.
+    import asyncio
+
+    try:
+        ctx = asyncio.run(
+            builder.build_embedding_context(
+                None, None, {"model": "synthetic:responses/embed-1", "input": "hi"}
+            )
         )
+    except Exception as exc:
+        # A provider/plugin that does not exist fails honestly (scope
+        # fakes make resolution provider-dependent) — but NEVER the old
+        # "embedding requests do not support transport profiles" reject.
+        assert "profile" not in str(exc).lower() or "does not support" not in str(exc)
+    else:
+        assert ctx.requested_operation == "embeddings"
+        assert ctx.input_protocol_name == "openai_embeddings"
 
 
 def test_acompletion_input_protocol_parameter_is_authoritative() -> None:

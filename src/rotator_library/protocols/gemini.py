@@ -44,7 +44,7 @@ from .canonical import (
     tool_result_object,
 )
 from .operation import OPERATION_CHAT, OPERATION_COUNT_TOKENS, OPERATION_GENERATE, OPERATION_UNKNOWN, normalize_operation
-from .validation import validate_generative_request, validate_generative_response
+from .validation import validate_embeddings_request, validate_generative_request, validate_generative_response
 from .types import (
     Annotation,
     ContentBlock,
@@ -78,6 +78,98 @@ _REQUEST_CORE_FIELDS = {
     "tool_config",
     "stream",
 }
+
+# G9 embeddings operations on the gemini wire: `embeddings` is the single
+# :embedContent form, `embeddings_batch` the :batchEmbedContents form. The
+# operation (not the input shape alone) selects the endpoint; the adapters
+# keep the payload shaped for whichever operation the context names.
+_EMBEDDING_OPERATIONS = ("embeddings", "embeddings_batch")
+
+# Embeddings request members with a canonical home. ``embedContentConfig``
+# (the newer nested config envelope) is flattened into the same controls.
+_EMBEDDING_REQUEST_FIELDS = {
+    "operation",
+    "model",
+    "content",
+    "requests",
+    "taskType",
+    "task_type",
+    "title",
+    "outputDimensionality",
+    "output_dimensionality",
+    "embedContentConfig",
+    "embed_content_config",
+}
+
+# Gemini embeddings controls -> canonical generation_params keys: the openai
+# wire's ``dimensions`` is the same concept as ``outputDimensionality``; the
+# adapters own that cross-name mapping, so the canonical home used by the
+# gemini parser stays gemini-spelled (same-protocol rebuilds stay faithful).
+
+
+def _sniff_gemini_embeddings_operation(request: dict[str, Any]) -> Optional[str]:
+    """Infer an embeddings operation when no context operation is available.
+
+    The shapes are unambiguous on the gemini wire: ``requests`` (and no
+    ``contents``) is batchEmbedContents; a bare ``content`` (and no
+    ``contents``) is embedContent. Generate/count bodies always use
+    ``contents``.
+    """
+
+    if "contents" in request or "messages" in request:
+        return None
+    if isinstance(request.get("requests"), list):
+        return "embeddings_batch"
+    if "content" in request:
+        return "embeddings"
+    return None
+
+
+def _gemini_embedding_text(content: Any) -> str:
+    """Extract the embeddable text from a gemini Content object.
+
+    Only ``parts.text`` participates (Google: "Only the parts.text fields
+    will be counted"); inline data parts belong to multimodal models and are
+    preserved in the raw body for same-protocol replay, not canonicalized
+    into an input string.
+    """
+
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, dict):
+        return ""
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+    texts = [str(part.get("text")) for part in parts if isinstance(part, dict) and part.get("text") is not None]
+    return "".join(texts)
+
+
+def _gemini_embedding_controls(source: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one EmbedContentRequest's controls into canonical keys.
+
+    Reads both wire spellings plus the newer ``embedContentConfig`` envelope
+    (whose keys are snake_case), without inventing defaults.
+    """
+
+    controls: dict[str, Any] = {}
+    mapped = {
+        "taskType": "task_type",
+        "task_type": "task_type",
+        "title": "title",
+        "outputDimensionality": "output_dimensionality",
+        "output_dimensionality": "output_dimensionality",
+    }
+    for wire_key, canonical in mapped.items():
+        if source.get(wire_key) is not None and canonical not in controls:
+            controls[canonical] = deepcopy(source[wire_key])
+    config = source.get("embedContentConfig") or source.get("embed_content_config")
+    if isinstance(config, dict):
+        for wire_key, canonical in mapped.items():
+            if config.get(wire_key) is not None and canonical not in controls:
+                controls[canonical] = deepcopy(config[wire_key])
+    return controls
+
 
 
 def _warn_gemini_once(unified_response: UnifiedResponse, *, code: str, message: str, field: str | None = None) -> None:
@@ -154,10 +246,31 @@ class GeminiProtocol(ProtocolAdapter):
     name: ClassVar[str] = "gemini"
     aliases: ClassVar[tuple[str, ...]] = ("google_gemini", "generate_content")
     supported_transports: ClassVar[tuple[str, ...]] = ("http", "sse")
-    supported_operations: ClassVar[tuple[str, ...]] = (OPERATION_CHAT, OPERATION_COUNT_TOKENS, "generate", "stream_generate")
+    supported_operations: ClassVar[tuple[str, ...]] = (
+        OPERATION_CHAT,
+        OPERATION_COUNT_TOKENS,
+        "generate",
+        "stream_generate",
+        # G9: embeddings as protocol operations — the client's chosen
+        # endpoint (single vs batch) is the batching choice; conversion
+        # from foreign shapes lands on batch for uniform arrays.
+        "embeddings",
+        "embeddings_batch",
+    )
 
     def parse_request(self, raw_request: dict[str, Any], context: ProtocolContext | None = None) -> UnifiedRequest:
         request = dict(raw_request or {})
+        # G9: embeddings bodies are a distinct wire family on the same
+        # adapter — branch before any generate-shaped parsing. The WIRE SHAPE
+        # is authoritative for batching (a requests[] body is a batch no
+        # matter what a stale context says); the context still supplies the
+        # operation for bodies whose shape alone is ambiguous.
+        operation = _operation_from_context(context, OPERATION_CHAT)
+        sniffed = _sniff_gemini_embeddings_operation(request)
+        if sniffed:
+            operation = sniffed
+        if operation in _EMBEDDING_OPERATIONS:
+            return self._parse_embeddings_request(request, operation, context)
         # G14: the SDK's CountTokensRequest nests the full generate body
         # under generateContentRequest — unwrap before parsing so nested
         # forms don't silently count zero messages.
@@ -196,12 +309,196 @@ class GeminiProtocol(ProtocolAdapter):
             extra={k: deepcopy(v) for k, v in request.items() if k not in _REQUEST_CORE_FIELDS},
         )
 
+    def _parse_embeddings_request(
+        self,
+        request: dict[str, Any],
+        operation: str,
+        context: ProtocolContext | None,
+    ) -> UnifiedRequest:
+        """Parse an embedContent / batchEmbedContents body into canonical form.
+
+        Canonical input is the plain text (or the ordered list of texts for a
+        batch) — the ONLY meaning all embeddings wires share. Controls
+        normalize into ``generation_params`` (gemini spellings); per-item
+        control snapshots and body-model identity ride ``metadata`` so a
+        same-protocol rebuild stays faithful. Unknown envelope fields ride
+        ``extra`` (source replay only).
+
+        Batch inputs are uniform by construction for cross-protocol
+        conversion (openai input is strings/tokens); a same-protocol client
+        may still carry per-item controls, which is why the snapshots exist.
+        """
+
+        warnings_list: list[ConversionWarning] = []
+        metadata: dict[str, Any] = {"gemini_embedding_operation": operation}
+        if operation == "embeddings_batch":
+            raw_items = [item for item in request.get("requests") or [] if isinstance(item, dict)]
+            input_value: Any = [_gemini_embedding_text(item.get("content")) for item in raw_items]
+            metadata["gemini_embedding_items"] = [
+                _gemini_embedding_controls(item) for item in raw_items
+            ]
+            uniform = raw_items[0] if raw_items else {}
+            generation_params = _gemini_embedding_controls(uniform)
+            # BatchEmbedContentsRequest carries a (proto-required) top-level
+            # model AND per-item models that must match; read either.
+            metadata["gemini_embedding_body_model"] = bool(uniform.get("model"))
+            model = str(request.get("model") or uniform.get("model") or getattr(context, "model", None) or "")
+        else:
+            input_value = _gemini_embedding_text(request.get("content"))
+            generation_params = _gemini_embedding_controls(request)
+            metadata["gemini_embedding_body_model"] = bool(request.get("model"))
+            model = str(request.get("model") or getattr(context, "model", None) or "")
+        return UnifiedRequest(
+            operation=operation,
+            logical_operation=OPERATION_GENERATE,
+            model=model,
+            input=input_value,
+            generation_params=generation_params,
+            metadata=metadata,
+            source_protocol=self.name,
+            warnings=warnings_list,
+            raw=deepcopy(request),
+            extra={k: deepcopy(v) for k, v in request.items() if k not in _EMBEDDING_REQUEST_FIELDS},
+        )
+
+    def _format_embeddings_item(
+        self,
+        value: Any,
+        *,
+        model_reference: Optional[str],
+        task_type: Any = None,
+        title: Any = None,
+        output_dimensionality: Any = None,
+    ) -> dict[str, Any]:
+        """Format one canonical embeddings input as an EmbedContentRequest.
+
+        Google requires ``model`` on every EmbedContentRequest in a batch
+        ("the model in each of these requests must match") and documents
+        text-only embedding of ``parts.text``; token arrays have no gemini
+        representation and are rejected rather than silently mangled.
+        """
+
+        if not isinstance(value, str):
+            raise ProtocolError(
+                "Gemini embeddings accept text inputs only; token arrays have no Gemini representation",
+                protocol=self.name,
+                pass_name="build_request",
+                payload={"input": value if not isinstance(value, (list, dict)) else type(value).__name__},
+            )
+        item: dict[str, Any] = {}
+        if model_reference:
+            item["model"] = model_reference
+        item["content"] = {"parts": [{"text": value}]}
+        if task_type is not None:
+            item["taskType"] = deepcopy(task_type)
+        if title is not None:
+            item["title"] = deepcopy(title)
+        if output_dimensionality is not None:
+            item["outputDimensionality"] = deepcopy(output_dimensionality)
+        return item
+
+    def _build_embeddings_request(
+        self,
+        unified_request: UnifiedRequest,
+        context: ProtocolContext | None,
+        capabilities: Optional[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Build the gemini embeddings wire from canonical state (G9).
+
+        The operation decides single vs batch (:embedContent writes ONE
+        content; :batchEmbedContents writes ``requests[]``), and a list input
+        forces batch even when the context lags — an array cannot ride the
+        single endpoint. Cross-protocol sources (openai) are uniform by
+        construction, so the item loop uses the uniform controls; a
+        same-protocol rebuild reuses the per-item control snapshots the
+        parser recorded when their count still matches.
+        """
+
+        validate_embeddings_request(unified_request, self.name, context, capabilities=capabilities)
+        operation = _operation_from_context(context, unified_request.operation or "embeddings")
+        if operation not in _EMBEDDING_OPERATIONS:
+            operation = unified_request.operation if unified_request.operation in _EMBEDDING_OPERATIONS else "embeddings"
+        input_value = unified_request.input
+        is_batch = operation == "embeddings_batch" or isinstance(input_value, list)
+        params = deepcopy(unified_request.generation_params)
+        task_type = params.pop("task_type", None)
+        title = params.pop("title", None)
+        output_dimensionality = params.pop("output_dimensionality", None)
+        if output_dimensionality is None:
+            # The openai control name is the same concept.
+            output_dimensionality = params.pop("dimensions", None)
+        # openai response-encoding and identity controls have no gemini
+        # representation: the wire returns floats and carries no end-user id.
+        preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
+        if params.pop("encoding_format", None) is not None and not preserve_source:
+            add_conversion_warning(
+                unified_request,
+                code="unsupported_optional_control",
+                message="Gemini embeddings return float vectors only; encoding_format has no representation and was dropped",
+                field="encoding_format",
+                target_protocol=self.name,
+            )
+        if params.pop("user", None) is not None and not preserve_source:
+            add_conversion_warning(
+                unified_request,
+                code="unsupported_optional_control",
+                message="Gemini embeddings have no per-request user control; user was dropped",
+                field="user",
+                target_protocol=self.name,
+            )
+        model_reference = _gemini_model_reference(unified_request.model)
+        payload: dict[str, Any]
+        if is_batch:
+            items = input_value if isinstance(input_value, list) else [input_value]
+            stored = unified_request.metadata.get("gemini_embedding_items")
+            preserve_items = preserve_source and isinstance(stored, list) and len(stored) == len(items)
+            requests: list[dict[str, Any]] = []
+            for position, item in enumerate(items):
+                item_controls = stored[position] if preserve_items and isinstance(stored[position], dict) else {}
+                requests.append(
+                    self._format_embeddings_item(
+                        item,
+                        # Batch requests require the model on every item.
+                        model_reference=model_reference,
+                        task_type=item_controls.get("task_type", task_type),
+                        title=item_controls.get("title", title),
+                        output_dimensionality=item_controls.get("output_dimensionality", output_dimensionality),
+                    )
+                )
+            payload = {"requests": requests}
+        else:
+            # The single endpoint carries the model on the URL; the body
+            # includes it only when the source client did (same-protocol
+            # rebuild fidelity — cross-protocol omits it like the docs sample).
+            body_model = model_reference if (preserve_source and unified_request.metadata.get("gemini_embedding_body_model")) else None
+            payload = self._format_embeddings_item(
+                input_value,
+                model_reference=body_model,
+                task_type=task_type,
+                title=title,
+                output_dimensionality=output_dimensionality,
+            )
+        # Unknown/custom controls pass through verbatim (the parser disclosed
+        # them); source extensions replay only to their home protocol.
+        payload.update(deepcopy(params))
+        payload.update(source_extensions(unified_request.extra, context, self.name, unified_request.source_protocol))
+        return payload
     def build_request(
         self,
         unified_request: UnifiedRequest,
         context: ProtocolContext | None = None,
         capabilities: Optional[Mapping[str, Any]] = None,
     ) -> dict[str, Any]:
+        requested_operation = unified_request.operation
+        if requested_operation not in _EMBEDDING_OPERATIONS:
+            context_operation = _operation_from_context(context, "")
+            if context_operation in _EMBEDDING_OPERATIONS:
+                requested_operation = context_operation
+        if requested_operation in _EMBEDDING_OPERATIONS:
+            # G9: embeddings have no message/tool machinery — branch before
+            # the generative validation so an embeddings UnifiedRequest is
+            # validated by its own contract, never by the chat contract.
+            return self._build_embeddings_request(unified_request, context, capabilities)
         validate_generative_request(unified_request, self.name, context, capabilities=capabilities)
         preserve_source = is_same_protocol(context, self.name, unified_request.source_protocol)
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
@@ -372,6 +669,18 @@ class GeminiProtocol(ProtocolAdapter):
 
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
         response = _as_dict(raw_response)
+        # G9: embeddings responses are the sibling family of generate
+        # responses — branch before candidate parsing. The context operation
+        # wins; a shape sniff covers direct adapter calls (embedding/
+        # embeddings envelopes carry no candidates).
+        operation = _response_operation(response, context)
+        if operation not in _EMBEDDING_OPERATIONS and "candidates" not in response:
+            if "embeddings" in response:
+                operation = "embeddings_batch"
+            elif "embedding" in response:
+                operation = "embeddings"
+        if operation in _EMBEDDING_OPERATIONS:
+            return self._parse_embeddings_response(response, operation, context)
         messages: list[UnifiedMessage] = []
         stop_reason = None
         finish_message = None
@@ -456,6 +765,71 @@ class GeminiProtocol(ProtocolAdapter):
             )
         return unified_response
 
+    def _parse_embeddings_response(
+        self,
+        response: dict[str, Any],
+        operation: str,
+        context: ProtocolContext | None,
+    ) -> UnifiedResponse:
+        """Normalize gemini embeddings responses into the canonical envelope.
+
+        ``embedding.values`` / ``embeddings[].values`` become opaque
+        ``data[]`` entries (``embedding`` + ``index``, unknown entry fields
+        preserved); ``usageMetadata.promptTokenCount`` rides the canonical
+        prompt-only usage. Batch order is the wire order, indexed from 0.
+        """
+
+        data: list[dict[str, Any]] = []
+        if operation == "embeddings_batch" or isinstance(response.get("embeddings"), list):
+            items = response.get("embeddings") if isinstance(response.get("embeddings"), list) else []
+            for position, item in enumerate(items):
+                data.append(_canonical_embedding_entry(item, position))
+        else:
+            data.append(_canonical_embedding_entry(response.get("embedding"), 0))
+        return UnifiedResponse(
+            operation=operation,
+            logical_operation=OPERATION_GENERATE,
+            model=response.get("modelVersion") or getattr(context, "model", None),
+            data=data,
+            usage=self.extract_usage(response, context),
+            source_protocol=self.name,
+            raw=deepcopy(response),
+            extra={k: deepcopy(v) for k, v in response.items() if k not in {"embedding", "embeddings", "usageMetadata", "modelVersion"}},
+        )
+
+    def _format_embeddings_response(
+        self,
+        unified_response: UnifiedResponse,
+        context: ProtocolContext | None,
+    ) -> dict[str, Any]:
+        """Format canonical embeddings data back onto the gemini wire.
+
+        Single vs batch follows the response operation (a lone batch entry
+        still answers ``embeddings[]`` — the caller asked a batch endpoint).
+        Provider-bound extras replay only to their source family; the
+        change-log channel carries conversion warnings like every formatter.
+        """
+
+        entries = list(unified_response.data or [])
+        operation = unified_response.operation
+        payload: dict[str, Any] = {}
+        if operation == "embeddings_batch" or len(entries) > 1:
+            payload["embeddings"] = [{"values": _embedding_values(entry)} for entry in entries]
+        else:
+            payload["embedding"] = {"values": _embedding_values(entries[0]) if entries else []}
+        if unified_response.model:
+            payload["modelVersion"] = unified_response.model
+        usage = unified_response.usage
+        if usage is not None:
+            payload["usageMetadata"] = {
+                "promptTokenCount": int(usage.input_tokens or 0),
+                "totalTokenCount": int(usage.total_tokens or usage.input_tokens or 0),
+            }
+        payload.update(source_extensions(unified_response.extra, context, self.name, unified_response.source_protocol))
+        if unified_response.warnings:
+            payload["_proxy_warnings"] = list(unified_response.warnings)
+        return payload
+
     def format_response(
         self,
         unified_response: UnifiedResponse,
@@ -474,6 +848,8 @@ class GeminiProtocol(ProtocolAdapter):
             if unified_response.warnings:
                 payload["_proxy_warnings"] = list(unified_response.warnings)
             return payload
+        if unified_response.operation in _EMBEDDING_OPERATIONS:
+            return self._format_embeddings_response(unified_response, context)
         validate_generative_response(unified_response, self.name)
         preserve_source = is_same_protocol(context, self.name, unified_response.source_protocol)
         emit_opaque_state = may_emit_opaque_provider_state(context, preserve_source=preserve_source)
@@ -1340,7 +1716,7 @@ def _as_dict(value: Any) -> dict[str, Any]:
 
 
 def _operation_from_context(context: ProtocolContext | None, default: str) -> str:
-    supported = {OPERATION_CHAT, OPERATION_COUNT_TOKENS, "generate", "stream_generate"}
+    supported = {OPERATION_CHAT, OPERATION_COUNT_TOKENS, "generate", "stream_generate", *_EMBEDDING_OPERATIONS}
     if context and isinstance(context.provider_options, dict):
         operation = normalize_operation(context.provider_options.get("operation"))
         if operation in supported:
@@ -1358,7 +1734,59 @@ def _response_operation(response: dict[str, Any], context: ProtocolContext | Non
         return OPERATION_COUNT_TOKENS
     if "totalTokens" in response and "candidates" not in response:
         return OPERATION_COUNT_TOKENS
+    if requested in _EMBEDDING_OPERATIONS:
+        return requested
     return requested if requested in {"generate", "stream_generate"} else OPERATION_CHAT
+
+
+def _canonical_embedding_entry(item: Any, position: int) -> dict[str, Any]:
+    """Opaque canonical entry from one ContentEmbedding (values -> embedding).
+
+    Unknown entry fields (statistics, provider extras) survive verbatim —
+    the openai formatter carries them through, so a sparse/metadata-bearing
+    compatible response is never narrowed at the gemini boundary.
+    """
+
+    if isinstance(item, dict):
+        entry = {k: deepcopy(v) for k, v in item.items() if k != "values"}
+        entry["embedding"] = deepcopy(item.get("values"))
+    else:
+        entry = {"embedding": deepcopy(item)}
+    entry.setdefault("object", "embedding")
+    entry["index"] = position
+    return entry
+
+
+def _embedding_values(entry: Any) -> Any:
+    """Vector out of a canonical entry (dict) or a bare vector."""
+
+    if isinstance(entry, dict):
+        if "embedding" in entry:
+            return deepcopy(entry["embedding"])
+        if "values" in entry:
+            return deepcopy(entry["values"])
+        return []
+    return deepcopy(entry)
+
+
+def _gemini_model_reference(model: Any) -> Optional[str]:
+    """Render a model id in the ``models/{model}`` resource form.
+
+    Gemini embeddings bodies name the model as a resource; a client/upstream
+    id already in that form is kept verbatim, a provider-prefixed id is
+    stripped by the caller before this point.
+    """
+
+    text = str(model or "").strip()
+    if not text:
+        return None
+    if text.startswith("models/"):
+        return text
+    if "/" in text:
+        # Callers pass the bare upstream id (provider prefix stripped by the
+        # executor); a leftover path segment is not a resource name.
+        text = text.split("/")[-1]
+    return f"models/{text}"
 
 
 def _decode_sse_data(raw_event: Any) -> Any:
