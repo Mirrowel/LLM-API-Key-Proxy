@@ -146,6 +146,24 @@ git fetch origin "pull/$PR/head" >/dev/null 2>&1 || {
 }
 FULL_DIFF="$KIT_DIR/full_diff.patch"
 git diff --full-index "origin/$PR_BASE...FETCH_HEAD" > "$FULL_DIFF" 2>/dev/null || git diff --full-index "origin/$PR_BASE..FETCH_HEAD" > "$FULL_DIFF"
+# Compact per-file list, git-native (the files API's additions/deletions go
+# null on huge PRs and mislabel source files as binary - live-caught
+# 2026-09-15). The prompt carries only a one-line summary; this file is the
+# on-demand index the summary points at. Same compact shape the prompt's
+# regenerate recipe produces (no %-formats: safe inside any printf).
+NS_TMP="$KIT_DIR/.numstat.tmp"
+git diff --numstat "origin/$PR_BASE...FETCH_HEAD" > "$NS_TMP" 2>/dev/null || true
+git diff --name-status "origin/$PR_BASE...FETCH_HEAD" 2>/dev/null | awk -F'\t' '
+  NR==FNR { n[$3] = $1 "/" $2; next }
+  {
+    s = substr($1,1,1)
+    p = $NF
+    if (s ~ /[CR]/) s = "M"
+    c = (p in n) ? n[p] : "0/0"
+    print s, p, (c ~ /^-/ ? "(binary)" : "+" c)
+  }
+' "$NS_TMP" > "$KIT_DIR/changed-files.txt"
+rm -f "$NS_TMP"
 INCREMENTAL_DIFF=""
 if [ "$REVIEW_TYPE" = "FOLLOW-UP" ]; then
   INCREMENTAL_DIFF="$KIT_DIR/incremental_diff.patch"
@@ -289,4 +307,5 @@ echo "  Review memory:    /tmp/instructions/review-memory.md"
 echo "  Full diff:        $FULL_DIFF ($(diff_desc "$FULL_DIFF"))"
 [ -n "$INCREMENTAL_DIFF" ] && echo "  Incremental diff: $INCREMENTAL_DIFF ($(diff_desc "$INCREMENTAL_DIFF"))"
 echo "  Head SHA file:    $KIT_DIR/head_sha.txt"
+echo "  Changed files:    $KIT_DIR/changed-files.txt"
 echo "  Kit files are for PR #$PR - re-run the kit to switch PRs."

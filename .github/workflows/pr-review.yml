@@ -442,7 +442,7 @@ jobs:
           # requester.login — it demands user-profile scopes the PAT lacks
           # (see compliance-check.yml pr_info for the REST pattern if a
           # field ever needs migrating). Do NOT add reviewRequests here.
-          pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository)
+          pr_json=$(gh pr view $PR_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,closingIssuesReferences,headRepository)
           timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/timeline")
 
           author=$(echo "$pr_json" | jq -r .author.login)
@@ -452,24 +452,29 @@ jobs:
           state=$(echo "$pr_json" | jq -r .state)
           additions=$(echo "$pr_json" | jq -r .additions)
           deletions=$(echo "$pr_json" | jq -r .deletions)
-          total_commits=$(echo "$pr_json" | jq -r '.commits | length')
+          # gh pr view's `commits` --json field is a LIST capped at 100
+          # entries - the list-length derivation reported the CAP, not
+          # the count (live-caught: "Total Commits: 100" on a
+          # 100+-commit PR). The REST payload carries the exact scalar.
+          total_commits=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.commits // 0' 2>/dev/null || echo 0)
           title=$(echo "$pr_json" | jq -r .title)
           body=$(echo "$pr_json" | jq -r '.body // "(No description provided)"')
 
-          # Changed files via the paginated REST files API: gh pr view's
-          # --json files caps at ONE page (100) and silently lied about
-          # 300+-file PRs (live-caught: "Changed Files: 100" on a
-          # 324-file PR, src/ invisible to the list). Compact one line
-          # per file - status letter (A/D/M/R) + path + counts - keeps
-          # the prompt small; binary files are marked instead of
-          # numberless.
-          files_tsv=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files?per_page=100" --paginate --jq '.[] | [.status, (.additions // 0), (.deletions // 0), .filename] | @tsv' 2>/dev/null || true)
-          changed_files_count=$(printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
-          changed_files_list=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==4 {
+          # Changed files: ONE summary line only. The inline per-file list
+          # was ~5.5K tokens of prompt on a 359-file PR (plus the files
+          # API's additions/deletions go null on huge PRs, mislabeling
+          # real source files as binary-or-empty) - live-caught 2026-09-15.
+          # The exact per-file list lives in the kit (git-native numstat):
+          # /tmp/kit/<pr>/changed-files.txt; the agent reads it on demand.
+          files_tsv=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER/files?per_page=100" --paginate --jq '.[] | [.status, .filename] | @tsv' 2>/dev/null || true)
+          changed_files_count=$(gh api "repos/${{ github.repository }}/pulls/$PR_NUMBER" --jq '.changed_files // 0' 2>/dev/null || printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
+          changed_files_summary=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==2 {
             st = toupper(substr($1,1,1))
             if (st == "C") st = "M"
-            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
-            printf "%s %s %s %s\n", "-", st, $4, counts
+            if (st == "R") st = "M"
+            cnt[st]++
+          } END {
+            printf "(A %d / M %d / D %d)", cnt["A"]+0, cnt["M"]+0, cnt["D"]+0
           }')
 
           # Prepare linked issues robustly by fetching each one individually
@@ -507,15 +512,12 @@ jobs:
           echo "Additions: $additions" >> "$GITHUB_ENV"
           echo "Deletions: $deletions" >> "$GITHUB_ENV"
           echo "Total Commits: $total_commits" >> "$GITHUB_ENV"
-          echo "Changed Files: $changed_files_count files" >> "$GITHUB_ENV"
+          echo "Changed Files: $changed_files_count $changed_files_summary - per-file compact list: /tmp/kit/$PR_NUMBER/changed-files.txt" >> "$GITHUB_ENV"
           echo "<pull_request_body>" >> "$GITHUB_ENV"
           echo "$title" >> "$GITHUB_ENV"
           echo "---" >> "$GITHUB_ENV"
           echo "$body" >> "$GITHUB_ENV"
           echo "</pull_request_body>" >> "$GITHUB_ENV"
-          echo "<pull_request_changed_files>" >> "$GITHUB_ENV"
-          echo "$changed_files_list" >> "$GITHUB_ENV"
-          echo "</pull_request_changed_files>" >> "$GITHUB_ENV"
           echo "<linked_issues>" >> "$GITHUB_ENV"
           echo "$linked_issues" >> "$GITHUB_ENV"
           echo "</linked_issues>" >> "$GITHUB_ENV"

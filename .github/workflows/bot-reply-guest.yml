@@ -690,13 +690,18 @@ jobs:
           deletions=$(printf '%s' "$pr_json" | jq -r '.deletions')
           title=$(printf '%s' "$pr_json" | jq -r '.title')
           pr_body=$(printf '%s' "$pr_json" | jq -r '.body // "(No description provided)"')
-          files_tsv=$(gh api "repos/${TARGET_REPO}/pulls/${THREAD_NUMBER}/files?per_page=100" --paginate --jq '.[] | [.status, (.additions // 0), (.deletions // 0), .filename] | @tsv' 2>/dev/null || true)
-          changed_files_count=$(printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
-          changed_files_list=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==4 {
+          # One-line summary only; the per-file list lives in the kit
+          # (git-native numstat; the files API's per-file counts go null
+          # on huge PRs - see pr-review.yml for the live catch).
+          files_tsv=$(gh api "repos/${TARGET_REPO}/pulls/${THREAD_NUMBER}/files?per_page=100" --paginate --jq '.[] | [.status, .filename] | @tsv' 2>/dev/null || true)
+          changed_files_count=$(gh api "/repos/${TARGET_REPO}/pulls/${THREAD_NUMBER}" --jq '.changed_files // 0' 2>/dev/null || printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
+          changed_files_summary=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==2 {
             st = toupper(substr($1,1,1))
             if (st == "C") st = "M"
-            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
-            printf "%s %s %s %s\n", "-", st, $4, counts
+            if (st == "R") st = "M"
+            cnt[st]++
+          } END {
+            printf "(A %d / M %d / D %d)", cnt["A"]+0, cnt["M"]+0, cnt["D"]+0
           }')
           CLJ2="${CONTEXT_LIMITS_JSON:-}"
           [ -z "$CLJ2" ] && CLJ2='{}'
@@ -716,6 +721,7 @@ jobs:
               linked_issues+=$(printf '<issue>\n <number>#%s</number>\n <title>%s</title>\n <body>\n%s\n</body>\n</issue>\n' "$number" "$li_title" "$li_body")
             done
           fi
+
           pr_xrefs=$(gh api "/repos/${TARGET_REPO}/issues/${THREAD_NUMBER}/timeline?per_page=100" 2>/dev/null \
             | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"' 2>/dev/null || true)
           [ -n "$pr_xrefs" ] || pr_xrefs="This PR has not been mentioned in other issues or PRs."
@@ -723,8 +729,8 @@ jobs:
           # Three-block discussion context + review memory via the shared
           # script, QUERY_REPO-qualified to the foreign repo (full parity
           # with home PR mode: reviews, threads, own-review elevation).
-          PREFIX_TEXT=$(printf 'Type: Pull Request (GUEST repository)\nRepository: %s\nPR Number: #%s\nTitle: %s\nAuthor: %s\nCreated At: %s\nBase Branch (target): %s\nHead Branch (source): %s\nState: %s\nTotal Commits: %s\nAdditions: %s\nDeletions: %s\nChanged Files: %s files\n<pull_request_body>\n%s\n</pull_request_body>\n<pull_request_changed_files>\n%s\n</pull_request_changed_files>\n<linked_issues>\n%s\n</linked_issues>\n<cross_references>\n%s\n</cross_references>' \
-            "$TARGET_REPO" "$THREAD_NUMBER" "$title" "$author" "$created_at" "$base_branch" "$head_branch" "$state" "$total_commits" "$additions" "$deletions" "$changed_files_count" "$pr_body_clipped" "$changed_files_list" "$linked_issues" "$pr_xrefs")
+          PREFIX_TEXT=$(printf 'Type: Pull Request (GUEST repository)\nRepository: %s\nPR Number: #%s\nTitle: %s\nAuthor: %s\nCreated At: %s\nBase Branch (target): %s\nHead Branch (source): %s\nState: %s\nTotal Commits: %s\nAdditions: %s\nDeletions: %s\nChanged Files: %s %s - per-file compact list: /tmp/kit/%s/changed-files.txt\n<pull_request_body>\n%s\n</pull_request_body>\n<linked_issues>\n%s\n</linked_issues>\n<cross_references>\n%s\n</cross_references>' \
+            "$TARGET_REPO" "$THREAD_NUMBER" "$title" "$author" "$created_at" "$base_branch" "$head_branch" "$state" "$total_commits" "$additions" "$deletions" "$changed_files_count" "$changed_files_summary" "$THREAD_NUMBER" "$pr_body_clipped" "$linked_issues" "$pr_xrefs")
           if ! PREFIX_TEXT="$PREFIX_TEXT" QUERY_REPO="$TARGET_REPO" bash /tmp/fetch-pr-discussion.sh "$THREAD_NUMBER"; then
             echo "::warning::Discussion context unavailable - proceeding with metadata-only context."
             echo "PREVIOUS_BOT_REVIEWS=(No previous reviews by this agent yet.)" >> "$GITHUB_ENV"
