@@ -263,6 +263,7 @@ python -m rotator_library.credential_tool
 | Type | Providers | How to Add |
 |------|-----------|------------|
 | **API Keys** | Gemini, OpenAI, Anthropic, OpenRouter, Groq, Mistral, NVIDIA, Cohere, Chutes | Enter key in TUI or add to `.env` |
+| **Assisted Login** | Player2 | Interactive wizard in the credential tool: auto-detects a local Player2 app, or opens a browser to approve access |
 | **OAuth** | Gemini CLI | Interactive browser login via credential tool |
 
 ### The `.env` File
