@@ -7,7 +7,7 @@ This document provides a detailed technical explanation of the project's archite
 The project is a monorepo containing two primary components:
 
 1.  **The Proxy Application (`proxy_app`)**: This is the user-facing component. It's a FastAPI application that acts as a universal gateway. It uses `litellm` to translate requests to various provider formats and includes:
-    *   **Batch Manager**: Optimizes high-volume embedding requests.
+    *   **native wire batching**: Optimizes high-volume embedding requests.
     *   **Detailed Logger**: Provides per-request file logging for debugging.
     *   **OpenAI-Compatible Endpoints**: `/v1/chat/completions`, `/v1/embeddings`, etc.
     *   **Anthropic-Compatible Endpoints**: `/v1/messages`, `/v1/messages/count_tokens` for Claude Code and other Anthropic API clients.

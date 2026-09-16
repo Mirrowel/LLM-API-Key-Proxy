@@ -279,7 +279,13 @@ class RequestContextBuilder:
             metadata={"operation": requested_operation} if requested_operation else None,
         )
         unified_request = input_protocol.parse_request(protocol_request, protocol_context)
-        if input_protocol.name != "openai_chat":
+        if input_protocol.name != "openai_chat" and requested_operation != "embeddings":
+            # Embeddings skip the chat rebuild: an embeddings payload from
+            # a non-openai ingress (ollama /api/embed) must stay in ITS
+            # wire shape — the native path builds from the protocol
+            # snapshot, and a litellm fallback dispatches aembedding with
+            # the ollama shape litellm's own handler expects. A chat
+            # rebuild would hand both a {messages: []} body.
             kwargs = get_protocol("openai_chat").build_request(
                 unified_request,
                 ProtocolContext(

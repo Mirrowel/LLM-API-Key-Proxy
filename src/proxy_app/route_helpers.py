@@ -5,7 +5,7 @@
 
 The main module stays a thin route surface; the pieces here are the
 proxy-level behaviors that surround client calls: stream framing with
-in-band error handling, request overrides, and embedding fan-out.
+in-band error handling and request overrides.
 """
 
 from __future__ import annotations

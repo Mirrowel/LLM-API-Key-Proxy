@@ -129,9 +129,24 @@ class OpenAIEmbeddingsProtocol(ProtocolAdapter):
                         target_protocol=self.name,
                     )
         # Anything else is a custom option: opaque pass-through, same
-        # doctrine as the request-side unknown-option disclosure.
+        # doctrine as the request-side unknown-option disclosure — EXCEPT
+        # foreign host controls riding ``extra`` (ollama's truncate is
+        # parsed there), which drop with the same disclosure instead of
+        # leaking onto the openai wire (unknown args are a hard 400).
+        extras = deepcopy(unified_request.extra)
+        if not preserve_source:
+            for key in sorted(_FOREIGN_EMBEDDING_CONTROLS):
+                if key in extras:
+                    extras.pop(key)
+                    add_conversion_warning(
+                        unified_request,
+                        code="unsupported_optional_control",
+                        message=f"embeddings control {key!r} has no openai representation; dropped",
+                        field=key,
+                        target_protocol=self.name,
+                    )
         payload.update(params)
-        payload.update(deepcopy(unified_request.extra))
+        payload.update(extras)
         return payload
 
     def parse_response(self, raw_response: Any, context: ProtocolContext | None = None) -> UnifiedResponse:
