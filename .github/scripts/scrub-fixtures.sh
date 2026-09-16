@@ -2963,24 +2963,34 @@ fi
 SECTION_NAME='files caps at one page of 100 and lied about a 324-file PR)'
 if [ "$PARALLEL" = 1 ]; then
   ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
-check "files: PR-context fetch no longer asks --json for files" yes \
-  "$(grep -q -- '--json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "files: paginated REST files API used" yes \
-  "$(grep -q 'pulls/\$PR_NUMBER/files?per_page=100' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q -- '--paginate' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "files: compact status-letter rendering" yes \
-  "$(grep -q 'toupper(substr(\$1,1,1))' "$SCRIPT_DIR/../workflows/pr-review.yml" && ! grep -q '(MODIFIED)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-# Behavioral probe (live-caught: printf -- is a shell-ism mawk rejects with a
-# syntax error - the grep pin alone shipped a broken awk). Mirror of the
-# workflow body; the grep pins above guard the drift.
-FILES_PROBE=$(printf 'modified\t10\t2\tsrc/a.py\ndeleted\t0\t40\told.py\nadded\t0\t0\timg.png\n' | awk -F'\t' 'NF==4 {
+# 2026-09-15 live catch (2nd generation): gh pr view's `commits` --json
+# field is a LIST capped at 100 -> "Total Commits: 100" on 100+-commit PRs;
+# and the files API's per-file additions/deletions go null on huge PRs,
+# mislabeling real source files "(binary or empty)". New contract: exact
+# commits from the REST scalar, ONE summary line in the prompt, and the
+# per-file list lives in the kit (git-native numstat, never the API).
+check "files: commits from REST scalar (no capped list length)" yes \
+  "$(grep -rq '.commits | length' "$SCRIPT_DIR/../workflows/" && echo no || echo yes)"
+check "files: REST commits scalar fetched" yes \
+  "$(grep -q "jq '.commits // 0'" "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q "jq '.commits // 0'" "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "files: no inline per-file list in any PR context" yes \
+  "$(grep -rq 'pull_request_changed_files' "$SCRIPT_DIR/../workflows/" && echo no || echo yes)"
+check "files: no (binary or empty) mislabel anywhere" yes \
+  "$(grep -rq 'binary or empty' "$SCRIPT_DIR/../workflows/" && echo no || echo yes)"
+check "files: summary distribution line rendered" yes \
+  "$(grep -q '(A %d / M %d / D %d)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "files: kit writes git-native per-file list" yes \
+  "$(grep -q 'changed-files.txt' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q -- '--name-status' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q -- '--numstat' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q '(binary)' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Behavioral probe: the summary awk on a sample status TSV.
+FILES_PROBE=$(printf 'modified\tsrc/a.py\ndeleted\told.py\nadded\tnew.py\nrenamed\tm.py\n' | awk -F'\t' 'NF==2 {
             st = toupper(substr($1,1,1))
             if (st == "C") st = "M"
-            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
-            printf "%s %s %s %s\n", "-", st, $4, counts
+            if (st == "R") st = "M"
+            cnt[st]++
+          } END {
+            printf "(A %d / M %d / D %d)", cnt["A"]+0, cnt["M"]+0, cnt["D"]+0
           }' 2>&1)
-check "files: awk renders compact lines on mawk-compatible syntax" "3" \
-  "$(printf '%s\n' "$FILES_PROBE" | grep -c -- '- [MDAR] ')"
-
+check "files: summary awk folds renames into M (mawk-safe)" "(A 1 / M 2 / D 1)" "$FILES_PROBE"
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
   ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
@@ -2988,24 +2998,34 @@ check "files: awk renders compact lines on mawk-compatible syntax" "3" \
 else
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
-check "files: PR-context fetch no longer asks --json for files" yes \
-  "$(grep -q -- '--json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "files: paginated REST files API used" yes \
-  "$(grep -q 'pulls/\$PR_NUMBER/files?per_page=100' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q -- '--paginate' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-check "files: compact status-letter rendering" yes \
-  "$(grep -q 'toupper(substr(\$1,1,1))' "$SCRIPT_DIR/../workflows/pr-review.yml" && ! grep -q '(MODIFIED)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
-# Behavioral probe (live-caught: printf -- is a shell-ism mawk rejects with a
-# syntax error - the grep pin alone shipped a broken awk). Mirror of the
-# workflow body; the grep pins above guard the drift.
-FILES_PROBE=$(printf 'modified\t10\t2\tsrc/a.py\ndeleted\t0\t40\told.py\nadded\t0\t0\timg.png\n' | awk -F'\t' 'NF==4 {
+# 2026-09-15 live catch (2nd generation): gh pr view's `commits` --json
+# field is a LIST capped at 100 -> "Total Commits: 100" on 100+-commit PRs;
+# and the files API's per-file additions/deletions go null on huge PRs,
+# mislabeling real source files "(binary or empty)". New contract: exact
+# commits from the REST scalar, ONE summary line in the prompt, and the
+# per-file list lives in the kit (git-native numstat, never the API).
+check "files: commits from REST scalar (no capped list length)" yes \
+  "$(grep -rq '.commits | length' "$SCRIPT_DIR/../workflows/" && echo no || echo yes)"
+check "files: REST commits scalar fetched" yes \
+  "$(grep -q "jq '.commits // 0'" "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q "jq '.commits // 0'" "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
+check "files: no inline per-file list in any PR context" yes \
+  "$(grep -rq 'pull_request_changed_files' "$SCRIPT_DIR/../workflows/" && echo no || echo yes)"
+check "files: no (binary or empty) mislabel anywhere" yes \
+  "$(grep -rq 'binary or empty' "$SCRIPT_DIR/../workflows/" && echo no || echo yes)"
+check "files: summary distribution line rendered" yes \
+  "$(grep -q '(A %d / M %d / D %d)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+check "files: kit writes git-native per-file list" yes \
+  "$(grep -q 'changed-files.txt' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q -- '--name-status' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q -- '--numstat' "$SCRIPT_DIR/generate-review-kit.sh" && grep -q '(binary)' "$SCRIPT_DIR/generate-review-kit.sh" && echo yes || echo no)"
+# Behavioral probe: the summary awk on a sample status TSV.
+FILES_PROBE=$(printf 'modified\tsrc/a.py\ndeleted\told.py\nadded\tnew.py\nrenamed\tm.py\n' | awk -F'\t' 'NF==2 {
             st = toupper(substr($1,1,1))
             if (st == "C") st = "M"
-            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
-            printf "%s %s %s %s\n", "-", st, $4, counts
+            if (st == "R") st = "M"
+            cnt[st]++
+          } END {
+            printf "(A %d / M %d / D %d)", cnt["A"]+0, cnt["M"]+0, cnt["D"]+0
           }' 2>&1)
-check "files: awk renders compact lines on mawk-compatible syntax" "3" \
-  "$(printf '%s\n' "$FILES_PROBE" | grep -c -- '- [MDAR] ')"
-
+check "files: summary awk folds renames into M (mawk-safe)" "(A 1 / M 2 / D 1)" "$FILES_PROBE"
 fi
 section_end
 fi

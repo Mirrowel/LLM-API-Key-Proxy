@@ -692,7 +692,7 @@ jobs:
           # requester.login — it demands user-profile scopes the PAT lacks
           # (see compliance-check.yml pr_info for the REST pattern if a
           # field ever needs migrating). Do NOT add reviewRequests here.
-          pr_json=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,commits,closingIssuesReferences,headRepository)
+            pr_json=$(gh pr view $THREAD_NUMBER --repo ${{ github.repository }} --json author,title,body,createdAt,state,headRefName,baseRefName,headRefOid,additions,deletions,closingIssuesReferences,headRepository)
             timeline_data=$(gh api "/repos/${{ github.repository }}/issues/$THREAD_NUMBER/timeline")
 
             echo "PR_HEAD_SHA=$(echo "$pr_json" | jq -r .headRefOid)" >> $GITHUB_ENV
@@ -709,21 +709,24 @@ jobs:
             state=$(echo "$pr_json" | jq -r .state)
             additions=$(echo "$pr_json" | jq -r .additions)
             deletions=$(echo "$pr_json" | jq -r .deletions)
-            total_commits=$(echo "$pr_json" | jq -r '.commits | length')
+            # REST scalar, not gh's capped-at-100 commits list (see
+            # pr-review.yml for the live catch).
+            total_commits=$(gh api "repos/${{ github.repository }}/pulls/$THREAD_NUMBER" --jq '.commits // 0' 2>/dev/null || echo 0)
             title=$(echo "$pr_json" | jq -r .title)
             body=$(echo "$pr_json" | jq -r '.body // "(No description provided)"')
 
-            # Changed files via the paginated REST files API (gh pr view's
-            # --json files caps at ONE page of 100 and lies on 300+-file
-            # PRs); compact one line per file - status letter + counts.
-            # Same fix pr-review got.
-            files_tsv=$(gh api "repos/${{ github.repository }}/pulls/$THREAD_NUMBER/files?per_page=100" --paginate --jq '.[] | [.status, (.additions // 0), (.deletions // 0), .filename] | @tsv' 2>/dev/null || true)
-            changed_files_count=$(printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
-            changed_files_list=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==4 {
+            # One-line summary only; the per-file list lives in the kit
+            # (git-native numstat - the files API's per-file counts go
+            # null on huge PRs; see pr-review.yml for the live catch).
+            files_tsv=$(gh api "repos/${{ github.repository }}/pulls/$THREAD_NUMBER/files?per_page=100" --paginate --jq '.[] | [.status, .filename] | @tsv' 2>/dev/null || true)
+            changed_files_count=$(gh api "repos/${{ github.repository }}/pulls/$THREAD_NUMBER" --jq '.changed_files // 0' 2>/dev/null || printf '%s\n' "$files_tsv" | awk 'NF' | wc -l | tr -d ' ')
+            changed_files_summary=$(printf '%s\n' "$files_tsv" | awk -F'\t' 'NF==2 {
             st = toupper(substr($1,1,1))
             if (st == "C") st = "M"
-            counts = ($2 <= 0 && $3 <= 0) ? "(binary or empty)" : "+" $2 "/-" $3
-            printf "%s %s %s %s\n", "-", st, $4, counts
+            if (st == "R") st = "M"
+            cnt[st]++
+          } END {
+            printf "(A %d / M %d / D %d)", cnt["A"]+0, cnt["M"]+0, cnt["D"]+0
           }')
 
             linked_issues_content=""
@@ -743,13 +746,14 @@ jobs:
               linked_issues=$linked_issues_content
             fi
 
+
             references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
             if [ -z "$references" ]; then references="This PR has not been mentioned in other issues or PRs."; fi
 
             # Metadata/body prefix handed to the shared script; it prepends
             # this verbatim to THREAD_CONTEXT.
-            PREFIX_TEXT=$(printf 'Type: Pull Request\nPR Number: #%s\nTitle: %s\nAuthor: %s\nCreated At: %s\nBase Branch (target): %s\nHead Branch (source): %s\nState: %s\nAdditions: %s\nDeletions: %s\nTotal Commits: %s\nChanged Files: %s files\n<pull_request_body>\n%s\n---\n%s\n</pull_request_body>\n<pull_request_changed_files>\n%s\n</pull_request_changed_files>\n<linked_issues>\n%s\n</linked_issues>\n<cross_references>\n%s\n</cross_references>' \
-              "$THREAD_NUMBER" "$title" "$author" "$created_at" "$base_branch" "$head_branch" "$state" "$additions" "$deletions" "$total_commits" "$changed_files_count" "$title" "$body" "$changed_files_list" "$linked_issues" "$references")
+            PREFIX_TEXT=$(printf 'Type: Pull Request\nPR Number: #%s\nTitle: %s\nAuthor: %s\nCreated At: %s\nBase Branch (target): %s\nHead Branch (source): %s\nState: %s\nAdditions: %s\nDeletions: %s\nTotal Commits: %s\nChanged Files: %s %s - per-file compact list: /tmp/kit/%s/changed-files.txt\n<pull_request_body>\n%s\n---\n%s\n</pull_request_body>\n<linked_issues>\n%s\n</linked_issues>\n<cross_references>\n%s\n</cross_references>' \
+              "$THREAD_NUMBER" "$title" "$author" "$created_at" "$base_branch" "$head_branch" "$state" "$additions" "$deletions" "$total_commits" "$changed_files_count" "$changed_files_summary" "$THREAD_NUMBER" "$title" "$body" "$linked_issues" "$references")
 
             if ! PREFIX_TEXT="$PREFIX_TEXT" bash .github/scripts/fetch-pr-discussion.sh "$THREAD_NUMBER"; then
               echo "::warning::Discussion context unavailable - proceeding with metadata-only context."
