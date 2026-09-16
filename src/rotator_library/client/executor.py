@@ -607,11 +607,12 @@ class RequestExecutor:
         # native path — LiteLLM/custom paths execute generative calls and
         # would silently answer a count with a generation.
         requested_operation = getattr(context, "requested_operation", "") or ""
-        if requested_operation:
+        if requested_operation and requested_operation != "embeddings":
             # Only the native path serves non-generative requested
             # operations (count_tokens): LiteLLM/custom would silently
-            # answer a count with a generation. Auto mode routes the
-            # request natively; the native branch validates support.
+            # answer a count with a generation. Embeddings are exempt —
+            # the litellm branch dispatches aembedding (never
+            # acompletion) and custom providers implement aembedding.
             if execution in ("litellm_fallback", "custom"):
                 raise RoutingExecutionError(
                     f"Provider {provider} cannot serve requested operation {requested_operation} via {execution} execution",
@@ -631,6 +632,12 @@ class RequestExecutor:
             credential_id=credential_id,
             metadata={"execution": execution, "provider": provider, "model": model},
         )
+        # Embeddings responses are embeddings-shaped: formatting through
+        # the chat parser would park the vectors in extras and hand the
+        # client an empty list (gatekeeper-caught data loss).
+        response_source_protocol = (
+            "openai_embeddings" if requested_operation == "embeddings" else "openai_chat"
+        )
         if execution == "litellm_fallback":
             self._log_routing_trace(
                 context,
@@ -640,9 +647,9 @@ class RequestExecutor:
             response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
             _raise_for_structured_response_error(response)
             self._record_litellm_fallback_identity(context, provider, plugin, model, stream=False)
-            return self._format_execution_response(response, "openai_chat", context)
+            return self._format_execution_response(response, response_source_protocol, context)
 
-        if not requested_operation and (execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic())):
+        if (not requested_operation or requested_operation == "embeddings") and (execution == "custom" or (execution == "auto" and plugin and plugin.has_custom_logic())):
             if not plugin or not plugin.has_custom_logic():
                 raise RoutingExecutionError(f"Provider {provider} does not support custom execution")
             kwargs["credential_identifier"] = credential_secret
@@ -655,9 +662,12 @@ class RequestExecutor:
                 credential_id=credential_id,
                 metadata={"execution": "custom", "provider": provider, "model": model},
             )
-            response = await plugin.acompletion(self._http_client, **kwargs)
+            if requested_operation == "embeddings":
+                response = await plugin.aembedding(self._http_client, **kwargs)
+            else:
+                response = await plugin.acompletion(self._http_client, **kwargs)
             _raise_for_structured_response_error(response)
-            return self._format_execution_response(response, "openai_chat", context)
+            return self._format_execution_response(response, response_source_protocol, context)
 
         if execution == "native" or (execution == "auto" and _should_use_native_protocol(plugin, model, target, kwargs, stream=False, execution=execution, requested_operation=getattr(context, "requested_operation", "") or "")):
             native_context, native_request = self._build_native_provider_context(
@@ -682,7 +692,7 @@ class RequestExecutor:
         response = await self._execute_litellm_request(kwargs, credential_secret, context=context, credential_id=credential_id)
         _raise_for_structured_response_error(response)
         self._record_litellm_fallback_identity(context, provider, plugin, model, stream=False)
-        return self._format_execution_response(response, "openai_chat", context)
+        return self._format_execution_response(response, response_source_protocol, context)
 
     def _record_litellm_fallback_identity(
         self,

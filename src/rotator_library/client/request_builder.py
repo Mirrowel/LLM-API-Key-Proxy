@@ -556,24 +556,37 @@ class RequestContextBuilder:
                 unified_request.model = clean_model
         routing_decision = self._resolve_routing_decision(clean_model)
         routing_targets = routing_decision.targets if routing_decision else None
-        provider = routing_targets[0].provider if routing_targets else self._provider_from_model(model)
-        if not provider:
-            self._raise_no_provider(model)
-
-        scope = await self._resolve_scope_for_provider(
-            provider,
-            classifier,
-            request_api_keys,
-            request_providers,
-            private,
-        )
-        if not scope["credentials"]:
-            self._raise_no_provider(model)
+        if not routing_targets:
+            provider = self._provider_from_model(model)
+            if not provider:
+                self._raise_no_provider(model)
+            scope = await self._resolve_scope_for_provider(
+                provider,
+                classifier,
+                request_api_keys,
+                request_providers,
+                private,
+            )
+            if not scope["credentials"]:
+                self._raise_no_provider(model)
+        else:
+            provider = routing_targets[0].provider
+            scope = await self._resolve_scope_for_provider(
+                provider,
+                classifier,
+                request_api_keys,
+                request_providers,
+                private,
+            )
 
         if routing_targets:
             # Skip-and-record for BOTH no-credentials and no-embeddings-
             # surface targets (D17 breaker shape): a mixed group routes
-            # embeddings to whoever can serve them.
+            # embeddings to whoever can serve them. The FIRST target is
+            # not special — a group whose head lacks credentials or an
+            # embeddings surface falls through to the next target, and
+            # identity (provider, scope, logger, session) binds to the
+            # SURVIVING head, never the skipped one.
             scoped_targets = []
             skipped: list[str] = []
             for index, target in enumerate(routing_targets):
@@ -589,20 +602,13 @@ class RequestContextBuilder:
                     reason = "no credentials"
                 else:
                     target_plugin = self._get_provider_instance(target.provider) if self._get_provider_instance else None
-                    if target_plugin is not None:
-                        try:
-                            endpoint = target_plugin.get_native_endpoint(
-                                target.model if hasattr(target, "model") else clean_model,
-                                "embeddings",
-                                getattr(target, "profile", None),
-                            )
-                        except Exception:
-                            endpoint = None
-                        if not endpoint:
-                            reason = "no embeddings surface"
+                    if target_plugin is not None and not _target_serves_embeddings(target_plugin):
+                        reason = "no embeddings surface"
                 if reason:
                     skipped.append(f"{target.prefixed_model} ({reason})")
                     continue
+                if index == 0 and target_scope is not scope:
+                    scope = target_scope
                 scoped_targets.append(self._with_request_scope(target, target_scope))
             if skipped:
                 logging.getLogger("rotator_library").warning(
@@ -611,8 +617,20 @@ class RequestContextBuilder:
                     ", ".join(skipped),
                 )
             if not scoped_targets:
-                self._raise_no_provider(model)
+                raise ModelReferenceError(
+                    "No fallback target can serve an embeddings request "
+                    f"(model {model!r}): every target lacks credentials or an "
+                    "embeddings surface"
+                )
             routing_targets = tuple(scoped_targets)
+            provider = routing_targets[0].provider
+            scope = await self._resolve_scope_for_provider(
+                provider,
+                classifier,
+                request_api_keys,
+                request_providers,
+                private,
+            )
 
         resolved_model = self._model_resolver.resolve_model_id(routing_targets[0].prefixed_model if routing_targets else model, provider)
         kwargs["model"] = resolved_model
@@ -729,6 +747,22 @@ class RequestContextBuilder:
             routing_group=routing_decision.group if routing_decision else None,
             pipeline_run=pipeline_run,
         )
+
+
+def _target_serves_embeddings(plugin: Any) -> bool:
+    """Whether ANY declared face of the provider natively serves embeddings.
+
+    Multi-face providers (openai: responses-default + chat) serve
+    embeddings on a NON-default face — probing the default face alone
+    would wrongly skip them. Mirrors the executor's face-scan.
+    """
+
+    try:
+        from .executor import _operation_declared_on_faces
+
+        return _operation_declared_on_faces(plugin, "embeddings")
+    except Exception:
+        return False
 
 
 def _normalize_profile_reference(kwargs: Dict[str, Any]) -> Optional[str]:

@@ -284,7 +284,7 @@ Balanced mode defaults to `optimal_concurrent=1` and `max_concurrent=-1`, which 
 
 ### 2.3. `batch_manager.py` - Efficient Request Aggregation
 
-The `EmbeddingBatcher` class optimizes high-throughput embedding workloads.
+The `native wire batching` class optimizes high-throughput embedding workloads.
 
 *   **Mechanism**: It uses an `asyncio.Queue` to collect incoming requests.
 *   **Triggers**: A batch is dispatched when either:

@@ -57,6 +57,31 @@ class GeminiHandler:
             request=raw_request,
         )
 
+    async def embeddings(self, payload: dict[str, Any], *, model: str, operation: str = "embeddings") -> dict[str, Any]:
+        """Embed natively (provider embedContent / batchEmbedContents).
+
+        G9 ingress parity: the client's chosen endpoint IS the batching
+        choice — the single route stamps operation ``embeddings``, the
+        batch route ``embeddings_batch``, and the runtime honors both
+        through the same protocol machinery cross-protocol traffic uses.
+        """
+
+        request_payload = dict(payload)
+        request_payload["model"] = self._routable_model(model)
+        captured: dict[str, Any] = {}
+
+        def _capture_context(ctx: Any) -> None:
+            captured["logger"] = getattr(ctx, "transaction_logger", None)
+
+        result = await self._client.agenerate(
+            request_payload,
+            input_protocol="gemini",
+            _requested_operation=operation,
+            _request_context_callback=_capture_context,
+        )
+        _drain_proxy_warnings(result, captured.get("logger"))
+        return result
+
     async def count_tokens(self, payload: dict[str, Any], *, model: str) -> dict[str, Any]:
         """Count tokens natively (provider countTokens) with an opt-in local estimate.
 

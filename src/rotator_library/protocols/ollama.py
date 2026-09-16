@@ -25,6 +25,7 @@ from .canonical import (
     STOP_REASON_STOP,
     add_conversion_warning,
     canonical_tool_arguments,
+    is_same_protocol,
     message_reasoning,
     message_tool_calls,
     message_tool_results,
@@ -139,6 +140,22 @@ class OllamaProtocol(ProtocolAdapter):
         if unified_request.tools:
             payload["tools"] = [_tool_to_ollama(tool) for tool in unified_request.tools]
         payload.update(_build_options(unified_request, context))
+        if unified_request.operation == OPERATION_EMBEDDINGS and not is_same_protocol(
+            context, self.name, unified_request.source_protocol
+        ):
+            # Foreign embedding controls with no ollama representation
+            # drop WITH disclosure (the openai dialect's encoding_format /
+            # user), never silently onto the NDJSON wire.
+            for key in sorted(("encoding_format", "user", "task_type", "title")):
+                if key in payload:
+                    payload.pop(key)
+                    add_conversion_warning(
+                        unified_request,
+                        code="unsupported_optional_control",
+                        message=f"embeddings control {key!r} has no ollama representation; dropped",
+                        field=key,
+                        target_protocol=self.name,
+                    )
         payload.update(deepcopy(unified_request.extra))
         return payload
 

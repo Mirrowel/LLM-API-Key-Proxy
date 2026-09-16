@@ -21,7 +21,11 @@ _REQUEST_OPTION_FIELDS = {"encoding_format", "dimensions", "user"}
 # arrive from the gemini adapter (task_type/title/output_dimensionality maps
 # onto dimensions), and dropping them silently would change the meaning of a
 # retrieval/document embedding request — so the drop is disclosed.
-_FOREIGN_EMBEDDING_CONTROLS = {"task_type", "title"}
+# Controls that exist on OTHER embedding dialects but have no openai
+# representation: gemini retrieval controls, ollama host controls.
+# Cross-protocol traffic drops them WITH disclosure; same-protocol replay
+# preserves them (source fidelity).
+_FOREIGN_EMBEDDING_CONTROLS = {"task_type", "title", "keep_alive", "truncate", "options"}
 
 
 class OpenAIEmbeddingsProtocol(ProtocolAdapter):

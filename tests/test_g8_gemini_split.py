@@ -536,5 +536,7 @@ def test_request_sanitizer_no_longer_owns_gemini_thinking() -> None:
     assert sanitize_request_payload(dict(payload), "gemini/gemini-2.5-pro") == payload
     assert sanitize_request_payload(dict(payload), "someone/else") == payload
 
-    # The dimensions branch (the sanitizer's remaining job) still runs.
-    assert sanitize_request_payload({"dimensions": 3}, "someone/else") == {}
+    # The dimensions prefix hack died too (G9): per-model legality is
+    # capability data (validation checks the shape; the model database
+    # seam will own legality) — the control never silently vanishes here.
+    assert sanitize_request_payload({"dimensions": 3}, "someone/else") == {"dimensions": 3}

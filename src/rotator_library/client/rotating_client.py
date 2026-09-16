@@ -711,6 +711,13 @@ class RotatingClient:
 
         return await self._gemini_handler.count_tokens(payload, model=model)
 
+    async def gemini_embeddings(
+        self, payload: Dict[str, Any], *, model: str, operation: str = "embeddings"
+    ) -> Dict[str, Any]:
+        """Execute a Gemini embedContent/batchEmbedContents request natively."""
+
+        return await self._gemini_handler.embeddings(payload, model=model, operation=operation)
+
     def _model_cache_key(
         self,
         provider: str,

@@ -1328,6 +1328,61 @@ async def gemini_count_tokens(
         return JSONResponse(status_code=status, content=content)
 
 
+@app.post("/v1beta/models/{model:path}:embedContent")
+async def gemini_embed_content(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-native single embeddings endpoint (G9 ingress parity).
+
+    The client's endpoint choice is the batching choice: this route
+    stamps operation ``embeddings`` (single); the batch sibling below
+    stamps ``embeddings_batch``.
+    """
+
+    return await _gemini_embeddings_route(request, client, model, "embeddings")
+
+
+@app.post("/v1beta/models/{model:path}:batchEmbedContents")
+async def gemini_batch_embed_contents(
+    model: str,
+    request: Request,
+    client: RotatingClient = Depends(get_rotating_client),
+    _=Depends(verify_gemini_api_key),
+):
+    """Gemini-native batch embeddings endpoint (G9 ingress parity)."""
+
+    return await _gemini_embeddings_route(request, client, model, "embeddings_batch")
+
+
+async def _gemini_embeddings_route(request: Request, client: RotatingClient, model: str, operation: str):
+    """Shared body for the two Gemini embeddings ingress routes."""
+
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        status, content = route_error_response(
+            "Invalid JSON in request body.", protocol="gemini"
+        )
+        return JSONResponse(status_code=status, content=content)
+    if not isinstance(payload, dict):
+        status, content = route_error_response(
+            ValueError("request body must be a JSON object"), protocol="gemini"
+        )
+        return JSONResponse(status_code=status, content=content)
+    try:
+        result = await client.gemini_embeddings(payload, model=model, operation=operation)
+        return JSONResponse(content=result)
+    except HTTPException:
+        raise
+    except Exception as error:
+        logging.error(f"Gemini embeddings endpoint error: {error}")
+        status, content = route_error_response(error, protocol="gemini")
+        return JSONResponse(status_code=status, content=content)
+
+
 @app.get("/v1beta/models")
 async def gemini_models_discovery(
     request: Request,

@@ -10,8 +10,12 @@ def sanitize_request_payload(payload: Dict[str, Any], model: str) -> Dict[str, A
     The legacy hardcoded gemini-2.5 thinking-budget list was deleted (G8):
     thinking controls are owned by the declared capability rows + the effort
     chain, never by a model-name literal in the client request path.
+
+    The dimensions prefix hack died with it (G9): whether a model accepts
+    ``dimensions`` is per-model capability data — the validation layer
+    checks the value's SHAPE (positive int), the model database seam will
+    own per-model legality, and a provider that rejects the word answers
+    its own honest 400 instead of the control silently vanishing here.
     """
-    if "dimensions" in payload and not model.startswith("openai/text-embedding-3"):
-        del payload["dimensions"]
 
     return payload

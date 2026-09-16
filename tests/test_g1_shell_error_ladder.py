@@ -96,7 +96,6 @@ def _install(monkeypatch, error: BaseException | None = None) -> TestClient:
     monkeypatch.setattr(proxy_main, "PROXY_API_KEY", None)
     monkeypatch.setattr(proxy_main, "ENABLE_RAW_LOGGING", False)
     proxy_main.app.state.rotating_client = RouteClient(error)
-    proxy_main.app.state.embedding_batcher = None
     return TestClient(proxy_main.app)
 
 
@@ -166,7 +165,6 @@ def test_auth_401_uses_route_dialect(monkeypatch, path, protocol) -> None:
     monkeypatch.setattr(proxy_main, "PROXY_API_KEY", "secret-key")
     monkeypatch.setattr(proxy_main, "ENABLE_RAW_LOGGING", False)
     proxy_main.app.state.rotating_client = RouteClient()
-    proxy_main.app.state.embedding_batcher = None
     client = TestClient(proxy_main.app)
 
     if path == "/v1/models":
