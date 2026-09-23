@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 
 from ..core.types import RequestContext
 from ..transaction_logger import TransactionLogger
+from .model_args import apply_model_args_to_kwargs, split_model_args
 
 
 class RequestContextBuilder:
@@ -98,6 +99,14 @@ class RequestContextBuilder:
             kwargs
         )
         model = kwargs.get("model", "")
+        # Model-string arguments (``model:high``): split before provider
+        # extraction and alias resolution so both key on the clean id; the
+        # hint fills the request parameter only when the client sent none.
+        clean_model, model_args = split_model_args(model)
+        if model_args:
+            kwargs["model"] = clean_model
+            model = clean_model
+        apply_model_args_to_kwargs(kwargs, model_args)
         provider = self._provider_from_model(model)
         if not provider:
             self._raise_no_provider(model)
