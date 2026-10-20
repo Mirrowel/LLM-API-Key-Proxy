@@ -9,7 +9,6 @@ import os
 import logging
 from typing import Any, Dict, Optional
 
-
 lib_logger = logging.getLogger("rotator_library")
 
 
@@ -30,12 +29,25 @@ MINIMAX_ENDPOINTS: Dict[str, Dict[str, str]] = {
 }
 
 MINIMAX_MODEL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
+    "MiniMax-M3.1-Flash": {
+        "context_window": 1_000_000,
+        "max_output": 524_288,
+        "pricing_usd_per_million_tokens": {
+            "input": 0.15,
+            "output": 0.60,
+            "cache_read": 0.015,
+            "cache_write": None,
+        },
+        "input_modalities": ["text", "image", "video"],
+        "thinking": ["adaptive"],
+        "interleaved": True,
+    },
     "MiniMax-M3": {
         "context_window": 1_000_000,
         "pricing_usd_per_million_tokens": {
-            "input": 0.6,
-            "output": 2.4,
-            "cache_read": 0.12,
+            "input": 0.3,
+            "output": 1.2,
+            "cache_read": 0.06,
             "cache_write": None,
         },
         "input_modalities": ["text", "image", "video"],
@@ -55,7 +67,8 @@ MINIMAX_MODEL_DEFINITIONS: Dict[str, Dict[str, Any]] = {
     },
 }
 
-MINIMAX_DEFAULT_MODELS = tuple(MINIMAX_MODEL_DEFINITIONS)
+# Legacy metadata remains available for explicit requests and usage history.
+MINIMAX_DEFAULT_MODELS = ("MiniMax-M3.1-Flash", "MiniMax-M3")
 
 _REGION_ENV_VARS = {
     GLOBAL_EN: {

@@ -133,11 +133,11 @@ def _build_minimax_model_catalog() -> Dict[str, Dict[str, Any]]:
             ),
             "pricing_tiers": normalize_tiers(definition),
             "context": definition["context_window"],
-            "max_out": 0,
+            "max_out": definition.get("max_output", 0),
             "inputs": input_types,
             "outputs": ["text"],
-            "has_tools": model_id == "MiniMax-M3",
-            "has_functions": model_id == "MiniMax-M3",
+            "has_tools": model_id in ("MiniMax-M3.1-Flash", "MiniMax-M3"),
+            "has_functions": model_id in ("MiniMax-M3.1-Flash", "MiniMax-M3"),
             "has_reasoning": bool(definition["thinking"]),
             "has_vision": "image" in input_types,
             "has_structured_output": False,
@@ -147,7 +147,7 @@ def _build_minimax_model_catalog() -> Dict[str, Dict[str, Any]]:
             "thinking_modes": thinking_modes,
             "supported_parameters": (
                 ["tools", "tool_choice", "thinking"]
-                if model_id == "MiniMax-M3"
+                if model_id in ("MiniMax-M3.1-Flash", "MiniMax-M3")
                 else []
             ),
         }

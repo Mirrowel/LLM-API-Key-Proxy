@@ -3,22 +3,20 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, List
 
 import httpx
+import litellm
 
 from ..minimax_config import (
+    ANTHROPIC_PROTOCOL,
     MINIMAX_DEFAULT_MODELS,
-    OPENAI_PROTOCOL,
     get_minimax_endpoint,
     get_minimax_protocol,
     get_minimax_region,
 )
 from ..model_definitions import ModelDefinitions
 from .provider_interface import ProviderInterface
-
-lib_logger = logging.getLogger("rotator_library")
 
 
 class MinimaxProvider(ProviderInterface):
@@ -30,44 +28,44 @@ class MinimaxProvider(ProviderInterface):
         self.model_definitions = ModelDefinitions()
 
     async def get_models(self, api_key: str, client: httpx.AsyncClient) -> List[str]:
-        """Return configured fallback models and any models exposed by the API."""
-        models: List[str] = []
-        seen: set[str] = set()
-
-        configured_models = self.model_definitions.get_all_provider_models("minimax")
-        for model in configured_models:
-            if model not in seen:
+        """List current text models first, followed by explicit user definitions."""
+        models = [f"minimax/{model_id}" for model_id in MINIMAX_DEFAULT_MODELS]
+        for model in self.model_definitions.get_all_provider_models("minimax"):
+            if model not in models:
                 models.append(model)
-                seen.add(model)
-
-        for model_id in MINIMAX_DEFAULT_MODELS:
-            model = f"minimax/{model_id}"
-            if model not in seen:
-                models.append(model)
-                seen.add(model)
-
-        try:
-            models_url = f"{get_minimax_endpoint(protocol=OPENAI_PROTOCOL)}/models"
-            response = await client.get(
-                models_url,
-                headers={"Authorization": f"Bearer {api_key}"},
-            )
-            response.raise_for_status()
-            for model_data in response.json().get("data", []):
-                model_id = model_data.get("id")
-                model = f"minimax/{model_id}" if model_id else ""
-                if model and model not in seen:
-                    models.append(model)
-                    seen.add(model)
-        except Exception as exc:
-            lib_logger.debug("MiniMax model discovery failed: %s", exc)
-
         return models
 
     def get_model_options(self, model_name: str) -> Dict[str, Any]:
         """Return user-defined options for a MiniMax model."""
         model_name = model_name.rsplit("/", 1)[-1]
-        return self.model_definitions.get_model_options("minimax", model_name)
+        options = dict(self.model_definitions.get_model_options("minimax", model_name))
+        self._adapt_flash_effort(options, model_name, get_minimax_protocol())
+        return options
+
+    @staticmethod
+    def _adapt_flash_effort(options: Dict[str, Any], model: str, protocol: str) -> None:
+        if model == "MiniMax-M3.1-Flash" and protocol == ANTHROPIC_PROTOCOL:
+            effort = options.pop("reasoning_effort", None)
+            if effort is not None:
+                litellm.register_model(
+                    {
+                        "anthropic/MiniMax-M3.1-Flash": {
+                            **litellm.model_cost.get(
+                                "anthropic/MiniMax-M3.1-Flash", {}
+                            ),
+                            "litellm_provider": "anthropic",
+                            "mode": "chat",
+                            "supports_reasoning": True,
+                            "supports_output_config": True,
+                            "supports_xhigh_reasoning_effort": True,
+                            "supports_max_reasoning_effort": True,
+                        }
+                    }
+                )
+                options["output_config"] = {
+                    **options.get("output_config", {}),
+                    "effort": effort,
+                }
 
     async def transform_request(
         self,
@@ -78,6 +76,7 @@ class MinimaxProvider(ProviderInterface):
         """Route the normalized request through the selected compatibility API."""
         protocol = get_minimax_protocol()
         model_name = model.rsplit("/", 1)[-1]
+        self._adapt_flash_effort(kwargs, model_name, protocol)
         kwargs["model"] = f"{protocol}/{model_name}"
         kwargs["api_base"] = get_minimax_endpoint(protocol=protocol)
         kwargs["custom_llm_provider"] = protocol

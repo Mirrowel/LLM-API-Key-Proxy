@@ -1147,11 +1147,26 @@ The library handles provider idiosyncrasies through specialized "Provider" class
 
 ### 3.1. MiniMax (`minimax_provider.py`)
 
-The MiniMax provider exposes the built-in `MiniMax-M3` and `MiniMax-M2.7`
-models while preserving additional models returned by the provider's model
-discovery endpoint. Native model metadata includes context limits, pricing,
-input modalities, tool use, and interleaved thinking for the
-`/v1/models` and cost APIs.
+The MiniMax provider lists `MiniMax-M3.1-Flash` first, followed by `MiniMax-M3`.
+Explicit `MINIMAX_MODELS` definitions are appended without duplicates. Older
+models returned by upstream discovery are not added to the ordinary catalog;
+explicit legacy model requests and their metadata remain supported.
+Native model metadata includes context limits, pricing, input modalities,
+tool use, and interleaved thinking for the `/v1/models` and cost APIs.
+
+Flash has a 1,000,000-token context, a 524,288-token output limit, and adaptive-only
+thinking. The provider forwards `reasoning_effort` directly on the OpenAI route
+and maps it to `output_config.effort` on the Anthropic route, including saved
+model options. Supported efforts are `low`, `medium`, `high`, `xhigh`, and `max`;
+omitting effort leaves the service's `max` default in effect.
+Its input/output/cache-read prices are $0.15/$0.60/$0.015 per million
+tokens. M3 metadata uses the standard prices for inputs up to 512k:
+$0.30/$1.20/$0.06 per million tokens. Inputs above 512k cost
+$0.60/$2.40/$0.12, and priority requests cost 1.5 times the standard rate;
+the cost API's flat M3 estimate does not account for these surcharges.
+
+See the [MiniMax model documentation](https://platform.minimax.io/docs/guides/models-intro.md)
+and [pricing](https://platform.minimax.io/docs/guides/pricing-paygo.md).
 
 Configure the upstream region and protocol with these environment variables:
 
