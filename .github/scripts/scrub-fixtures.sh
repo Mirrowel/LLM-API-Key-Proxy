@@ -391,13 +391,67 @@ fi
 section_end
 fi
 
+# OpenShare passive-export behavioral probe (helper; the multiline heredoc
+# must live in a function body, not inside $() - the MSYS parser rejects
+# multiline command substitution with heredocs).
+osh_passive_probe() { # exporter-path
+  local py=""
+  local cand
+  for cand in python3 python; do
+    if "$cand" -c 'import sys' >/dev/null 2>&1; then py="$cand"; break; fi
+  done
+  [ -z "$py" ] && return 0
+  "$py" - "$1" <<'PYEOF'
+import importlib.util, json, os, sys, tempfile
+spec = importlib.util.spec_from_file_location("exp", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+# urlFile: JSON lines preferred, bare URLs accepted, malformed skipped
+with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+    tf.write('{"id":"ab","url":"https://w/s/ab","status":"completed","gated":true}\n')
+    tf.write("garbage{\n")
+    tf.write("https://w/s/legacy\n")
+    urlpath = tf.name
+lines = mod.parse_url_file(urlpath)
+os.unlink(urlpath)
+assert len(lines) == 2, f"urlFile parse: {lines}"
+assert lines[0]["gated"] is True and lines[0]["id"] == "ab"
+assert lines[1]["url"] == "https://w/s/legacy" and not lines[1]["gated"]
+assert mod.parse_url_file(None) == [] and mod.parse_url_file("/nonexistent") == []
+
+# ref resolution: from the bundle-url env, default master
+os.environ.pop("OPENSHARE_BUNDLE_URL", None)
+assert mod.bundle_ref() == "master", "default ref must be master"
+os.environ["OPENSHARE_BUNDLE_URL"] = \
+    "https://raw.githubusercontent.com/Mirrowel/OpenShare/dev/share-plugin/ci/openshare.js"
+assert mod.bundle_ref() == "dev"
+os.environ["OPENSHARE_BUNDLE_URL"] = \
+    "https://raw.githubusercontent.com/Mirrowel/OpenShare/v0.3.0/share-plugin/ci/openshare.js"
+assert mod.bundle_ref() == "v0.3.0"
+
+# auth pair from the config env: parsed in-memory, never printed
+os.environ["OPENSHARE_CONFIG"] = json.dumps(
+    {"authLogin": "u1", "authPassword": "p1"})
+assert mod.auth_pair() == ("u1", "p1")
+os.environ["OPENSHARE_CONFIG"] = "not-json"
+assert mod.auth_pair() == ("", ""), "malformed config must not raise"
+
+# payload shape: raw exports + snapshot carried, osh-passive format
+src = open(sys.argv[1], encoding="utf-8").read()
+assert '"format": "osh-passive"' in src, "payload format marker missing"
+assert "snapshot_html" in src and '"exports"' in src
+print("ok")
+PYEOF
+}
+
 # ---- share-link filter contract (drift tripwire) ---------------------------
 SECTION_NAME='share-link filter contract (drift tripwire)'
 if [ "$PARALLEL" = 1 ]; then
   ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
-# Every opencode --share invocation MUST pipe through the trusted /tmp copy
-# of share-filter.sh (raw share URLs must never reach the public log), every
-# agent step must pass the SHARE_LINK_PUBKEY secret, and the summary step
+# Every opencode run invocation MUST pipe through the trusted /tmp copy
+# of share-filter.sh (redaction + banner masking; the dead share-URL capture is
+# gone), every agent step must pass the SESSION_ARTIFACT_PUBKEY secret, and the summary step
 # must exist to surface the encrypted block on the run page.
 for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   WFF="$SCRIPT_DIR/../workflows/$wf.yml"
@@ -411,19 +465,32 @@ for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
     issue-comment)   AGENT_KEY="issue-comment" ;;
     bot-reply-guest) AGENT_KEY="bot-reply" ;;  # guest lane shares the conversational model key
   esac
-  check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
-  # opencode prints the share link on STDERR (TUI/status channel): the
-  # merge is load-bearing - without 2>&1 the link bypasses the filter.
-  check "share: $wf merges stderr into filter"      yes "$(grep -q 'opencode run --share.*2>&1 | bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  check "share: $wf pipes run through filter"   yes "$(grep -q 'opencode run -.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  # opencode prints status/model banners on STDERR (TUI/status channel): the
+  # merge is load-bearing - without 2>&1 those lines bypass the filter
+  # (the dead --share URL capture is gone; redaction stays).
+  check "share: $wf merges stderr into filter"      yes "$(grep -q 'opencode run -.*2>&1 | bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   # "PR #{0}" inside an UNQUOTED scalar truncates the value at the YAML
   # comment marker (" #") - the workflow file goes invalid and every push
   # red-Xes with 0 jobs (live-caught on bot-reply). Values carrying # in
   # expressions must be quoted.
-  check "share: $wf SHARE_CTX values quoted (hash trap)" no "$(grep -E 'SHARE_CTX_[A-Z]+: [^\"'\"']' "$WFF" | grep -q '\$\{{' && echo yes || echo no)"
-  check "share: $wf passes SHARE_LINK_PUBKEY env"  yes "$(grep -q 'SHARE_LINK_PUBKEY: \${{ secrets.SHARE_LINK_PUBKEY }}' "$WFF" && echo yes || echo no)"
+  check "share: $wf passes SESSION_ARTIFACT_PUBKEY env"  yes "$(grep -q 'SESSION_ARTIFACT_PUBKEY: \${{ secrets.SESSION_ARTIFACT_PUBKEY }}' "$WFF" && echo yes || echo no)"
   check "share: $wf copies filter to /tmp"         yes "$(grep -q 'cp .github/scripts/share-filter.sh /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   check "share: $wf has summary step"              yes "$(grep -q 'Share link summary' "$WFF" && echo yes || echo no)"
-  check "share: $wf step sets pipefail"            yes "$(grep -B15 'opencode run --share' "$WFF" | grep -q 'set -o pipefail' && echo yes || echo no)"
+  check "share: $wf no dead SHARE_CTX envs"        yes "$(grep -q 'SHARE_CTX' "$WFF" && echo no || echo yes)"
+  check "share: filter has no dead capture path"   yes "$(grep -q 'opncd\|MRB1' "$SCRIPT_DIR/share-filter.sh" && echo no || echo yes)"
+  check "share: filter keeps boot sentinel"        yes "$(grep -q 'oc-booted' "$SCRIPT_DIR/share-filter.sh" && echo yes || echo no)"
+  check "share: $wf step sets pipefail"            yes "$(grep -B15 'opencode run -' "$WFF" | grep -q 'set -o pipefail' && echo yes || echo no)"
+  # Live-share announcer: the encrypted share URL must surface MID-RUN
+  # (notice + step summary, ciphertext only) so the operator can watch
+  # live; the watcher is killed when the session pipe ends.
+  check "share: $wf copies announcer to /tmp"       yes "$(grep -q 'cp .github/scripts/live-share-announce.sh /tmp/live-share-announce.sh' "$WFF" && echo yes || echo no)"
+  check "share: $wf starts announcer pre-session"   yes "$(grep -q 'bash /tmp/live-share-announce.sh & ANNOUNCER=' "$WFF" && echo yes || echo no)"
+  check "share: $wf kills announcer post-session"   yes "$(grep -q 'kill "$ANNOUNCER"' "$WFF" && echo yes || echo no)"
+  check "share: $wf session env has announce pubkey" yes "$(grep -q 'SESSION_ARTIFACT_PUBKEY: \${{ secrets.SESSION_ARTIFACT_PUBKEY }}' "$WFF" && echo yes || echo no)"
+check "share: announcer never echoes a raw URL"    yes "$(grep -q 'printf.*\$url.*\$url' "$SCRIPT_DIR/live-share-announce.sh" && echo no || echo yes)"
+check "share: announcer stays notice-only"         yes "$(grep -q 'GITHUB_STEP_SUMMARY' "$SCRIPT_DIR/live-share-announce.sh" && echo no || echo yes)"
+check "share: announcer encrypts with the pubkey"  yes "$(grep -q 'pkeyutl -encrypt' "$SCRIPT_DIR/live-share-announce.sh" && grep -q 'SESSION_ARTIFACT_PUBKEY' "$SCRIPT_DIR/live-share-announce.sh" && echo yes || echo no)"
 
   # ---- per-agent models + plugins + config lifecycle (bot-setup contract) ----
   check "models: $wf passes its agent-key"         yes "$(grep -q "agent-key: $AGENT_KEY" "$WFF" && echo yes || echo no)"
@@ -444,7 +511,51 @@ for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   check "stats: $wf runs bare stats (no --days)"   no  "$(grep -q 'stats --days' "$WFF" && echo yes || echo no)"
   # Pause gate: the agent's brain skips visibly; rails (stub/gate) stay on.
   check "pause: $wf job gated on AGENT_PAUSED"     yes "$(grep -q "vars.AGENT_PAUSED != 'true'" "$WFF" && echo yes || echo no)"
+  # ---- OpenShare live-sharing + passive-artifact contract ----
+  check "openshare: $wf passes config secret"      yes "$(grep -q 'openshare-config-json: \${{ secrets.OPENSHARE_CONFIG_JSON }}' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf session urlFile env"       yes "$(grep -q 'OPENSHARE_URL_FILE: \${{ runner.temp }}/openshare-urls.txt' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf session spool env"         yes "$(grep -q 'OPENSHARE_SPOOL_DIR: \${{ runner.temp }}/openshare-spool' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf copies exporter to /tmp"   yes "$(grep -q 'cp .github/scripts/export-session.py /tmp/export-session.py' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive export step"       yes "$(grep -q 'Passive session export (encrypted artifact)' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive runs always()"     yes "$(grep -A6 'Passive session export' "$WFF" | grep -q 'if: always()' && echo yes || echo no)"
+  check "openshare: $wf passive toggle respected"  yes "$(grep -q "OPENSHARE_PASSIVE != 'false'" "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive uses --url-file"   yes "$(grep -A20 'Passive session export' "$WFF" | grep -q -- '--url-file' && ! grep -A20 'Passive session export' "$WFF" | grep -q -- '--live-url' && echo yes || echo no)"
+  check "openshare: $wf passive passes bundle env" yes "$(grep -q 'OPENSHARE_BUNDLE_URL: \${{ vars.OPENSHARE_BUNDLE_URL' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive passes cfg secret" yes "$(grep -q 'OPENSHARE_CONFIG: \${{ secrets.OPENSHARE_CONFIG_JSON }}' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf bundle-url input wired"    yes "$(grep -q 'openshare-bundle-url: \${{ vars.OPENSHARE_BUNDLE_URL' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive never fails run"   yes "$(grep -A6 'Passive session export' "$WFF" | grep -q 'continue-on-error: true' && echo yes || echo no)"
+  check "openshare: $wf artifact upload wired"     yes "$(grep -q 'name: session-\${{ github.run_id }}.enc' "$WFF" && grep -q 'if-no-files-found: ignore' "$WFF" && echo yes || echo no)"
 done
+
+# ---- OpenShare bot-setup contract (fetch + adjacent config + masks) -------
+ACT="$SCRIPT_DIR/../actions/bot-setup/action.yml"
+check "openshare: action declares input"             yes "$(grep -q '  openshare-config-json:' "$ACT" && echo yes || echo no)"
+check "openshare: bundle-url input declared"          yes "$(grep -q '  openshare-bundle-url:' "$ACT" && echo yes || echo no)"
+check "openshare: master fetch stays the default"      yes "$(grep -q 'OPENSHARE_BUNDLE_URL:-https://raw.githubusercontent.com/Mirrowel/OpenShare/master' "$ACT" && echo yes || echo no)"
+check "openshare: env auth belt removed"               yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'OPENSHARE_AUTH_LOGIN' && echo no || echo yes)"
+check "openshare: fetch failure degrades (warning)"  yes "$(grep -B2 -A2 'bundle fetch failed' "$ACT" | grep -q '::warning' && echo yes || echo no)"
+check "openshare: config written adjacent to plugin" yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '\$PLUGINS_DIR/openshare.config.json' && echo yes || echo no)"
+check "openshare: credential leaves add-masked"      yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '::add-mask' && echo yes || echo no)"
+check "openshare: plugin registered idempotently"    yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'index(\$p)' && echo yes || echo no)"
+
+# ---- OpenShare export-session v2 contract (behavioral + structural) -------
+# The passive artifact must emit OpenShare contract v2 (content-embedded
+# messages, NO part items - the v2 viewer ignores parts) and must select
+# the newest ROOT session (a subagent child finishing last must never
+# become the export root).
+OSH_PROBE_OUT="$(osh_passive_probe "$SCRIPT_DIR/export-session.py" 2>&1)" || true
+check "openshare: exporter passive contract (probe)"   yes "$(printf '%s' "$OSH_PROBE_OUT" | grep -q '^ok$' && echo yes || echo no)"
+check "openshare: exporter picks newest ROOT session"  yes "$(grep -q 'WHERE parent_id IS NULL' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter online tool fetch (ref)"    yes "$(grep -q 'TOOLS_ONLINE' "$SCRIPT_DIR/export-session.py" && grep -q 'osh-snapshot.mjs' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter offline tool fetch (ref)"   yes "$(grep -q 'TOOLS_OFFLINE' "$SCRIPT_DIR/export-session.py" && grep -q 'osh-snapshot-local.mjs' "$SCRIPT_DIR/export-session.py" && grep -q 'osh-session.mjs' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter dist from release asset"    yes "$(grep -q 'viewer-dist-' "$SCRIPT_DIR/export-session.py" && grep -q 'releases?per_page' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter gate warning wired"         yes "$(grep -q '::warning::' "$SCRIPT_DIR/export-session.py" && grep -q 'NOT login-gated' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter snapshot degrade note"      yes "$(grep -q 'raw exports intact' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+if [ -f "$SCRIPT_DIR/../../decrypt_share_link.py" ]; then
+  # the decrypt tool is agent-repo-only (consuming repos skip these pins)
+  check "openshare: decrypt tool writes file:// library" yes "$(grep -q 'snapshot.html' "$SCRIPT_DIR/../../decrypt_share_link.py" && echo yes || echo no)"
+  check "openshare: decrypt tool serve is gone"         yes "$( ! grep -q 'ensure_local_server' "$SCRIPT_DIR/../../decrypt_share_link.py" && echo yes || echo no)"
+fi
 
 # ---- share-filter credential redaction (behavioral, live shapes) ----------
 # The 2026-09-15 incident class: credential-shaped content in tool output
@@ -460,7 +571,7 @@ printf '%s\n' \
   '  "apiKey": "zaikey.value12345678"' \
   'the token" concept in prose stays' \
   '  "key": "short"' \
-  | SHARE_LINK_PUBKEY="" bash "$SCRIPT_DIR/share-filter.sh" > "$SF_TEST_OUT" 2>/dev/null || true
+  | SESSION_ARTIFACT_PUBKEY="" bash "$SCRIPT_DIR/share-filter.sh" > "$SF_TEST_OUT" 2>/dev/null || true
 SF_BODY=$(grep -v '^::add-mask' "$SF_TEST_OUT")
 check "redact: ghp/x-access-token redacted"    yes "$(printf '%s' "$SF_BODY" | grep -q 'ghp_ABKvrGK' && echo no || echo yes)"
 check "redact: cr_ provider key pair redacted" yes "$(printf '%s' "$SF_BODY" | grep -q 'cr_abcdefghij' && echo no || echo yes)"
@@ -478,9 +589,9 @@ rm -f "$SF_TEST_OUT"
 else
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
-# Every opencode --share invocation MUST pipe through the trusted /tmp copy
-# of share-filter.sh (raw share URLs must never reach the public log), every
-# agent step must pass the SHARE_LINK_PUBKEY secret, and the summary step
+# Every opencode run invocation MUST pipe through the trusted /tmp copy
+# of share-filter.sh (redaction + banner masking; the dead share-URL capture is
+# gone), every agent step must pass the SESSION_ARTIFACT_PUBKEY secret, and the summary step
 # must exist to surface the encrypted block on the run page.
 for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   WFF="$SCRIPT_DIR/../workflows/$wf.yml"
@@ -494,19 +605,32 @@ for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
     issue-comment)   AGENT_KEY="issue-comment" ;;
     bot-reply-guest) AGENT_KEY="bot-reply" ;;  # guest lane shares the conversational model key
   esac
-  check "share: $wf pipes --share through filter"  yes "$(grep -q 'opencode run --share.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
-  # opencode prints the share link on STDERR (TUI/status channel): the
-  # merge is load-bearing - without 2>&1 the link bypasses the filter.
-  check "share: $wf merges stderr into filter"      yes "$(grep -q 'opencode run --share.*2>&1 | bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  check "share: $wf pipes run through filter"   yes "$(grep -q 'opencode run -.*| bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
+  # opencode prints status/model banners on STDERR (TUI/status channel): the
+  # merge is load-bearing - without 2>&1 those lines bypass the filter
+  # (the dead --share URL capture is gone; redaction stays).
+  check "share: $wf merges stderr into filter"      yes "$(grep -q 'opencode run -.*2>&1 | bash /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   # "PR #{0}" inside an UNQUOTED scalar truncates the value at the YAML
   # comment marker (" #") - the workflow file goes invalid and every push
   # red-Xes with 0 jobs (live-caught on bot-reply). Values carrying # in
   # expressions must be quoted.
-  check "share: $wf SHARE_CTX values quoted (hash trap)" no "$(grep -E 'SHARE_CTX_[A-Z]+: [^\"'\"']' "$WFF" | grep -q '\$\{{' && echo yes || echo no)"
-  check "share: $wf passes SHARE_LINK_PUBKEY env"  yes "$(grep -q 'SHARE_LINK_PUBKEY: \${{ secrets.SHARE_LINK_PUBKEY }}' "$WFF" && echo yes || echo no)"
+  check "share: $wf passes SESSION_ARTIFACT_PUBKEY env"  yes "$(grep -q 'SESSION_ARTIFACT_PUBKEY: \${{ secrets.SESSION_ARTIFACT_PUBKEY }}' "$WFF" && echo yes || echo no)"
   check "share: $wf copies filter to /tmp"         yes "$(grep -q 'cp .github/scripts/share-filter.sh /tmp/share-filter.sh' "$WFF" && echo yes || echo no)"
   check "share: $wf has summary step"              yes "$(grep -q 'Share link summary' "$WFF" && echo yes || echo no)"
-  check "share: $wf step sets pipefail"            yes "$(grep -B15 'opencode run --share' "$WFF" | grep -q 'set -o pipefail' && echo yes || echo no)"
+  check "share: $wf no dead SHARE_CTX envs"        yes "$(grep -q 'SHARE_CTX' "$WFF" && echo no || echo yes)"
+  check "share: filter has no dead capture path"   yes "$(grep -q 'opncd\|MRB1' "$SCRIPT_DIR/share-filter.sh" && echo no || echo yes)"
+  check "share: filter keeps boot sentinel"        yes "$(grep -q 'oc-booted' "$SCRIPT_DIR/share-filter.sh" && echo yes || echo no)"
+  check "share: $wf step sets pipefail"            yes "$(grep -B15 'opencode run -' "$WFF" | grep -q 'set -o pipefail' && echo yes || echo no)"
+  # Live-share announcer: the encrypted share URL must surface MID-RUN
+  # (notice + step summary, ciphertext only) so the operator can watch
+  # live; the watcher is killed when the session pipe ends.
+  check "share: $wf copies announcer to /tmp"       yes "$(grep -q 'cp .github/scripts/live-share-announce.sh /tmp/live-share-announce.sh' "$WFF" && echo yes || echo no)"
+  check "share: $wf starts announcer pre-session"   yes "$(grep -q 'bash /tmp/live-share-announce.sh & ANNOUNCER=' "$WFF" && echo yes || echo no)"
+  check "share: $wf kills announcer post-session"   yes "$(grep -q 'kill "$ANNOUNCER"' "$WFF" && echo yes || echo no)"
+  check "share: $wf session env has announce pubkey" yes "$(grep -q 'SESSION_ARTIFACT_PUBKEY: \${{ secrets.SESSION_ARTIFACT_PUBKEY }}' "$WFF" && echo yes || echo no)"
+check "share: announcer never echoes a raw URL"    yes "$(grep -q 'printf.*\$url.*\$url' "$SCRIPT_DIR/live-share-announce.sh" && echo no || echo yes)"
+check "share: announcer stays notice-only"         yes "$(grep -q 'GITHUB_STEP_SUMMARY' "$SCRIPT_DIR/live-share-announce.sh" && echo no || echo yes)"
+check "share: announcer encrypts with the pubkey"  yes "$(grep -q 'pkeyutl -encrypt' "$SCRIPT_DIR/live-share-announce.sh" && grep -q 'SESSION_ARTIFACT_PUBKEY' "$SCRIPT_DIR/live-share-announce.sh" && echo yes || echo no)"
 
   # ---- per-agent models + plugins + config lifecycle (bot-setup contract) ----
   check "models: $wf passes its agent-key"         yes "$(grep -q "agent-key: $AGENT_KEY" "$WFF" && echo yes || echo no)"
@@ -527,7 +651,51 @@ for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
   check "stats: $wf runs bare stats (no --days)"   no  "$(grep -q 'stats --days' "$WFF" && echo yes || echo no)"
   # Pause gate: the agent's brain skips visibly; rails (stub/gate) stay on.
   check "pause: $wf job gated on AGENT_PAUSED"     yes "$(grep -q "vars.AGENT_PAUSED != 'true'" "$WFF" && echo yes || echo no)"
+  # ---- OpenShare live-sharing + passive-artifact contract ----
+  check "openshare: $wf passes config secret"      yes "$(grep -q 'openshare-config-json: \${{ secrets.OPENSHARE_CONFIG_JSON }}' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf session urlFile env"       yes "$(grep -q 'OPENSHARE_URL_FILE: \${{ runner.temp }}/openshare-urls.txt' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf session spool env"         yes "$(grep -q 'OPENSHARE_SPOOL_DIR: \${{ runner.temp }}/openshare-spool' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf copies exporter to /tmp"   yes "$(grep -q 'cp .github/scripts/export-session.py /tmp/export-session.py' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive export step"       yes "$(grep -q 'Passive session export (encrypted artifact)' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive runs always()"     yes "$(grep -A6 'Passive session export' "$WFF" | grep -q 'if: always()' && echo yes || echo no)"
+  check "openshare: $wf passive toggle respected"  yes "$(grep -q "OPENSHARE_PASSIVE != 'false'" "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive uses --url-file"   yes "$(grep -A20 'Passive session export' "$WFF" | grep -q -- '--url-file' && ! grep -A20 'Passive session export' "$WFF" | grep -q -- '--live-url' && echo yes || echo no)"
+  check "openshare: $wf passive passes bundle env" yes "$(grep -q 'OPENSHARE_BUNDLE_URL: \${{ vars.OPENSHARE_BUNDLE_URL' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive passes cfg secret" yes "$(grep -q 'OPENSHARE_CONFIG: \${{ secrets.OPENSHARE_CONFIG_JSON }}' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf bundle-url input wired"    yes "$(grep -q 'openshare-bundle-url: \${{ vars.OPENSHARE_BUNDLE_URL' "$WFF" && echo yes || echo no)"
+  check "openshare: $wf passive never fails run"   yes "$(grep -A6 'Passive session export' "$WFF" | grep -q 'continue-on-error: true' && echo yes || echo no)"
+  check "openshare: $wf artifact upload wired"     yes "$(grep -q 'name: session-\${{ github.run_id }}.enc' "$WFF" && grep -q 'if-no-files-found: ignore' "$WFF" && echo yes || echo no)"
 done
+
+# ---- OpenShare bot-setup contract (fetch + adjacent config + masks) -------
+ACT="$SCRIPT_DIR/../actions/bot-setup/action.yml"
+check "openshare: action declares input"             yes "$(grep -q '  openshare-config-json:' "$ACT" && echo yes || echo no)"
+check "openshare: bundle-url input declared"          yes "$(grep -q '  openshare-bundle-url:' "$ACT" && echo yes || echo no)"
+check "openshare: master fetch stays the default"      yes "$(grep -q 'OPENSHARE_BUNDLE_URL:-https://raw.githubusercontent.com/Mirrowel/OpenShare/master' "$ACT" && echo yes || echo no)"
+check "openshare: env auth belt removed"               yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'OPENSHARE_AUTH_LOGIN' && echo no || echo yes)"
+check "openshare: fetch failure degrades (warning)"  yes "$(grep -B2 -A2 'bundle fetch failed' "$ACT" | grep -q '::warning' && echo yes || echo no)"
+check "openshare: config written adjacent to plugin" yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '\$PLUGINS_DIR/openshare.config.json' && echo yes || echo no)"
+check "openshare: credential leaves add-masked"      yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '::add-mask' && echo yes || echo no)"
+check "openshare: plugin registered idempotently"    yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'index(\$p)' && echo yes || echo no)"
+
+# ---- OpenShare export-session v2 contract (behavioral + structural) -------
+# The passive artifact must emit OpenShare contract v2 (content-embedded
+# messages, NO part items - the v2 viewer ignores parts) and must select
+# the newest ROOT session (a subagent child finishing last must never
+# become the export root).
+OSH_PROBE_OUT="$(osh_passive_probe "$SCRIPT_DIR/export-session.py" 2>&1)" || true
+check "openshare: exporter passive contract (probe)"   yes "$(printf '%s' "$OSH_PROBE_OUT" | grep -q '^ok$' && echo yes || echo no)"
+check "openshare: exporter picks newest ROOT session"  yes "$(grep -q 'WHERE parent_id IS NULL' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter online tool fetch (ref)"    yes "$(grep -q 'TOOLS_ONLINE' "$SCRIPT_DIR/export-session.py" && grep -q 'osh-snapshot.mjs' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter offline tool fetch (ref)"   yes "$(grep -q 'TOOLS_OFFLINE' "$SCRIPT_DIR/export-session.py" && grep -q 'osh-snapshot-local.mjs' "$SCRIPT_DIR/export-session.py" && grep -q 'osh-session.mjs' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter dist from release asset"    yes "$(grep -q 'viewer-dist-' "$SCRIPT_DIR/export-session.py" && grep -q 'releases?per_page' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter gate warning wired"         yes "$(grep -q '::warning::' "$SCRIPT_DIR/export-session.py" && grep -q 'NOT login-gated' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+check "openshare: exporter snapshot degrade note"      yes "$(grep -q 'raw exports intact' "$SCRIPT_DIR/export-session.py" && echo yes || echo no)"
+if [ -f "$SCRIPT_DIR/../../decrypt_share_link.py" ]; then
+  # the decrypt tool is agent-repo-only (consuming repos skip these pins)
+  check "openshare: decrypt tool writes file:// library" yes "$(grep -q 'snapshot.html' "$SCRIPT_DIR/../../decrypt_share_link.py" && echo yes || echo no)"
+  check "openshare: decrypt tool serve is gone"         yes "$( ! grep -q 'ensure_local_server' "$SCRIPT_DIR/../../decrypt_share_link.py" && echo yes || echo no)"
+fi
 
 # ---- share-filter credential redaction (behavioral, live shapes) ----------
 # The 2026-09-15 incident class: credential-shaped content in tool output
@@ -543,7 +711,7 @@ printf '%s\n' \
   '  "apiKey": "zaikey.value12345678"' \
   'the token" concept in prose stays' \
   '  "key": "short"' \
-  | SHARE_LINK_PUBKEY="" bash "$SCRIPT_DIR/share-filter.sh" > "$SF_TEST_OUT" 2>/dev/null || true
+  | SESSION_ARTIFACT_PUBKEY="" bash "$SCRIPT_DIR/share-filter.sh" > "$SF_TEST_OUT" 2>/dev/null || true
 SF_BODY=$(grep -v '^::add-mask' "$SF_TEST_OUT")
 check "redact: ghp/x-access-token redacted"    yes "$(printf '%s' "$SF_BODY" | grep -q 'ghp_ABKvrGK' && echo no || echo yes)"
 check "redact: cr_ provider key pair redacted" yes "$(printf '%s' "$SF_BODY" | grep -q 'cr_abcdefghij' && echo no || echo yes)"
@@ -1689,7 +1857,7 @@ if [ -f "$GUESTWF" ]; then
   check "guest lane: no API-only/no-checkout escape hatch" yes "$(grep -q 'no foreign tree in the workspace' "$GUESTWF" && echo no || echo yes)"
   check "guest lane: real scrub removal count exported"   yes "$(grep -q 'auto-load item(s) were removed' "$GUESTWF" && echo yes || echo no)"
   check "guest lane: GH_REPO targets the foreign repo"    yes "$( [ "$(grep -c 'GH_REPO: \${{ env.TARGET_REPO }}' "$GUESTWF")" -ge 2 ] && echo yes || echo no)"
-  check "guest lane: share-link encryption env present"   yes "$(grep -q 'SHARE_LINK_PUBKEY' "$GUESTWF" && grep -q 'SHARE_CTX_THREAD' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: passive artifact env present"      yes "$(grep -q 'SESSION_ARTIFACT_PUBKEY' "$GUESTWF" && grep -q 'OPENSHARE_URL_FILE' "$GUESTWF" && echo yes || echo no)"
   check "guest lane: issue-body eyes branch"              yes "$(grep -q 'issues/\${THREAD_NUMBER}/reactions' "$GUESTWF" && echo yes || echo no)"
   check "guest lane: PR linked issues + cross-refs"       yes "$(grep -q 'closingIssuesReferences' "$GUESTWF" && grep -q '<cross_references>' "$GUESTWF" && echo yes || echo no)"
 fi
@@ -1787,7 +1955,7 @@ if [ -f "$GUESTWF" ]; then
   check "guest lane: no API-only/no-checkout escape hatch" yes "$(grep -q 'no foreign tree in the workspace' "$GUESTWF" && echo no || echo yes)"
   check "guest lane: real scrub removal count exported"   yes "$(grep -q 'auto-load item(s) were removed' "$GUESTWF" && echo yes || echo no)"
   check "guest lane: GH_REPO targets the foreign repo"    yes "$( [ "$(grep -c 'GH_REPO: \${{ env.TARGET_REPO }}' "$GUESTWF")" -ge 2 ] && echo yes || echo no)"
-  check "guest lane: share-link encryption env present"   yes "$(grep -q 'SHARE_LINK_PUBKEY' "$GUESTWF" && grep -q 'SHARE_CTX_THREAD' "$GUESTWF" && echo yes || echo no)"
+  check "guest lane: passive artifact env present"      yes "$(grep -q 'SESSION_ARTIFACT_PUBKEY' "$GUESTWF" && grep -q 'OPENSHARE_URL_FILE' "$GUESTWF" && echo yes || echo no)"
   check "guest lane: issue-body eyes branch"              yes "$(grep -q 'issues/\${THREAD_NUMBER}/reactions' "$GUESTWF" && echo yes || echo no)"
   check "guest lane: PR linked issues + cross-refs"       yes "$(grep -q 'closingIssuesReferences' "$GUESTWF" && grep -q '<cross_references>' "$GUESTWF" && echo yes || echo no)"
 fi
@@ -2580,7 +2748,7 @@ check "rebase: walk targets the PR HEAD object, not HEAD" yes \
 check "rebase: recent commits listed from the PR head" yes \
   "$(grep -q 'git log --oneline -12 "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "rebase: share-context words the no-SHA case honestly" yes \
-  "$(grep -q 'rebased - full re-review' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+  "$(grep -q 'history was rewritten' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -2609,7 +2777,7 @@ check "rebase: walk targets the PR HEAD object, not HEAD" yes \
 check "rebase: recent commits listed from the PR head" yes \
   "$(grep -q 'git log --oneline -12 "$PR_HEAD_OBJ"' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "rebase: share-context words the no-SHA case honestly" yes \
-  "$(grep -q 'rebased - full re-review' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+  "$(grep -q 'history was rewritten' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 
 fi
 section_end
@@ -3036,14 +3204,18 @@ if [ "$PARALLEL" = 1 ]; then
   ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
 # Live-caught: opencode prints "> build <middot> <model>" on stderr in every
 # session; the model identifier is config-derived and must not reach public
-# logs. Runs the REAL filter against the byte-exact captured shape.
+# logs. Runs the REAL filter against the byte-exact captured shape. The
+# OpenShare boot banner is dropped (public-log noise) while [openshare]
+# alarm lines survive (gate assurance rides on them).
 SFIX="$(mktemp -d)"
-printf '\033[0m\r\n> build \302\267 glm-5.3\r\n\033[0m\r\nsome agent output line\r\n> quoted prose \302\267 with a middot\r\n> plan \302\267 a-very-long-model-name\r\n' > "$SFIX/stream"
-SHARE_LINK_PUBKEY="" URL_OUT="$SFIX/url" CTX_OUT="$SFIX/ctx" BOOT_OUT="$SFIX/boot" \
+printf '\033[0m\r\n> build \302\267 glm-5.3\r\n\033[0m\r\n[openshare] share mode: all (directory: /w worktree: /w)\r\n[openshare] ALARM: share ungated despite auth config\r\nsome agent output line\r\n> quoted prose \302\267 with a middot\r\n> plan \302\267 a-very-long-model-name\r\n' > "$SFIX/stream"
+SESSION_ARTIFACT_PUBKEY="" BOOT_OUT="$SFIX/boot" \
   bash "$SCRIPT_DIR/share-filter.sh" < "$SFIX/stream" > "$SFIX/out" 2>&1
 check "share: model header line removed"            no  "$(grep -q 'glm-5.3' "$SFIX/out" && echo yes || echo no)"
 check "share: plan-mode header removed"             no  "$(grep 'a-very-long-model-name' "$SFIX/out" | grep -qv add-mask && echo yes || echo no)"
 check "share: long model masked"                    yes "$(grep -q '::add-mask::a-very-long-model-name' "$SFIX/out" && echo yes || echo no)"
+check "share: openshare boot banner dropped"        no  "$(grep -q 'share mode: all' "$SFIX/out" && echo yes || echo no)"
+check "share: openshare alarm lines survive"        yes "$(grep -q 'ALARM: share ungated' "$SFIX/out" && echo yes || echo no)"
 check "share: blockquote prose survives"            yes "$(grep -q 'quoted prose' "$SFIX/out" && echo yes || echo no)"
 check "share: plain output passes through"          yes "$(grep -q 'some agent output line' "$SFIX/out" && echo yes || echo no)"
 rm -rf "$SFIX"
@@ -3057,14 +3229,18 @@ section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
 # Live-caught: opencode prints "> build <middot> <model>" on stderr in every
 # session; the model identifier is config-derived and must not reach public
-# logs. Runs the REAL filter against the byte-exact captured shape.
+# logs. Runs the REAL filter against the byte-exact captured shape. The
+# OpenShare boot banner is dropped (public-log noise) while [openshare]
+# alarm lines survive (gate assurance rides on them).
 SFIX="$(mktemp -d)"
-printf '\033[0m\r\n> build \302\267 glm-5.3\r\n\033[0m\r\nsome agent output line\r\n> quoted prose \302\267 with a middot\r\n> plan \302\267 a-very-long-model-name\r\n' > "$SFIX/stream"
-SHARE_LINK_PUBKEY="" URL_OUT="$SFIX/url" CTX_OUT="$SFIX/ctx" BOOT_OUT="$SFIX/boot" \
+printf '\033[0m\r\n> build \302\267 glm-5.3\r\n\033[0m\r\n[openshare] share mode: all (directory: /w worktree: /w)\r\n[openshare] ALARM: share ungated despite auth config\r\nsome agent output line\r\n> quoted prose \302\267 with a middot\r\n> plan \302\267 a-very-long-model-name\r\n' > "$SFIX/stream"
+SESSION_ARTIFACT_PUBKEY="" BOOT_OUT="$SFIX/boot" \
   bash "$SCRIPT_DIR/share-filter.sh" < "$SFIX/stream" > "$SFIX/out" 2>&1
 check "share: model header line removed"            no  "$(grep -q 'glm-5.3' "$SFIX/out" && echo yes || echo no)"
 check "share: plan-mode header removed"             no  "$(grep 'a-very-long-model-name' "$SFIX/out" | grep -qv add-mask && echo yes || echo no)"
 check "share: long model masked"                    yes "$(grep -q '::add-mask::a-very-long-model-name' "$SFIX/out" && echo yes || echo no)"
+check "share: openshare boot banner dropped"        no  "$(grep -q 'share mode: all' "$SFIX/out" && echo yes || echo no)"
+check "share: openshare alarm lines survive"        yes "$(grep -q 'ALARM: share ungated' "$SFIX/out" && echo yes || echo no)"
 check "share: blockquote prose survives"            yes "$(grep -q 'quoted prose' "$SFIX/out" && echo yes || echo no)"
 check "share: plain output passes through"          yes "$(grep -q 'some agent output line' "$SFIX/out" && echo yes || echo no)"
 rm -rf "$SFIX"

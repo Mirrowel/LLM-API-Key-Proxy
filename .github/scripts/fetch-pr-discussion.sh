@@ -64,7 +64,7 @@
 #   $1      : PR number
 #   env in  : GH_TOKEN, GITHUB_REPOSITORY, BOT_NAMES_JSON (resolved by
 #             bot-config.sh), CONTEXT_LIMITS_JSON (optional; per-key defaults),
-#             PREVIOUS_BOT_REVIEWS_COUNT (default 1 - the ELEVATED count,
+#             ELEVATED_REVIEWS_COUNT (default 1 - the ELEVATED count,
 #             distinct from the own-reviews fetch safeguard),
 #             EXCLUDE_COMMENT_IDS (optional comma-separated databaseIds to drop
 #             from THREAD_CONTEXT - used to dedup elevated injections),
@@ -82,7 +82,7 @@ PR_NUMBER="${1:?usage: fetch-pr-discussion.sh <pr_number>}"
 : "${GITHUB_REPOSITORY:?}"
 
 BOT_NAMES_JSON="${BOT_NAMES_JSON:-[\"mirrobot-agent\", \"mirrobot-agent[bot]\"]}"
-ELEVATED_COUNT="${PREVIOUS_BOT_REVIEWS_COUNT:-1}"
+ELEVATED_COUNT="${ELEVATED_REVIEWS_COUNT:-1}"
 EXCLUDE_COMMENT_IDS="${EXCLUDE_COMMENT_IDS:-}"
 PREFIX_TEXT="${PREFIX_TEXT:-}"
 

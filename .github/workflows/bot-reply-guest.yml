@@ -80,7 +80,7 @@ jobs:
       CONTEXT_IGNORE_AUTHORS: ${{ vars.CONTEXT_IGNORE_AUTHORS || '' }}
       CONTEXT_FILTER_PATTERNS_JSON: ${{ vars.CONTEXT_FILTER_PATTERNS_JSON || '' }}
       CONTEXT_LIMITS_JSON: ${{ vars.CONTEXT_LIMITS_JSON || '' }}
-      PREVIOUS_BOT_REVIEWS_COUNT: ${{ vars.PREVIOUS_BOT_REVIEWS_COUNT || '1' }}
+      ELEVATED_REVIEWS_COUNT: ${{ vars.ELEVATED_REVIEWS_COUNT || '1' }}
       ACCOUNT_TOKEN_SET: ${{ secrets.ACCOUNT_GH_TOKEN != '' }}
 
     steps:
@@ -546,6 +546,8 @@ jobs:
           plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
           plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
           plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
+          openshare-config-json: ${{ secrets.OPENSHARE_CONFIG_JSON }}
+          openshare-bundle-url: ${{ vars.OPENSHARE_BUNDLE_URL || '' }}
 
       - name: Add reaction to comment (lifecycle start)
         if: steps.validate.outputs.should_proceed == 'true' && steps.fast_eyes.outputs.posted != 'true'
@@ -584,6 +586,8 @@ jobs:
           cp .github/scripts/react.sh /tmp/react.sh
           cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
+          cp .github/scripts/live-share-announce.sh /tmp/live-share-announce.sh
+          cp .github/scripts/export-session.py /tmp/export-session.py
           cp .github/scripts/split-diff.sh /tmp/split-diff.sh
           cp .github/scripts/minimized-nodes.sh /tmp/minimized-nodes.sh
           cp .github/scripts/bot-config.sh /tmp/bot-config.sh
@@ -851,6 +855,12 @@ jobs:
       - name: Analyze comment and respond
         if: steps.validate.outputs.should_proceed == 'true'
         env:
+          # OpenShare live sharing (plugin staged by bot-setup;
+          # urlFile/spool are runner-path-dependent, so they ride env,
+          # not the config secret).
+          OPENSHARE_URL_FILE: ${{ runner.temp }}/openshare-urls.txt
+          SESSION_ARTIFACT_PUBKEY: ${{ secrets.SESSION_ARTIFACT_PUBKEY }}
+          OPENSHARE_SPOOL_DIR: ${{ runner.temp }}/openshare-spool
           GH_TOKEN: ${{ steps.setup.outputs.token }}
           # gh defaults to the FOREIGN repo for this session (GH_REPO is the
           # gh CLI's own variable - legal to set; the platform restriction
@@ -858,19 +868,14 @@ jobs:
           # All shared prompt examples (gh issue comment N ...) then land in
           # the summoned repo unchanged; other repos need explicit --repo.
           GH_REPO: ${{ env.TARGET_REPO }}
-          # Share-link encryption (pub key from secret; private key stays
-          # with the admin - see decrypt_share_link.py). Context fields are
-          # public metadata identifying which session this is.
-          SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
-          SHARE_CTX_THREAD: "${{ format('{0} #{1}', env.TARGET_REPO, env.THREAD_NUMBER) }}"
-          SHARE_CTX_HEAD: ${{ env.PR_HEAD_SHA || env.DEFAULT_SHA }}
-          SHARE_CTX_DETAIL: ${{ format('guest session ({0})', inputs.triggerKind || 'mention') }}
         run: |
           set -o pipefail
+          bash /tmp/live-share-announce.sh & ANNOUNCER=$!
           # Guest brief + guest manifest. Untrusted thread content reaches
           # the prompt ONLY through envsubst'd environment variables.
           { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $GUEST_SUMMONER_LINE $SCRUB_REMOVALS_SUMMARY' < /tmp/security-brief-guest.md; \
-            bash /tmp/assemble-prompt.sh bot-reply-guest | envsubst "$GVARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
+            bash /tmp/assemble-prompt.sh bot-reply-guest | envsubst "$GVARS"; } | opencode run - 2>&1 | bash /tmp/share-filter.sh
+          kill "$ANNOUNCER" 2>/dev/null || true
 
       - name: Post-run cleanup and usage stats
         if: always()
@@ -883,8 +888,35 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Passive session export (encrypted artifact)
+        # OpenShare offline track: always runs, live sharing or not (live
+        # sharing is optional; the passive artifact is not). Best-effort:
+        # never fails the run - a visible warning is the failure signal.
+        if: always() && vars.OPENSHARE_PASSIVE != 'false'
+        continue-on-error: true
+        env:
+          SESSION_ARTIFACT_PUBKEY: ${{ secrets.SESSION_ARTIFACT_PUBKEY }}
+          OPENSHARE_URL_FILE: ${{ runner.temp }}/openshare-urls.txt
+          OPENSHARE_BUNDLE_URL: ${{ vars.OPENSHARE_BUNDLE_URL || '' }}
+          OPENSHARE_CONFIG: ${{ secrets.OPENSHARE_CONFIG_JSON }}
+        run: |
+          set -eu
+          python3 /tmp/export-session.py --out-dir "${RUNNER_TEMP:-/tmp}" \
+            --run-id "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --url-file "${OPENSHARE_URL_FILE:-}"
+
+      - name: Upload session artifact
+        if: always() && vars.OPENSHARE_PASSIVE != 'false'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-${{ github.run_id }}.enc
+          path: ${{ runner.temp }}/session-${{ github.run_id }}.enc
+          retention-days: 90
+          if-no-files-found: ignore
+
       - name: Share link summary
-        if: always() && steps.validate.outputs.should_proceed == 'true'
+        if: always() && steps.validate.outputs.should_proceed == 'true' && vars.OPENSHARE_PASSIVE != 'false'
         run: |
           # The share filter writes the encrypted link + context into
           # RUNNER_TEMP (share-link.enc / .ctx); surface them in the step
@@ -899,6 +931,9 @@ jobs:
                 echo "Context: $(cat "$RUNNER_TEMP/share-link.ctx")"
               fi
             } >> "$GITHUB_STEP_SUMMARY"
+            if [ -s "$TMP_DIR/session-meta.txt" ]; then
+              cat "$TMP_DIR/session-meta.txt"
+            fi
           fi
 
       - name: Lifecycle reaction (session success)
