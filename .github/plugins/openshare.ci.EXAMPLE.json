@@ -1,0 +1,19 @@
+{
+  "_comment": "EXAMPLE ONLY - never loaded. Copy to openshare.ci.config.json (gitignored), fill in your deployment's values, and seal as the OPENSHARE_CONFIG_JSON secret: gh secret set OPENSHARE_CONFIG_JSON < .github/plugins/openshare.ci.config.json (run from a minified copy: jq -c . openshare.ci.config.json | gh secret set OPENSHARE_CONFIG_JSON). Absent secret = live sharing disabled, passive artifacts still produced. Recommended token: a scoped CI token (reaches only its own shares), minted from your user's full token via POST /api/token {\"kind\":\"scoped\"}.",
+  "servers": {
+    "https://your-openshare-worker.example.com": { "token": "osk_scoped_token_here" }
+  },
+  "authLogin": "mirrobot",
+  "authPassword": "choose-a-viewer-password",
+  "ttlHours": 2160,
+  "shareMode": "all",
+  "urlFileFormat": "json",
+  "modelLabel": "$Provider/$Model",
+  "announceStderr": false,
+  "urlFile": "leave-unset-to-use-the-OPENSHARE_URL_FILE-env-override",
+  "meta": {
+    "repo": "${GITHUB_REPOSITORY}",
+    "run": "${GITHUB_RUN_ID}",
+    "lane": "${GITHUB_WORKFLOW}"
+  }
+}

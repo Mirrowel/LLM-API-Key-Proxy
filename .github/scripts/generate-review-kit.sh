@@ -16,7 +16,7 @@
 #   $1      : PR number (required)
 #   env in  : GH_TOKEN (required), GITHUB_REPOSITORY (required),
 #             BOT_NAMES_JSON (optional; default = this agent's identities),
-#             PREVIOUS_BOT_REVIEWS_COUNT (optional, default 1)
+#             ELEVATED_REVIEWS_COUNT (optional, default 1)
 #   files   : /tmp/kit/<pr>/... (diffs, head_sha.txt; context.env exists
 #            only transiently during generation and is deleted after the
 #            review-memory extraction),
@@ -212,7 +212,7 @@ extract_env_var() { # $1 file, $2 var name -> prints heredoc value
 if [ -f /tmp/fetch-pr-discussion.sh ]; then
   rm -f "$KIT_DIR/context.env"
   GITHUB_ENV="$KIT_DIR/context.env" BOT_NAMES_JSON="$BOT_NAMES_JSON" \
-    PREVIOUS_BOT_REVIEWS_COUNT="${PREVIOUS_BOT_REVIEWS_COUNT:-1}" \
+    ELEVATED_REVIEWS_COUNT="${ELEVATED_REVIEWS_COUNT:-1}" \
     QUERY_REPO="$REPO" \
     bash /tmp/fetch-pr-discussion.sh "$PR" >/dev/null 2>&1 || echo "KIT NOTE: discussion fetch degraded - review memory may be empty"
 fi

@@ -56,6 +56,12 @@ inputs:
     default: ''
   plugins-json-5:
     description: 'Optional: contents of OPENCODE_PLUGINS_JSON_5.'
+  openshare-config-json:
+    description: 'Optional: contents of the OPENSHARE_CONFIG_JSON secret. When set: the released OpenShare single-file plugin is fetched from the OpenShare repo (sha256 logged), staged under ~/.mirrobot-plugins/ with this config adjacent, and registered in the opencode plugin array. Live session sharing; absent = plugin dormant (passive artifacts still produced). The whole dir is deleted after boot like the opencode config.'
+    required: false
+    default: ''
+  openshare-bundle-url:
+    description: 'Optional: override the URL the OpenShare bundle is fetched from (repo variable OPENSHARE_BUNDLE_URL, e.g. raw .../OpenShare/dev/share-plugin/ci/openshare.js while dev is ahead of master). Empty = released master line.'
     required: false
     default: ''
 
@@ -445,6 +451,66 @@ runs:
           done < <(jq -r "$CRED_LEAF_WALK" "$cred_source" 2>/dev/null || true)
         done
         echo "Credential leaf masking applied."
+
+    - name: Stage OpenShare plugin (live session sharing)
+      shell: bash
+      env:
+        OPENSHARE_CONFIG: ${{ inputs.openshare-config-json }}
+        OPENSHARE_BUNDLE_URL: ${{ inputs.openshare-bundle-url }}
+      run: |
+        set -e
+        if [ -z "$(printf '%s' "$OPENSHARE_CONFIG" | tr -d '[:space:]')" ]; then
+          echo "OpenShare config secret absent - live sharing disabled (passive artifacts still produced)."
+          exit 0
+        fi
+        # Shape check + credential-leaf masking. GitHub masks the whole
+        # secret blob, but inner values (servers[].token, authPassword)
+        # echoed on their own would print unmasked - same reasoning as the
+        # config walker above.
+        jq -e 'type == "object"' <<< "$OPENSHARE_CONFIG" >/dev/null || {
+          echo "::error::OPENSHARE_CONFIG_JSON is not a JSON object."; exit 1; }
+        while IFS= read -r leaf; do
+          [ -z "$leaf" ] && continue
+          [ "${#leaf}" -ge 8 ] && printf '::add-mask::%s\n' "$leaf"
+        done < <(jq -r '[.. | objects | to_entries[]
+            | select(.key | test("(token|password|secret|key)"; "i"))
+            | .value | strings | select(length >= 8)] | .[]' <<< "$OPENSHARE_CONFIG")
+
+        # Released single-file bundle from the OpenShare repo (master is
+        # the released line; auto-updates on every OpenShare release). The
+        # repo variable can point the fetch at another branch while it is
+        # ahead (OPENSHARE_BUNDLE_URL); delete the variable to return to
+        # the released master line. Fetch failure degrades to no live
+        # sharing - never fails the run.
+        PLUGINS_DIR="$HOME/.mirrobot-plugins"
+        mkdir -p "$PLUGINS_DIR"; chmod 700 "$PLUGINS_DIR"
+        BUNDLE="$PLUGINS_DIR/openshare.js"
+        BUNDLE_URL="${OPENSHARE_BUNDLE_URL:-https://raw.githubusercontent.com/Mirrowel/OpenShare/master/share-plugin/ci/openshare.js}"
+        if ! curl -fsSL --retry 3 --max-time 60 "$BUNDLE_URL" -o "$BUNDLE"; then
+          echo "::warning::OpenShare bundle fetch failed - live sharing disabled for this run."
+          exit 0
+        fi
+        grep -q 'openshare' "$BUNDLE" || {
+          echo "::warning::OpenShare bundle failed validation - live sharing disabled for this run."
+          rm -f "$BUNDLE"; exit 0; }
+        chmod 600 "$BUNDLE"
+        echo "OpenShare bundle sha256: $(sha256sum "$BUNDLE" | cut -d' ' -f1)"
+
+        # Adjacent config: the plugin reads it at load (env > adjacent
+        # file > package root > walk-up > global home > defaults). Read
+        # gating is assured by the plugin's init-ack alarm plus the
+        # post-run step's gated:false warning - no env duplication.
+        printf '%s' "$OPENSHARE_CONFIG" > "$PLUGINS_DIR/openshare.config.json"
+        chmod 600 "$PLUGINS_DIR/openshare.config.json"
+
+        # Register the plugin (idempotent append; the generated config is
+        # file-local, the secret stays untouched).
+        CFG="$HOME/.config/opencode/opencode.json"
+        if [ -f "$CFG" ] && ! jq -e --arg p "$BUNDLE" '(.plugin // []) | index($p)' "$CFG" >/dev/null; then
+          tmp=$(mktemp)
+          jq --arg p "$BUNDLE" '.plugin = ((.plugin // []) + [$p])' "$CFG" > "$tmp" && mv "$tmp" "$CFG"
+        fi
+        echo "OpenShare staged: bundle + adjacent config + plugin registered."
 
     - name: Check for Python requirements file
       id: check_requirements_file

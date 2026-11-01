@@ -115,9 +115,10 @@ jobs:
             [CONTEXT_LIMITS_JSON]='{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-threads":40,"discussion-replies":30,"body-chars":4000}'
             [CONTEXT_FILTER_PATTERNS_JSON]='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review"]'
             [FOREIGN_MENTIONS_ENABLED]="false"
+            [OPENSHARE_PASSIVE]="true"
             [OPEN_TRIGGERING]="true"
             [OPENCODE_PLUGINS_JSON]="{}"
-            [PREVIOUS_BOT_REVIEWS_COUNT]="1"
+            [ELEVATED_REVIEWS_COUNT]="1"
           )
           FAILED=0
           for name in "${!DEFAULTS[@]}"; do
@@ -222,7 +223,10 @@ jobs:
           | `FOREIGN_MENTIONS_ENABLED` | `false` | Cross-repo guest mode master switch. |
           | `FOREIGN_MENTIONS_USERS` | empty | Allowlist for cross-repo summons (comma-separated logins). |
           | `OPENCODE_PLUGINS_JSON` | `{}` | Plugin files: `{"<relative-path>": "<file content>"}` materialized to `~/.mirrobot-plugins/`. Reference by absolute path in the config secret's `plugin` array. For multiple plugins use `OPENCODE_PLUGINS_JSON_1` .. `_5`. |
-          | `PREVIOUS_BOT_REVIEWS_COUNT` | `1` | How many of the agent's own newest reviews are ELEVATED (unfiltered memory). Older own reviews still appear - filtered - in the history block. |
+          | `ELEVATED_REVIEWS_COUNT` | `1` | How many of the agent's own newest reviews are ELEVATED (unfiltered memory). Older own reviews still appear - filtered - in the history block. |
+          | `OPENSHARE_PASSIVE` | `true` | `false` disables the passive track entirely (session export + snapshot + encrypted artifact). The passive artifact is the safety net for live sharing - normally leave on. |
+          | `OPENSHARE_BUNDLE_URL` | absent = released master | Override where the OpenShare plugin bundle (and snapshot tools) are fetched from. Set only while tracking a dev branch ahead of the released line; delete to return to self-updating master. |
+          | `GUEST_REPO_RULES` | absent = allow everywhere (except the platform repo) | Flat comma list of `<owner>/<repo>:deny|allow`, last match wins. Deny repos where your local workflows already handle everything, so mentions there don't double-handle. |
 
           ### Secrets (Settings → Secrets and variables → Actions → Secrets)
 
@@ -234,7 +238,8 @@ jobs:
           | `OPENCODE_CONFIG_JSON` | strongly recommended | Complete opencode config (providers with API keys, mcp, plugins, permission block). Template: `.github/actions/bot-setup/permissions.example.json`. The permission block is the agent's security profile - without it the agent runs on permissive defaults. |
           | `OPENCODE_FAST_MODEL` | optional | Global small_model (session-title generation). |
           | `OPENCODE_API_KEY` | optional | API key applied to the main model's provider (redundant when keys live inside `OPENCODE_CONFIG_JSON`). |
-          | `SHARE_LINK_PUBKEY` | optional | RSA public key enabling encrypted session share links (see `decrypt_share_link.py`). |
+          | `SESSION_ARTIFACT_PUBKEY` | optional | RSA public key sealing the passive session artifacts (MRB2) + summary blobs; `python decrypt_share_link.py setup` generates the pair and sets the secret. |
+          | `OPENSHARE_CONFIG_JSON` | optional | Complete OpenShare plugin config for live session sharing (template: `.github/plugins/openshare.ci.EXAMPLE.json`). Absent = plugin dormant, passive artifacts continue. |
 
           Quick fill (run from a machine with `gh` authenticated as an admin; Windows PowerShell: `Get-Content config.min.json | gh secret set OPENCODE_CONFIG_JSON -R <owner>/<repo>`):
           ```bash
@@ -253,7 +258,7 @@ jobs:
 
           ### Manual variable seeding (if the seeding step could not run)
 
-          Variables that default to empty (`CONTEXT_IGNORE_AUTHORS`, `TRUSTED_AGENT_USERS`, `FOREIGN_MENTIONS_USERS`) are intentionally NOT created - GitHub variables cannot hold empty values, and absence already means empty. Create them only when you have content.
+          Variables that default to empty (`CONTEXT_IGNORE_AUTHORS`, `TRUSTED_AGENT_USERS`, `FOREIGN_MENTIONS_USERS`) are intentionally NOT created - GitHub variables cannot hold empty values, and absence already means empty. Create them only when you have content. Two more variables default to a useful absence: `OPENSHARE_BUNDLE_URL` (absent = the released OpenShare master line, self-updating; set it only while tracking a dev branch) and `GUEST_REPO_RULES` (absent = guest mentions allowed everywhere except the platform repo; set deny rules for repos your local workflows already cover).
 
           For `BOT_IDENTITIES`, list ONLY identities you control. The `[bot]` form is a SEPARATE GitHub namespace (app slugs vs usernames): include `your-bot-name[bot]` ONLY if you registered the GitHub App of that name - the platform never assumes a `[bot]` twin is yours, and neither should you.
 
@@ -269,7 +274,11 @@ jobs:
           gh variable set CONTEXT_FILTER_PATTERNS_JSON -R <owner>/<repo> --body '<same pattern list as seeded above - copy from the DEFAULTS block>'
           gh variable set FOREIGN_MENTIONS_ENABLED -R <owner>/<repo> --body "false"
           gh variable set OPENCODE_PLUGINS_JSON -R <owner>/<repo> --body "{}"
-          gh variable set PREVIOUS_BOT_REVIEWS_COUNT -R <owner>/<repo> --body "1"
+          gh variable set ELEVATED_REVIEWS_COUNT -R <owner>/<repo> --body "1"
+          gh variable set OPENSHARE_PASSIVE -R <owner>/<repo> --body "true"
+          # Optional knobs (absent = the documented default):
+          gh variable set OPENSHARE_BUNDLE_URL -R <owner>/<repo> --body "https://raw.githubusercontent.com/Mirrowel/OpenShare/dev/share-plugin/ci/openshare.js"   # track the dev branch instead of released master
+          gh variable set GUEST_REPO_RULES -R <owner>/<repo> --body "owner/local-repo-one:deny, owner/local-repo-two:deny"   # skip guest handling where local workflows already run
           ```
           EOF
           echo "Checklist written to the run summary."

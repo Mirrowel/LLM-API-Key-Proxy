@@ -136,6 +136,8 @@ jobs:
           plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
           plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
           plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
+          openshare-config-json: ${{ secrets.OPENSHARE_CONFIG_JSON }}
+          openshare-bundle-url: ${{ vars.OPENSHARE_BUNDLE_URL || '' }}
 
       - name: Add reaction to issue
         env:
@@ -163,6 +165,8 @@ jobs:
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
+          cp .github/scripts/live-share-announce.sh /tmp/live-share-announce.sh
+          cp .github/scripts/export-session.py /tmp/export-session.py
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           cp .github/scripts/bot-config.sh /tmp/bot-config.sh
           cp .github/scripts/react.sh /tmp/react.sh
@@ -283,6 +287,12 @@ jobs:
 
       - name: Analyze issue and suggest resolution
         env:
+          # OpenShare live sharing (plugin staged by bot-setup;
+          # urlFile/spool are runner-path-dependent, so they ride env,
+          # not the config secret).
+          OPENSHARE_URL_FILE: ${{ runner.temp }}/openshare-urls.txt
+          SESSION_ARTIFACT_PUBKEY: ${{ secrets.SESSION_ARTIFACT_PUBKEY }}
+          OPENSHARE_SPOOL_DIR: ${{ runner.temp }}/openshare-spool
           GITHUB_TOKEN: ${{ steps.setup.outputs.token }}
           ISSUE_CONTEXT: ${{ env.ISSUE_CONTEXT }}
           ISSUE_AUTHOR: ${{ env.ISSUE_AUTHOR }}
@@ -296,11 +306,6 @@ jobs:
           # Optional public-account token for verified-lead actions abroad
           # (scope-of-action rules). Absent secret => empty => unavailable.
           ACCOUNT_GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN }}
-          # Share-link encryption (pub key from secret; private key stays
-          # with the admin - see decrypt_share_link.py).
-          SHARE_LINK_PUBKEY: ${{ secrets.SHARE_LINK_PUBKEY }}
-          SHARE_CTX_THREAD: "Issue #${{ env.ISSUE_NUMBER }}"
-          SHARE_CTX_DETAIL: issue triage
         run: |
             set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
@@ -311,8 +316,10 @@ jobs:
             # the sensitive files shortly after. Hard timeout so a hung
             # boot cannot pin them; the always() post-run step is the belt.
             ( bash /tmp/opencode-cleanup.sh waiter ) &
+            bash /tmp/live-share-announce.sh & ANNOUNCER=$!
             # Prepend the security brief (with the verified requester + trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run --share - 2>&1 | bash /tmp/share-filter.sh
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run - 2>&1 | bash /tmp/share-filter.sh
+            kill "$ANNOUNCER" 2>/dev/null || true
             bash /tmp/opencode-cleanup.sh now
 
       - name: Post-run cleanup and usage stats
@@ -329,8 +336,35 @@ jobs:
               { echo "### Agent usage (this run)"; echo '```'; "$OC" stats 2>/dev/null || true; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
             fi
 
+      - name: Passive session export (encrypted artifact)
+        # OpenShare offline track: always runs, live sharing or not (live
+        # sharing is optional; the passive artifact is not). Best-effort:
+        # never fails the run - a visible warning is the failure signal.
+        if: always() && vars.OPENSHARE_PASSIVE != 'false'
+        continue-on-error: true
+        env:
+          SESSION_ARTIFACT_PUBKEY: ${{ secrets.SESSION_ARTIFACT_PUBKEY }}
+          OPENSHARE_URL_FILE: ${{ runner.temp }}/openshare-urls.txt
+          OPENSHARE_BUNDLE_URL: ${{ vars.OPENSHARE_BUNDLE_URL || '' }}
+          OPENSHARE_CONFIG: ${{ secrets.OPENSHARE_CONFIG_JSON }}
+        run: |
+          set -eu
+          python3 /tmp/export-session.py --out-dir "${RUNNER_TEMP:-/tmp}" \
+            --run-id "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --url-file "${OPENSHARE_URL_FILE:-}"
+
+      - name: Upload session artifact
+        if: always() && vars.OPENSHARE_PASSIVE != 'false'
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: session-${{ github.run_id }}.enc
+          path: ${{ runner.temp }}/session-${{ github.run_id }}.enc
+          retention-days: 90
+          if-no-files-found: ignore
+
       - name: Share link summary
-        if: always()
+        if: always() && vars.OPENSHARE_PASSIVE != 'false'
         run: |
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
           if [ -s "$TMP_DIR/share-link.enc" ]; then
@@ -344,4 +378,7 @@ jobs:
               echo
               echo "Decrypt locally: \`python decrypt_share_link.py\` and paste the block above."
             } >> "$GITHUB_STEP_SUMMARY"
+            if [ -s "$TMP_DIR/session-meta.txt" ]; then
+              cat "$TMP_DIR/session-meta.txt"
+            fi
           fi
