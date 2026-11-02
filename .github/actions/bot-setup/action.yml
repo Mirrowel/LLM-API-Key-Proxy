@@ -326,23 +326,19 @@ runs:
         if ! jq -e 'has("permission")' <<< "$CONFIG" >/dev/null 2>&1; then
           echo "::warning::OPENCODE_CONFIG_JSON has no permission block; the agent will run on opencode's permissive defaults. Paste the permission block from .github/actions/bot-setup/permissions.example.json into the secret."
         else
-          # Drift check (deny-subset semantics): the secret's permission
-          # block must carry every DENY the recommended example carries -
-          # operator additions and stricter flips are fine and silent; a
-          # missing or loosened example deny erodes the security core and
-          # gets a warning. The warning deliberately names NOTHING (run
-          # logs are public): no rules, no sections, no specifics - just
+          # Drift check (effective-verdict semantics): the live permission
+          # block must effectively DENY everything the recommended example
+          # denies. opencode evaluates ordered rules last-match-wins, so a
+          # deny key shadowed by a later allow is no deny at all - the
+          # checker compares EFFECTIVE verdicts over a probe corpus built
+          # from both profiles' patterns (see permission-drift.py).
+          # Operator additions and stricter flips are fine and silent; a
+          # missing, shadowed, or loosened example deny erodes the security
+          # core and gets a warning. The warning deliberately names NOTHING
+          # (run logs are public): no rules, no sections, no specifics - just
           # the count. Compare against the example locally to see what.
-          mismatch=$(jq -n \
-            --argjson live "$CONFIG" \
-            --slurpfile ex "${GITHUB_ACTION_PATH}/permissions.example.json" '
-            ($ex[0].permission // {}) as $e | ($live.permission // {}) as $l |
-            [ ($e | to_entries[])
-              | select(.value | type == "object") as $sec
-              | (.value | to_entries[])
-              | select(.value == "deny")
-              | select(($l[$sec.key][.key] // "") != "deny") ]
-            | length')
+          mismatch=$(printf '%s' "$CONFIG" | python3 "${GITHUB_ACTION_PATH}/permission-drift.py" \
+            "${GITHUB_ACTION_PATH}/permissions.example.json" - 2>/dev/null || echo 0)
           if [ "${mismatch:-0}" -gt 0 ]; then
             echo "::warning::OPENCODE_CONFIG_JSON permission block is missing or has loosened ${mismatch} security rule(s) from the recommended profile. Details are deliberately not logged (public run logs) - compare the secret against .github/actions/bot-setup/permissions.example.json and refresh it."
           fi

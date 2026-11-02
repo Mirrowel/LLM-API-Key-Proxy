@@ -771,7 +771,7 @@ check "setup: numbered plugin vars merge (collision errors)" yes "$(grep -q 'Dup
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
 # comparing against the whole file would false-warn on every repo whose
 # config lacks the example's providers/mcp/plugin shape.
-check "setup: drift is deny-subset (deny-select present)" yes "$(grep -q 'select(.value == "deny")' "$ACTION" && echo yes || echo no)"
+check "setup: drift check runs the effective-verdict script" yes "$(grep -q 'permission-drift.py' "$ACTION" && echo yes || echo no)"
 check "setup: drift warning carries no rule specifics" yes "$(grep 'OPENCODE_CONFIG_JSON permission block is missing' "$ACTION" | grep -qE 'to_entries|\.permission\.' && echo no || echo yes)"
 # The example must look like a full config, carry the GENERIC plugin entry,
 # and never name a real router/provider anywhere in the repo.
@@ -800,7 +800,7 @@ check "setup: numbered plugin vars merge (collision errors)" yes "$(grep -q 'Dup
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
 # comparing against the whole file would false-warn on every repo whose
 # config lacks the example's providers/mcp/plugin shape.
-check "setup: drift is deny-subset (deny-select present)" yes "$(grep -q 'select(.value == "deny")' "$ACTION" && echo yes || echo no)"
+check "setup: drift check runs the effective-verdict script" yes "$(grep -q 'permission-drift.py' "$ACTION" && echo yes || echo no)"
 check "setup: drift warning carries no rule specifics" yes "$(grep 'OPENCODE_CONFIG_JSON permission block is missing' "$ACTION" | grep -qE 'to_entries|\.permission\.' && echo no || echo yes)"
 # The example must look like a full config, carry the GENERIC plugin entry,
 # and never name a real router/provider anywhere in the repo.
@@ -1175,25 +1175,48 @@ fi
 section_end
 fi
 
-# ---- drift check: deny-subset, count-only warning (bot-setup contract) -----
-SECTION_NAME='drift check: deny-subset, count-only warning (bot-setup contract)'
+# ---- drift check: effective verdicts, count-only warning (bot-setup) -------
+SECTION_NAME='drift check: effective verdicts, count-only warning (bot-setup)'
 if [ "$PARALLEL" = 1 ]; then
   ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
-# Operator additions and stricter flips are silent; a missing/loosened
-# example deny warns. The warning must NEVER name rules (public run logs).
-drift_count() { # live-config-json -> mismatch count via the REAL jq
-  jq -n --argjson live "$1" --slurpfile ex "$EXAMPLE" '
-    ($ex[0].permission // {}) as $e | ($live.permission // {}) as $l |
-    [ ($e | to_entries[]) | select(.value | type == "object") as $sec
-      | (.value | to_entries[])
-      | select(.value == "deny") | select(($l[$sec.key][.key] // "") != "deny") ] | length'
+# Operator additions and stricter flips are silent; anything the example
+# EFFECTIVELY denies (last-match-wins over the ordered rules - a deny key
+# shadowed by a later allow is no deny at all) must stay denied in the
+# live config. Runs the REAL permission-drift.py. The warning must NEVER
+# name rules (public run logs).
+PD_BIN=""
+for cand in python3 python; do
+  if "$cand" -c 'import json, fnmatch' >/dev/null 2>&1; then PD_BIN="$cand"; break; fi
+done
+DRIFT="$(dirname "$EXAMPLE")/permission-drift.py"
+drift_count() { # live-config-json -> mismatch count via the REAL script
+  printf '%s' "$1" | "$PD_BIN" "$DRIFT" "$EXAMPLE" - 2>/dev/null
 }
-SUPERSET=$(jq -S '.permission.bash["curl*"] = "deny" | .permission.bash["evil-cmd*"] = "deny"' "$EXAMPLE")
+if [ -n "$PD_BIN" ]; then
+SUPERSET=$(jq -c '.permission.bash["curl*"] = "deny" | .permission.bash["evil-cmd*"] = "deny"' "$EXAMPLE")
 check "drift: superset config silent (0 mismatches)" 0 "$(drift_count "$SUPERSET")"
-LOOSEened=$(jq -S 'del(.permission.edit[".git/*"]) | del(.permission.write["~/.config/*"])' "$EXAMPLE")
+LOOSEened=$(jq -c 'del(.permission.edit[".git/*"]) | del(.permission.write[".github/workflows/*"])' "$EXAMPLE")
 check "drift: loosened config counted" 2 "$(drift_count "$LOOSEened")"
+FLIP=$(jq -c '.permission.bash["*"] = "allow"' "$EXAMPLE")
+check "drift: catch-all flipped in place counted" 1 "$(drift_count "$FLIP")"
+TRAIL=$(jq -c '.permission.bash["git *"] = "allow"' "$EXAMPLE")
+check "drift: trailing shadow allow counted (10 git denies)" 10 "$(drift_count "$TRAIL")"
+STRFLIP=$(jq -c '.permission.webfetch = "allow"' "$EXAMPLE")
+check "drift: string-section flip counted (webfetch)" 1 "$(drift_count "$STRFLIP")"
+STRICTER=$(jq -c '.permission.websearch = "deny"' "$EXAMPLE")
+check "drift: stricter section flip silent" 0 "$(drift_count "$STRICTER")"
+BROADER=$(jq -c 'del(.permission.bash["git push --force*"]) | .permission.bash["git push *force*"] = "deny"' "$EXAMPLE")
+check "drift: broader glob variant silent" 0 "$(drift_count "$BROADER")"
+ASKV=$(jq -c '.permission.bash["git config --global*"] = "ask"' "$EXAMPLE")
+check "drift: ask is not deny, counts as loosened" 1 "$(drift_count "$ASKV")"
+check "drift: broken input fails open (0)" 0 "$(printf '{broken' | "$PD_BIN" "$DRIFT" "$EXAMPLE" - 2>/dev/null)"
+else
+echo "FAIL: drift section - no working python found"; FAIL=$((FAIL+1))
+fi
+check "drift: action wires the real drift script" yes \
+  "$(grep -q 'permission-drift.py' "$ACTION" && echo yes || echo no)"
 check "drift: warning line carries no rule specifics" yes \
-  "$(grep -A3 "mismatch=\$(jq" "$ACTION" | grep "::warning::" | grep -qE '\$\(jq|to_entries|\.key' && echo no || echo yes)"
+  "$(grep -A3 'mismatch=' "$ACTION" | grep '::warning::' | grep -qE 'python3|fnmatch|\.key|to_entries' && echo no || echo yes)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -1202,21 +1225,44 @@ check "drift: warning line carries no rule specifics" yes \
 else
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
-# Operator additions and stricter flips are silent; a missing/loosened
-# example deny warns. The warning must NEVER name rules (public run logs).
-drift_count() { # live-config-json -> mismatch count via the REAL jq
-  jq -n --argjson live "$1" --slurpfile ex "$EXAMPLE" '
-    ($ex[0].permission // {}) as $e | ($live.permission // {}) as $l |
-    [ ($e | to_entries[]) | select(.value | type == "object") as $sec
-      | (.value | to_entries[])
-      | select(.value == "deny") | select(($l[$sec.key][.key] // "") != "deny") ] | length'
+# Operator additions and stricter flips are silent; anything the example
+# EFFECTIVELY denies (last-match-wins over the ordered rules - a deny key
+# shadowed by a later allow is no deny at all) must stay denied in the
+# live config. Runs the REAL permission-drift.py. The warning must NEVER
+# name rules (public run logs).
+PD_BIN=""
+for cand in python3 python; do
+  if "$cand" -c 'import json, fnmatch' >/dev/null 2>&1; then PD_BIN="$cand"; break; fi
+done
+DRIFT="$(dirname "$EXAMPLE")/permission-drift.py"
+drift_count() { # live-config-json -> mismatch count via the REAL script
+  printf '%s' "$1" | "$PD_BIN" "$DRIFT" "$EXAMPLE" - 2>/dev/null
 }
-SUPERSET=$(jq -S '.permission.bash["curl*"] = "deny" | .permission.bash["evil-cmd*"] = "deny"' "$EXAMPLE")
+if [ -n "$PD_BIN" ]; then
+SUPERSET=$(jq -c '.permission.bash["curl*"] = "deny" | .permission.bash["evil-cmd*"] = "deny"' "$EXAMPLE")
 check "drift: superset config silent (0 mismatches)" 0 "$(drift_count "$SUPERSET")"
-LOOSEened=$(jq -S 'del(.permission.edit[".git/*"]) | del(.permission.write["~/.config/*"])' "$EXAMPLE")
+LOOSEened=$(jq -c 'del(.permission.edit[".git/*"]) | del(.permission.write[".github/workflows/*"])' "$EXAMPLE")
 check "drift: loosened config counted" 2 "$(drift_count "$LOOSEened")"
+FLIP=$(jq -c '.permission.bash["*"] = "allow"' "$EXAMPLE")
+check "drift: catch-all flipped in place counted" 1 "$(drift_count "$FLIP")"
+TRAIL=$(jq -c '.permission.bash["git *"] = "allow"' "$EXAMPLE")
+check "drift: trailing shadow allow counted (10 git denies)" 10 "$(drift_count "$TRAIL")"
+STRFLIP=$(jq -c '.permission.webfetch = "allow"' "$EXAMPLE")
+check "drift: string-section flip counted (webfetch)" 1 "$(drift_count "$STRFLIP")"
+STRICTER=$(jq -c '.permission.websearch = "deny"' "$EXAMPLE")
+check "drift: stricter section flip silent" 0 "$(drift_count "$STRICTER")"
+BROADER=$(jq -c 'del(.permission.bash["git push --force*"]) | .permission.bash["git push *force*"] = "deny"' "$EXAMPLE")
+check "drift: broader glob variant silent" 0 "$(drift_count "$BROADER")"
+ASKV=$(jq -c '.permission.bash["git config --global*"] = "ask"' "$EXAMPLE")
+check "drift: ask is not deny, counts as loosened" 1 "$(drift_count "$ASKV")"
+check "drift: broken input fails open (0)" 0 "$(printf '{broken' | "$PD_BIN" "$DRIFT" "$EXAMPLE" - 2>/dev/null)"
+else
+echo "FAIL: drift section - no working python found"; FAIL=$((FAIL+1))
+fi
+check "drift: action wires the real drift script" yes \
+  "$(grep -q 'permission-drift.py' "$ACTION" && echo yes || echo no)"
 check "drift: warning line carries no rule specifics" yes \
-  "$(grep -A3 "mismatch=\$(jq" "$ACTION" | grep "::warning::" | grep -qE '\$\(jq|to_entries|\.key' && echo no || echo yes)"
+  "$(grep -A3 'mismatch=' "$ACTION" | grep '::warning::' | grep -qE 'python3|fnmatch|\.key|to_entries' && echo no || echo yes)"
 
 fi
 section_end
