@@ -9,9 +9,9 @@ python-dotenv
 -e src/rotator_library
 
 # A library for calling LLM APIs with a consistent format
-litellm==1.105.1
+litellm==1.108.3
 
-filelock
+filelock>=4.2.1,<5
 httpx
 aiofiles
 aiohttp
