@@ -30,8 +30,12 @@ jobs:
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          uv tool install guarddog
-          uv tool install pip-audit
+          # Pin the tool interpreter: guarddog pulls pygit2, which has no
+          # cp314 wheel, so installing into the runner's Python 3.14 tries to
+          # build pygit2 from source and dies on a missing git2.h. A managed
+          # 3.12 gets the prebuilt wheel.
+          uv tool install --python 3.12 guarddog
+          uv tool install --python 3.12 pip-audit
 
       - name: Read the pinned version
         id: pin
