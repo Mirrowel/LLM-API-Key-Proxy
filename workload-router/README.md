@@ -6,6 +6,12 @@ loopback-only canary; it has not replaced the existing gateway.
 
 ## Status: parallel and gated, not production-wired
 
+Target architecture (2026-11-22): this sidecar is the router brain in front of
+New-API, which becomes the transport; LiteLLM stays as the rollback path.
+Layering, repo roles and the ordered work list are in
+`../docs/ARCHITECTURE-DECISION-2026-11-22.md`. Work on this directory, not on a
+new router.
+
 This directory is a parallel build owned by the canonical repo. It is not in
 the live request path:
 

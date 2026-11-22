@@ -3,7 +3,11 @@
 ## Session startup
 
 Read `STATE.md`, `HANDOFF.md`, `README.md`, and the P0 specification at
-`docs/specs/p0-router.md` before changing files. The full architecture plan is
+`docs/specs/p0-router.md` before changing files. The layering decision (New-API
+is transport, this sidecar is the router brain) and the ordered work list are in
+`../docs/ARCHITECTURE-DECISION-2026-11-22.md`; read that before choosing what to
+work on, and amend it in place rather than writing a new design document. The
+full architecture plan is
 at `/home/osees/CodingProjects/temp-omnirush/docs/ai-workload-router-architecture.md`.
 
 Preserve existing work. Inspect `git status` before edits. Work in small,

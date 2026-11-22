@@ -2,6 +2,12 @@
 
 Task-board: #1070 (gate issue #1071, PR #315, both merged before this plan).
 
+> **Direction (2026-11-22):** the target is now sidecar-in-front-of-New-API,
+> with LiteLLM as the rollback path. This document still governs the
+> LiteLLM-side shadow/opt-in stages used for measurement; the layering and the
+> work order are in `docs/ARCHITECTURE-DECISION-2026-11-22.md`. Do not extend
+> the in-process shadow into a second production router.
+
 This plan defines how the vendored `workload-router/` component may move from
 parallel/dry-run into the VPS-40 gateway path. Every stage is opt-in, reversible
 with one environment flag, and gated on measured evidence. No stage carries

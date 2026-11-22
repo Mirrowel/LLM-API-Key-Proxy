@@ -4,6 +4,15 @@
 **Commit:** 12e0ccb
 **Branch:** main
 
+## CURRENT DIRECTION (read first)
+
+New-API becomes the transport on `:8001`; the `workload-router/` sidecar is the
+router brain in front of it; LiteLLM on `:8000` is the rollback path. Do not add
+prompt classification or quota logic to this gateway, and do not build another
+router. Layers, repo roles and the ordered work list (alias collision,
+review findings #370-#389, `s0-cost-vector` merge, gradual cutover) are in
+[`docs/ARCHITECTURE-DECISION-2026-11-22.md`](docs/ARCHITECTURE-DECISION-2026-11-22.md).
+
 ## OVERVIEW
 
 FastAPI-based LLM API proxy with virtual models and automatic fallback. Routes requests through 33 free LLM providers (groq, gemini, cerebras, nvidia, mistral, openrouter, sambanova, together, cloudflare, bluesminds, kilo, freemodel, freemodel-anthropic, supacoder, wiwi, iflow, xinjianya, g4f_*, github-models, aihubmix, antigravity, brave_search, duckduckgo, exa, jina, tavily, cloudflare, zyf, etc.) with telemetry-driven fallback chains.
