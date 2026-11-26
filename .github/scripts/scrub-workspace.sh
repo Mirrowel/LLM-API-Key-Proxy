@@ -391,11 +391,19 @@ if [ -e .mirrobot_files ]; then
   echo "scrub: reset .mirrobot_files (workflow scratch space)" >> "$REMOVALS_FILE"
 fi
 
-# --- .github taint check: detect, NEVER remove ------------------------------
-# Files under .github/ are NOT auto-loaded by the agent, so they are never
-# removed (the reviewer must see them in the diff). But any branch-side change
-# to .github/ is a red flag — the PR is modifying the agent system's own
-# configuration.
+# --- Protected-path taint check: detect, classify, NEVER remove .github ----
+# ONE mechanic for two classes of protected paths:
+#   - .github/ is the agent system itself. It is NOT auto-loaded, so it is
+#     never removed (the reviewer must see it in the diff), but any
+#     branch-side change to it is a red flag: the PR is modifying the agent
+#     system's own configuration.
+#   - Auto-load surfaces (the AGENTS.md family, .opencode/, .agents/,
+#     .claude/, the other harness dirs, root opencode.json) were judged file
+#     by file above. A touched file the scrub KEPT is trusted; one it
+#     REMOVED, or a trusted one the branch DELETED, changes what the agent
+#     loads and counts as taint exactly like a .github change.
+# Classification: a .github file matching a post-fork anchor state, or an
+# auto-load file the scrub kept, is EXPLAINED; everything else is TAINT.
 #
 # Detection is a UNION of two merge-base-anchored signals:
 #   1. HISTORY: commits in merge-base..HEAD touching .github/ (catches
@@ -416,7 +424,19 @@ fi
 # trust-context line) and to the job log as a loud alarm.
 TAINT_FILE="${SCRUB_TAINT_FILE:-/tmp/scrub-taint.txt}"
 rm -f "$TAINT_FILE"
+# Protected paths: ONE list drives one detection pass. .github is the agent
+# system itself; the rest is every surface opencode or another harness
+# auto-loads from the worktree, scoped exactly like the removal pass above
+# (instruction files at any depth, config files and directories root-only).
+PROTECTED=(.github .claude .agents .opencode .cursor .windsurf .devin .clinerules opencode.json opencode.jsonc)
+for f in AGENTS.md CLAUDE.md GEMINI.md CLAUDE.local.md .cursorrules .windsurfrules .clinerules; do
+  PROTECTED+=(":(glob)**/$f")
+done
 tree_diff=""
+gh_paths=""
+al_paths=""
+al_bad=0
+al_details=""
 if [ "$FOREIGN" = 1 ]; then
   # A guest repository's .github cannot execute for us (workflows run from
   # the HOME repo) — there is no trusted base to compare against and no
@@ -435,7 +455,10 @@ elif [ -n "$ANCHOR" ]; then
   # else: no common ancestor (unrelated history) — keep the anchor tip as the
   # base: over-triggers, but that is the fail-safe direction.
   fi
-  if ! taint=$(git log --name-status --format='@%h' "${TAINT_BASE}"..HEAD -- .github 2>/dev/null | awk '
+  # NOTE: the marker format MUST contain a % placeholder ('@%h', not bare '@'):
+  # a %-less --format value is parsed as a format NAME and fatals with
+  # "invalid --pretty format" (live-observed: n_files/areas silently empty).
+  if ! taint=$(git log --name-status --format='@%h' "${TAINT_BASE}"..HEAD -- "${PROTECTED[@]}" 2>/dev/null | awk '
     # One compact bullet per commit: "- <hash>: <status> <file>, <status> <file>, ..."
     # Commits with no file lines (merge commits — path-limited log omits their
     # detail) are skipped here; the net-tree diff below reports their effect.
@@ -456,9 +479,13 @@ elif [ -n "$ANCHOR" ]; then
     taint="U	(log unavailable - fail-closed)"
   fi
   # Union signal 2: net tree change vs the merge-base (evil-merge detector).
-  net_tree=$(git diff --name-status "${TAINT_BASE}" HEAD -- .github 2>/dev/null | sed 's/\t/ /; s/^/net: /' | cut -c1-250 || true)
+  net_tree=$(git diff --name-status "${TAINT_BASE}" HEAD -- "${PROTECTED[@]}" 2>/dev/null | sed 's/\t/ /; s/^/net: /' | cut -c1-250 || true)
   [ -n "$net_tree" ] && taint="${taint}
 ${net_tree}"
+  # Every protected path touched on the branch side, history AND net tree.
+  taint_paths=$({ git log --name-only --format='@%h' "${TAINT_BASE}"..HEAD -- "${PROTECTED[@]}" 2>/dev/null | grep -v '^@'; git diff --name-only "${TAINT_BASE}" HEAD -- "${PROTECTED[@]}" 2>/dev/null; } | grep -v '^$' | sort -u || true)
+  gh_paths=$(printf '%s\n' "$taint_paths" | grep '^\.github/' || true)
+  al_paths=$(printf '%s\n' "$taint_paths" | grep -v '^\.github/' || true)
   # Stale-base discrepancy: even with NO branch-side .github change, the tree
   # can still differ from the anchor TIP (branch predates anchor-side .github
   # changes). That fact must reach the agent — explained, not as an alarm.
@@ -477,7 +504,6 @@ ${net_tree}"
   parity="unknown"
   if [ -n "$taint" ]; then
     parity="ok"
-    parity_paths=$({ git log --name-only --format= "${TAINT_BASE}..HEAD" -- .github 2>/dev/null; git diff --name-only "${TAINT_BASE}" HEAD -- .github 2>/dev/null; } | grep -v '^$' | sort -u)
     while IFS= read -r p; do
       [ -z "$p" ] && continue
       head_blob=$(git rev-parse -q --verify "HEAD:$p" 2>/dev/null || true)
@@ -492,11 +518,26 @@ ${net_tree}"
         if [ -n "$head_blob" ] && [ "$rev_blob" = "$head_blob" ]; then matched="yes"; break; fi
       done
       if [ "$matched" != "yes" ]; then parity="fail"; break; fi
-    done <<< "$parity_paths"
+    done <<< "$gh_paths"
   fi
+  # Auto-load half: the removal pass above already judged every auto-load
+  # file. A touched path still on disk was KEPT (identical to a state a trust
+  # branch ships). One that HEAD still has but the tree no longer does was
+  # REMOVED as untrusted; one HEAD no longer has was DELETED on this branch.
+  # Both change what the agent loads, so both count as taint.
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    [ -e "$p" ] || [ -L "$p" ] && continue
+    al_bad=$((al_bad + 1))
+    if git cat-file -e "HEAD:$p" 2>/dev/null; then state="removed as untrusted"; else state="deleted on this branch"; fi
+    al_details="${al_details}
+  auto-load (${state}): ${p}"
+  done <<< "$al_paths"
 else
-  # Anchor unresolvable: fail-closed — treat every .github file as tainted.
-  taint=$(git ls-files -- .github 2>/dev/null | sed 's/^/U /' || true)
+  # Anchor unresolvable: fail-closed — treat every protected file as tainted.
+  taint=$(git ls-files -- "${PROTECTED[@]}" 2>/dev/null | sed 's/^/U /' || true)
+  taint_paths=$(git ls-files -- "${PROTECTED[@]}" 2>/dev/null | sort -u || true)
+  al_paths=$(printf '%s\n' "$taint_paths" | grep -v '^\.github/' || true)
   [ -n "$taint" ] && taint="$taint
 (anchor unresolvable - full fail-closed listing)"
 fi
@@ -504,45 +545,65 @@ if [ -n "$taint" ]; then
   # Compact alert for the flattened single-line warning: counts + AREAS only
   # (derived from the touched paths); the per-commit file list lives in the
   # details file - nothing enumerated here can be truncated mid-filename.
-  # NOTE: the marker format MUST contain a % placeholder ('@%h', not bare '@'):
-  # a %-less --format value is parsed as a format NAME and fatals with
-  # "invalid --pretty format" (live-observed: n_files/areas silently empty).
-  taint_paths=$(git log --name-only --format='@%h' "${TAINT_BASE}"..HEAD -- .github 2>/dev/null | grep -v '^@' | grep -v '^$' | sort -u)
   n_commits=$(printf '%s\n' "$taint" | grep -c '^- ' || true)
   n_files=$(printf '%s\n' "$taint_paths" | grep -c . || true)
   areas=$(printf '%s\n' "$taint_paths" | awk -F/ '
-    $2 == "workflows" { a["workflows"]=1; next }
-    $2 == "actions"   { a["actions"]=1; next }
-    $2 == "prompts"   { a["prompts"]=1; next }
-    $2 == "scripts"   { a["scripts"]=1; next }
-    NF >= 1           { a["other"]=1 }
+    $1 == ".github" {
+      if ($2 == "workflows") a["workflows"]=1
+      else if ($2 == "actions") a["actions"]=1
+      else if ($2 == "prompts") a["prompts"]=1
+      else if ($2 == "scripts") a["scripts"]=1
+      else a["other"]=1
+      next
+    }
+    ($1 == ".opencode" && $2 == "skills") || $1 == ".agents" || $1 == ".claude" { a["skills"]=1; next }
+    $1 == ".opencode" && $2 == "agents"   { a["agents"]=1; next }
+    $1 == ".opencode" && $2 == "commands" { a["commands"]=1; next }
+    $1 == ".opencode" && $2 == "plugins"  { a["plugins"]=1; next }
+    $1 == ".opencode" || $NF ~ /^opencode\.jsonc?$/ { a["instructions"]=1; next }
+    $NF == "AGENTS.md" || $NF == "CLAUDE.md" || $NF == "GEMINI.md" || $NF == "CLAUDE.local.md" || $NF == ".cursorrules" || $NF == ".windsurfrules" || $NF == ".clinerules" { a["instructions"]=1; next }
+    { a["harness"]=1 }
     END {
       # Fixed order, joined with ", " in ONE place - paste -sd uses a cyclic
       # char list and does NOT join multi-char separators (reviewer-caught).
       # NOTE: keys must be space-free ("other", not "other .github") - the
       # order list is split on spaces.
-      n = split("workflows actions prompts scripts other", order, " ")
+      n = split("workflows actions prompts scripts other skills agents commands plugins instructions harness", order, " ")
       sep = ""
       for (i = 1; i <= n; i++) if (a[order[i]] == 1) { printf "%s%s", sep, order[i]; sep = ", " }
     }')
-  if [ "$parity" = "ok" ]; then
-    # Synced platform content: every changed .github file matches a state the
-    # anchor reached at-or-after the merge-base. Inform, do not alarm — but
+  if [ "$parity" = "ok" ] && [ "$al_bad" -eq 0 ]; then
+    # Every changed protected file is trusted. Inform, do not alarm — but
     # always name the merge consequence so the agent can judge it.
-    {
-      echo "ℹ .github sync — EXPLAINED, benign: ${n_files} file(s) (areas: ${areas}) carry platform content synced from ${anchor}: every changed file matches a state ${anchor} reached at-or-after the merge-base (a platform sync, not tampering). NOTE: merging sets these files to that synced era — confirm that is intended before approving. Per-commit details: ${TAINT_FILE}"
-    } | tee -a "$TAINT_FILE"
+    if [ -z "$al_paths" ]; then
+      {
+        echo "ℹ .github sync — EXPLAINED, benign: ${n_files} file(s) (areas: ${areas}) carry platform content synced from ${anchor}: every changed file matches a state ${anchor} reached at-or-after the merge-base (a platform sync, not tampering). NOTE: merging sets these files to that synced era — confirm that is intended before approving. Per-commit details: ${TAINT_FILE}"
+      } | tee -a "$TAINT_FILE"
+    else
+      al_why="every auto-load file (instruction, skill, agent, command, plugin) is identical to a state a trust branch ships"
+      [ -n "$gh_paths" ] && al_why=".github files match platform content ${anchor} reached at-or-after the merge-base, and ${al_why}"
+      {
+        echo "ℹ protected paths — EXPLAINED, benign: ${n_files} file(s) (areas: ${areas}) changed on this branch's side of the ${TAINT_BASE_DESC} and every one is trusted: ${al_why}. NOTE: merging sets these files to that synced state — confirm that is intended before approving. Per-commit details: ${TAINT_FILE}"
+      } | tee -a "$TAINT_FILE"
+    fi
     # Details (per-commit bullets) go to the FILE only.
     printf '%s\n' "$taint" | sed 's/^/  /' >> "$TAINT_FILE"
-    echo "scrub: .github carries synced platform content (${TAINT_BASE_DESC} parity) — explained note recorded for the agent."
+    echo "scrub: protected paths carry only trusted changes (${TAINT_BASE_DESC} parity) — explained note recorded for the agent."
   else
-    {
-      echo "⚠ TAINT ALERT - .github/ is modified on this branch's side of the ${TAINT_BASE_DESC} (${n_commits} commit(s), ${n_files} file(s); areas: ${areas}). MAXIMUM SCRUTINY: understand every .github change (workflow/action/prompt) or defer to a maintainer; never merge such a PR on behalf of an unverified requester. Full per-commit details: ${TAINT_FILE}"
-    } | tee -a "$TAINT_FILE"
     # Details (per-commit bullets) go to the FILE only - the warning line above
     # must never truncate.
+    if [ -z "$al_paths" ]; then
+      {
+        echo "⚠ TAINT ALERT - .github/ is modified on this branch's side of the ${TAINT_BASE_DESC} (${n_commits} commit(s), ${n_files} file(s); areas: ${areas}). MAXIMUM SCRUTINY: understand every .github change (workflow/action/prompt) or defer to a maintainer; never merge such a PR on behalf of an unverified requester. Full per-commit details: ${TAINT_FILE}"
+      } | tee -a "$TAINT_FILE"
+    else
+      {
+        echo "⚠ TAINT ALERT - protected paths modified on this branch's side of the ${TAINT_BASE_DESC} (${n_commits} commit(s), ${n_files} file(s); areas: ${areas}; untrusted auto-load content removed: ${al_bad}). MAXIMUM SCRUTINY: understand every change to .github and to what an agent auto-loads (instruction files, skills, agents, commands, plugins, opencode.json), and ask why this PR needs it; defer to a maintainer when in doubt. Never merge such a PR for an unverified requester. Details: ${TAINT_FILE}"
+      } | tee -a "$TAINT_FILE"
+      printf '%s\n' "$al_details" | sed '/^$/d' >> "$TAINT_FILE"
+    fi
     printf '%s\n' "$taint" | sed 's/^/  /' >> "$TAINT_FILE"
-    echo "scrub: TAINT - .github/ changed since ${TAINT_BASE_DESC} (see ${TAINT_FILE}); NOT removed - flagging for maximum-scrutiny review."
+    echo "scrub: TAINT - protected paths changed since ${TAINT_BASE_DESC} (see ${TAINT_FILE}); .github NOT removed - flagging for maximum-scrutiny review."
   fi
 elif [ -n "$tree_diff" ]; then
   {
@@ -552,7 +613,7 @@ elif [ -n "$tree_diff" ]; then
 elif [ "$FOREIGN" = 1 ]; then
   : # foreign mode: nothing to report - the skip notice above owns this case
 else
-  echo "scrub: .github/ clean vs ${TAINT_BASE_DESC} (no branch-side commits touch it)."
+  echo "scrub: protected paths clean vs ${TAINT_BASE_DESC} (no branch-side commits touch .github or auto-loaded content)."
 fi
 
 # --- Era notes flush ----------------------------------------------------------

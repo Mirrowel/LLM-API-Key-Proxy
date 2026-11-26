@@ -325,7 +325,7 @@ jobs:
       # This prevents malicious PRs from injecting code into the AI prompt.
       - name: Checkout base branch (for trusted prompt)
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false  # no credentials in .git/config (public repo: anonymous fetches still work)
 
@@ -393,18 +393,13 @@ jobs:
           bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
-          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
-          # Per-agent model override (AGENT_MODELS_JSON variable) and
-          # plugin materialization (OPENCODE_PLUGINS_JSON / _1.._5).
+          # Per-agent model override (AGENT_MODELS_JSON variable).
           agent-key: compliance-check
           agent-models-json: ${{ vars.AGENT_MODELS_JSON }}
-          plugins-json: ${{ vars.OPENCODE_PLUGINS_JSON }}
-          plugins-json-1: ${{ vars.OPENCODE_PLUGINS_JSON_1 }}
-          plugins-json-2: ${{ vars.OPENCODE_PLUGINS_JSON_2 }}
-          plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
-          plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
-          plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
+          content-packs: ${{ vars.CONTENT_PACKS }}
+          content-pack-token: ${{ secrets.CONTENT_PACK_TOKEN }}
+          private-content-packs: ${{ secrets.CONTENT_PACKS_PRIVATE }}
           openshare-config-json: ${{ secrets.OPENSHARE_CONFIG_JSON }}
           openshare-bundle-url: ${{ vars.OPENSHARE_BUNDLE_URL || '' }}
 
@@ -586,7 +581,7 @@ jobs:
       # The trusted artifacts are already secured in /tmp
       - name: Checkout PR Head for Diff Generation
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ steps.pr_info.outputs.head_sha }}
           fetch-depth: 0  # Full history needed for diff
@@ -938,7 +933,7 @@ jobs:
       - name: Upload session artifact
         if: always() && vars.OPENSHARE_PASSIVE != 'false'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: session-${{ github.run_id }}.enc
           path: ${{ runner.temp }}/session-${{ github.run_id }}.enc

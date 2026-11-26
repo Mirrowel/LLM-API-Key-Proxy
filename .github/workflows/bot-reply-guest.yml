@@ -129,7 +129,7 @@ jobs:
           esac
 
       - name: Checkout routing script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
@@ -516,7 +516,7 @@ jobs:
       # with "Can't find 'action.yml'" until this restore existed).
       - name: Checkout repository
         if: steps.validate.outputs.should_proceed == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Stash local action for the post phase
@@ -535,17 +535,13 @@ jobs:
           bot-private-key: ${{ secrets.BOT_PRIVATE_KEY }}
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           opencode-model: ${{ secrets.OPENCODE_MODEL }}
-          opencode-fast-model: ${{ secrets.OPENCODE_FAST_MODEL }}
           opencode-config-json: ${{ secrets.OPENCODE_CONFIG_JSON }}
           # Guest sessions share the bot-reply model key (AGENT_MODELS_JSON).
           agent-key: bot-reply
           agent-models-json: ${{ vars.AGENT_MODELS_JSON }}
-          plugins-json: ${{ vars.OPENCODE_PLUGINS_JSON }}
-          plugins-json-1: ${{ vars.OPENCODE_PLUGINS_JSON_1 }}
-          plugins-json-2: ${{ vars.OPENCODE_PLUGINS_JSON_2 }}
-          plugins-json-3: ${{ vars.OPENCODE_PLUGINS_JSON_3 }}
-          plugins-json-4: ${{ vars.OPENCODE_PLUGINS_JSON_4 }}
-          plugins-json-5: ${{ vars.OPENCODE_PLUGINS_JSON_5 }}
+          content-packs: ${{ vars.CONTENT_PACKS }}
+          content-pack-token: ${{ secrets.CONTENT_PACK_TOKEN }}
+          private-content-packs: ${{ secrets.CONTENT_PACKS_PRIVATE }}
           openshare-config-json: ${{ secrets.OPENSHARE_CONFIG_JSON }}
           openshare-bundle-url: ${{ vars.OPENSHARE_BUNDLE_URL || '' }}
 
@@ -908,7 +904,7 @@ jobs:
       - name: Upload session artifact
         if: always() && vars.OPENSHARE_PASSIVE != 'false'
         continue-on-error: true
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: session-${{ github.run_id }}.enc
           path: ${{ runner.temp }}/session-${{ github.run_id }}.enc

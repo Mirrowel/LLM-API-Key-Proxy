@@ -81,7 +81,7 @@ jobs:
       # workflow file itself) - NOT the untrusted-PR-code case the security
       # model prohibits. No PR/fork ref is ever checked out here.
       - name: Checkout routing script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false
@@ -260,7 +260,7 @@ jobs:
     timeout-minutes: 3
     steps:
       - name: Checkout routing script
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           sparse-checkout: .github/scripts
           persist-credentials: false

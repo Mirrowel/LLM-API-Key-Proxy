@@ -71,7 +71,7 @@ jobs:
       - name: Mint App installation token (app mode only)
         id: app_token
         if: steps.token.outputs.mode == 'app'
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_PRIVATE_KEY }}
@@ -117,7 +117,6 @@ jobs:
             [FOREIGN_MENTIONS_ENABLED]="false"
             [OPENSHARE_PASSIVE]="true"
             [OPEN_TRIGGERING]="true"
-            [OPENCODE_PLUGINS_JSON]="{}"
             [ELEVATED_REVIEWS_COUNT]="1"
           )
           FAILED=0
@@ -222,7 +221,7 @@ jobs:
           | `TRUSTED_AGENT_USERS` | empty | Extra trusted users (comma-separated) beyond direct collaborators (who already count as friendly). |
           | `FOREIGN_MENTIONS_ENABLED` | `false` | Cross-repo guest mode master switch. |
           | `FOREIGN_MENTIONS_USERS` | empty | Allowlist for cross-repo summons (comma-separated logins). |
-          | `OPENCODE_PLUGINS_JSON` | `{}` | Plugin files: `{"<relative-path>": "<file content>"}` materialized to `~/.mirrobot-plugins/`. Reference by absolute path in the config secret's `plugin` array. For multiple plugins use `OPENCODE_PLUGINS_JSON_1` .. `_5`. |
+          | `CONTENT_PACKS` | absent = no content | Public content packs, flat comma list of `owner/repo[@ref]` (shallow-fetched) or public archive links (zip, tar.gz). A pack holds skills (`.agents/skills/`), plugins, agents, commands, boot-time extensions and an optional `opencode.json` fragment; later entries win. Private archive links belong in the `CONTENT_PACKS_PRIVATE` secret, never here. See docs/configuration.md. |
           | `ELEVATED_REVIEWS_COUNT` | `1` | How many of the agent's own newest reviews are ELEVATED (unfiltered memory). Older own reviews still appear - filtered - in the history block. |
           | `OPENSHARE_PASSIVE` | `true` | `false` disables the passive track entirely (session export + snapshot + encrypted artifact). The passive artifact is the safety net for live sharing - normally leave on. |
           | `OPENSHARE_BUNDLE_URL` | absent = released master | Override where the OpenShare plugin bundle (and snapshot tools) are fetched from. Set only while tracking a dev branch ahead of the released line; delete to return to self-updating master. |
@@ -236,8 +235,9 @@ jobs:
           | `BOT_APP_ID` + `BOT_PRIVATE_KEY` | identity B (pick A or B) | GitHub App credentials (fallback identity when no account token). For bootstrap seeding the App also needs its Variables: write permission. |
           | `OPENCODE_MODEL` | yes | Global model in `provider/model` format; used by every agent without a per-agent override. |
           | `OPENCODE_CONFIG_JSON` | strongly recommended | Complete opencode config (providers with API keys, mcp, plugins, permission block). Template: `.github/actions/bot-setup/permissions.example.json`. The permission block is the agent's security profile - without it the agent runs on permissive defaults. |
-          | `OPENCODE_FAST_MODEL` | optional | Global small_model (session-title generation). |
           | `OPENCODE_API_KEY` | optional | API key applied to the main model's provider (redundant when keys live inside `OPENCODE_CONFIG_JSON`). |
+          | `CONTENT_PACK_TOKEN` | optional | Token for private content pack sources (repository or link); sent as a git credential or Bearer header. |
+          | `CONTENT_PACKS_PRIVATE` | optional | Private archive links for content packs, same format as `CONTENT_PACKS`. A secret because the run log prints repository variables in clear. |
           | `SESSION_ARTIFACT_PUBKEY` | optional | RSA public key sealing the passive session artifacts (MRB2) + summary blobs; `python decrypt_share_link.py setup` generates the pair and sets the secret. |
           | `OPENSHARE_CONFIG_JSON` | optional | Complete OpenShare plugin config for live session sharing (template: `.github/plugins/openshare.ci.EXAMPLE.json`). Absent = plugin dormant, passive artifacts continue. |
 
@@ -273,9 +273,10 @@ jobs:
           # Absent = built-in defaults; [] disables noise filtering; a list replaces the defaults.
           gh variable set CONTEXT_FILTER_PATTERNS_JSON -R <owner>/<repo> --body '<same pattern list as seeded above - copy from the DEFAULTS block>'
           gh variable set FOREIGN_MENTIONS_ENABLED -R <owner>/<repo> --body "false"
-          gh variable set OPENCODE_PLUGINS_JSON -R <owner>/<repo> --body "{}"
           gh variable set ELEVATED_REVIEWS_COUNT -R <owner>/<repo> --body "1"
           gh variable set OPENSHARE_PASSIVE -R <owner>/<repo> --body "true"
+          # Content packs are never seeded (absent = none). Example of the value:
+          # gh variable set CONTENT_PACKS -R <owner>/<repo> --body "owner/agent-pack@main, https://files.example.com/private-pack.zip"
           # Optional knobs (absent = the documented default):
           gh variable set OPENSHARE_BUNDLE_URL -R <owner>/<repo> --body "https://raw.githubusercontent.com/Mirrowel/OpenShare/dev/share-plugin/ci/openshare.js"   # track the dev branch instead of released master
           gh variable set GUEST_REPO_RULES -R <owner>/<repo> --body "owner/local-repo-one:deny, owner/local-repo-two:deny"   # skip guest handling where local workflows already run

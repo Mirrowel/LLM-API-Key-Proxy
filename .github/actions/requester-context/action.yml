@@ -7,8 +7,8 @@ description: 'Classifies the triggering user via GitHub author association plus 
 # brief so the agent knows whether the requester is verified, and applies stricter
 # judgment (not refusal) for unverified requesters.
 #
-# FUTURE OPTION (deliberately NOT enabled): route untrusted requesters to the
-# fast model (OPENCODE_FAST_MODEL) via a trust-tier output consumed by bot-setup.
+# FUTURE OPTION (deliberately NOT enabled): route untrusted requesters to a
+# cheaper model through a per-requester model override consumed by bot-setup.
 
 inputs:
   login:

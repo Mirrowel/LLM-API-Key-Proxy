@@ -21,6 +21,14 @@ SCRUB="$SCRIPT_DIR/scrub-workspace.sh"
 GATE="$SCRIPT_DIR/../workflows/compliance-gate.yml"
 ACTION="$SCRIPT_DIR/../actions/bot-setup/action.yml"
 EXAMPLE="$SCRIPT_DIR/../actions/bot-setup/permissions.example.json"
+PACKS="$SCRIPT_DIR/../actions/bot-setup/install-packs.py"
+PCHECK="$SCRIPT_DIR/../actions/bot-setup/permission-check.py"
+# A working interpreter for the two Python checkers (Windows aliases a bare
+# `python3` to a store stub that exits non-zero without running anything).
+PY=""
+for cand in python3 python; do
+  if "$cand" -c 'import json' >/dev/null 2>&1; then PY="$cand"; break; fi
+done
 STUBWF="$SCRIPT_DIR/../workflows/pr-review-trigger.yml"
 PRWF="$SCRIPT_DIR/../workflows/pr-review.yml"
 STUB="$SCRIPT_DIR/../workflows/pr-review-trigger.yml"
@@ -32,6 +40,45 @@ trap 'rm -rf "$WORK"' EXIT
 PASS=0; FAIL=0
 
 check() { if [ "$2" = "$3" ]; then echo "PASS: $1"; PASS=$((PASS+1)); else echo "FAIL: $1"; echo "  want=[$2]"; echo "  got =[$3]"; FAIL=$((FAIL+1)); fi; }
+
+sdk_step() { awk -v n="$1" 'index($0, "    - name: " n) { f=1; print; next } f && /^    - name: / { f=0 } f' "$ACTION"; }
+sdk_section() {
+  # The cache holds the plugin SDK opencode installs on a cold boot (20-70 s on
+  # a fresh runner) so a warm run skips it. A fork's pull_request run can
+  # restore caches saved on the default branch, so nothing that can carry a
+  # credential may ever be cached: only the SDK's own three paths in each of
+  # the two directories opencode installs it into, never the config file,
+  # auth.json, a plugin directory or the opencode binary. The boot report
+  # that waits for the SDK runs before the scrub, so its one opencode call
+  # must ignore workspace config and send the skill listing (every skill's
+  # full text, possibly private) to an unlinked file; only names are printed.
+  local restore save both expected
+  restore="$(sdk_step 'Restore the plugin SDK')"
+  save="$(sdk_step 'Keep the plugin SDK')"
+  both="$(printf '%s\n%s\n' "$restore" "$save")"
+  expected="~/.cache/opencode/models.json ~/.config/opencode/node_modules ~/.config/opencode/package-lock.json ~/.config/opencode/package.json ~/.opencode/node_modules ~/.opencode/package-lock.json ~/.opencode/package.json"
+  check "sdk cache: restore and save steps present" "2" "$([ -n "$restore" ] && [ -n "$save" ] && echo 2 || echo 0)"
+  check "sdk cache: restore caches exactly the SDK paths in both directories and the model catalog" "$expected" "$(printf '%s\n' "$restore" | tr -d '\r' | grep -E '~/\.(config|cache|opencode)/' | LC_ALL=C sort -u | xargs)"
+  check "sdk cache: save caches exactly the SDK paths in both directories and the model catalog"    "$expected" "$(printf '%s\n' "$save" | tr -d '\r' | grep -E '~/\.(config|cache|opencode)/' | LC_ALL=C sort -u | xargs)"
+  check "sdk cache: no config file, auth file, plugin directory or opencode binary in either step" no "$(printf '%s\n' "$both" | grep -Eq 'opencode\.json|auth\.json|plugins|\.opencode/bin' && echo yes || echo no)"
+  check "sdk cache: both steps tolerate a cache service failure" "2" "$(printf '%s\n' "$both" | grep -c 'continue-on-error: true')"
+  check "sdk cache: restore and save use the same cache action major" yes "$([ "$(printf '%s\n' "$restore" | grep -o 'actions/cache/restore@v[0-9]*')" != "" ] && [ "$(printf '%s\n' "$restore" | grep -o '@v[0-9]*')" = "$(printf '%s\n' "$save" | grep -o '@v[0-9]*')" ] && echo yes || echo no)"
+  check "sdk cache: save runs only when nothing was restored"     yes "$(printf '%s\n' "$save" | grep -Eq "cache-hit != 'true'" && echo yes || echo no)"
+  check "sdk cache: the key carries the opencode version"         yes "$(printf '%s\n' "$restore" | grep -Eq 'key: .*steps\.opencode_version\.outputs\.version' && echo yes || echo no)"
+  check "sdk cache: install, restore, extensions, wait, save in that order" yes "$(awk '/^    - name: /{n=$0} /Restore the plugin SDK/{r=NR} /Wait for the opencode install/{i=NR} /Wait for pack extensions/{w=NR} /Keep the plugin SDK/{s=NR} /^    - name: Start pack extensions/{x=NR} END{print (i<r && r<x && x<w && w<s) ? "yes" : "no"}' "$ACTION")"
+  check "report: exactly one opencode call" "1" "$(grep -c '\[binary, "debug", "skill"' "$PACKS")"
+  check "report: that call ignores workspace config" yes "$(awk '/\[binary, "debug", "skill"/{f=1} f{print} f&&/timeout=/{f=0}' "$PACKS" | grep -q 'env=env' && grep -q 'OPENCODE_DISABLE_PROJECT_CONFIG="1"' "$PACKS" && echo yes || echo no)"
+  check "report: the listing goes to an unlinked file, never a pipe" yes "$(awk '/\[binary, "debug", "skill"/{f=1} f{print} f&&/timeout=/{f=0}' "$PACKS" | grep -q 'stdout=buffer' && echo yes || echo no)"
+  # The installer makes `opencode` reachable only by appending to $GITHUB_PATH,
+  # which the runner reads when the launching step ends: lost from the
+  # background, which left opencode off PATH for every later step and made
+  # the report skip itself in silence.
+  check "opencode: the wait step exports the install directory to GITHUB_PATH" yes "$(sdk_step 'Wait for the opencode install' | grep -q 'GITHUB_PATH' && echo yes || echo no)"
+  check "opencode: the background installer cannot write GITHUB_PATH late"     yes "$(sdk_step 'Start the opencode install in the background' | grep -q 'GITHUB_PATH=/dev/null' && echo yes || echo no)"
+  check "report: finds opencode without PATH"                                  yes "$(grep -q '\.opencode" / "bin" / "opencode"' "$PACKS" && echo yes || echo no)"
+  check "report: a missing opencode is a warning, never a silent skip"         yes "$(grep -q 'content check was skipped' "$PACKS" && echo yes || echo no)"
+  check "packs: skill fetch starts beside the installer, extensions after the restore" yes "$(awk '/name: Fetch content packs/{f=NR} /name: Start the upstream skill fetch/{s=NR} /name: Restore the plugin SDK/{r=NR} /^    - name: Start pack extensions/{x=NR} /name: Wait for pack extensions and report/{w=NR} END{print (f && s && r && x && w && f < s && s < r && r < x && x < w) ? "yes" : "no"}' "$ACTION")"
+}
 
 
 # ---- section selectors (dev-loop speed; CI runs everything) -----------------
@@ -74,7 +121,7 @@ section_begin() { # name
   fi
   if [ "$QUICK" = 1 ]; then
     case "$n" in
-      "fixture repo"|"taint matrix"*|"autoload surface"*|"autoload split-trust"*|"graceful degradation"*|"scrub --foreign mode"*|"BOT_NAMES_JSON shadowing"*|"channel hygiene"*) SECTION_ACTIVE=0; return 0 ;;
+      "fixture repo"|"taint matrix"*|"autoload surface"*|"autoload taint matrix"*|"autoload split-trust"*|"graceful degradation"*|"scrub --foreign mode"*|"BOT_NAMES_JSON shadowing"*|"channel hygiene"*) SECTION_ACTIVE=0; return 0 ;;
     esac
   fi
   SECTION_ACTIVE=1
@@ -289,7 +336,7 @@ check "autoload: hostile root .cursorrules removed"    no  "$(survives .cursorru
 check "autoload: modified GEMINI.md removed"           no  "$(survives GEMINI.md)"
 check "autoload: modified .cursor rule removed"        no  "$(survives .cursor/rules/a.mdc)"
 check "autoload: identical .cursor sibling kept"       yes "$(survives .cursor/rules/b.mdc)"
-check "autoload: permission example carries skill deny" yes "$(grep -q '"skill": {' "$SCRIPT_DIR/../actions/bot-setup/permissions.example.json" && echo yes || echo no)"
+check "autoload: permission example opens the skill tool" yes "$(jq -e '.permission.skill["*"] == "allow"' "$EXAMPLE" >/dev/null && echo yes || echo no)"
 check "quarantine: removed GEMINI.md preserved"        yes "$(quarantined GEMINI.md)"
 check "quarantine: removed .cursorrules preserved"     yes "$(quarantined .cursorrules)"
 check "quarantine: removed .agents skill preserved"    yes "$(quarantined .agents/skills/evil/SKILL.md)"
@@ -304,6 +351,27 @@ if [ "$SYMLINKS_REAL" = yes ]; then
 else
   echo "SKIP: out-of-repo symlink staging checks (120000 blobs materialize as text files on this platform; the mode precondition above already failed loudly if the fixture itself degraded)"
 fi
+
+fi
+section_end
+
+# ---- autoload taint matrix (one mechanic: auto-load changes raise the alert) --
+SECTION_NAME='autoload taint matrix (unified: auto-load tampering alarms like .github)'
+section_begin "$SECTION_NAME"
+if [ "$SECTION_ACTIVE" = 1 ]; then
+# Same harness, same branch as the autoload surface matrix: that branch
+# changes only auto-load content (hostile skill, edited GEMINI.md, hostile
+# .cursorrules). Before the unified mechanic such a branch raised nothing:
+# the scrub removed the files and stayed silent.
+check "unified: auto-load tampering alone raises TAINT" yes "$(run_scrub autoload >/dev/null; head -1 /tmp/scrub-taint.txt | grep -q 'TAINT ALERT - protected paths modified' && echo yes || echo no)"
+check "unified: header names the skills area and a removed count" yes "$(head -1 /tmp/scrub-taint.txt | grep -q 'areas: .*skills' && head -1 /tmp/scrub-taint.txt | grep -q 'untrusted auto-load content removed: [1-9]' && echo yes || echo no)"
+check "unified: header carries the scrutiny instruction" yes "$(head -1 /tmp/scrub-taint.txt | grep -q 'MAXIMUM SCRUTINY' && head -1 /tmp/scrub-taint.txt | grep -q 'Never merge such a PR for an unverified requester' && echo yes || echo no)"
+check "unified: header fits the 600-char flatten" yes "$([ "$(head -1 /tmp/scrub-taint.txt | tr -d '\n' | wc -c)" -lt 600 ] && echo yes || echo no)"
+check "unified: details name each removed path with its state" yes "$(grep -q 'auto-load (removed as untrusted): .agents/skills/evil/SKILL.md' /tmp/scrub-taint.txt && grep -q 'auto-load (removed as untrusted): GEMINI.md' /tmp/scrub-taint.txt && echo yes || echo no)"
+check "unified: details stay below the header" yes "$(sed -n '2,$p' /tmp/scrub-taint.txt | grep -q '^  auto-load' && echo yes || echo no)"
+check "unified: .github-only alarm keeps its own wording" yes "$(run_scrub evil >/dev/null; head -1 /tmp/scrub-taint.txt | grep -q 'TAINT ALERT - .github/ is modified' && echo yes || echo no)"
+check "unified: stale-base branch stays INFO, anchor stays CLEAN" "INFO CLEAN" "$(run_scrub stale) $(run_scrub main)"
+check "unified: a clean branch exits 0 and writes no taint file" CLEAN "$(git checkout -q --detach origin/main; rm -f /tmp/scrub-taint.txt; bash "$SCRUB" --anchor main >/tmp/scrub-fix.log 2>&1 && { [ -s /tmp/scrub-taint.txt ] && echo PRESENT || echo CLEAN; } || echo CRASH)"
 
 fi
 section_end
@@ -495,8 +563,10 @@ check "share: announcer encrypts with the pubkey"  yes "$(grep -q 'pkeyutl -encr
   # ---- per-agent models + plugins + config lifecycle (bot-setup contract) ----
   check "models: $wf passes its agent-key"         yes "$(grep -q "agent-key: $AGENT_KEY" "$WFF" && echo yes || echo no)"
   check "models: $wf passes AGENT_MODELS_JSON"     yes "$(grep -q 'agent-models-json: \${{ vars.AGENT_MODELS_JSON }}' "$WFF" && echo yes || echo no)"
-  check "plugins: $wf wires base plugins var"      yes "$(grep -q 'plugins-json: \${{ vars.OPENCODE_PLUGINS_JSON }}' "$WFF" && echo yes || echo no)"
-  check "plugins: $wf wires numbered plugin vars"  yes "$(grep -q 'plugins-json-5: \${{ vars.OPENCODE_PLUGINS_JSON_5 }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf wires CONTENT_PACKS"            yes "$(grep -q 'content-packs: \${{ vars.CONTENT_PACKS }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf wires the pack token"           yes "$(grep -q 'content-pack-token: \${{ secrets.CONTENT_PACK_TOKEN }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf wires the private pack secret"      yes "$(grep -q 'private-content-packs: \${{ secrets.CONTENT_PACKS_PRIVATE }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf carries no retired plugin var"  no  "$(grep -q 'OPENCODE_PLUGINS_JSON' "$WFF" && echo yes || echo no)"
   # Config lifecycle: opencode reads config+plugins once at boot; the
   # boot-sentinel waiter + post-run cleanup guarantee the sensitive files
   # do not survive the run.
@@ -532,11 +602,20 @@ ACT="$SCRIPT_DIR/../actions/bot-setup/action.yml"
 check "openshare: action declares input"             yes "$(grep -q '  openshare-config-json:' "$ACT" && echo yes || echo no)"
 check "openshare: bundle-url input declared"          yes "$(grep -q '  openshare-bundle-url:' "$ACT" && echo yes || echo no)"
 check "openshare: master fetch stays the default"      yes "$(grep -q 'OPENSHARE_BUNDLE_URL:-https://raw.githubusercontent.com/Mirrowel/OpenShare/master' "$ACT" && echo yes || echo no)"
-check "openshare: env auth belt removed"               yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'OPENSHARE_AUTH_LOGIN' && echo no || echo yes)"
+check "openshare: env auth belt removed"               yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q 'OPENSHARE_AUTH_LOGIN' && echo no || echo yes)"
 check "openshare: fetch failure degrades (warning)"  yes "$(grep -B2 -A2 'bundle fetch failed' "$ACT" | grep -q '::warning' && echo yes || echo no)"
-check "openshare: config written adjacent to plugin" yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '\$PLUGINS_DIR/openshare.config.json' && echo yes || echo no)"
-check "openshare: credential leaves add-masked"      yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '::add-mask' && echo yes || echo no)"
-check "openshare: plugin registered idempotently"    yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'index(\$p)' && echo yes || echo no)"
+check "openshare: config written adjacent to plugin" yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q '\$PLUGINS_DIR/openshare.config.json' && echo yes || echo no)"
+check "openshare: credential leaves add-masked"      yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q '::add-mask' && echo yes || echo no)"
+check "openshare: plugin registered idempotently"    yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q 'index(\$p)' && echo yes || echo no)"
+# raw.githubusercontent.com answers 429 to hosted-runner addresses in windows
+# that outlast a quick retry loop (a run lost its live share to four attempts
+# inside seven seconds). The download runs in the background, spreads its
+# retries over a minute, and the staging step collects it right before the
+# report boot without ever failing the run.
+check "openshare: download retries spread over a minute, in the background" yes "$(sdk_step 'Prepare OpenShare plugin' | grep -q 'nohup setsid' && [ "$(sdk_step 'Prepare OpenShare plugin' | grep -c 'for i in 1 2 3 4 5 6 7')" = 1 ] && echo yes || echo no)"
+check "openshare: staging waits for the download marker"            yes "$(sdk_step 'Stage OpenShare plugin' | grep -q 'openshare-bundle.done' && echo yes || echo no)"
+check "openshare: a failed download never fails the run"             yes "$(sdk_step 'Stage OpenShare plugin' | grep -q 'bundle fetch failed' && [ "$(sdk_step 'Stage OpenShare plugin' | grep -c 'exit 0')" -ge 3 ] && echo yes || echo no)"
+check "openshare: staging sits after the SDK restore, before the report" yes "$(awk '/name: Stage OpenShare plugin/{s=NR} /name: Restore the plugin SDK/{r=NR} /name: Wait for pack extensions and report/{w=NR} END{print (r && s && w && r < s && s < w) ? "yes" : "no"}' "$ACT")"
 
 # ---- OpenShare export-session v2 contract (behavioral + structural) -------
 # The passive artifact must emit OpenShare contract v2 (content-embedded
@@ -635,8 +714,10 @@ check "share: announcer encrypts with the pubkey"  yes "$(grep -q 'pkeyutl -encr
   # ---- per-agent models + plugins + config lifecycle (bot-setup contract) ----
   check "models: $wf passes its agent-key"         yes "$(grep -q "agent-key: $AGENT_KEY" "$WFF" && echo yes || echo no)"
   check "models: $wf passes AGENT_MODELS_JSON"     yes "$(grep -q 'agent-models-json: \${{ vars.AGENT_MODELS_JSON }}' "$WFF" && echo yes || echo no)"
-  check "plugins: $wf wires base plugins var"      yes "$(grep -q 'plugins-json: \${{ vars.OPENCODE_PLUGINS_JSON }}' "$WFF" && echo yes || echo no)"
-  check "plugins: $wf wires numbered plugin vars"  yes "$(grep -q 'plugins-json-5: \${{ vars.OPENCODE_PLUGINS_JSON_5 }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf wires CONTENT_PACKS"            yes "$(grep -q 'content-packs: \${{ vars.CONTENT_PACKS }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf wires the pack token"           yes "$(grep -q 'content-pack-token: \${{ secrets.CONTENT_PACK_TOKEN }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf wires the private pack secret"      yes "$(grep -q 'private-content-packs: \${{ secrets.CONTENT_PACKS_PRIVATE }}' "$WFF" && echo yes || echo no)"
+  check "packs: $wf carries no retired plugin var"  no  "$(grep -q 'OPENCODE_PLUGINS_JSON' "$WFF" && echo yes || echo no)"
   # Config lifecycle: opencode reads config+plugins once at boot; the
   # boot-sentinel waiter + post-run cleanup guarantee the sensitive files
   # do not survive the run.
@@ -672,11 +753,20 @@ ACT="$SCRIPT_DIR/../actions/bot-setup/action.yml"
 check "openshare: action declares input"             yes "$(grep -q '  openshare-config-json:' "$ACT" && echo yes || echo no)"
 check "openshare: bundle-url input declared"          yes "$(grep -q '  openshare-bundle-url:' "$ACT" && echo yes || echo no)"
 check "openshare: master fetch stays the default"      yes "$(grep -q 'OPENSHARE_BUNDLE_URL:-https://raw.githubusercontent.com/Mirrowel/OpenShare/master' "$ACT" && echo yes || echo no)"
-check "openshare: env auth belt removed"               yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'OPENSHARE_AUTH_LOGIN' && echo no || echo yes)"
+check "openshare: env auth belt removed"               yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q 'OPENSHARE_AUTH_LOGIN' && echo no || echo yes)"
 check "openshare: fetch failure degrades (warning)"  yes "$(grep -B2 -A2 'bundle fetch failed' "$ACT" | grep -q '::warning' && echo yes || echo no)"
-check "openshare: config written adjacent to plugin" yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '\$PLUGINS_DIR/openshare.config.json' && echo yes || echo no)"
-check "openshare: credential leaves add-masked"      yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q '::add-mask' && echo yes || echo no)"
-check "openshare: plugin registered idempotently"    yes "$(sed -n '/Stage OpenShare/,/registered/p' "$ACT" | grep -q 'index(\$p)' && echo yes || echo no)"
+check "openshare: config written adjacent to plugin" yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q '\$PLUGINS_DIR/openshare.config.json' && echo yes || echo no)"
+check "openshare: credential leaves add-masked"      yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q '::add-mask' && echo yes || echo no)"
+check "openshare: plugin registered idempotently"    yes "$(sed -n '/Prepare OpenShare plugin/,/plugin registered/p' "$ACT" | grep -q 'index(\$p)' && echo yes || echo no)"
+# raw.githubusercontent.com answers 429 to hosted-runner addresses in windows
+# that outlast a quick retry loop (a run lost its live share to four attempts
+# inside seven seconds). The download runs in the background, spreads its
+# retries over a minute, and the staging step collects it right before the
+# report boot without ever failing the run.
+check "openshare: download retries spread over a minute, in the background" yes "$(sdk_step 'Prepare OpenShare plugin' | grep -q 'nohup setsid' && [ "$(sdk_step 'Prepare OpenShare plugin' | grep -c 'for i in 1 2 3 4 5 6 7')" = 1 ] && echo yes || echo no)"
+check "openshare: staging waits for the download marker"            yes "$(sdk_step 'Stage OpenShare plugin' | grep -q 'openshare-bundle.done' && echo yes || echo no)"
+check "openshare: a failed download never fails the run"             yes "$(sdk_step 'Stage OpenShare plugin' | grep -q 'bundle fetch failed' && [ "$(sdk_step 'Stage OpenShare plugin' | grep -c 'exit 0')" -ge 3 ] && echo yes || echo no)"
+check "openshare: staging sits after the SDK restore, before the report" yes "$(awk '/name: Stage OpenShare plugin/{s=NR} /name: Restore the plugin SDK/{r=NR} /name: Wait for pack extensions and report/{w=NR} END{print (r && s && w && r < s && s < w) ? "yes" : "no"}' "$ACT")"
 
 # ---- OpenShare export-session v2 contract (behavioral + structural) -------
 # The passive artifact must emit OpenShare contract v2 (content-embedded
@@ -765,9 +855,18 @@ check "setup: mask sweep walks credential keys"    yes "$(grep -q 'api\[_-\]?key
 # a leading-anchor alternation misses them (live-caught in local test).
 check "setup: mask URL rule catches prefixed params" yes "$(grep -q '\[?&\].\*(api\[_-\]?key|token|secret|password)=' "$ACTION" && echo yes || echo no)"
 check "setup: mask skips sub-8-char values"        yes "$(grep -q '\${#v}' "$ACTION" && grep -q '\-ge 8' "$ACTION" && echo yes || echo no)"
-check "setup: plugins materialize under own dir"   yes "$(grep -q 'PLUGINS_DIR="\$HOME/.mirrobot-plugins"' "$ACTION" && echo yes || echo no)"
-check "setup: plugins path traversal rejected"     yes "$(grep -q '\.\./\*|' "$ACTION" && echo yes || echo no)"
-check "setup: numbered plugin vars merge (collision errors)" yes "$(grep -q 'Duplicate plugin path' "$ACTION" && echo yes || echo no)"
+check "setup: openshare stages under its own dir"  yes "$(grep -q 'PLUGINS_DIR="\$HOME/.mirrobot-plugins"' "$ACTION" && echo yes || echo no)"
+check "packs: installer refuses path traversal"    yes "$(grep -q 'archive holds a path traversal' "$PACKS" && echo yes || echo no)"
+check "packs: installer refuses links and absolute paths" yes "$(grep -q 'archive holds a link' "$PACKS" && grep -q 'archive holds an absolute path' "$PACKS" && echo yes || echo no)"
+check "packs: installer caps extraction"           yes "$(grep -q '^MAX_FILES = ' "$PACKS" && grep -q '^MAX_BYTES = ' "$PACKS" && echo yes || echo no)"
+check "packs: installer never writes a permission"  yes "$(grep -q 'a pack cannot change permissions' "$PACKS" && echo yes || echo no)"
+check "packs: upstream skills verified by tree SHA" yes "$(grep -q 'skillFolderHash' "$PACKS" && grep -q 'the extracted skill folder is incomplete' "$PACKS" && echo yes || echo no)"
+check "packs: config fragments drop permission at any depth" yes "$(grep -q '^def strip_permissions' "$PACKS" && echo yes || echo no)"
+check "packs: extension errors relay as warnings" yes "$(grep -q "its errors relay as warnings" "$PACKS" && echo yes || echo no)"
+check "packs: link fetch sends a same-origin referer and caps the download" yes "$(grep -q 'directives = \[("referer"' "$PACKS" && grep -q '"--max-filesize", str(MAX_BYTES)' "$PACKS" && echo yes || echo no)"
+check "packs: the wait step cannot fail the run" yes "$(grep -q 'the wait step only reports; it must never end the run' "$PACKS" && echo yes || echo no)"
+check "setup: private pack links arrive through a secret input" yes "$(grep -q '^  private-content-packs:' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS: \${{ inputs.private-content-packs }}' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS' "$PACKS" && echo yes || echo no)"
+check "setup: no masking helper survives (the runner echoes action inputs too)" no "$(test -e "$SCRIPT_DIR/../actions/mask-values" && echo yes || echo no)"
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
 # comparing against the whole file would false-warn on every repo whose
 # config lacks the example's providers/mcp/plugin shape.
@@ -776,7 +875,15 @@ check "setup: drift warning carries no rule specifics" yes "$(grep 'OPENCODE_CON
 # The example must look like a full config, carry the GENERIC plugin entry,
 # and never name a real router/provider anywhere in the repo.
 check "example: full-config shape (has \$schema)"  yes "$(grep -q '"\$schema"' "$EXAMPLE" && echo yes || echo no)"
-check "example: plugin entry uses generic name"    yes "$(grep -q 'secretplugin/secretplugin.js' "$EXAMPLE" && echo yes || echo no)"
+check "example: plugin array carries no runner path" yes "$(jq -e '(.plugin // []) | length == 0' "$EXAMPLE" >/dev/null && echo yes || echo no)"
+check "packs: fetch precedes config, install follows it" yes "$(grep -n 'name: Fetch content packs\|name: Generate OpenCode Configuration\|name: Install content packs and mask' "$ACTION" | cut -d: -f1 | tr '\n' ' ' | awk '{print ($1 < $2 && $2 < $3) ? "yes" : "no"}')"
+check "packs: extension step carries no env block"  yes "$(awk '/name: Start pack extensions/{f=1; next} f && /- name:/{exit} f && /env:/{print "no"} END{print "yes"}' "$ACTION" | head -n 1)"
+check "packs: wait step sits after the opencode install" yes "$(awk '/name: Wait for the opencode install/{a=NR} /name: Wait for pack extensions and report/{b=NR} END{print (a && b && a < b) ? "yes" : "no"}' "$ACTION")"
+check "packs: opencode install runs in the background with pipefail and a completion marker" yes "$(sdk_step 'Start the opencode install in the background' | grep -q 'set -o pipefail' && sdk_step 'Start the opencode install in the background' | grep -q 'opencode-install.done' && echo yes || echo no)"
+check "packs: a failed opencode installer fails the run" yes "$(sdk_step 'Wait for the opencode install' | grep -q '::error::' && sdk_step 'Wait for the opencode install' | grep -q 'exit 1' && echo yes || echo no)"
+check "packs: action carries no retired plugin input" no "$(grep -q 'plugins-json' "$ACTION" && echo yes || echo no)"
+check "packs: bootstrap seeds no plugin variable"    no "$(grep -q 'OPENCODE_PLUGINS_JSON' "$BOOT" && echo yes || echo no)"
+check "packs: bootstrap shows CONTENT_PACKS only as an example" yes "$(grep -q '# gh variable set CONTENT_PACKS' "$BOOT" && ! grep -q '^ *gh variable set CONTENT_PACKS' "$BOOT" && echo yes || echo no)"
 check "example: plugin denies in bash tail"        yes "$(grep -q '\*~/.mirrobot-plugins\*' "$EXAMPLE" && echo yes || echo no)"
 check "example: plugin denies in read block"       yes "$(grep -q '~/.mirrobot-plugins/\*' "$EXAMPLE" && echo yes || echo no)"
 check "repo: no closedrouter references"           no  "$(grep -rqi closedrouter "$SCRIPT_DIR/../../.github/" --exclude=scrub-fixtures.sh && echo yes || echo no)"
@@ -794,9 +901,18 @@ check "setup: mask sweep walks credential keys"    yes "$(grep -q 'api\[_-\]?key
 # a leading-anchor alternation misses them (live-caught in local test).
 check "setup: mask URL rule catches prefixed params" yes "$(grep -q '\[?&\].\*(api\[_-\]?key|token|secret|password)=' "$ACTION" && echo yes || echo no)"
 check "setup: mask skips sub-8-char values"        yes "$(grep -q '\${#v}' "$ACTION" && grep -q '\-ge 8' "$ACTION" && echo yes || echo no)"
-check "setup: plugins materialize under own dir"   yes "$(grep -q 'PLUGINS_DIR="\$HOME/.mirrobot-plugins"' "$ACTION" && echo yes || echo no)"
-check "setup: plugins path traversal rejected"     yes "$(grep -q '\.\./\*|' "$ACTION" && echo yes || echo no)"
-check "setup: numbered plugin vars merge (collision errors)" yes "$(grep -q 'Duplicate plugin path' "$ACTION" && echo yes || echo no)"
+check "setup: openshare stages under its own dir"  yes "$(grep -q 'PLUGINS_DIR="\$HOME/.mirrobot-plugins"' "$ACTION" && echo yes || echo no)"
+check "packs: installer refuses path traversal"    yes "$(grep -q 'archive holds a path traversal' "$PACKS" && echo yes || echo no)"
+check "packs: installer refuses links and absolute paths" yes "$(grep -q 'archive holds a link' "$PACKS" && grep -q 'archive holds an absolute path' "$PACKS" && echo yes || echo no)"
+check "packs: installer caps extraction"           yes "$(grep -q '^MAX_FILES = ' "$PACKS" && grep -q '^MAX_BYTES = ' "$PACKS" && echo yes || echo no)"
+check "packs: installer never writes a permission"  yes "$(grep -q 'a pack cannot change permissions' "$PACKS" && echo yes || echo no)"
+check "packs: upstream skills verified by tree SHA" yes "$(grep -q 'skillFolderHash' "$PACKS" && grep -q 'the extracted skill folder is incomplete' "$PACKS" && echo yes || echo no)"
+check "packs: config fragments drop permission at any depth" yes "$(grep -q '^def strip_permissions' "$PACKS" && echo yes || echo no)"
+check "packs: extension errors relay as warnings" yes "$(grep -q "its errors relay as warnings" "$PACKS" && echo yes || echo no)"
+check "packs: link fetch sends a same-origin referer and caps the download" yes "$(grep -q 'directives = \[("referer"' "$PACKS" && grep -q '"--max-filesize", str(MAX_BYTES)' "$PACKS" && echo yes || echo no)"
+check "packs: the wait step cannot fail the run" yes "$(grep -q 'the wait step only reports; it must never end the run' "$PACKS" && echo yes || echo no)"
+check "setup: private pack links arrive through a secret input" yes "$(grep -q '^  private-content-packs:' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS: \${{ inputs.private-content-packs }}' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS' "$PACKS" && echo yes || echo no)"
+check "setup: no masking helper survives (the runner echoes action inputs too)" no "$(test -e "$SCRIPT_DIR/../actions/mask-values" && echo yes || echo no)"
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
 # comparing against the whole file would false-warn on every repo whose
 # config lacks the example's providers/mcp/plugin shape.
@@ -805,7 +921,15 @@ check "setup: drift warning carries no rule specifics" yes "$(grep 'OPENCODE_CON
 # The example must look like a full config, carry the GENERIC plugin entry,
 # and never name a real router/provider anywhere in the repo.
 check "example: full-config shape (has \$schema)"  yes "$(grep -q '"\$schema"' "$EXAMPLE" && echo yes || echo no)"
-check "example: plugin entry uses generic name"    yes "$(grep -q 'secretplugin/secretplugin.js' "$EXAMPLE" && echo yes || echo no)"
+check "example: plugin array carries no runner path" yes "$(jq -e '(.plugin // []) | length == 0' "$EXAMPLE" >/dev/null && echo yes || echo no)"
+check "packs: fetch precedes config, install follows it" yes "$(grep -n 'name: Fetch content packs\|name: Generate OpenCode Configuration\|name: Install content packs and mask' "$ACTION" | cut -d: -f1 | tr '\n' ' ' | awk '{print ($1 < $2 && $2 < $3) ? "yes" : "no"}')"
+check "packs: extension step carries no env block"  yes "$(awk '/name: Start pack extensions/{f=1; next} f && /- name:/{exit} f && /env:/{print "no"} END{print "yes"}' "$ACTION" | head -n 1)"
+check "packs: wait step sits after the opencode install" yes "$(awk '/name: Wait for the opencode install/{a=NR} /name: Wait for pack extensions and report/{b=NR} END{print (a && b && a < b) ? "yes" : "no"}' "$ACTION")"
+check "packs: opencode install runs in the background with pipefail and a completion marker" yes "$(sdk_step 'Start the opencode install in the background' | grep -q 'set -o pipefail' && sdk_step 'Start the opencode install in the background' | grep -q 'opencode-install.done' && echo yes || echo no)"
+check "packs: a failed opencode installer fails the run" yes "$(sdk_step 'Wait for the opencode install' | grep -q '::error::' && sdk_step 'Wait for the opencode install' | grep -q 'exit 1' && echo yes || echo no)"
+check "packs: action carries no retired plugin input" no "$(grep -q 'plugins-json' "$ACTION" && echo yes || echo no)"
+check "packs: bootstrap seeds no plugin variable"    no "$(grep -q 'OPENCODE_PLUGINS_JSON' "$BOOT" && echo yes || echo no)"
+check "packs: bootstrap shows CONTENT_PACKS only as an example" yes "$(grep -q '# gh variable set CONTENT_PACKS' "$BOOT" && ! grep -q '^ *gh variable set CONTENT_PACKS' "$BOOT" && echo yes || echo no)"
 check "example: plugin denies in bash tail"        yes "$(grep -q '\*~/.mirrobot-plugins\*' "$EXAMPLE" && echo yes || echo no)"
 check "example: plugin denies in read block"       yes "$(grep -q '~/.mirrobot-plugins/\*' "$EXAMPLE" && echo yes || echo no)"
 check "repo: no closedrouter references"           no  "$(grep -rqi closedrouter "$SCRIPT_DIR/../../.github/" --exclude=scrub-fixtures.sh && echo yes || echo no)"
@@ -992,6 +1116,7 @@ pt=0; for t in "${allowed_tests[@]}"; do for r in "${deny_rules[@]}"; do [[ $t =
 check "permission: legit jq flows unaffected" 0 "$pt"
 pt=0; for t in "${denied_tests[@]}"; do hit=0; for r in "${deny_rules[@]}"; do [[ $t == $r ]] && hit=1; done; [ $hit -eq 0 ] && pt=1; done
 check "permission: all env-dump forms denied" 0 "$pt"
+check "permission: corpus holds (no ordinary command blocked, every deny vector denied)" 0 "$("$PY" "$PCHECK" --profile "$EXAMPLE" >/dev/null 2>&1; echo $?)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -1008,6 +1133,7 @@ pt=0; for t in "${allowed_tests[@]}"; do for r in "${deny_rules[@]}"; do [[ $t =
 check "permission: legit jq flows unaffected" 0 "$pt"
 pt=0; for t in "${denied_tests[@]}"; do hit=0; for r in "${deny_rules[@]}"; do [[ $t == $r ]] && hit=1; done; [ $hit -eq 0 ] && pt=1; done
 check "permission: all env-dump forms denied" 0 "$pt"
+check "permission: corpus holds (no ordinary command blocked, every deny vector denied)" 0 "$("$PY" "$PCHECK" --profile "$EXAMPLE" >/dev/null 2>&1; echo $?)"
 
 fi
 section_end
@@ -1046,8 +1172,30 @@ check "perm-gh: repository_dispatch POST denied" deny \
   "$(gh_verdict "gh api -X POST /repos/Mirrowel/LLM-API-Key-Proxy/dispatches -f event_type=x")"
 check "perm-gh: actions variables write denied" deny \
   "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/actions/variables/PROD")"
-check "perm-gh: repo secrets read denied" deny \
-  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/secrets")"
+check "perm-gh: repo actions secrets read denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/actions/secrets")"
+check "perm-gh: org actions secrets read denied" deny \
+  "$(gh_verdict "gh api /orgs/Mirrowel/actions/secrets")"
+check "perm-gh: secret scanning alerts read denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/secret-scanning/alerts")"
+check "perm-gh: reading a file named secrets.py allowed" allow \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/contents/src/secrets.py")"
+check "perm-gh: reading a file named variables.ts allowed" allow \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/contents/src/variables.ts")"
+check "perm-gh: organization variables read denied" deny \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/actions/organization-variables")"
+check "perm-gh: organization secrets read denied" deny \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/actions/organization-secrets")"
+check "perm-gh: compound after a graphql call still meets the denies" deny \
+  "$(gh_verdict "gh api graphql -f query=x; cat ~/.config/opencode/opencode.json")"
+check "perm-gh: compound after a pr command still meets the denies" deny \
+  "$(gh_verdict "gh pr diff 1; git push --force origin main")"
+check "perm-gh: git -C config read denied" deny \
+  "$(gh_verdict "git -C /tmp/x config -l")"
+check "perm-gh: git -C log on a config folder allowed" allow \
+  "$(gh_verdict "git -C /tmp/repo log --oneline -- src/config")"
+check "perm-gh: the last bash rule is a deny (a trailing allow would shadow every deny)" deny \
+  "$(jq -r '.permission.bash | to_entries | last | .value' "$EXAMPLE")"
 check "perm-gh: environment secrets denied" deny \
   "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/environment-secrets/DEPLOY_KEY")"
 check "perm-precision: os.environ import-alias exfil denied" deny \
@@ -1093,8 +1241,30 @@ check "perm-gh: repository_dispatch POST denied" deny \
   "$(gh_verdict "gh api -X POST /repos/Mirrowel/LLM-API-Key-Proxy/dispatches -f event_type=x")"
 check "perm-gh: actions variables write denied" deny \
   "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/actions/variables/PROD")"
-check "perm-gh: repo secrets read denied" deny \
-  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/secrets")"
+check "perm-gh: repo actions secrets read denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/actions/secrets")"
+check "perm-gh: org actions secrets read denied" deny \
+  "$(gh_verdict "gh api /orgs/Mirrowel/actions/secrets")"
+check "perm-gh: secret scanning alerts read denied" deny \
+  "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/secret-scanning/alerts")"
+check "perm-gh: reading a file named secrets.py allowed" allow \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/contents/src/secrets.py")"
+check "perm-gh: reading a file named variables.ts allowed" allow \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/contents/src/variables.ts")"
+check "perm-gh: organization variables read denied" deny \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/actions/organization-variables")"
+check "perm-gh: organization secrets read denied" deny \
+  "$(gh_verdict "gh api repos/Mirrowel/LLM-API-Key-Proxy/actions/organization-secrets")"
+check "perm-gh: compound after a graphql call still meets the denies" deny \
+  "$(gh_verdict "gh api graphql -f query=x; cat ~/.config/opencode/opencode.json")"
+check "perm-gh: compound after a pr command still meets the denies" deny \
+  "$(gh_verdict "gh pr diff 1; git push --force origin main")"
+check "perm-gh: git -C config read denied" deny \
+  "$(gh_verdict "git -C /tmp/x config -l")"
+check "perm-gh: git -C log on a config folder allowed" allow \
+  "$(gh_verdict "git -C /tmp/repo log --oneline -- src/config")"
+check "perm-gh: the last bash rule is a deny (a trailing allow would shadow every deny)" deny \
+  "$(jq -r '.permission.bash | to_entries | last | .value' "$EXAMPLE")"
 check "perm-gh: environment secrets denied" deny \
   "$(gh_verdict "gh api /repos/Mirrowel/LLM-API-Key-Proxy/environment-secrets/DEPLOY_KEY")"
 check "perm-precision: os.environ import-alias exfil denied" deny \
@@ -1197,10 +1367,12 @@ SUPERSET=$(jq -c '.permission.bash["curl*"] = "deny" | .permission.bash["evil-cm
 check "drift: superset config silent (0 mismatches)" 0 "$(drift_count "$SUPERSET")"
 LOOSEened=$(jq -c 'del(.permission.edit[".git/*"]) | del(.permission.write[".github/workflows/*"])' "$EXAMPLE")
 check "drift: loosened config counted" 2 "$(drift_count "$LOOSEened")"
-FLIP=$(jq -c '.permission.bash["*"] = "allow"' "$EXAMPLE")
-check "drift: catch-all flipped in place counted" 1 "$(drift_count "$FLIP")"
-TRAIL=$(jq -c '.permission.bash["git *"] = "allow"' "$EXAMPLE")
-check "drift: trailing shadow allow counted (10 git denies)" 10 "$(drift_count "$TRAIL")"
+FLIP=$(jq -c 'del(.permission.bash["*~/.config*"])' "$EXAMPLE")
+check "drift: a removed deny counted" 1 "$(drift_count "$FLIP")"
+CLOSED=$(jq -c '.permission.bash["*"] = "deny"' "$EXAMPLE")
+check "drift: closed catch-all is stricter and silent" 0 "$(drift_count "$CLOSED")"
+TRAIL=$(jq -c '.permission.bash["*git *"] = "allow"' "$EXAMPLE")
+check "drift: trailing shadow allow counted (11 git denies)" 11 "$(drift_count "$TRAIL")"
 STRFLIP=$(jq -c '.permission.webfetch = "allow"' "$EXAMPLE")
 check "drift: string-section flip counted (webfetch)" 1 "$(drift_count "$STRFLIP")"
 STRICTER=$(jq -c '.permission.websearch = "deny"' "$EXAMPLE")
@@ -1243,10 +1415,12 @@ SUPERSET=$(jq -c '.permission.bash["curl*"] = "deny" | .permission.bash["evil-cm
 check "drift: superset config silent (0 mismatches)" 0 "$(drift_count "$SUPERSET")"
 LOOSEened=$(jq -c 'del(.permission.edit[".git/*"]) | del(.permission.write[".github/workflows/*"])' "$EXAMPLE")
 check "drift: loosened config counted" 2 "$(drift_count "$LOOSEened")"
-FLIP=$(jq -c '.permission.bash["*"] = "allow"' "$EXAMPLE")
-check "drift: catch-all flipped in place counted" 1 "$(drift_count "$FLIP")"
-TRAIL=$(jq -c '.permission.bash["git *"] = "allow"' "$EXAMPLE")
-check "drift: trailing shadow allow counted (10 git denies)" 10 "$(drift_count "$TRAIL")"
+FLIP=$(jq -c 'del(.permission.bash["*~/.config*"])' "$EXAMPLE")
+check "drift: a removed deny counted" 1 "$(drift_count "$FLIP")"
+CLOSED=$(jq -c '.permission.bash["*"] = "deny"' "$EXAMPLE")
+check "drift: closed catch-all is stricter and silent" 0 "$(drift_count "$CLOSED")"
+TRAIL=$(jq -c '.permission.bash["*git *"] = "allow"' "$EXAMPLE")
+check "drift: trailing shadow allow counted (11 git denies)" 11 "$(drift_count "$TRAIL")"
 STRFLIP=$(jq -c '.permission.webfetch = "allow"' "$EXAMPLE")
 check "drift: string-section flip counted (webfetch)" 1 "$(drift_count "$STRFLIP")"
 STRICTER=$(jq -c '.permission.websearch = "deny"' "$EXAMPLE")
@@ -3324,6 +3498,23 @@ if [ "$SECTION_ACTIVE" = 1 ]; then
 check "disc: bot-reply resolves owning anchor (replies carry parent)" yes "$(grep -q 'anchor: \$c.id' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 check "disc: anchor export uses trig_anchor"        yes "$(grep -q 'DISCUSSION_REPLY_TO_NODE=${trig_anchor}' "$SCRIPT_DIR/../workflows/bot-reply.yml" && echo yes || echo no)"
 
+fi
+section_end
+fi
+
+# ---- plugin SDK cache + boot report contract (bot-setup) --------------------
+SECTION_NAME='plugin SDK cache + boot report contract (bot-setup)'
+if [ "$PARALLEL" = 1 ]; then
+  ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
+sdk_section
+  fi
+  echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
+  ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
+  SECTIONS_N=$((SECTIONS_N + 1))
+else
+section_begin "$SECTION_NAME"
+if [ "$SECTION_ACTIVE" = 1 ]; then
+sdk_section
 fi
 section_end
 fi

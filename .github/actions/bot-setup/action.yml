@@ -1,5 +1,5 @@
 name: 'Bot Setup'
-description: 'Performs all common setup steps for bot workflows, including token selection, git config, and dependency installation. Dual identity mode: uses the bot ACCOUNT token when provided (account mode), falling back to the GitHub App installation token (app mode). Agent permissions are owned by the OPENCODE_CONFIG_JSON secret (see permissions.example.json); this action does not inject or export any permission configuration.'
+description: 'Performs all common setup steps for bot workflows, including token selection, git config, and dependency installation. Dual identity mode: uses the bot ACCOUNT token when provided (account mode), falling back to the GitHub App installation token (app mode). Agent permissions are owned by the OPENCODE_CONFIG_JSON secret (see permissions.example.json); this action does not inject or export any permission configuration, and content packs cannot change it either.'
 
 inputs:
   account-token:
@@ -20,42 +20,29 @@ inputs:
   opencode-model:
     description: 'The main model to use, in provider/model format (e.g., openai/gpt-4o). Optional when OPENCODE_CONFIG_JSON carries its own "model" field; one of the two is required.'
     required: false
-  opencode-fast-model:
-    description: 'Optional: The fast model for smaller tasks.'
-    required: false
   opencode-config-json:
     description: 'Optional: A complete minified opencode.json used as the base config before model and API key overrides.'
     required: false
+  content-packs:
+    description: 'Optional: contents of the CONTENT_PACKS repo variable. Flat comma list of content pack sources: owner/repo[@ref] (GitHub repository, shallow-fetched) or https://... (zip or tar.gz). Later entries win. A pack may hold .agents/skills/, plugins/, agents/, commands/, extensions/<name>/install.sh and an opencode.json fragment; everything else is ignored. Unset = no packs.'
+    required: false
+    default: ''
+  content-pack-token:
+    description: 'Optional: token for private pack sources (repository or link). Used as a git credential or Bearer header; never placed in a URL or printed.'
+    required: false
+    default: ''
+  private-content-packs:
+    description: 'Optional: value of the CONTENT_PACKS_PRIVATE secret. Private archive links in the same format as content-packs, appended after its entries. Private links must travel through this secret and never through a repository variable: the runner echoes variables into the log in clear.'
+    required: false
+    default: ''
   agent-key:
-    description: 'Optional: per-agent key (e.g. pr-review, bot-reply) resolved against the AGENT_MODELS_JSON variable to override opencode-model/opencode-fast-model for this agent. Missing key or empty model string falls back to the global inputs.'
+    description: 'Optional: per-agent key (e.g. pr-review, bot-reply) resolved against the AGENT_MODELS_JSON variable to override the global model for this agent. Missing key or empty model string falls back to the global inputs.'
     required: false
     default: ''
   agent-models-json:
     description: 'Optional: contents of the AGENT_MODELS_JSON repo variable: {"<agent-key>": {"model": "provider/model", "fast": "provider/model"}}. Malformed JSON fails loudly; empty/missing keys fall back silently.'
     required: false
     default: ''
-  plugins-json:
-    description: 'Optional: contents of the OPENCODE_PLUGINS_JSON repo variable: {"<relative-path>": "<file content>"} materialized under $HOME/.mirrobot-plugins/ (on GitHub-hosted runners /home/runner/.mirrobot-plugins/) for referencing from the config secret plugin array.'
-    required: false
-    default: ''
-  plugins-json-1:
-    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_1. Numbered variables let each plugin live in its own variable; all are merged (path collisions are a hard error). Supported through _5.'
-    required: false
-    default: ''
-  plugins-json-2:
-    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_2.'
-    required: false
-    default: ''
-  plugins-json-3:
-    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_3.'
-    required: false
-    default: ''
-  plugins-json-4:
-    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_4.'
-    required: false
-    default: ''
-  plugins-json-5:
-    description: 'Optional: contents of OPENCODE_PLUGINS_JSON_5.'
   openshare-config-json:
     description: 'Optional: contents of the OPENSHARE_CONFIG_JSON secret. When set: the released OpenShare single-file plugin is fetched from the OpenShare repo (sha256 logged), staged under ~/.mirrobot-plugins/ with this config adjacent, and registered in the opencode plugin array. Live session sharing; absent = plugin dormant (passive artifacts still produced). The whole dir is deleted after boot like the opencode config.'
     required: false
@@ -167,7 +154,7 @@ runs:
     - name: Generate GitHub App Token (app mode)
       id: generate_token
       if: steps.resolve_mode.outputs.mode == 'app'
-      uses: actions/create-github-app-token@v1
+      uses: actions/create-github-app-token@v3
       with:
         app-id: ${{ inputs.bot-app-id }}
         private-key: ${{ inputs.bot-private-key }}
@@ -211,11 +198,41 @@ runs:
         # credential-shaped in any URL, config value, or printed output.
         git config --global credential.https://github.com.helper '!gh auth git-credential'
 
+    # Private archive links arrive through a SECRET input on purpose: the
+    # runner echoes every step env block and action input into the log, and
+    # GitHub masks secrets there but prints repository variables in clear.
+    - name: Fetch content packs
+      shell: bash
+      env:
+        CONTENT_PACKS: ${{ inputs.content-packs }}
+        PRIVATE_CONTENT_PACKS: ${{ inputs.private-content-packs }}
+        PACK_TOKEN: ${{ inputs.content-pack-token }}
+      run: python3 "${GITHUB_ACTION_PATH}/install-packs.py" fetch
+
+    # The installer runs in the background from here and is waited for below,
+    # so its download overlaps the config and content steps. It needs no
+    # credentials: the installer is a public script. Its GITHUB_PATH file is
+    # pointed at /dev/null on purpose: the runner reads that file when the
+    # launching step ends, so a write from the background is lost, and the
+    # wait step below exports the install directory itself.
+    - name: Start the opencode install in the background
+      shell: bash
+      run: |
+        rm -f "$RUNNER_TEMP/opencode-install.done"
+        GITHUB_PATH=/dev/null nohup setsid bash -c 'set -o pipefail; curl -fsSL https://opencode.ai/install | bash; echo "$?" > "$0"' "$RUNNER_TEMP/opencode-install.done" > "$RUNNER_TEMP/opencode-install.log" 2>&1 < /dev/null &
+        echo "opencode installer started in the background."
+
+    # The upstream skill fetch is plain git and file copying, about 4 seconds
+    # alone. It starts here, beside the installer, and is normally done by
+    # the time the extensions start; see the step that starts them.
+    - name: Start the upstream skill fetch in the background
+      shell: bash
+      run: python3 "${GITHUB_ACTION_PATH}/install-packs.py" start-skills
+
     - name: Generate OpenCode Configuration
       shell: bash
       env:
         MAIN_MODEL: ${{ inputs.opencode-model }}
-        FAST_MODEL: ${{ inputs.opencode-fast-model }}
         DEFAULT_API_KEY: ${{ inputs.opencode-api-key }}
         AGENT_KEY: ${{ inputs.agent-key }}
         AGENT_MODELS_JSON: ${{ inputs.agent-models-json }}
@@ -347,71 +364,23 @@ runs:
         # --- FINALIZATION ---
         jq -e . <<< "$CONFIG" > ~/.config/opencode/opencode.json
         chmod 600 ~/.config/opencode/opencode.json
+        # A content pack may carry an opencode.json fragment; it merges under
+        # the config just written (arrays union, base wins, permission never).
+        python3 "${GITHUB_ACTION_PATH}/install-packs.py" merge-config "$HOME/.config/opencode/opencode.json"
         # echo "--- Generated OpenCode Configuration ---"
         # jq . ~/.config/opencode/opencode.json
         # echo "----------------------------------------"
         echo "Successfully generated OpenCode configuration."
 
-    - name: Materialize plugins and mask credential leaves
+    - name: Install content packs and mask credential leaves
       shell: bash
-      env:
-        PLUGINS_JSON: ${{ inputs.plugins-json }}
-        PLUGINS_JSON_1: ${{ inputs.plugins-json-1 }}
-        PLUGINS_JSON_2: ${{ inputs.plugins-json-2 }}
-        PLUGINS_JSON_3: ${{ inputs.plugins-json-3 }}
-        PLUGINS_JSON_4: ${{ inputs.plugins-json-4 }}
-        PLUGINS_JSON_5: ${{ inputs.plugins-json-5 }}
       run: |
         set -e
-        # --- PLUGINS (OPENCODE_PLUGINS_JSON + numbered _1.._5 -> ~/.mirrobot-plugins/) ---
-        # Operator-owned code files referenced BY the config secret's plugin
-        # array via absolute path (/home/runner/.mirrobot-plugins/<path>).
-        # Numbered variables let each plugin live in its own variable; all
-        # maps merge (path collisions across variables are a hard error -
-        # two plugins claiming one path is always a config mistake).
-        # Reading this directory is permission-denied in the example profile
-        # and the workflows delete it after opencode boots (config and
-        # plugins are read once at startup). Plugin SOURCE is add-masked:
-        # the variable values ride env dumps of later steps, and without a
-        # registered mask the whole source (operator code) would print in
-        # public run logs (live-caught 2026-09-15).
-        for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
-          [ -n "$src" ] && printf "::add-mask::%s\n" "$src"
-        done
-        ALL_PLUGINS='{}'
-        for src in "$PLUGINS_JSON" "$PLUGINS_JSON_1" "$PLUGINS_JSON_2" "$PLUGINS_JSON_3" "$PLUGINS_JSON_4" "$PLUGINS_JSON_5"; do
-          [ -z "$(printf '%s' "$src" | tr -d '[:space:]')" ] && continue
-          if ! jq -e 'type == "object"' <<< "$src" >/dev/null 2>&1; then
-            echo "::error::An OPENCODE_PLUGINS_JSON(_N) variable is not a JSON object. Expected {\"<relative-path>\": \"<file content>\"} - see the repo README."
-            exit 1
-          fi
-          if [ -n "$(jq -n --argjson acc "$ALL_PLUGINS" --argjson add "$src" '$add | keys[] | select(. as $k | $acc | has($k))')" ]; then
-            echo "::error::Duplicate plugin path across OPENCODE_PLUGINS_JSON variables - each file path may be defined exactly once."
-            exit 1
-          fi
-          ALL_PLUGINS=$(jq -n --argjson acc "$ALL_PLUGINS" --argjson add "$src" '$acc * $add')
-        done
-
-        if [ "$ALL_PLUGINS" != "{}" ]; then
-          PLUGINS_DIR="$HOME/.mirrobot-plugins"
-          mkdir -p "$PLUGINS_DIR"
-          chmod 700 "$PLUGINS_DIR"
-          while IFS= read -r relpath; do
-            # Defensive CR strip: some jq builds emit CRLF; a real path never ends in CR.
-            relpath="${relpath%$'\r'}"
-            case "$relpath" in
-              ""|".."|../*|*/../*|*/..|/*|*[[:space:]]*|*"~"*|*"\\"*)
-                echo "::error::OPENCODE_PLUGINS_JSON contains an unsafe path entry. Use relative paths without spaces, traversal, or escapes."
-                exit 1
-                ;;
-            esac
-            target="$PLUGINS_DIR/$relpath"
-            mkdir -p "$(dirname "$target")"
-            jq -rn --argjson all "$ALL_PLUGINS" --arg k "$relpath" '$all[$k]' > "$target"
-            chmod 600 "$target"
-          done < <(jq -r 'keys[]' <<< "$ALL_PLUGINS")
-          echo "Plugins materialized."
-        fi
+        # Allowlisted pack content lands where opencode discovers it: skills
+        # under ~/.agents/skills, plugins, agents and commands under
+        # ~/.config/opencode. Reading those homes is permission-denied except
+        # for skills, and nothing there holds a credential.
+        python3 "${GITHUB_ACTION_PATH}/install-packs.py" install
 
         # --- MASK CREDENTIAL LEAVES (config- and auth-derived secrets) ---
         # GitHub masks whole SECRET values automatically, but
@@ -448,7 +417,7 @@ runs:
         done
         echo "Credential leaf masking applied."
 
-    - name: Stage OpenShare plugin (live session sharing)
+    - name: Prepare OpenShare plugin (masks + background download)
       shell: bash
       env:
         OPENSHARE_CONFIG: ${{ inputs.openshare-config-json }}
@@ -481,9 +450,148 @@ runs:
         PLUGINS_DIR="$HOME/.mirrobot-plugins"
         mkdir -p "$PLUGINS_DIR"; chmod 700 "$PLUGINS_DIR"
         BUNDLE="$PLUGINS_DIR/openshare.js"
+
+        # Released single-file bundle from the OpenShare repo (master is
+        # the released line; auto-updates on every OpenShare release). The
+        # repo variable can point the fetch at another branch while it is
+        # ahead (OPENSHARE_BUNDLE_URL); delete the variable to return to
+        # the released master line.
+        #
+        # raw.githubusercontent.com answers 429 to the shared addresses of
+        # hosted runners, and that window outlasts a quick retry loop: four
+        # attempts inside seven seconds all failed in one run, which cost
+        # that run its live share. The download runs in the background with
+        # retries spread over a minute and the staging step below collects
+        # it, so a healthy download costs setup nothing.
         BUNDLE_URL="${OPENSHARE_BUNDLE_URL:-https://raw.githubusercontent.com/Mirrowel/OpenShare/master/share-plugin/ci/openshare.js}"
-        if ! curl -fsSL --retry 3 --max-time 60 "$BUNDLE_URL" -o "$BUNDLE"; then
+        rm -f "$RUNNER_TEMP/openshare-bundle.done"
+        nohup setsid bash -c 'for i in 1 2 3 4 5 6 7; do
+            if curl -fsSL --max-time 20 "$1" -o "$2.part"; then mv "$2.part" "$2"; echo 0 > "$3"; exit 0; fi
+            rm -f "$2.part"; [ "$i" -lt 7 ] && sleep $(( i * 4 ))
+          done; echo 1 > "$3"' _ "$BUNDLE_URL" "$BUNDLE" "$RUNNER_TEMP/openshare-bundle.done" > "$RUNNER_TEMP/openshare-bundle.log" 2>&1 < /dev/null &
+        echo "OpenShare bundle download started in the background."
+
+    - name: Check for Python requirements file
+      id: check_requirements_file
+      shell: bash
+      run: |
+        if [ -f requirements.txt ]; then
+          echo "exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "exists=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Set up uv
+      if: steps.check_requirements_file.outputs.exists == 'true'
+      # Pinned to the exact release: setup-uv stopped maintaining moving
+      # major tags at v8 (there is no v10 tag, only v10.x.y).
+      uses: astral-sh/setup-uv@v10.4.0
+      with:
+        enable-cache: true
+        cache-dependency-glob: "requirements.txt"
+
+    - name: Set up Python with uv
+      if: steps.check_requirements_file.outputs.exists == 'true'
+      shell: bash
+      run: |
+        uv python install 3.12
+        uv venv --python 3.12
+
+    - name: Install dependencies
+      if: steps.check_requirements_file.outputs.exists == 'true'
+      shell: bash
+      run: |
+        source .venv/bin/activate
+        uv pip install -r requirements.txt
+
+    - name: Wait for the opencode install
+      shell: bash
+      run: |
+        done_file="$RUNNER_TEMP/opencode-install.done"
+        for _ in $(seq 1 1500); do [ -f "$done_file" ] && break; sleep 0.2; done
+        if [ ! -f "$done_file" ] || [ "$(cat "$done_file")" != "0" ]; then
+          if [ -x "$HOME/.opencode/bin/opencode" ]; then
+            echo "The opencode installer reported a failure, but the binary is present; continuing."
+          else
+            echo "::error::The opencode installer did not finish. Last lines of its log:"
+            tail -n 30 "$RUNNER_TEMP/opencode-install.log"
+            exit 1
+          fi
+        fi
+        # The installer's own PATH export is lost when it runs in the background.
+        echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+
+    - name: Read the opencode version
+      id: opencode_version
+      shell: bash
+      run: |
+        bin="$(command -v opencode || true)"
+        [ -n "$bin" ] || bin="$HOME/.opencode/bin/opencode"
+        echo "version=$("$bin" --version 2>/dev/null | head -n 1 | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+    # opencode installs its plugin SDK (@opencode-ai/plugin and about 28
+    # dependencies) into every config directory before it loads the first
+    # plugin. On a GitHub runner that is two directories: the global config
+    # directory, and the install directory (~/.opencode), which opencode also
+    # counts as a project config directory because the workspace lies under
+    # the home directory. Each install takes about 5 seconds on a fresh
+    # runner (20 to 70 when the package registry is slow), and the agent's
+    # plugins import none of it. A copy from the previous run makes opencode
+    # skip both. The same entry keeps opencode's model catalog (models.json,
+    # public data), which spares a small download. Cached: only the SDK's own
+    # three paths in each directory and that file, never a config file or a
+    # plugin. The key carries the opencode version, so each new release pays
+    # the install once. The cache is an optimization: when it fails, the run
+    # is exactly what it was before.
+    - name: Restore the plugin SDK from the previous run
+      id: plugin_sdk
+      continue-on-error: true
+      uses: actions/cache/restore@v6
+      with:
+        path: |
+          ~/.config/opencode/node_modules
+          ~/.config/opencode/package.json
+          ~/.config/opencode/package-lock.json
+          ~/.opencode/node_modules
+          ~/.opencode/package.json
+          ~/.opencode/package-lock.json
+          ~/.cache/opencode/models.json
+        key: opencode-plugin-sdk-${{ runner.os }}-${{ runner.arch }}-${{ steps.opencode_version.outputs.version }}-v2
+
+    # Deliberately after the opencode install and the SDK restore. The runner
+    # has two cores, and a job started before them stretches from about 4
+    # seconds to about 13 while it competes with them. Extensions launch
+    # browsers and package installs, which suffer most from that: the Chrome
+    # launch check of the agent-browser extension takes under 2 seconds on
+    # an idle runner and 7 to 10 beside the skill fetch. This step's
+    # environment holds no credentials by design.
+    - name: Start pack extensions
+      shell: bash
+      run: python3 "${GITHUB_ACTION_PATH}/install-packs.py" start
+
+    - name: Ensure opencode directory exists
+      shell: bash
+      run: mkdir -p /home/runner/.local/share/opencode/project
+
+    # Collects the download started by the prepare step. It sits right
+    # before the report boot, which loads the plugin. A failed download
+    # costs this run its live share and nothing else.
+    - name: Stage OpenShare plugin (config + registration)
+      shell: bash
+      env:
+        OPENSHARE_CONFIG: ${{ inputs.openshare-config-json }}
+      run: |
+        set -e
+        if [ -z "$(printf '%s' "$OPENSHARE_CONFIG" | tr -d '[:space:]')" ]; then
+          exit 0
+        fi
+        PLUGINS_DIR="$HOME/.mirrobot-plugins"
+        BUNDLE="$PLUGINS_DIR/openshare.js"
+        done_file="$RUNNER_TEMP/openshare-bundle.done"
+        for _ in $(seq 1 450); do [ -f "$done_file" ] && break; sleep 0.2; done
+        if [ ! -f "$done_file" ] || [ "$(cat "$done_file")" != "0" ]; then
           echo "::warning::OpenShare bundle fetch failed - live sharing disabled for this run."
+          tail -n 5 "$RUNNER_TEMP/openshare-bundle.log" 2>/dev/null || true
           exit 0
         fi
         grep -q 'openshare' "$BUNDLE" || {
@@ -508,41 +616,23 @@ runs:
         fi
         echo "OpenShare staged: bundle + adjacent config + plugin registered."
 
-    - name: Check for Python requirements file
-      id: check_requirements_file
+    - name: Wait for pack extensions and report
       shell: bash
-      run: |
-        if [ -f requirements.txt ]; then
-          echo "exists=true" >> $GITHUB_OUTPUT
-        else
-          echo "exists=false" >> $GITHUB_OUTPUT
-        fi
+      run: python3 "${GITHUB_ACTION_PATH}/install-packs.py" wait
 
-    - name: Set up uv
-      if: steps.check_requirements_file.outputs.exists == 'true'
-      uses: astral-sh/setup-uv@v4
+    # The wait step above is where a missing copy gets installed; keep the
+    # copies only when there was none to restore.
+    - name: Keep the plugin SDK for the next run
+      if: steps.plugin_sdk.outputs.cache-hit != 'true' && steps.opencode_version.outputs.version != ''
+      continue-on-error: true
+      uses: actions/cache/save@v6
       with:
-        enable-cache: true
-        cache-dependency-glob: "requirements.txt"
-
-    - name: Set up Python with uv
-      if: steps.check_requirements_file.outputs.exists == 'true'
-      shell: bash
-      run: |
-        uv python install 3.12
-        uv venv --python 3.12
-
-    - name: Install dependencies
-      if: steps.check_requirements_file.outputs.exists == 'true'
-      shell: bash
-      run: |
-        source .venv/bin/activate
-        uv pip install -r requirements.txt
-
-    - name: Install opencode
-      shell: bash
-      run: curl -fsSL https://opencode.ai/install | bash
-
-    - name: Ensure opencode directory exists
-      shell: bash
-      run: mkdir -p /home/runner/.local/share/opencode/project
+        path: |
+          ~/.config/opencode/node_modules
+          ~/.config/opencode/package.json
+          ~/.config/opencode/package-lock.json
+          ~/.opencode/node_modules
+          ~/.opencode/package.json
+          ~/.opencode/package-lock.json
+          ~/.cache/opencode/models.json
+        key: ${{ steps.plugin_sdk.outputs.cache-primary-key }}
