@@ -90,7 +90,7 @@ jobs:
           # Account mode: derive the login for the identity seed (the token
           # is validated by /user in bot-setup on every run anyway). The
           # account login is seeded ALONE: never a [bot] twin (separate
-          # namespace тАФ shape proves nothing; an operator who also runs a
+          # namespace — shape proves nothing; an operator who also runs a
           # same-named App adds its full "name[bot]" login to the variable
           # themselves, as an explicit claim of control).
           IDENT_SEED='mirrobot-agent, mirrobot-agent[bot]'
@@ -206,7 +206,7 @@ jobs:
 
           Every documented variable should now exist (existing values were left untouched). Fill in what you want to use:
 
-          ### Variables (Settings тЖТ Secrets and variables тЖТ Actions тЖТ Variables)
+          ### Variables (Settings → Secrets and variables → Actions → Variables)
 
           | Variable | Default | What it does |
           |---|---|---|
@@ -227,7 +227,7 @@ jobs:
           | `OPENSHARE_BUNDLE_URL` | absent = released master | Override where the OpenShare plugin bundle (and snapshot tools) are fetched from. Set only while tracking a dev branch ahead of the released line; delete to return to self-updating master. |
           | `GUEST_REPO_RULES` | absent = allow everywhere (except the platform repo) | Flat comma list of `<owner>/<repo>:deny|allow`, last match wins. Deny repos where your local workflows already handle everything, so mentions there don't double-handle. |
 
-          ### Secrets (Settings тЖТ Secrets and variables тЖТ Actions тЖТ Secrets)
+          ### Secrets (Settings → Secrets and variables → Actions → Secrets)
 
           | Secret | Required? | What it does |
           |---|---|---|
@@ -249,12 +249,12 @@ jobs:
 
           ### Labels
 
-          The bootstrap also seeds the triage label vocabulary (existing labels untouched тАФ your repo's own labels always win). The issue-analysis agent applies these automatically; maintainers can use them freely:
+          The bootstrap also seeds the triage label vocabulary (existing labels untouched — your repo's own labels always win). The issue-analysis agent applies these automatically; maintainers can use them freely:
 
           - **Kind:** `bug` `duplicate` `enhancement` `documentation` `question` `invalid` `wontfix` (+ `help wanted`, `good first issue` for contributors)
           - **Severity (agent-applied with the verdict):** `severity: critical` `severity: major` `severity: minor` `severity: info`
           - **Triage state:** `confirmed` `as-designed` `needs-info` `needs-decision` `already-fixed` `accepted` `wish`
-          - **Collaborator-only:** `Agent Monitored` (marks PRs watched by the agent тАФ the agent itself never applies it)
+          - **Collaborator-only:** `Agent Monitored` (marks PRs watched by the agent — the agent itself never applies it)
 
           ### Manual variable seeding (if the seeding step could not run)
 
