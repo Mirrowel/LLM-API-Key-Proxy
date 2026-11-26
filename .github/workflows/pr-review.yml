@@ -79,6 +79,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      actions: write          # reserve the plugin-SDK cache (restore needs only read)
 
     env:
       # ─── EDITABLE KNOBS ──────────────────────────────────────────────────

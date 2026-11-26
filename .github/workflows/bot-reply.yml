@@ -82,6 +82,7 @@ jobs:
     # scopes come from the App installation settings, not this block.
     permissions:
       contents: read
+      actions: write          # reserve the plugin-SDK cache (restore needs only read)
 
     env:
       # ─── EDITABLE KNOBS ──────────────────────────────────────────────────

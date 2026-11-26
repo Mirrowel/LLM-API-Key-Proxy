@@ -82,6 +82,7 @@ jobs:
       pull-requests: write    # Post comments and reviews
       statuses: write         # Update commit status checks
       issues: write           # Post issue comments
+      actions: write          # Reserve the plugin-SDK cache (restore needs only read)
 
     env:
       # ─── EDITABLE KNOBS ──────────────────────────────────────────────────

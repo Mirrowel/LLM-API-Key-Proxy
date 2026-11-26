@@ -35,6 +35,7 @@ jobs:
     # whose scopes come from the App installation settings, not this block.
     permissions:
       contents: read
+      actions: write          # reserve the plugin-SDK cache (restore needs only read)
 
     env:
       # ─── EDITABLE KNOBS ──────────────────────────────────────────────────
@@ -149,6 +150,10 @@ jobs:
       - name: Set trigger message
         # Issue analysis is never comment-triggered (router owns comments);
         # the issue body itself - in ISSUE_CONTEXT below - is the request.
+        env:
+          # Bound here because ISSUE_AUTHOR is exported later, with the context
+          # fetch; reading it before that renders a bare "@" (live-caught).
+          ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
         run: |
           echo "TRIGGER_MESSAGE=Issue #${ISSUE_NUMBER} opened by @${ISSUE_AUTHOR} - the issue body in the context below is the request." >> "$GITHUB_ENV"
 
@@ -313,7 +318,7 @@ jobs:
             ( bash /tmp/opencode-cleanup.sh waiter ) &
             bash /tmp/live-share-announce.sh & ANNOUNCER=$!
             # Prepend the security brief (with the verified requester + trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run - 2>&1 | bash /tmp/share-filter.sh
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run - 2>&1 | bash /tmp/share-filter.sh
             kill "$ANNOUNCER" 2>/dev/null || true
             bash /tmp/opencode-cleanup.sh now
 

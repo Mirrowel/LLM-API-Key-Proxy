@@ -17,7 +17,7 @@ The body file may contain anything (`$` signs, backticks, bullets, multi-line se
 
 **INCORRECT Examples (DO NOT USE):**
 ```bash
-# WRONG: heredoc/stdin form - DENIED by the permission profile
+# WRONG: heredoc/stdin form - expands variables and corrupts bodies
 gh issue comment <number> -F - <<'EOF'
 <user>, Starting work.
 EOF
@@ -26,7 +26,7 @@ EOF
 gh issue comment <number> --body "Starting work."
 ```
 
-Failing to use the file-based form gets the command denied or makes the shell misinterpret your message.
+Failing to use the file-based form makes the shell misinterpret your message.
 
 **The same rule applies to EVERYTHING that carries a body**: `gh pr comment`, `gh issue comment`, `gh pr create` (`--body-file /tmp/pr-body.md`), `gh issue create`, and `gh api` payloads (`--input /tmp/payload.json`). Write the full content to a /tmp file with your file tools and pass it - this preserves markdown, code blocks, backticks, `$` signs, and newlines byte-perfectly. Never build bodies inline.
 
