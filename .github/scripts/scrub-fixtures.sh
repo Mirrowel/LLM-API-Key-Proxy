@@ -865,6 +865,8 @@ check "packs: config fragments drop permission at any depth" yes "$(grep -q '^de
 check "packs: extension errors relay as warnings" yes "$(grep -q "its errors relay as warnings" "$PACKS" && echo yes || echo no)"
 check "packs: link fetch sends a same-origin referer and caps the download" yes "$(grep -q 'directives = \[("referer"' "$PACKS" && grep -q '"--max-filesize", str(MAX_BYTES)' "$PACKS" && echo yes || echo no)"
 check "packs: the wait step cannot fail the run" yes "$(grep -q 'the wait step only reports; it must never end the run' "$PACKS" && echo yes || echo no)"
+check "setup: lanes grant actions: write for the SDK cache" yes "$(all=yes; for w in issue-comment bot-reply bot-reply-guest compliance-check pr-review; do grep -q 'actions: write' "$SCRIPT_DIR/../workflows/$w.yml" || all=no; done; echo $all)"
+check "openshare: export streams opencode output to a file" yes "$(grep -q 'stdout=fh' "$SCRIPT_DIR/../scripts/export-session.py" && echo yes || echo no)"
 check "setup: private pack links arrive through a secret input" yes "$(grep -q '^  private-content-packs:' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS: \${{ inputs.private-content-packs }}' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS' "$PACKS" && echo yes || echo no)"
 check "setup: no masking helper survives (the runner echoes action inputs too)" no "$(test -e "$SCRIPT_DIR/../actions/mask-values" && echo yes || echo no)"
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
@@ -911,6 +913,8 @@ check "packs: config fragments drop permission at any depth" yes "$(grep -q '^de
 check "packs: extension errors relay as warnings" yes "$(grep -q "its errors relay as warnings" "$PACKS" && echo yes || echo no)"
 check "packs: link fetch sends a same-origin referer and caps the download" yes "$(grep -q 'directives = \[("referer"' "$PACKS" && grep -q '"--max-filesize", str(MAX_BYTES)' "$PACKS" && echo yes || echo no)"
 check "packs: the wait step cannot fail the run" yes "$(grep -q 'the wait step only reports; it must never end the run' "$PACKS" && echo yes || echo no)"
+check "setup: lanes grant actions: write for the SDK cache" yes "$(all=yes; for w in issue-comment bot-reply bot-reply-guest compliance-check pr-review; do grep -q 'actions: write' "$SCRIPT_DIR/../workflows/$w.yml" || all=no; done; echo $all)"
+check "openshare: export streams opencode output to a file" yes "$(grep -q 'stdout=fh' "$SCRIPT_DIR/../scripts/export-session.py" && echo yes || echo no)"
 check "setup: private pack links arrive through a secret input" yes "$(grep -q '^  private-content-packs:' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS: \${{ inputs.private-content-packs }}' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS' "$PACKS" && echo yes || echo no)"
 check "setup: no masking helper survives (the runner echoes action inputs too)" no "$(test -e "$SCRIPT_DIR/../actions/mask-values" && echo yes || echo no)"
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
@@ -2642,6 +2646,10 @@ check "era: pr-review exports TRUST_CONTEXT_ERA" yes \
   "$(grep -q 'TRUST_CONTEXT_ERA<<' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'ERA_EOF_\$(openssl rand -hex 8)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "era: brief carries the era placeholder" yes \
   "$(grep -q 'TRUST_CONTEXT_ERA' "$SCRIPT_DIR/../prompts/security-brief.md" && echo yes || echo no)"
+check "era: every home lane substitutes TRUST_CONTEXT_ERA" yes \
+  "$(all=yes; for w in issue-comment bot-reply compliance-check pr-review; do grep -q "envsubst '[^']*TRUST_CONTEXT_ERA" "$SCRIPT_DIR/../workflows/$w.yml" || all=no; done; echo $all)"
+check "trigger: issue lane binds ISSUE_AUTHOR for the trigger line" yes \
+  "$(grep -A8 'name: Set trigger message' "$SCRIPT_DIR/../workflows/issue-comment.yml" | grep -q 'ISSUE_AUTHOR: ${{ github.event.issue.user.login }}' && echo yes || echo no)"
 
   fi
   echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
@@ -2656,6 +2664,10 @@ check "era: pr-review exports TRUST_CONTEXT_ERA" yes \
   "$(grep -q 'TRUST_CONTEXT_ERA<<' "$SCRIPT_DIR/../workflows/pr-review.yml" && grep -q 'ERA_EOF_\$(openssl rand -hex 8)' "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
 check "era: brief carries the era placeholder" yes \
   "$(grep -q 'TRUST_CONTEXT_ERA' "$SCRIPT_DIR/../prompts/security-brief.md" && echo yes || echo no)"
+check "era: every home lane substitutes TRUST_CONTEXT_ERA" yes \
+  "$(all=yes; for w in issue-comment bot-reply compliance-check pr-review; do grep -q "envsubst '[^']*TRUST_CONTEXT_ERA" "$SCRIPT_DIR/../workflows/$w.yml" || all=no; done; echo $all)"
+check "trigger: issue lane binds ISSUE_AUTHOR for the trigger line" yes \
+  "$(grep -A8 'name: Set trigger message' "$SCRIPT_DIR/../workflows/issue-comment.yml" | grep -q 'ISSUE_AUTHOR: ${{ github.event.issue.user.login }}' && echo yes || echo no)"
 
 fi
 section_end

@@ -136,14 +136,17 @@ def newest_session_id(db: Path) -> str:
 def opencode_export(session_id: str, exe: str) -> dict:
     cmd = [exe] if exe else ["opencode"]
     cmd += ["export", session_id]
-    # Capture BYTES + decode UTF-8 explicitly: text=True uses the locale
-    # codec on Windows (cp1251 etc.) and dies on non-ASCII session content,
-    # leaving stdout as None mid-read (live-caught).
-    p = subprocess.run(cmd, capture_output=True, timeout=300)
-    if p.returncode != 0:
-        sys.exit(f"error: opencode export failed: "
-                 f"{p.stderr.decode('utf-8', errors='replace').strip()[:400]}")
-    raw = p.stdout.decode("utf-8", errors="replace")
+    # stdout goes to a FILE, never a pipe: opencode exits before a large
+    # stdout pipe drains on the runner (cut at ~128 KiB, live-caught), and
+    # export JSON is routinely larger. Bytes + explicit UTF-8 for Windows.
+    with tempfile.TemporaryDirectory() as td:
+        out = Path(td) / "export.json"
+        with out.open("wb") as fh:
+            p = subprocess.run(cmd, stdout=fh, stderr=subprocess.PIPE, timeout=300)
+        if p.returncode != 0:
+            sys.exit(f"error: opencode export failed: "
+                     f"{p.stderr.decode('utf-8', errors='replace').strip()[:400]}")
+        raw = out.read_text(encoding="utf-8", errors="replace")
     i = raw.find("{")
     if i < 0:
         sys.exit("error: export produced no JSON")
