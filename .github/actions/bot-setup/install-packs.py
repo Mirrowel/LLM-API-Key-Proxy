@@ -294,35 +294,73 @@ def save_json(name, data):
     (STATE / name).write_text(json.dumps(data))
 
 
-def excluded_skills():
-    """Skill directory names this installation must not load, from .github/content-packs.exclude.txt.
+EXCLUDE_NAME = "content-packs.exclude.txt"
 
-    The file is committed content on the base branch (bot-setup runs before any
-    PR-head checkout), so a PR cannot change what is excluded. Missing file =
-    nothing excluded. Comments and blank lines are ignored.
-    """
-    workspace = Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
-    candidates = [workspace / ".github" / "content-packs.exclude.txt", Path(".github") / "content-packs.exclude.txt"]
-    for path in candidates:
-        if not path.is_file():
+
+def parse_exclude_file(path):
+    """Parse one exclusion list: skill directory names, # comments ignored, invalid names warned and skipped."""
+    names = set()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        name = line.split("#", 1)[0].strip()
+        if not name:
             continue
-        names = set()
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            name = line.split("#", 1)[0].strip()
-            if not name:
-                continue
-            if name in (".", "..") or "/" in name or "\\" in name:
-                say(f"content-packs.exclude.txt: ignoring invalid skill name {name!r}", "warning")
-                continue
-            names.add(name)
-        return names
+        if name in (".", "..") or "/" in name or "\\" in name:
+            say(f"{EXCLUDE_NAME}: ignoring invalid skill name {name!r} ({path})", "warning")
+            continue
+        names.add(name)
+    return names
+
+
+def pack_exclusions(manifest):
+    """Union of the root exclusion lists of every fetched pack.
+
+    Returns (found, names): a pack that carries an empty list is authoritative
+    (nothing excluded) and stops the consumer fallback.
+    """
+    found = False
+    names = set()
+    for pack in manifest:
+        path = Path(pack["root"]) / EXCLUDE_NAME
+        if path.is_file():
+            found = True
+            names |= parse_exclude_file(path)
+    return found, names
+
+
+def consumer_exclusions():
+    """Fallback exclusion list from the consumer repository (base-branch content under bot-setup)."""
+    workspace = Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
+    for path in (workspace / ".github" / EXCLUDE_NAME, Path(".github") / EXCLUDE_NAME):
+        if path.is_file():
+            return parse_exclude_file(path)
     return set()
+
+
+def excluded_skills(manifest=None):
+    """The exclusion set for this installation.
+
+    Pack lists are primary and combine across packs; only when no pack carries
+    one does the consumer repository's .github file apply. The fetch step saves
+    the resolved set so install and the background skill job agree in separate
+    processes.
+    """
+    saved = STATE / "exclude.json"
+    if saved.is_file():
+        try:
+            return set(json.loads(saved.read_text()))
+        except (ValueError, TypeError):
+            say("exclude.json is not valid; recomputing the exclusion set", "warning")
+    if manifest is not None:
+        found, names = pack_exclusions(manifest)
+        if found:
+            return names
+    return consumer_exclusions()
 
 
 def skill_plan(manifest):
     """Map every skill name to its provider: a committed pack directory, or a lock entry to fetch upstream. Later packs win."""
     plan = {}
-    excluded = excluded_skills()
+    excluded = excluded_skills(manifest)
     for index, pack in enumerate(manifest):
         root = Path(pack["root"])
         skills_dir = root / ".agents" / "skills"
@@ -370,6 +408,12 @@ def cmd_fetch(args):
         manifest.append(entry)
         say(f"content pack {index} of {len(sources)}: {kind}, {'commit' if kind == 'repo' else 'sha256'} {detail[:12]}, {entry['files']} files")
     save_json("manifest.json", manifest)
+    found, names = pack_exclusions(manifest)
+    excluded = names if found else consumer_exclusions()
+    save_json("exclude.json", sorted(excluded))
+    if excluded:
+        source = "from the packs" if found else "from the consumer repository"
+        say(f"skills excluded ({source}): {', '.join(sorted(excluded))}")
     save_json("skills.json", skill_plan(manifest))
 
 
