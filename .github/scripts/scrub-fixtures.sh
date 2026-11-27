@@ -1171,33 +1171,52 @@ fi
 packs_exclude_checks() {
   local EXCL="$SCRIPT_DIR/../content-packs.exclude.txt" PY="" got cand
   local T="$WORK/pack-exclude"
-  check "packs: the exclusion file is committed" yes "$([ -f "$EXCL" ] && echo yes || echo no)"
-  check "packs: the exclusion list names the six skills that cannot run async" "browse domain-modeling grill-with-docs grilling improve-codebase-architecture security-audit " \
-    "$(grep -v '^[[:space:]]*#' "$EXCL" 2>/dev/null | grep -v '^[[:space:]]*$' | sort | tr '\n' ' ')"
-  check "packs: the installer reads the base-branch exclusion file" yes \
-    "$(grep -q 'content-packs.exclude.txt' "$PACKS" && echo yes || echo no)"
+  # The list lives in the shared pack library; the consumer file is a fallback
+  # for forks, not this repo's primary source.
+  check "packs: no exclusion list is committed in the consumer repo" no "$([ -e "$EXCL" ] && echo yes || echo no)"
+  check "packs: the installer reads the list from the pack root" yes \
+    "$(grep -q 'EXCLUDE_NAME = "content-packs.exclude.txt"' "$PACKS" && grep -q 'Path(pack\["root"\]) / EXCLUDE_NAME' "$PACKS" && echo yes || echo no)"
+  check "packs: pack lists are primary, the consumer file is the fallback" yes \
+    "$(grep -q '^def pack_exclusions' "$PACKS" && grep -q '^def consumer_exclusions' "$PACKS" && grep -q 'if found:' "$PACKS" && echo yes || echo no)"
+  check "packs: the resolved exclusion set is saved for the install step" yes \
+    "$(grep -q 'save_json("exclude.json"' "$PACKS" && echo yes || echo no)"
   check "packs: excluded skills never enter the skill plan" yes \
     "$(grep -q 'if name in excluded:' "$PACKS" && echo yes || echo no)"
   check "packs: install removes an excluded skill from the home" yes \
     "$(grep -q 'remove_tree(SKILLS_HOME / name)' "$PACKS" && echo yes || echo no)"
   for cand in python3 python; do "$cand" -c 'import sys' >/dev/null 2>&1 && { PY=$cand; break; }; done
   if [ -z "$PY" ]; then
-    check "packs: the exclusion plan is executed" ran "SKIP: no python"
+    check "packs: exclusion precedence is executed" ran "SKIP: no python"
     return 0
   fi
-  mkdir -p "$T/ws/.github" "$T/pack/.agents/skills/browse" "$T/pack/.agents/skills/keepme"
+  mkdir -p "$T/ws/.github" "$T/a/.agents/skills/browse" "$T/a/.agents/skills/keep-a" \
+    "$T/b/.agents/skills/grilling" "$T/b/.agents/skills/keep-b" "$T/c/.agents/skills/browse" "$T/c/.agents/skills/keep-c"
+  printf 'browse\n' > "$T/a/content-packs.exclude.txt"
+  printf 'grilling\n' > "$T/b/content-packs.exclude.txt"
   printf 'browse\n' > "$T/ws/.github/content-packs.exclude.txt"
-  printf -- '---\nname: browse\ndescription: x\n---\n' > "$T/pack/.agents/skills/browse/SKILL.md"
-  printf -- '---\nname: keepme\ndescription: y\n---\n' > "$T/pack/.agents/skills/keepme/SKILL.md"
-  got=$(GITHUB_WORKSPACE="$T/ws" "$PY" - "$PACKS" "$T/pack" <<'PYEOF'
+  printf -- '---\nname: browse\ndescription: x\n---\n' > "$T/a/.agents/skills/browse/SKILL.md"
+  printf -- '---\nname: keep-a\ndescription: x\n---\n' > "$T/a/.agents/skills/keep-a/SKILL.md"
+  printf -- '---\nname: grilling\ndescription: x\n---\n' > "$T/b/.agents/skills/grilling/SKILL.md"
+  printf -- '---\nname: keep-b\ndescription: x\n---\n' > "$T/b/.agents/skills/keep-b/SKILL.md"
+  printf -- '---\nname: browse\ndescription: x\n---\n' > "$T/c/.agents/skills/browse/SKILL.md"
+  printf -- '---\nname: keep-c\ndescription: x\n---\n' > "$T/c/.agents/skills/keep-c/SKILL.md"
+  plan_run() { # state-dir workspace packs...
+    local state=$1 ws=$2; shift 2
+    RUNNER_TEMP="$state" GITHUB_WORKSPACE="$ws" "$PY" - "$PACKS" "$@" <<'PYEOF'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("packs", sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
-print(",".join(sorted(module.skill_plan([{"root": sys.argv[2]}]))))
+print(",".join(sorted(module.skill_plan([{"root": r} for r in sys.argv[2:]]))))
 PYEOF
-)
-  check "packs: the plan keeps included skills and drops excluded ones" "keepme" "$got"
+  }
+  got=$(plan_run "$T/state1" "$T/ws" "$T/a" "$T/b")
+  check "packs: lists from several packs combine and beat the consumer file" "keep-a,keep-b" "$got"
+  got=$(plan_run "$T/state2" "$T/ws" "$T/c")
+  check "packs: the consumer file applies when no pack carries a list" "keep-c" "$got"
+  : > "$T/a/content-packs.exclude.txt"
+  got=$(plan_run "$T/state3" "$T/ws" "$T/a")
+  check "packs: an empty pack list is authoritative and stops the fallback" "browse,keep-a" "$got"
 }
 
 # ---- bot-setup: mask sweep + plugins materialization + drift scope -----------
