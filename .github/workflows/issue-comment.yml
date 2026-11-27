@@ -162,6 +162,7 @@ jobs:
           cp .github/prompts/security-brief.md /tmp/security-brief.md
           cp -r .github/prompts/parts /tmp/parts
           cp -r .github/prompts/manifests /tmp/manifests
+          cp -r .github/prompts/skills /tmp/skills
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
@@ -169,12 +170,29 @@ jobs:
           cp .github/scripts/export-session.py /tmp/export-session.py
           cp .github/scripts/fetch-roster.sh /tmp/fetch-roster.sh
           cp .github/scripts/bot-config.sh /tmp/bot-config.sh
+          cp .github/scripts/render-labels.sh /tmp/render-labels.sh
           cp .github/scripts/react.sh /tmp/react.sh
           cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh
+          cp -r .github/scripts/post /tmp/post
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/post/*.sh
           bash /tmp/assemble-prompt.sh --verify
           # Resolve identity + trigger stems (exports BOT_NAMES_JSON / BOT_TRIGGER_STEMS)
           bash /tmp/bot-config.sh
+
+      - name: Render the label palette (the labels this repository has now)
+        # One API read, rendered into the prompt: the agent never lists
+        # labels itself and can never see one that does not exist. The
+        # palette file only classifies; what exists is what GitHub returns.
+        env:
+          GH_TOKEN: ${{ steps.setup.outputs.token }}
+        run: |
+          set -eu
+          if gh label list -R "$GITHUB_REPOSITORY" --limit 200 --json name,description,color > "$RUNNER_TEMP/live-labels.json"; then
+            bash /tmp/render-labels.sh .github/labels.txt "$RUNNER_TEMP/live-labels.json"
+          else
+            echo "::warning::Live labels could not be read (gh label list failed); this run applies no labels."
+            printf 'LABEL_PALETTE=%s\n' "(labels could not be read in this run: do not label anything)" >> "$GITHUB_ENV"
+          fi
 
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -309,7 +327,7 @@ jobs:
         run: |
             set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
-            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY}'
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${LABEL_PALETTE}'
             # Config lifecycle: opencode reads config + plugins once at boot.
             # The share filter touches /tmp/.oc-booted on the first output
             # line (= boot complete, config consumed); this waiter deletes
@@ -318,7 +336,7 @@ jobs:
             ( bash /tmp/opencode-cleanup.sh waiter ) &
             bash /tmp/live-share-announce.sh & ANNOUNCER=$!
             # Prepend the security brief (with the verified requester + trust context lines)
-            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run - 2>&1 | bash /tmp/share-filter.sh
+            { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; SKILLS_ENVSUBST="$VARS" bash /tmp/assemble-prompt.sh issue-comment | envsubst "$VARS"; } | opencode run - 2>&1 | bash /tmp/share-filter.sh
             kill "$ANNOUNCER" 2>/dev/null || true
             bash /tmp/opencode-cleanup.sh now
 

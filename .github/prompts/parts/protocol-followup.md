@@ -13,6 +13,8 @@ Load the complete scratchpad (`cat /tmp/review_findings.jsonl`) and place every 
 #### Step 3: Submit Bundled Follow-up Review
 Choose the review event and state your verdict per the **Verdict Levels** section (below), then build and submit using the **Review Submission Flow** section (below).
 
-Summary shape for a FOLLOW-UP review: verdict line, **Previous feedback - status** (addressed/verified, or still open), **Assessment of New Changes** with findings grouped under the severity headings (omit empty groups), **Overall Status**. Write your own; don't copy templates verbatim.
+Summary shape for a FOLLOW-UP review: verdict line, the grade lines (each either unchanged, or its new level with one line of reason), **Previous feedback - status** (addressed/verified, or still open), **Assessment of New Changes** with findings grouped under the severity headings (omit empty groups), **Overall Status**. Write your own; don't copy templates verbatim.
+
+Re-check your grades from the previous review. Change one only if the new commits change it: replace the PR's old grade label with the new one.
 
 **Closing rule:** the review is the whole deliverable: no acknowledgment before, no announcement after. Zero additional thread comments on this run.

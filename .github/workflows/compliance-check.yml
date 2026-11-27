@@ -563,6 +563,7 @@ jobs:
           cp .github/prompts/security-brief.md /tmp/security-brief.md
           cp -r .github/prompts/parts /tmp/parts
           cp -r .github/prompts/manifests /tmp/manifests
+          cp -r .github/prompts/skills /tmp/skills
           cp .github/scripts/assemble-prompt.sh /tmp/assemble-prompt.sh
           cp .github/scripts/scrub-workspace.sh /tmp/scrub-workspace.sh
           cp .github/scripts/share-filter.sh /tmp/share-filter.sh
@@ -573,7 +574,8 @@ jobs:
           cp .github/scripts/react.sh /tmp/react.sh
           cp .github/scripts/opencode-cleanup.sh /tmp/opencode-cleanup.sh
           cp .github/scripts/split-diff.sh /tmp/split-diff.sh
-          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh
+          cp -r .github/scripts/post /tmp/post
+          chmod +x /tmp/scrub-workspace.sh /tmp/assemble-prompt.sh /tmp/react.sh /tmp/opencode-cleanup.sh /tmp/share-filter.sh /tmp/split-diff.sh /tmp/post/*.sh
           bash /tmp/assemble-prompt.sh --verify
           # Resolve identity + trigger stems (exports BOT_NAMES_JSON / BOT_TRIGGER_STEMS)
           bash /tmp/bot-config.sh
@@ -792,6 +794,7 @@ jobs:
           [AI to complete: Actionable guidance]
 
           ---
+          <!-- mirrobot:compliance -->
           _Compliance verification by AI agent • Re-run with `/mirrobot-check`_
           <!-- compliance-check-id: ${PR_NUMBER}-${PR_HEAD_SHA} -->
           TEMPLATE
@@ -845,7 +848,7 @@ jobs:
             MODE=compliance-first
           fi
           # Prepend the security brief (with the verified requester + trust context lines)
-          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; bash /tmp/assemble-prompt.sh "$MODE" | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
+          { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; SKILLS_ENVSUBST="$VARS" bash /tmp/assemble-prompt.sh "$MODE" | envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
 
       # Execute the AI compliance check
       - name: React to trigger (lifecycle start)
@@ -992,15 +995,26 @@ jobs:
         run: |
           sleep 3  # Wait for comment to be posted
           
-          # Find the compliance comment just posted by the bot
+          # Find the compliance report just posted by the bot. Tagged or marked
+          # reports only: a trailing "done" comment must never be mistaken for it.
           latest_comment=$(gh api "/repos/${{ github.repository }}/issues/$PR_NUMBER/comments" \
             --paginate | jq -r --argjson bots "$BOT_NAMES_JSON" '
               map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
+              | map(select(
+                  (.body | contains("<!-- mirrobot:compliance -->")) or
+                  (.body | contains("<!-- compliance-check-id:")) or
+                  (.body | contains("_Compliance verification by AI agent"))
+                ))
               | sort_by(.created_at)
               | last
               | {id: .id, body: .body}
             ')
-          
+
+          if [ -z "$latest_comment" ] || [ "$latest_comment" == "null" ]; then
+            echo "::notice::No tagged compliance report yet; skipping the reviewer mention prepend."
+            exit 0
+          fi
+
           comment_id=$(echo "$latest_comment" | jq -r .id)
           current_body=$(echo "$latest_comment" | jq -r .body)
           
@@ -1052,6 +1066,7 @@ jobs:
           # missing markers are REPAIRED, not just warned about.
           EXPECTED_SIGNATURE="_Compliance verification by AI agent"
           EXPECTED_MARKER="<!-- compliance-check-id: ${PR_NUMBER}-${PR_HEAD_SHA} -->"
+          EXPECTED_TAG='<!-- mirrobot:compliance -->'
 
           latest_comment=""
           for ((i=1; i<=3; i++)); do
@@ -1059,6 +1074,11 @@ jobs:
               --paginate | jq -c --argjson bots "$BOT_NAMES_JSON" --arg runstart "$RUN_STARTED" '
                 map(select((.user.login // "" | ascii_downcase) as $u | $bots | index($u)))
                 | map(select(.created_at != null and .created_at > $runstart))
+                | map(select(
+                    (.body | contains("<!-- mirrobot:compliance -->")) or
+                    (.body | contains("<!-- compliance-check-id:")) or
+                    (.body | contains("_Compliance verification by AI agent"))
+                  ))
                 | sort_by(.created_at)
                 | last
                 | if . == null then null else {id: .id, body: (.body // "")} end
@@ -1069,14 +1089,19 @@ jobs:
           done
 
           if [ -z "$latest_comment" ] || [ "$latest_comment" == "null" ]; then
-            echo "::warning::No bot comment found to verify. The agent may have failed before posting."
-            exit 0
+            echo "::error::No compliance report found from this run (no compliance tag, marker, or signature). The gate cannot be verified."
+            exit 1
           fi
 
           comment_id=$(echo "$latest_comment" | jq -r .id)
           current_body=$(echo "$latest_comment" | jq -r .body)
 
           needs_fix=false
+
+          if [[ "$current_body" != *"$EXPECTED_TAG"* ]]; then
+            echo "::warning::Missing compliance identity tag."
+            needs_fix=true
+          fi
 
           if [[ "$current_body" != *"$EXPECTED_SIGNATURE"* ]]; then
             echo "::warning::Missing compliance signature footer."
@@ -1109,14 +1134,15 @@ jobs:
             fi
             echo "Repairing compliance report footers on comment $comment_id (marker: ${effective_marker})..."
             clean_body=$(printf '%s' "$current_body" | perl -0777 -pe 's/<!--\s*compliance-check-id:\s*[0-9]+-[a-f0-9]+\s*-->//g')
+            clean_body=$(printf '%s' "$clean_body" | perl -0777 -pe 's/<!--\s*mirrobot:compliance\s*-->//g')
             clean_body=$(printf '%s' "$clean_body" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba' | sed -e 's/[[:space:]]*$//')
-            printf '%s\n\n%s\n%s\n' "$clean_body" "$EXPECTED_SIGNATURE" "$effective_marker" > /tmp/repaired_compliance_body.txt
+            printf '%s\n\n%s\n%s\n%s\n' "$clean_body" "$EXPECTED_TAG" "$EXPECTED_SIGNATURE" "$effective_marker" > /tmp/repaired_compliance_body.txt
             gh api --method PATCH "/repos/${{ github.repository }}/issues/comments/$comment_id" -F body=@/tmp/repaired_compliance_body.txt
 
             # Re-verify the repair actually landed
             sleep 3
             recheck=$(gh api "/repos/${{ github.repository }}/issues/comments/$comment_id" --jq .body)
-            if [[ "$recheck" == *"$EXPECTED_SIGNATURE"* && "$recheck" == *"$effective_marker"* ]]; then
+            if [[ "$recheck" == *"$EXPECTED_TAG"* && "$recheck" == *"$EXPECTED_SIGNATURE"* && "$recheck" == *"$effective_marker"* ]]; then
               echo "::notice::Compliance footers repaired and verified (marker = ${posted_id:-${PR_NUMBER}-${PR_HEAD_SHA}})."
             else
               echo "::error::Compliance footer repair did not land on comment $comment_id; FOLLOW-UP detection may read a wrong base. Manual check needed."

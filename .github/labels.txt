@@ -1,0 +1,66 @@
+# Mirrobot label palette: the ONE source for what Agent Bootstrap seeds and
+# for what the agent may apply. One label per line:
+#
+#     name|color|class|who|description
+#
+#   name         GitHub label name, exact (the PR review trigger keys on
+#                "Agent Monitored"; the grade families keep their prefixes)
+#   color        six hex digits, no '#'
+#   class        kind | flag | severity | value | risk | ai | waiting |
+#                resolution (agent classes) or decision | contribution |
+#                automation (maintainer classes)
+#   who          agent (the agent applies it and may replace it) or
+#                maintainer (the agent never applies or removes it); must
+#                match the class
+#   description  GitHub label description, at most 100 characters, no '|'
+#
+# Comment lines and blank lines are ignored. Agent Bootstrap creates the
+# labels that are missing and never overwrites existing ones; before an
+# agent session, the workflow fetches the repository's live labels and
+# renders exactly those, classified by this file, into the prompt
+# (render-labels.sh). The agent never invents a label. No file means
+# labeling is off.
+#
+# ---- what it is -------------------------------------------------------------
+bug|d73a4a|kind|agent|Something isn't working
+enhancement|a2eeef|kind|agent|A researched proposal: what to change and how
+wish|bfd4f2|kind|agent|Issues only: a bare idea ("why not have this?") with no proposed approach
+question|d876e3|kind|agent|Support ask or clarification
+documentation|0075ca|kind|agent|Improvements or additions to documentation
+chore|ededed|kind|agent|Maintenance with no behavior change: refactors, CI, dependencies, cleanup, tech debt
+# ---- flags ------------------------------------------------------------------
+regression|0f62fe|flag|agent|Worked before; broken by a later change
+external|c5def5|flag|agent|Real problem whose cause is outside this repository (upstream service, dependency)
+# ---- grades: severity (how bad the problem is) ------------------------------
+severity: critical|b60205|severity|agent|Agent grade, how bad: security, data loss, or a broken core flow
+severity: major|ff7518|severity|agent|Agent grade, how bad: wrong behavior with a workaround, or many users hit it
+severity: minor|fbca04|severity|agent|Agent grade, how bad: edge case, cosmetic, or narrow impact
+severity: info|1d76db|severity|agent|Agent grade, how bad: nothing broken; worth knowing
+# ---- grades: value (how good it would be if done) ---------------------------
+value: high|0e8a16|value|agent|Agent grade, how good if done: removes real pain for many, or unlocks something wanted
+value: medium|5cb85c|value|agent|Agent grade, how good if done: useful for a real subset, or a moderate gain
+value: low|c2e0c6|value|agent|Agent grade, how good if done: marginal; fine to have
+# ---- grades: risk (the danger of doing the change) --------------------------
+risk: high|6f42c1|risk|agent|Agent grade, risk of doing it: sensitive or broad (auth, data, migrations), hard to reverse
+risk: medium|8250df|risk|agent|Agent grade, risk of doing it: a functional change with a moderate blast radius
+risk: low|d4c5f9|risk|agent|Agent grade, risk of doing it: small, isolated, easy to reverse
+# ---- the agent's own conclusions --------------------------------------------
+ai: confirmed|0e8a8a|ai|agent|Agent's conclusion: traced to its cause or reproduced
+ai: plausible|bfe5e9|ai|agent|Agent's conclusion: reads as real; not reproduced
+ai: recommended|1a7f37|ai|agent|Agent's conclusion: worth doing
+ai: discouraged|a22127|ai|agent|Agent's conclusion: not worth doing as proposed; the reason is in its comment
+# ---- waiting on -------------------------------------------------------------
+needs-info|fef2c0|waiting|agent|Blocked on facts from the filer: version, config, logs
+needs-repro|f9d0c4|waiting|agent|Believed possible; blocked until steps or an example reproduce it
+needs-discussion|ffc9c9|waiting|agent|Needs a maintainer or design decision before work starts
+# ---- fixed, or not a bug ----------------------------------------------------
+already-fixed|dbe9f7|resolution|agent|Fixed on a branch, PR, or release; nothing left to do here
+duplicate|cfd3d7|resolution|agent|This issue or pull request already exists
+invalid|e4e669|resolution|agent|Closed as invalid for any reason: not a real issue here (user error, spam, cannot act on it)
+as-designed|9e9e9e|resolution|agent|Behavior is intended; not a bug
+# ---- the maintainer's (the agent never applies or removes these) ------------
+accepted|207de5|decision|maintainer|Maintainer's decision: passed human review; wanted, work may start
+Priority|af2107|decision|maintainer|Maintainer's mark: do this next. Usually features, enhancements, PRs
+help wanted|008672|contribution|maintainer|Extra attention is needed
+good first issue|7057ff|contribution|maintainer|Good for newcomers
+Agent Monitored|5319e7|automation|maintainer|Collaborator-applied: pushes to this PR get reviewed by the agent

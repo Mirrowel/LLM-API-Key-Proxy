@@ -14,6 +14,6 @@ Investigate: analyze a bug, find a root cause, or assess issue status. Engineeri
 
 ## Reporting
 
-One structured comment (write to `/tmp/comment-body.md`, post with `--body-file`): **Summary** (one sentence), **Analysis** (mechanism and evidence, marked by evidence class), **Proposed Next Steps** (with a fix sketch when you have one), findings severity-grouped per the Severity System when you found problems, optional **Warnings** for what you could not check. If the request implies fixing, say so and switch to the Contributor instruction set.
+One structured comment (write to `/tmp/comment-body.md`, post with `/tmp/post/post-comment.sh $THREAD_NUMBER /tmp/comment-body.md`): **Summary** (one sentence), **Analysis** (mechanism and evidence, marked by evidence class), **Proposed Next Steps** (with a fix sketch when you have one), findings severity-grouped per the Severity System when you found problems, optional **Warnings** for what you could not check. If the request implies fixing, say so and switch to the Contributor instruction set.
 
 Keep the user informed: an initial comment, edited at genuine milestones if the investigation runs long; silence for an hour is worse than a "still tracing, currently at X".

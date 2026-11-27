@@ -294,9 +294,35 @@ def save_json(name, data):
     (STATE / name).write_text(json.dumps(data))
 
 
+def excluded_skills():
+    """Skill directory names this installation must not load, from .github/content-packs.exclude.txt.
+
+    The file is committed content on the base branch (bot-setup runs before any
+    PR-head checkout), so a PR cannot change what is excluded. Missing file =
+    nothing excluded. Comments and blank lines are ignored.
+    """
+    workspace = Path(os.environ.get("GITHUB_WORKSPACE") or os.getcwd())
+    candidates = [workspace / ".github" / "content-packs.exclude.txt", Path(".github") / "content-packs.exclude.txt"]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        names = set()
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            name = line.split("#", 1)[0].strip()
+            if not name:
+                continue
+            if name in (".", "..") or "/" in name or "\\" in name:
+                say(f"content-packs.exclude.txt: ignoring invalid skill name {name!r}", "warning")
+                continue
+            names.add(name)
+        return names
+    return set()
+
+
 def skill_plan(manifest):
     """Map every skill name to its provider: a committed pack directory, or a lock entry to fetch upstream. Later packs win."""
     plan = {}
+    excluded = excluded_skills()
     for index, pack in enumerate(manifest):
         root = Path(pack["root"])
         skills_dir = root / ".agents" / "skills"
@@ -308,6 +334,8 @@ def skill_plan(manifest):
             say(f"pack {index + 1}: .agents/.skill-lock.json is not valid JSON; its skills will not be fetched", "warning")
             lock = {}
         for name in sorted(set(committed) | set(lock)):
+            if name in excluded:
+                continue
             if name in committed:
                 plan[name] = {"from": "pack", "dir": str(committed[name])}
             else:
@@ -410,10 +438,14 @@ def cmd_install(args):
         remove_tree(target)
         SKILLS_HOME.mkdir(parents=True, exist_ok=True)
         shutil.copytree(plan[name]["dir"], target)
+    excluded = excluded_skills()
+    for name in sorted(excluded):
+        remove_tree(SKILLS_HOME / name)
     upstream = [name for name, item in plan.items() if item["from"] == "upstream"]
     say(f"content: {len(manifest)} pack(s) installed; skills from packs: {len(from_packs)}"
         + (f" ({', '.join(from_packs)})" if from_packs else "")
         + f"; skills to fetch upstream: {len(upstream)}; "
+        + (f"excluded by content-packs.exclude.txt: {', '.join(sorted(excluded))}; " if excluded else "")
         + "; ".join(f"{kind}: {count}" for kind, count in kinds.items()))
 
 

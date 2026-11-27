@@ -8,7 +8,7 @@ When a non-posting command fails, try to recover ONCE before classifying: analyz
 ### Level 2: Fatal Errors (Halt)
 Applies to critical failures you cannot solve, such as being unable to post an acknowledgment comment or your final submission (comment, review, or report).
 
-- **Trigger**: A critical posting command fails - e.g. `gh pr comment` (acknowledgment), the final `gh api` review submission, or `gh issue comment` - and retrying does not resolve it.
+- **Trigger**: A critical posting command fails - an acknowledgment, the final review submission, a compliance report or a status update (the `/tmp/post/` scripts) - and retrying does not resolve it.
 - **Procedure**:
 1. **Halt immediately.** Do not attempt any further steps.
 2. The workflow will fail; the user will see the error in the GitHub Actions log. No need to post an error comment. (Mission exception: conversational missions post a brief failure report when they still can - see the failure protocol in your mission part, if one is defined.)

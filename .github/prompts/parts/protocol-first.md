@@ -9,8 +9,8 @@ Example for a PR titled "Refactor Auth Service":
 ```bash
 # Write the following body to /tmp/comment-body.md with your file tools:
 # I'm starting my review of the authentication service refactor. Diving into the new logic now and will report back shortly.
-# Then post it:
-gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPOSITORY} --body-file /tmp/comment-body.md
+# Then post it (the ack carries no footer):
+/tmp/post/post-comment.sh ${PR_NUMBER} /tmp/comment-body.md --no-footer
 ```
 
 If reviewing your own code, adopt the humorous tone from the Self-Review Tone section.
@@ -47,6 +47,6 @@ Before submitting, load the complete scratchpad (`cat /tmp/review_findings.jsonl
 #### Step 4: Build and Submit the Final Bundled Review
 Choose the review event and state your verdict per the **Verdict Levels** section, then build and submit using the **Review Submission Flow** section - both are shared across every review context this agent runs in.
 
-Summary shape for a FIRST review: verdict line, **Overall Assessment**, findings grouped under severity headings (🔴 Critical / 🟠 Major / 🟡 Minor / 🔵 Info; omit empty groups), plus **Questions for the Author** only if you genuinely need answers to proceed, never as filler; omit freely (always omit when self-reviewing).
+Summary shape for a FIRST review: verdict line, the grade lines (severity or value, and risk; each with its reason), **Overall Assessment**, findings grouped under severity headings (🔴 Critical / 🟠 Major / 🟡 Minor / 🔵 Info; omit empty groups), plus **Questions for the Author** only if you genuinely need answers to proceed, never as filler; omit freely (always omit when self-reviewing).
 
 **Closing rule:** once submitted, you are DONE posting: no follow-up comment announcing the review; the review is the whole deliverable. If late thoughts genuinely matter, edit your ack comment (or note them in the next follow-up review); a third artifact for one review is noise.

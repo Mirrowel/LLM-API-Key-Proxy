@@ -181,12 +181,13 @@ Aggregate all subtask findings into your single report. In subtask reports, cite
 
 After all reviews and aggregation, post the filled template:
 
-Copy the template from `${REPORT_TEMPLATE}` into `/tmp/compliance-report.md` with your file tools, fill each `[TO_BE_DETERMINED]` / `[AI to complete: ...]` section with your analysis, keep footer lines verbatim (including any @mentions and the compliance marker comment), then post:
+Copy the template from `${REPORT_TEMPLATE}` into `/tmp/compliance-report.md` with your file tools, fill each `[TO_BE_DETERMINED]` / `[AI to complete: ...]` section with your analysis, and keep its footer lines verbatim (including the @mentions), then post:
 ```bash
-gh pr comment ${PR_NUMBER} --repo ${GITHUB_REPOSITORY} --body-file /tmp/compliance-report.md
+/tmp/post/post-compliance.sh /tmp/compliance-report.md
 ```
+The script appends the compliance tag, signature and `compliance-check-id` marker with the SHA it resolved. The template @mentions the author; the workflow prepends reviewer mentions after you post.
 
-The template @mentions the author; the workflow prepends reviewer mentions after you post.
+**The report is the only comment you post on this run.** No acknowledgment, no closing summary: a second comment can become the report the next run reads as its previous audit.
 
 **Post the report BEFORE the status check** - the status links to it.
 
@@ -196,48 +197,19 @@ After posting the report, set the commit status. Own the `compliance-check` stat
 
 The statuses API accepts ONLY: `error`, `failure`, `pending`, `success`. Anything else (e.g. `neutral`) is rejected by the API with a 422 - never attempt it. `pending` is reserved for the trigger stub's initial marker; never post it. `error` is only for the check itself breaking (infrastructure), never PR findings.
 
-**Hex SHA discipline.** Three SHA sources: `/tmp/head_sha.txt` records the commit the workflow checked out; the `PR_HEAD_SHA` environment variable carries the same value; `git rev-parse HEAD` always tells what your working tree actually is. They should agree; use whichever is at hand, preferring fresh `git rev-parse` when in doubt; if they diverge, trust `git rev-parse` and say so. Hand-typing hex is unreliable, and a one-character typo posts a status to a nonexistent commit. If you deliberately audit a different commit, use ITS real SHA (from `git rev-parse`, not memory) and say so in the report.
+**SHA discipline.** `set-status.sh` resolves the SHA from `/tmp/head_sha.txt` and verifies it; if you deliberately audited a different commit, pass its real SHA from `git rev-parse` with `--sha` and say so in the report. Never retype hex.
 
 Map your verdict:
 
-**PASS (All Compliant):**
-```bash
-gh api \
-  --method POST \
-  -H "Accept: application/vnd.github+json" \
-  "/repos/${GITHUB_REPOSITORY}/statuses/$(cat /tmp/head_sha.txt)" \
-  -f state='success' \
-  -f context='compliance-check' \
-  -f description='All compliance checks passed' \
-  -f target_url='<URL of the compliance report comment you just posted>'
-```
+**PASS (All Compliant):** `/tmp/post/set-status.sh success 'All compliance checks passed' --target-url '<report URL>'`
 
-**WARNINGS (fix advised before merge; mergeable if you disagree after reading the report):**
-```bash
-gh api \
-  --method POST \
-  -H "Accept: application/vnd.github+json" \
-  "/repos/${GITHUB_REPOSITORY}/statuses/$(cat /tmp/head_sha.txt)" \
-  -f state='success' \
-  -f context='compliance-check' \
-  -f description='Passed with warnings - see report' \
-  -f target_url='<URL of the compliance report comment you just posted>'
-```
+**WARNINGS (fix advised before merge; mergeable if you disagree after reading the report):** `/tmp/post/set-status.sh success 'Passed with warnings - see report' --target-url '<report URL>'`
+
 Warnings are advisories and do not block merging. A human (or agent) reviewing the PR sees the warning description and report link, and can judge. Use `failure` only for blocking issues - never to make warnings "more visible".
 
-**BLOCKING (must fix before merge):**
-```bash
-gh api \
-  --method POST \
-  -H "Accept: application/vnd.github+json" \
-  "/repos/${GITHUB_REPOSITORY}/statuses/$(cat /tmp/head_sha.txt)" \
-  -f state='failure' \
-  -f context='compliance-check' \
-  -f description='Blocking issues - see report' \
-  -f target_url='<URL of the compliance report comment you just posted>'
-```
+**BLOCKING (must fix before merge):** `/tmp/post/set-status.sh failure 'Blocking issues - see report' --target-url '<report URL>'`
 
-Get the report comment URL from the post command's output (`gh pr comment` prints the comment URL) or look it up afterwards. The description MUST be one of the three exact strings above so machines and humans can distinguish pass / warnings / blocking from the status line alone.
+The report post prints the comment URL; use it. The description MUST be one of the three exact strings above so machines and humans can distinguish pass / warnings / blocking from the status line alone.
 
 ## Report Structure Guidance
 

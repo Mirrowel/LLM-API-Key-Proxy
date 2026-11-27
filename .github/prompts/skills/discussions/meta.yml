@@ -1,0 +1,2 @@
+name: mirrobot-discussions
+description: Use when the thread is a GitHub Discussion, before the first reply or edit, for reply anchoring, nested threads, locked threads and editing by node id
