@@ -1,8 +1,8 @@
-# [TOOLS NOTE]
+# [POSTING]
 
-`gh` and `git` run in `bash`. Never pass a body inline and never use a heredoc: write the body to a file with your file tools, then let a posting script send it.
+A body always goes to a file and is sent by a posting script; never inline it and never use a heredoc.
 
-**Posting toolkit** (`/tmp/post/`; every script takes `--help` and `--dry-run`):
+**Toolkit** (`/tmp/post/`; every script takes `--help` and `--dry-run`):
 
 | Script | Use |
 |---|---|

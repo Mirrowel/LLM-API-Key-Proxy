@@ -458,6 +458,17 @@ jobs:
           title=$(echo "$pr_json" | jq -r .title)
           body=$(echo "$pr_json" | jq -r '.body // "(No description provided)"')
 
+          # Thread identity: the one fact every prompt needs and the agent
+          # must never spend a call rediscovering. Self-review is detected
+          # from the configured identities (BOT_NAMES_JSON), never a baked
+          # name.
+          self_suffix=""
+          if printf '%s' "${BOT_NAMES_JSON:-[]}" | jq -e --arg a "$(printf '%s' "$author" | tr '[:upper:]' '[:lower:]')" 'index($a)' >/dev/null 2>&1; then
+            self_suffix=" (self-review: the author is you)"
+          fi
+          identity_title=$(printf '%s' "$title" | tr -d '\r\n')
+          echo "THREAD_IDENTITY=PR #$PR_NUMBER \"$identity_title\" by @$author in $GITHUB_REPOSITORY, head $PR_HEAD_SHA.$self_suffix" >> "$GITHUB_ENV"
+
           # Changed files: ONE summary line only. The inline per-file list
           # was ~5.5K tokens of prompt on a 359-file PR (plus the files
           # API's additions/deletions go null on huge PRs, mislabeling
@@ -502,6 +513,8 @@ jobs:
           # exported by fetch-pr-discussion.sh)
           CONTEXT_DELIMITER="GH_PR_CONTEXT_DELIMITER_$(openssl rand -hex 8)"
           echo "PULL_REQUEST_CONTEXT<<$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
+          echo "Number: #$PR_NUMBER" >> "$GITHUB_ENV"
+          echo "Title: $title" >> "$GITHUB_ENV"
           echo "Author: $author" >> "$GITHUB_ENV"
           echo "Created At: $created_at" >> "$GITHUB_ENV"
           echo "Base Branch (target): $base_branch" >> "$GITHUB_ENV"
@@ -955,7 +968,7 @@ jobs:
           fi
           # Substitute variables, embedding PR context and diff file path; DIFF_FILE_PATH kept local to this process
           TMP_DIR="${RUNNER_TEMP:-/tmp}"
-          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT} ${LABEL_PALETTE}'
+          VARS='${REVIEW_TYPE} ${PR_AUTHOR} ${PR_NUMBER} ${GITHUB_REPOSITORY} ${PR_HEAD_SHA} ${PULL_REQUEST_CONTEXT} ${DIFF_FILE_PATH} ${TRIGGER_MESSAGE} ${PREVIOUS_BOT_REVIEWS} ${AGENT_REVIEW_HISTORY} ${THREAD_CONTEXT} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${REBASE_CONTEXT} ${LABEL_PALETTE} ${THREAD_IDENTITY}'
           # Prepend the security brief (with the verified requester + trust context lines)
           { envsubst '$REQUESTER_CONTEXT $TRUST_CONTEXT $TRUST_CONTEXT_WARNING $TRUST_CONTEXT_ERA $TRUSTED_PEOPLE' < /tmp/security-brief.md; SKILLS_ENVSUBST="$VARS" bash /tmp/assemble-prompt.sh "$MANIFEST" | DIFF_FILE_PATH="$DIFF_FILE_PATH" envsubst "$VARS"; } > "$TMP_DIR/assembled_prompt.txt"
           # Immediately clear large env after use

@@ -8,7 +8,7 @@ Grade on three axes. Each says something different: a great idea can be high val
 - **Value**, how good it would be if this were done. Cost is not part of it. Three levels: high (removes real pain for many, or unlocks something the project wants), medium (useful for a real subset, or a moderate gain), low (marginal; fine to have).
 - **Risk**, the danger of doing the change. Three levels: high (sensitive or broad: auth, data, migrations, API contracts; hard to reverse), medium (a functional change with a moderate blast radius), low (small, isolated, easy to reverse). Breaking users, security or privacy exposure, performance and complexity all count.
 
-Which apply: a bug report gets severity; a proposal gets value; a PR gets severity (it fixes a bug) or value (it changes behavior), and always risk; an issue gets risk only when an approach is proposed. A severity grade is for the whole thread; the Severity System's icons are for individual findings.
+Which apply: a bug report gets severity; a proposal gets value; a PR gets severity (it fixes a bug) or value (it changes behavior), and always risk; an issue gets risk only when an approach is proposed. Kinds and flags describe the thread as written and apply to issues and pull requests alike: a docs-only PR is documentation, a fix is bug, a behavior-changing PR is enhancement; wish stays issues-only. A severity grade is for the whole thread; the Severity System's icons are for individual findings.
 
 **Every grade that applies is mandatory, with its reason:** the evidence that puts it at that level. Who is affected and how badly; who benefits and how much; what the change can break and how hard that is to undo. A skipped axis gets one short clause saying why.
 
