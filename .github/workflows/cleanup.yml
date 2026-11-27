@@ -1,15 +1,27 @@
 name: Cleanup Feature Builds
 
-# Trigger automatically when a branch is deleted (typically after PR merge)
-# Also allows manual triggering for testing or cleanup of specific branches
 on:
   delete:
   workflow_dispatch:
     inputs:
-      branch_name:
-        description: 'Branch name to clean up (for manual cleanup)'
+      cleanup_mode:
+        description: 'Cleanup mode'
         required: true
+        type: choice
+        default: branch
+        options:
+          - branch
+          - stale_branches
+      branch_name:
+        description: 'Branch name for branch mode. Leave empty for stale_branches.'
+        required: false
         type: string
+        default: ''
+      keep_latest:
+        description: 'Keep newest N matching releases. 0 deletes all matches.'
+        required: false
+        type: string
+        default: '0'
       dry_run:
         description: 'Dry run mode (preview without deleting)'
         required: false
@@ -18,259 +30,197 @@ on:
 
 jobs:
   delete-releases:
-    # Only run if:
-    # 1. Automatic trigger: deleted ref was a branch (not a tag)
-    # 2. Manual trigger: always run
     if: github.event_name == 'workflow_dispatch' || github.event.ref_type == 'branch'
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
-      # Configure protected branches that should NEVER be cleaned up
-      # Modify this list to match your repository's important branches
-      PROTECTED_BRANCHES: "main,master,production,prod,staging,develop"
+      PROTECTED_BRANCHES: "main,master,production,prod,staging,develop,dev"
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
 
-      - name: Determine branch name and mode
+      - name: Determine cleanup config
         id: config
         shell: bash
         run: |
-          # Determine branch name based on trigger type
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            CLEANUP_MODE="${{ github.event.inputs.cleanup_mode }}"
             BRANCH_NAME="${{ github.event.inputs.branch_name }}"
+            KEEP_LATEST="${{ github.event.inputs.keep_latest }}"
             DRY_RUN="${{ github.event.inputs.dry_run }}"
-            echo "🔧 Manual trigger detected"
           else
+            CLEANUP_MODE="branch"
             BRANCH_NAME="${{ github.event.ref }}"
+            KEEP_LATEST="0"
             DRY_RUN="false"
-            echo "🗑️ Branch deletion detected"
           fi
-          
-          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
-          echo "dry_run=$DRY_RUN" >> $GITHUB_OUTPUT
-          
-          echo "Branch: $BRANCH_NAME"
-          echo "Dry Run: $DRY_RUN"
 
-      - name: Validate branch is not protected
-        shell: bash
-        env:
-          BRANCH_NAME: ${{ steps.config.outputs.branch_name }}
-        run: |
-          echo "🔍 Checking if branch '$BRANCH_NAME' is protected..."
-          
-          # Convert comma-separated list to array
-          IFS=',' read -ra PROTECTED <<< "$PROTECTED_BRANCHES"
-          
-          # Check if branch is in protected list
-          for protected in "${PROTECTED[@]}"; do
-            # Trim whitespace
-            protected=$(echo "$protected" | xargs)
-            if [ "$BRANCH_NAME" == "$protected" ]; then
-              echo "❌ ERROR: Branch '$BRANCH_NAME' is protected and cannot be cleaned up."
-              echo ""
-              echo "Protected branches: $PROTECTED_BRANCHES"
-              echo ""
-              echo "If you need to clean up this branch, please remove it from the"
-              echo "PROTECTED_BRANCHES environment variable in .github/workflows/cleanup.yml"
-              exit 1
-            fi
-          done
-          
-          echo "✅ Branch '$BRANCH_NAME' is not protected. Proceeding with cleanup."
+          case "$CLEANUP_MODE" in
+            branch|stale_branches) ;;
+            *) echo "Unsupported cleanup mode: $CLEANUP_MODE" >&2; exit 1 ;;
+          esac
+
+          if ! printf '%s\n' "$KEEP_LATEST" | grep -Eq '^[0-9]+$'; then
+            echo "keep_latest must be a non-negative integer, got: $KEEP_LATEST" >&2
+            exit 1
+          fi
+
+          if [ "$CLEANUP_MODE" = "branch" ] && [ -z "$BRANCH_NAME" ]; then
+            echo "branch_name is required for branch mode" >&2
+            exit 1
+          fi
+
+          echo "cleanup_mode=$CLEANUP_MODE" >> "$GITHUB_OUTPUT"
+          echo "branch_name=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+          echo "keep_latest=$KEEP_LATEST" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+
+          echo "Mode: $CLEANUP_MODE"
+          echo "Branch: ${BRANCH_NAME:-'(none)'}"
+          echo "Keep latest: $KEEP_LATEST"
+          echo "Dry run: $DRY_RUN"
 
       - name: Find and process releases
         id: cleanup
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLEANUP_MODE: ${{ steps.config.outputs.cleanup_mode }}
           BRANCH_NAME: ${{ steps.config.outputs.branch_name }}
+          KEEP_LATEST: ${{ steps.config.outputs.keep_latest }}
           DRY_RUN: ${{ steps.config.outputs.dry_run }}
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "🔍 Searching for releases associated with branch: '$BRANCH_NAME'"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          
-          # List all releases and filter by tag pattern
-          # Your build.yaml creates tags like: branch_name/build-YYYYMMDD-N-sha
-          # We search for releases where the tag starts with the branch name followed by "/"
-          
-          RELEASES=$(gh release list --repo "${{ github.repository }}" --limit 1000 --json tagName --jq ".[] | select(.tagName | startswith(\"$BRANCH_NAME/\")) | .tagName")
-          
+          is_protected_branch() {
+            local branch="$1"
+            IFS=',' read -ra protected <<< "$PROTECTED_BRANCHES"
+            for item in "${protected[@]}"; do
+              item="$(echo "$item" | xargs)"
+              if [ "$branch" = "$item" ]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          branch_exists() {
+            git ls-remote --exit-code --heads origin "$1" >/dev/null 2>&1
+          }
+
+          releases_for_branch() {
+            local branch="$1"
+            gh release list --repo "${{ github.repository }}" --limit 1000 --json tagName,createdAt \
+              --jq "sort_by(.createdAt) | reverse | .[] | select(.tagName | startswith(\"$branch/\")) | .tagName"
+          }
+
+          all_build_releases() {
+            gh release list --repo "${{ github.repository }}" --limit 1000 --json tagName,createdAt \
+              --jq 'sort_by(.createdAt) | reverse | .[] | select(.tagName | contains("/build-")) | .tagName'
+          }
+
+          select_after_retention() {
+            local keep="$1"
+            if [ "$keep" -eq 0 ]; then
+              cat
+              return
+            fi
+            tail -n +$((keep + 1))
+          }
+
+          if [ "$CLEANUP_MODE" = "branch" ]; then
+            if is_protected_branch "$BRANCH_NAME"; then
+              echo "Branch '$BRANCH_NAME' is protected and cannot be cleaned up." >&2
+              echo "Protected branches: $PROTECTED_BRANCHES" >&2
+              exit 1
+            fi
+            SEARCH_PATTERN="$BRANCH_NAME/"
+            RELEASES="$(releases_for_branch "$BRANCH_NAME" | select_after_retention "$KEEP_LATEST")"
+          else
+            SEARCH_PATTERN="stale unprotected */build-* releases"
+            RELEASES="$({
+              all_build_releases | while read -r tag; do
+                [ -z "$tag" ] && continue
+                branch="${tag%/build-*}"
+                if is_protected_branch "$branch"; then
+                  continue
+                fi
+                if branch_exists "$branch"; then
+                  continue
+                fi
+                echo "$tag"
+              done
+            } | select_after_retention "$KEEP_LATEST")"
+          fi
+
           if [ -z "$RELEASES" ]; then
-            echo "ℹ️ No releases found for branch '$BRANCH_NAME'."
-            echo ""
-            echo "This could mean:"
-            echo "  • The branch never had any builds created"
-            echo "  • The releases were already cleaned up"
-            echo "  • The branch name doesn't match any release tag patterns"
-            echo ""
-            echo "searched_pattern=$BRANCH_NAME/" >> $GITHUB_OUTPUT
-            echo "release_count=0" >> $GITHUB_OUTPUT
-            echo "deleted_count=0" >> $GITHUB_OUTPUT
-            echo "failed_count=0" >> $GITHUB_OUTPUT
+            echo "No releases matched cleanup mode '$CLEANUP_MODE'."
+            echo "searched_pattern=$SEARCH_PATTERN" >> "$GITHUB_OUTPUT"
+            echo "release_count=0" >> "$GITHUB_OUTPUT"
+            echo "deleted_count=0" >> "$GITHUB_OUTPUT"
+            echo "failed_count=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          
-          # Count releases
-          RELEASE_COUNT=$(echo "$RELEASES" | wc -l)
-          echo "📦 Found $RELEASE_COUNT release(s) to process:"
-          echo ""
-          echo "$RELEASES" | while read -r tag; do
-            echo "  • $tag"
-          done
-          echo ""
-          
-          # Optional: Retention policy (commented out by default)
-          # Uncomment the following lines to keep the last N builds instead of deleting all
-          # RETENTION_KEEP=3
-          # if [ $RELEASE_COUNT -gt $RETENTION_KEEP ]; then
-          #   echo "📌 Retention policy: Keeping last $RETENTION_KEEP build(s)"
-          #   RELEASES=$(echo "$RELEASES" | head -n -$RETENTION_KEEP)
-          #   RELEASE_COUNT=$(echo "$RELEASES" | wc -l)
-          #   echo "📦 Adjusted to delete $RELEASE_COUNT release(s)"
-          #   echo ""
-          # else
-          #   echo "📌 Retention policy: All releases within retention limit"
-          #   echo "ℹ️ No cleanup needed"
-          #   exit 0
-          # fi
-          
-          # Process deletions
-          if [ "$DRY_RUN" == "true" ]; then
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "🧪 DRY RUN MODE - No actual deletions will occur"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo ""
-            echo "The following releases and tags would be deleted:"
-            echo ""
-            echo "$RELEASES" | while read -r TAG_NAME; do
-              if [ -n "$TAG_NAME" ]; then
-                echo "  🗑️ Would delete: $TAG_NAME"
-              fi
-            done
-            echo ""
-            echo "searched_pattern=$BRANCH_NAME/" >> $GITHUB_OUTPUT
-            echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
-            echo "deleted_count=0" >> $GITHUB_OUTPUT
-            echo "failed_count=0" >> $GITHUB_OUTPUT
-          else
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "🗑️ Starting deletion process"
-            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo ""
-            
-            DELETED=0
-            FAILED=0
-            
-            echo "$RELEASES" | while read -r TAG_NAME; do
-              if [ -n "$TAG_NAME" ]; then
-                echo "Processing: $TAG_NAME"
-                
-                # Delete the release and the associated tag (--cleanup-tag removes the git tag)
-                if gh release delete "$TAG_NAME" --repo "${{ github.repository }}" --cleanup-tag --yes 2>&1; then
-                  echo "  ✅ Successfully deleted: $TAG_NAME"
-                  DELETED=$((DELETED + 1))
-                else
-                  echo "  ⚠️ Failed to delete: $TAG_NAME"
-                  FAILED=$((FAILED + 1))
-                fi
-                echo ""
-                
-                # Brief pause to avoid rate limiting
-                sleep 0.5
-              fi
-            done
-            
-            # Note: The counter variables don't persist from the subshell, so we recalculate
-            # This is a limitation of bash subshells, but the individual status messages show the details
-            echo "searched_pattern=$BRANCH_NAME/" >> $GITHUB_OUTPUT
-            echo "release_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
-            # We'll use a different approach to count successes/failures
-            echo "deleted_count=$RELEASE_COUNT" >> $GITHUB_OUTPUT
-            echo "failed_count=0" >> $GITHUB_OUTPUT
+
+          RELEASE_COUNT="$(printf '%s\n' "$RELEASES" | grep -c .)"
+          echo "Found $RELEASE_COUNT release(s):"
+          printf '%s\n' "$RELEASES" | sed 's/^/  - /'
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run only. No releases will be deleted."
+            echo "searched_pattern=$SEARCH_PATTERN" >> "$GITHUB_OUTPUT"
+            echo "release_count=$RELEASE_COUNT" >> "$GITHUB_OUTPUT"
+            echo "deleted_count=0" >> "$GITHUB_OUTPUT"
+            echo "failed_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          DELETED=0
+          FAILED=0
+          while read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Deleting $tag"
+            if gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes; then
+              DELETED=$((DELETED + 1))
+            else
+              FAILED=$((FAILED + 1))
+            fi
+            sleep 0.5
+          done <<< "$RELEASES"
+
+          echo "searched_pattern=$SEARCH_PATTERN" >> "$GITHUB_OUTPUT"
+          echo "release_count=$RELEASE_COUNT" >> "$GITHUB_OUTPUT"
+          echo "deleted_count=$DELETED" >> "$GITHUB_OUTPUT"
+          echo "failed_count=$FAILED" >> "$GITHUB_OUTPUT"
+
+          if [ "$FAILED" -gt 0 ]; then
+            exit 1
           fi
 
       - name: Generate summary
         shell: bash
         env:
+          CLEANUP_MODE: ${{ steps.config.outputs.cleanup_mode }}
           BRANCH_NAME: ${{ steps.config.outputs.branch_name }}
+          KEEP_LATEST: ${{ steps.config.outputs.keep_latest }}
           DRY_RUN: ${{ steps.config.outputs.dry_run }}
           PATTERN: ${{ steps.cleanup.outputs.searched_pattern }}
           RELEASE_COUNT: ${{ steps.cleanup.outputs.release_count }}
           DELETED_COUNT: ${{ steps.cleanup.outputs.deleted_count }}
           FAILED_COUNT: ${{ steps.cleanup.outputs.failed_count }}
         run: |
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo "📊 Cleanup Summary"
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          echo ""
-          echo "Branch: $BRANCH_NAME"
-          echo "Search Pattern: ${PATTERN}*"
-          echo "Releases Found: $RELEASE_COUNT"
-          
-          if [ "$DRY_RUN" == "true" ]; then
-            echo "Mode: 🧪 DRY RUN (no actual deletions)"
-            echo ""
-            echo "✅ Dry run completed successfully"
-            echo "   Run again with dry_run=false to perform actual cleanup"
-          else
-            echo "Mode: 🗑️ DELETE"
-            echo "Successfully Deleted: $DELETED_COUNT"
-            if [ "$FAILED_COUNT" -gt 0 ]; then
-              echo "Failed: $FAILED_COUNT"
-            fi
-            echo ""
-            
-            if [ "$RELEASE_COUNT" -eq 0 ]; then
-              echo "ℹ️ No releases needed cleanup"
-            elif [ "$FAILED_COUNT" -gt 0 ]; then
-              echo "⚠️ Cleanup completed with some failures"
-              echo "   Check the logs above for details on failed deletions"
-            else
-              echo "✅ Cleanup completed successfully"
-            fi
-          fi
-          echo ""
-          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-          
-          # Create GitHub Actions summary
           {
-            echo "## 🧹 Cleanup Summary"
-            echo ""
+            echo "## Cleanup Summary"
+            echo
             echo "| Metric | Value |"
-            echo "|--------|-------|"
-            echo "| **Branch** | \`$BRANCH_NAME\` |"
-            echo "| **Search Pattern** | \`${PATTERN}*\` |"
-            echo "| **Releases Found** | $RELEASE_COUNT |"
-            
-            if [ "$DRY_RUN" == "true" ]; then
-              echo "| **Mode** | 🧪 Dry Run |"
-              echo ""
-              echo "> [!NOTE]"
-              echo "> This was a dry run. No actual deletions occurred."
-              echo "> Run the workflow again with \`dry_run=false\` to perform the cleanup."
-            else
-              echo "| **Mode** | 🗑️ Delete |"
-              echo "| **Successfully Deleted** | $DELETED_COUNT |"
-              if [ "$FAILED_COUNT" -gt 0 ]; then
-                echo "| **Failed** | $FAILED_COUNT |"
-                echo ""
-                echo "> [!WARNING]"
-                echo "> Some deletions failed. Check the workflow logs for details."
-              else
-                if [ "$RELEASE_COUNT" -eq 0 ]; then
-                  echo ""
-                  echo "> [!NOTE]"
-                  echo "> No releases were found that needed cleanup."
-                else
-                  echo ""
-                  echo "> [!NOTE]"
-                  echo "> All releases and tags were successfully deleted."
-                fi
-              fi
-            fi
-          } >> $GITHUB_STEP_SUMMARY
+            echo "| --- | --- |"
+            echo "| Mode | \`$CLEANUP_MODE\` |"
+            echo "| Branch | \`${BRANCH_NAME:-'(none)'}\` |"
+            echo "| Search | \`$PATTERN\` |"
+            echo "| Keep latest | \`$KEEP_LATEST\` |"
+            echo "| Dry run | \`$DRY_RUN\` |"
+            echo "| Releases found | $RELEASE_COUNT |"
+            echo "| Deleted | $DELETED_COUNT |"
+            echo "| Failed | $FAILED_COUNT |"
+          } >> "$GITHUB_STEP_SUMMARY"
