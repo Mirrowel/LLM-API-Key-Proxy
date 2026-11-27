@@ -81,6 +81,325 @@ sdk_section() {
 }
 
 
+labels_section() {
+  # The label palette is ONE committed file. Agent Bootstrap seeds GitHub
+  # labels from it (create-if-missing, drift reported, never overwritten).
+  # Before an agent session the workflow fetches the repository's live
+  # labels once and renders exactly those, classified by the palette, into
+  # the prompt: the agent never lists labels itself and never sees a label
+  # that does not exist.
+  local PALETTE="$SCRIPT_DIR/../labels.txt" RENDER="$SCRIPT_DIR/render-labels.sh"
+  local KIT="$SCRIPT_DIR/generate-review-kit.sh"
+  local rendered flat n w m got want slog all most r first last wf PY_L="" sb="$WORK/labels-stub" rt="$WORK/labels-rt"
+  check "labels: render script passes bash -n" OK "$(bash -n "$RENDER" && echo OK || echo BAD)"
+  # The script exports to $GITHUB_ENV when that is set, which it is on a
+  # runner: drop it here so the fixture reads the rendered block from stdout.
+  check "labels: the committed palette validates" OK "$(env -u GITHUB_ENV bash "$RENDER" "$PALETTE" >/dev/null 2>&1 && echo OK || echo BAD)"
+  rendered="$(env -u GITHUB_ENV bash "$RENDER" "$PALETTE")"
+  flat="$(printf '%s\n' "$rendered" | tr '\n' ',')"
+  m=0
+  while IFS= read -r n; do
+    case "$flat" in *", $n,"*|*": $n,"*) ;; *) m=$((m+1)) ;; esac
+  done < <(awk -F'|' '/^[ \t]*#/ || /^[ \t]*$/ { next } NF == 5 { print $1 }' "$PALETTE")
+  check "labels: every palette name renders" "0" "$m"
+  # The prompts explain grades and conclusions as ideas and never name a
+  # label: a repository may use none of this palette or a different one, and
+  # the agent maps ideas to whatever labels it finds. A palette label named
+  # (backticked) in any prompt part breaks that.
+  m=0
+  while IFS= read -r n; do
+    grep -rFq -- "\`$n\`" "$SCRIPT_DIR"/../prompts/parts "$SCRIPT_DIR"/../prompts/skills "$SCRIPT_DIR"/../prompts/security-brief.md "$SCRIPT_DIR"/../prompts/security-brief-guest.md && m=$((m+1))
+  done < <(awk -F'|' '/^[ \t]*#/ || /^[ \t]*$/ { next } NF == 5 { print $1 }' "$PALETTE")
+  check "labels: no prompt part names a palette label" "0" "$m"
+  # The review trigger gates on one exact label name: it must stay in the
+  # palette, or the label stops being seeded on a fresh repository.
+  n="$(grep -o 'index("[^"]*")' "$STUBWF" | head -1 | sed 's/index("//; s/")//')"
+  check "labels: the review trigger's gate label is in the palette" yes "$([ -n "$n" ] && [ -n "$(awk -F'|' -v n="$n" '$1 == n { print "yes" }' "$PALETTE")" ] && echo yes || echo no)"
+  for wf in issue-comment bot-reply pr-review; do
+    check "labels: $wf renders the repository's live labels into the prompt" yes \
+      "$(grep -q 'cp .github/scripts/render-labels.sh /tmp/render-labels.sh' "$SCRIPT_DIR/../workflows/$wf.yml" && grep -q 'gh label list -R "$GITHUB_REPOSITORY" --limit 200 --json name,description,color' "$SCRIPT_DIR/../workflows/$wf.yml" && grep -q 'bash /tmp/render-labels.sh .github/labels.txt "$RUNNER_TEMP/live-labels.json"' "$SCRIPT_DIR/../workflows/$wf.yml" && echo yes || echo no)"
+  done
+  check "labels: the review kit's instruction sets carry the label block" yes "$(grep -q 'LABEL_PALETTE' "$KIT" && echo yes || echo no)"
+  check "labels: the guest lane has no label machinery" no "$( { grep -q 'render-labels\|LABEL_PALETTE' "$SCRIPT_DIR/../workflows/bot-reply-guest.yml" || grep -q 'labels' "$SCRIPT_DIR/../prompts/manifests/bot-reply-guest.manifest"; } && echo yes || echo no)"
+  want="agentlib-manage issue-comment pr-review-first review-first-instructions "
+  got="$(grep -lx 'inline:labels' "$SCRIPT_DIR"/../prompts/manifests/*.manifest | sed 's#.*/##; s/\.manifest$//' | sort | tr '\n' ' ')"
+  check "labels: inline where grades are always owed (four modes)" "$want" "$got"
+  want="bot-reply pr-review-followup review-followup-instructions "
+  got="$(grep -lx 'skill:labels' "$SCRIPT_DIR"/../prompts/manifests/*.manifest | sed 's#.*/##; s/\.manifest$//' | sort | tr '\n' ' ')"
+  check "labels: the skill where grades come up sometimes (three modes)" "$want" "$got"
+  check "labels: compliance declares no label machinery" "0" "$(grep -l 'labels' "$SCRIPT_DIR"/../prompts/manifests/compliance-*.manifest 2>/dev/null | wc -l | tr -d ' ')"
+  check "labels: the labels skill has one shared body, two framings" yes "$([ -f "$SCRIPT_DIR/../prompts/skills/labels/body.md" ] && [ -f "$SCRIPT_DIR/../prompts/skills/labels/framing-inline.md" ] && [ -f "$SCRIPT_DIR/../prompts/skills/labels/framing-skill.md" ] && echo yes || echo no)"
+  check "labels: the required palette placeholder lives in the skill body" "1" "$(grep -c '^${LABEL_PALETTE}$' "$SCRIPT_DIR/../prompts/skills/labels/body.md" || true)"
+  check "labels: bootstrap carries no inline label list" no "$(grep -q 'LABELS_EOF' "$BOOT" && echo yes || echo no)"
+  check "labels: bootstrap reads the palette from the default branch through the API" yes "$(grep -q 'contents/.github/labels.txt?ref=$DEFAULT_BRANCH' "$BOOT" && echo yes || echo no)"
+  check "labels: bootstrap reports drift and never edits or deletes a live label" yes "$(grep -q 'Label palette drift' "$BOOT" && { grep -q 'gh label edit\|gh label delete' "$BOOT" && echo no || echo yes; })"
+  check "labels: bootstrap summary prints the generated label table" yes "$(grep -q 'cat "$RUNNER_TEMP/labels-summary.md"' "$BOOT" && echo yes || echo no)"
+  # The seeding step itself, executed against a stub gh: what it creates,
+  # what it leaves alone, and how each failure mode behaves.
+  for cand in python3 python; do
+    if "$cand" -c 'import yaml' >/dev/null 2>&1; then PY_L="$cand"; break; fi
+  done
+  if [ -z "$PY_L" ]; then
+    check "labels: seeding step behavior (stubbed gh)" ran "SKIP: no python with PyYAML"
+    return 0
+  fi
+  mkdir -p "$sb" "$rt"
+  "$PY_L" - "$BOOT" "Seed label palette" "$WORK/seed-step.sh" <<'PYEOF'
+import sys, yaml
+doc = yaml.safe_load(open(sys.argv[1], encoding="utf-8"))
+for job in doc["jobs"].values():
+    for step in job.get("steps") or []:
+        if (step.get("name") or "").startswith(sys.argv[2]) and step.get("run"):
+            with open(sys.argv[3], "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(step["run"])
+            sys.exit(0)
+sys.exit("step not found")
+PYEOF
+  cat > "$sb/gh" <<'STUBEOF'
+#!/usr/bin/env bash
+# Stub gh for the label-seeding fixture: answers exactly the calls the step
+# makes, logs them, and fails on anything else.
+set -u
+printf '%s\n' "$*" >> "$STUB_LOG"
+case "$1 $2" in
+  "api repos/$REPO") echo main ;;
+  "api repos/$REPO/contents/.github/labels.txt?ref="*) [ "${STUB_PALETTE:-}" != none ] && base64 < "$STUB_PALETTE" || exit 1 ;;
+  "label list") cat "$STUB_EXISTING" ;;
+  "label create")
+    name="$3"; color=""; desc=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --color) color="$2" ;; --description) desc="$2" ;; esac
+      shift
+    done
+    printf 'create|%s|%s|%s\n' "$name" "$color" "$desc" >> "$STUB_LOG"
+    [ "${STUB_FAIL_CREATE:-}" != "$name" ] || exit 1 ;;
+  *) echo "stub gh: unexpected call: $*" >&2; exit 1 ;;
+esac
+STUBEOF
+  chmod +x "$sb/gh"
+  slog="$WORK/seed-calls.log"
+  awk -F'|' '/^[ \t]*#/ || /^[ \t]*$/ { next } NF == 5 { printf "%s\t%s\t%s\n", $1, $2, $5 }' "$PALETTE" \
+    | jq -Rn '[inputs | split("\t") | {name: .[0], color: .[1], description: .[2]}]' > "$WORK/labels-all.json"
+  jq '[.[-1].name] as $miss | .[0].name as $drift | [.[] | if .name == $miss[0] then empty elif .name == $drift then .description += " (drifted)" else . end]' \
+    "$WORK/labels-all.json" > "$WORK/labels-most.json"
+  labels_run_seed() { # mode palette existing [label whose create fails] -> "rc|creates"
+    : > "$slog"
+    PATH="$sb:$PATH" REPO=o/r RUNNER_TEMP="$rt" MODE="$1" STUB_PALETTE="$2" STUB_EXISTING="$3" STUB_FAIL_CREATE="${4:-}" STUB_LOG="$slog" \
+      bash "$WORK/seed-step.sh" > "$WORK/seed.out" 2>&1
+    echo "$?|$(grep -c '^create|' "$slog")"
+  }
+  r="$(labels_run_seed account "$PALETTE" "$WORK/labels-most.json")"
+  check "labels: seeding creates exactly the missing label" "0|1" "$r"
+  check "labels: the created label carries the palette color and description" yes \
+    "$(jq -r '.[-1] | "create|\(.name)|\(.color)|\(.description)"' "$WORK/labels-all.json" | tr -d '\r' | grep -qxF -f - "$slog" && echo yes || echo no)"
+  first="$(jq -r '.[0].name' "$WORK/labels-all.json")"
+  check "labels: a drifted live label is reported and left alone" yes \
+    "$(grep -q "Label palette drift.* $first" "$WORK/seed.out" && ! grep -q "^create|$first|" "$slog" && echo yes || echo no)"
+  check "labels: the run summary's label table has one row per palette label" \
+    "$(awk -F'|' '/^[ \t]*#/ || /^[ \t]*$/ { next } NF == 5' "$PALETTE" | wc -l | tr -d ' ')" "$(grep -c '^| `' "$rt/labels-summary.md")"
+  r="$(labels_run_seed account none "$WORK/labels-all.json")"
+  check "labels: no palette file seeds nothing" "0|0" "$r"
+  check "labels: no palette file is announced, not treated as an error" yes "$(grep -q 'No .github/labels.txt on the default branch' "$WORK/seed.out" && echo yes || echo no)"
+  printf 'bug|d73a4a|kind|agent\n' > "$WORK/labels-bad.txt"
+  r="$(labels_run_seed account "$WORK/labels-bad.txt" "$WORK/labels-all.json")"
+  check "labels: a malformed palette fails the step before touching anything" "1|0" "$r"
+  check "labels: the malformed-palette error names the file" yes "$(grep -q '::error::.github/labels.txt is malformed' "$WORK/seed.out" && echo yes || echo no)"
+  r="$(labels_run_seed manual "$PALETTE" "$WORK/labels-all.json")"
+  check "labels: manual mode makes no API call" yes "$([ "$r" = "0|0" ] && [ ! -s "$slog" ] && echo yes || echo no)"
+  last="$(jq -r '.[-1].name' "$WORK/labels-all.json")"
+  r="$(labels_run_seed account "$PALETTE" "$WORK/labels-most.json" "$last")"
+  check "labels: a failed create warns and never fails the run" yes "$([ "${r%%|*}" = 0 ] && grep -q 'Some labels could not be added' "$WORK/seed.out" && echo yes || echo no)"
+}
+
+posting_section() {
+  # The posting toolkit owns every footer (identity tag, signature, metadata
+  # marker) and validates inline anchors against the real PR diff, so the
+  # mechanical failure classes (SHA transcription, wrong flag, heredoc
+  # corruption, out-of-hunk line) cannot reach the API.
+  local P="$SCRIPT_DIR/post" T="$WORK/posting" D="$WORK/posting.diff"
+  local out f rc bad r s wf
+  mkdir -p "$T/stubbin" "$T/nogh" "$T/repo/.github"
+  # The battery walks inside the fixture git repo; these fixtures carry a
+  # synthetic SHA, so run them where no repository can second-guess it.
+  cd "$T" || return 1
+  printf 'bug|d73a4a|kind|what it is\nPriority|e4e669|maintainer|maintainer only\nseverity: major|fbca04|severity|impact\n' > "$T/repo/.github/labels.txt"
+  cat > "$D" <<'POSTDIFF'
+diff --git a/src/app.py b/src/app.py
+index 1111111..2222222 100644
+--- a/src/app.py
++++ b/src/app.py
+@@ -1,4 +1,6 @@
+ line one
+-line two old
++line two new
++line three new
+ line three
+ line four
+diff --git a/img.png b/img.png
+Binary files a/img.png and b/img.png differ
+POSTDIFF
+  printf 'Found a real problem.\n' > "$T/body.md"
+  cat > "$T/footered.md" <<'POSTBODY'
+Found a real problem.
+
+_This review was generated by an AI assistant._
+<!-- last_reviewed_sha:abc1234 -->
+POSTBODY
+  printf '[]' > "$T/none.json"
+  printf '[{"path":"src/app.py","line":3,"body":"this line is fine"}]\n' > "$T/good.json"
+  printf '[{"path":"src/app.py","line":2,"side":"LEFT","body":"old line"}]\n' > "$T/left.json"
+  printf '[{"path":"src/app.py","line":99,"body":"wrong line"}]\n' > "$T/bad.json"
+  printf '[{"path":"img.png","subject_type":"file","body":"whole file"}]\n' > "$T/filelevel.json"
+  printf '{"path":"src/app.py","line":3,"body":"jsonl"}\n' > "$T/jsonl.json"
+  printf 'A title\n' > "$T/title.txt"
+  cat > "$T/stubbin/gh" <<'POSTGH'
+#!/usr/bin/env bash
+case "$*" in
+  *"label list"*) printf 'bug\nseverity: major\nPriority\nAgent Monitored\n' ;;
+  *) printf 'bug, severity: major\n' ;;
+esac
+POSTGH
+  cat > "$T/nogh/gh" <<'POSTNOGH'
+#!/usr/bin/env bash
+echo "stub gh: a dry-run must not call the API" >&2
+exit 99
+POSTNOGH
+  chmod +x "$T/stubbin/gh" "$T/nogh/gh"
+
+  bad=0
+  for s in "$P"/*.sh; do bash -n "$s" || bad=$((bad + 1)); done
+  check "posting: every script parses" "0" "$bad"
+
+  out=$(bash "$P/post-review.sh" "$T/body.md" "$T/good.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run 2>/dev/null)
+  check "posting: review carries the identity tag once" "1" "$(printf '%s' "$out" | jq -r '.body' | grep -cF '<!-- mirrobot:review -->' || true)"
+  check "posting: review carries the signature once" "1" "$(printf '%s' "$out" | jq -r '.body' | grep -cF '_This review was generated by an AI assistant._' || true)"
+  check "posting: review carries the SHA marker once" "1" "$(printf '%s' "$out" | jq -r '.body' | grep -cF '<!-- last_reviewed_sha:abc1234 -->' || true)"
+  check "posting: --sha overrides the marker and commit_id" "abc1234" "$(printf '%s' "$out" | jq -r '.commit_id')"
+  check "posting: the chosen event is honored" "COMMENT" "$(printf '%s' "$out" | jq -r '.event')"
+  out=$(bash "$P/post-review.sh" "$T/footered.md" "$T/none.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run 2>/dev/null)
+  check "posting: an existing footer is not duplicated" "1" "$(printf '%s' "$out" | jq -r '.body' | grep -cF 'last_reviewed_sha:abc1234' || true)"
+
+  bash "$P/post-review.sh" "$T/footered.md" "$T/none.json" --event COMMENT --sha deadbee --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>"$T/err"
+  check "posting: a conflicting marker is refused" "1" "$?"
+  check "posting: the conflict names both values" yes "$(grep -q 'declares last_reviewed_sha:abc1234' "$T/err" && echo yes || echo no)"
+  bash "$P/post-review.sh" "$T/body.md" "$T/none.json" --event NOPE --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: an invalid event is refused" "1" "$?"
+  bash "$P/post-review.sh" "$T/body.md" "$T/bad.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>"$T/err"
+  check "posting: an out-of-hunk line is refused" "1" "$?"
+  check "posting: the refusal names the nearest commentable line" yes "$(grep -q 'nearest below: 6' "$T/err" && echo yes || echo no)"
+  check "posting: the refusal offers the file-level fallback" yes "$(grep -q -- '--file-level' "$T/err" && echo yes || echo no)"
+  bash "$P/post-review.sh" "$T/body.md" "$T/left.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: LEFT-side lines are validated against the old side" "0" "$?"
+  bash "$P/post-review.sh" "$T/body.md" "$T/filelevel.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: a file-level remark on a binary file passes" "0" "$?"
+  bash "$P/post-review.sh" "$T/body.md" "$T/jsonl.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: a JSONL comments file is refused" "1" "$?"
+
+  out=$(bash "$P/post-inline.sh" src/app.py 3 "$T/body.md" --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run 2>/dev/null)
+  check "posting: standalone inline names the path" "src/app.py" "$(printf '%s' "$out" | jq -r '.path')"
+  bash "$P/post-inline.sh" src/app.py 99 "$T/body.md" --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: standalone inline validates its line" "1" "$?"
+
+  out=$(bash "$P/post-comment.sh" 7 "$T/body.md" --repo o/r --dry-run 2>/dev/null)
+  check "posting: comments travel as a body file" yes "$(printf '%s' "$out" | grep -q -- '--body-file' && echo yes || echo no)"
+  f=$(printf '%s' "$out" | sed -n 's/.*--body-file \([^ ]*\).*/\1/p')
+  check "posting: comment deliverables carry the signature" yes "$(grep -qF '_This response was generated by an AI assistant._' "$f" && echo yes || echo no)"
+  out=$(bash "$P/post-comment.sh" 7 "$T/body.md" --repo o/r --no-footer --dry-run 2>/dev/null)
+  f=$(printf '%s' "$out" | sed -n 's/.*--body-file \([^ ]*\).*/\1/p')
+  check "posting: --no-footer omits it (acks, progress)" no "$(grep -qF 'generated by an AI assistant' "$f" && echo yes || echo no)"
+  out=$(bash "$P/edit-comment.sh" 99 "$T/body.md" --repo o/r --dry-run 2>/dev/null)
+  check "posting: edits address the comment by id" yes "$(printf '%s' "$out" | grep -q 'issues/comments/99' && echo yes || echo no)"
+  out=$(bash "$P/edit-comment.sh" 99 "$T/body.md" --repo o/r --footer --dry-run 2>/dev/null)
+  f=$(printf '%s' "$out" | sed -n 's/^body=\(.*\)$/\1/p')
+  check "posting: a final ack edit can carry the signature" yes "$(grep -qF 'generated by an AI assistant' "$f" && echo yes || echo no)"
+
+  bash "$P/set-status.sh" success "All compliance checks passed" --sha abc1234 --repo o/r --dry-run 2>/dev/null | grep -q 'context=compliance-check'
+  check "posting: the compliance status uses the shared context" "0" "$?"
+  bash "$P/set-status.sh" success "All compliance checks passed" --sha abc1234 --repo o/r --target-url https://x/1 --dry-run 2>/dev/null | grep -q 'target_url=https://x/1'
+  check "posting: the status links to the report" "0" "$?"
+  bash "$P/set-status.sh" neutral desc --sha abc1234 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: an invalid status state is refused" "1" "$?"
+  long=$(printf 'x%.0s' $(seq 1 141))
+  bash "$P/set-status.sh" success "$long" --sha abc1234 --repo o/r --dry-run >/dev/null 2>&1
+  check "posting: a status description over 140 chars is refused" "1" "$?"
+
+  out=$(bash "$P/post-compliance.sh" "$T/body.md" --sha abc1234 --pr 5 --repo o/r --dry-run 2>/dev/null)
+  f=$(printf '%s' "$out" | sed -n 's/^body=\(.*\)$/\1/p')
+  check "posting: compliance carries its tag" yes "$(grep -qF '<!-- mirrobot:compliance -->' "$f" && echo yes || echo no)"
+  check "posting: compliance carries its marker" yes "$(grep -qF '<!-- compliance-check-id: 5-abc1234 -->' "$f" && echo yes || echo no)"
+  check "posting: compliance carries its signature" yes "$(grep -qF '_Compliance verification by AI agent' "$f" && echo yes || echo no)"
+
+  ( cd "$T/repo" && PATH="$T/stubbin:$PATH" bash "$P/edit-labels.sh" 5 --add bugg --repo o/r --dry-run ) >/dev/null 2>"$T/err"
+  check "posting: an unknown label is refused" "1" "$?"
+  check "posting: the refusal suggests close matches" yes "$(grep -qi 'did you mean: bug' "$T/err" && echo yes || echo no)"
+  ( cd "$T/repo" && PATH="$T/stubbin:$PATH" bash "$P/edit-labels.sh" 5 --add Priority --repo o/r --dry-run ) >/dev/null 2>&1
+  check "posting: a maintainer label needs an explicit flag" "1" "$?"
+  ( cd "$T/repo" && PATH="$T/stubbin:$PATH" bash "$P/edit-labels.sh" 5 --add "severity: major" --repo o/r --dry-run ) 2>/dev/null | grep -q 'POST /repos/o/r/issues/5/labels'
+  check "posting: a valid label plan is emitted" "0" "$?"
+  ( cd "$T/repo" && PATH="$T/stubbin:$PATH" bash "$P/edit-labels.sh" 5 --add Priority --allow-maintainer --repo o/r --dry-run ) 2>/dev/null | grep -q '"Priority"'
+  check "posting: --allow-maintainer permits it when a maintainer asked" "0" "$?"
+
+  bash "$P/create-pr.sh" "$T/title.txt" "$T/body.md" --base main --repo o/r --dry-run | grep -q -- '--body-file'
+  check "posting: PR bodies travel as a file" "0" "$?"
+  bash "$P/create-issue.sh" "$T/title.txt" "$T/body.md" --repo o/r --dry-run | grep -q -- '--title'
+  check "posting: issue titles come from a file" "0" "$?"
+
+  bash "$P/artifact-footer.sh" review abc1234 | grep -qF '<!-- mirrobot:review -->'
+  check "posting: footer helper (review)" "0" "$?"
+  bash "$P/artifact-footer.sh" compliance abc1234 --pr 5 | grep -qF '<!-- compliance-check-id: 5-abc1234 -->'
+  check "posting: footer helper (compliance)" "0" "$?"
+  bash "$P/artifact-footer.sh" comment | grep -qF '_This response was generated'
+  check "posting: footer helper (comment)" "0" "$?"
+
+  out=$(DISCUSSION_NODE_ID=DC_x DISCUSSION_REPLY_TO_NODE=DC_y bash "$P/post-discussion.sh" "$T/body.md" --dry-run 2>/dev/null)
+  check "posting: discussion replies bind the body as a file" yes "$(printf '%s' "$out" | grep -q -- '-F b=@' && echo yes || echo no)"
+  check "posting: discussion replies anchor to the trigger comment" yes "$(printf '%s' "$out" | grep -q 'reply_to=DC_y' && echo yes || echo no)"
+
+  mkdir -p "$T/git" && git -C "$T/git" init -q
+  ( cd "$T/git" && bash "$P/post-review.sh" "$T/body.md" "$T/none.json" --event COMMENT --sha deadbeef --diff "$D" --pr 5 --repo o/r --dry-run ) >/dev/null 2>"$T/err"
+  check "posting: an unknown SHA is refused unless explicitly allowed" "1" "$?"
+  check "posting: the refusal says how to proceed" yes "$(grep -q 'allow-missing-sha' "$T/err" && echo yes || echo no)"
+
+  bad=0
+  PATH="$T/nogh:$PATH" bash "$P/post-review.sh" "$T/body.md" "$T/none.json" --event COMMENT --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/post-inline.sh" src/app.py 3 "$T/body.md" --sha abc1234 --diff "$D" --pr 5 --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/post-comment.sh" 7 "$T/body.md" --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/post-discussion.sh" "$T/body.md" --discussion DC_x --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/set-status.sh" success desc --sha abc1234 --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/post-compliance.sh" "$T/body.md" --sha abc1234 --pr 5 --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/create-pr.sh" "$T/title.txt" "$T/body.md" --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/create-issue.sh" "$T/title.txt" "$T/body.md" --repo o/r --dry-run >/dev/null 2>&1 || bad=1
+  PATH="$T/nogh:$PATH" bash "$P/artifact-footer.sh" review abc1234 >/dev/null 2>&1 || bad=1
+  check "posting: dry-runs never call the API" "0" "$bad"
+
+  check "posting: no script takes an inline body" "0" "$(grep -REc -- '(-f +body=|--body[ =])' "$P"/*.sh | awk -F: '{ s += $2 } END { print s + 0 }')"
+  check "posting: the tag constants live in one file" "1" "$(grep -l '^REVIEW_TAG=' "$P"/*.sh | wc -l | tr -d ' ')"
+  check "posting: the compliance tag lives in one file" "1" "$(grep -l '^COMPLIANCE_TAG=' "$P"/*.sh | wc -l | tr -d ' ')"
+
+  bad=0
+  for wf in pr-review bot-reply bot-reply-guest compliance-check issue-comment; do
+    grep -q 'cp -r .github/scripts/post /tmp/post' "$SCRIPT_DIR/../workflows/$wf.yml" || bad=$((bad + 1))
+    grep -q '/tmp/post/\*.sh' "$SCRIPT_DIR/../workflows/$wf.yml" || bad=$((bad + 1))
+  done
+  check "posting: every lane stages the toolkit before checkout" "0" "$bad"
+
+  check "posting: the review verifier expects the identity tag" yes "$(grep -q "EXPECTED_TAG='<!-- mirrobot:review -->'" "$SCRIPT_DIR/../workflows/pr-review.yml" && echo yes || echo no)"
+  check "posting: the review verifier strips a stale tag before repair" "2" "$(grep -c 'mirrobot:review\\s' "$SCRIPT_DIR/../workflows/pr-review.yml" || true)"
+  check "posting: the review verifier rechecks the tag after repair" "2" "$(grep -c 'recheck.*EXPECTED_TAG' "$SCRIPT_DIR/../workflows/pr-review.yml" || true)"
+  check "posting: the compliance template carries its identity tag" yes "$(grep -q '^          <!-- mirrobot:compliance -->$' "$SCRIPT_DIR/../workflows/compliance-check.yml" && echo yes || echo no)"
+  check "posting: compliance selection requires a tag, marker or signature" "2" "$(grep -c 'contains("<!-- mirrobot:compliance -->")' "$SCRIPT_DIR/../workflows/compliance-check.yml" || true)"
+  check "posting: an untagged compliance report fails the gate" yes "$(grep -q '::error::No compliance report found from this run' "$SCRIPT_DIR/../workflows/compliance-check.yml" && echo yes || echo no)"
+  check "posting: review detection has no prose-phrase fallback" "0" "$(grep -c 'latest_phrase\|has_phrase' "$SCRIPT_DIR/../workflows/bot-reply.yml" || true)"
+  # Compliance is a one-artifact lane: its verifier reads the tagged report,
+  # so the lane carries no posting or communication craft and no reactions.
+  check "posting: compliance carries no posting, communication or reaction machinery" "0" \
+    "$(cat "$SCRIPT_DIR"/../prompts/manifests/compliance-*.manifest | tr -d '\r' | grep -cE '^(posting|communication|reactions)$' || true)"
+  check "posting: the compliance mission names the report as the only comment" yes \
+    "$(grep -q 'The report is the only comment you post on this run' "$SCRIPT_DIR/../prompts/parts/mission-compliance.md" && echo yes || echo no)"
+  check "posting: review lanes carry no reaction section" "0" \
+    "$(cat "$SCRIPT_DIR"/../prompts/manifests/pr-review-*.manifest | tr -d '\r' | grep -c '^reactions$' || true)"
+}
+
 # ---- section selectors (dev-loop speed; CI runs everything) -----------------
 # Usage: scrub-fixtures.sh [--only <substr>] [--quick] [--list] [--timing]
 #   --only  : run only sections whose header matches the substring; the git
@@ -845,6 +1164,42 @@ fi
 section_end
 fi
 
+# ---- content-pack skill exclusions: this installation's lens ----------------
+# The library is shared with the operator's own sessions; mirrobot excludes the
+# skills that cannot work as an asynchronous GitHub agent (a logged-in browser,
+# a human to interview, a separate audit workflow).
+packs_exclude_checks() {
+  local EXCL="$SCRIPT_DIR/../content-packs.exclude.txt" PY="" got cand
+  local T="$WORK/pack-exclude"
+  check "packs: the exclusion file is committed" yes "$([ -f "$EXCL" ] && echo yes || echo no)"
+  check "packs: the exclusion list names the six skills that cannot run async" "browse domain-modeling grill-with-docs grilling improve-codebase-architecture security-audit " \
+    "$(grep -v '^[[:space:]]*#' "$EXCL" 2>/dev/null | grep -v '^[[:space:]]*$' | sort | tr '\n' ' ')"
+  check "packs: the installer reads the base-branch exclusion file" yes \
+    "$(grep -q 'content-packs.exclude.txt' "$PACKS" && echo yes || echo no)"
+  check "packs: excluded skills never enter the skill plan" yes \
+    "$(grep -q 'if name in excluded:' "$PACKS" && echo yes || echo no)"
+  check "packs: install removes an excluded skill from the home" yes \
+    "$(grep -q 'remove_tree(SKILLS_HOME / name)' "$PACKS" && echo yes || echo no)"
+  for cand in python3 python; do "$cand" -c 'import sys' >/dev/null 2>&1 && { PY=$cand; break; }; done
+  if [ -z "$PY" ]; then
+    check "packs: the exclusion plan is executed" ran "SKIP: no python"
+    return 0
+  fi
+  mkdir -p "$T/ws/.github" "$T/pack/.agents/skills/browse" "$T/pack/.agents/skills/keepme"
+  printf 'browse\n' > "$T/ws/.github/content-packs.exclude.txt"
+  printf -- '---\nname: browse\ndescription: x\n---\n' > "$T/pack/.agents/skills/browse/SKILL.md"
+  printf -- '---\nname: keepme\ndescription: y\n---\n' > "$T/pack/.agents/skills/keepme/SKILL.md"
+  got=$(GITHUB_WORKSPACE="$T/ws" "$PY" - "$PACKS" "$T/pack" <<'PYEOF'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("packs", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(",".join(sorted(module.skill_plan([{"root": sys.argv[2]}]))))
+PYEOF
+)
+  check "packs: the plan keeps included skills and drops excluded ones" "keepme" "$got"
+}
+
 # ---- bot-setup: mask sweep + plugins materialization + drift scope -----------
 SECTION_NAME='bot-setup: mask sweep + plugins materialization + drift scope'
 if [ "$PARALLEL" = 1 ]; then
@@ -869,6 +1224,7 @@ check "setup: lanes grant actions: write for the SDK cache" yes "$(all=yes; for 
 check "openshare: export streams opencode output to a file" yes "$(grep -q 'stdout=fh' "$SCRIPT_DIR/../scripts/export-session.py" && echo yes || echo no)"
 check "setup: private pack links arrive through a secret input" yes "$(grep -q '^  private-content-packs:' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS: \${{ inputs.private-content-packs }}' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS' "$PACKS" && echo yes || echo no)"
 check "setup: no masking helper survives (the runner echoes action inputs too)" no "$(test -e "$SCRIPT_DIR/../actions/mask-values" && echo yes || echo no)"
+packs_exclude_checks
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
 # comparing against the whole file would false-warn on every repo whose
 # config lacks the example's providers/mcp/plugin shape.
@@ -917,6 +1273,7 @@ check "setup: lanes grant actions: write for the SDK cache" yes "$(all=yes; for 
 check "openshare: export streams opencode output to a file" yes "$(grep -q 'stdout=fh' "$SCRIPT_DIR/../scripts/export-session.py" && echo yes || echo no)"
 check "setup: private pack links arrive through a secret input" yes "$(grep -q '^  private-content-packs:' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS: \${{ inputs.private-content-packs }}' "$ACTION" && grep -q 'PRIVATE_CONTENT_PACKS' "$PACKS" && echo yes || echo no)"
 check "setup: no masking helper survives (the runner echoes action inputs too)" no "$(test -e "$SCRIPT_DIR/../actions/mask-values" && echo yes || echo no)"
+packs_exclude_checks
 # Drift check is PERMISSION-ONLY: the example is a full-config template, so
 # comparing against the whole file would false-warn on every repo whose
 # config lacks the example's providers/mcp/plugin shape.
@@ -2107,9 +2464,11 @@ check "home: PR-head sessions scrub the workspace"     yes "$(grep -q 'Scrub wor
 # thread-context block - the entire fetched THREAD_CONTEXT was exported and
 # never printed; the placeholder-coverage check cannot see exported-but-
 # unconsumed channels). Both conversational modes MUST print the wrapper.
-check "context: home prints the thread-context channel"  yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply | grep -q '<thread_context>' && echo yes || echo no)"
-check "context: guest prints the thread-context channel" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q '<thread_context>' && echo yes || echo no)"
-check "context: guest prints the summoner request block" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q 'new-request-from-user' && echo yes || echo no)"
+home_prompt="$(SKILLS_DIR="$WORK/skills-context-home" bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply)"
+guest_prompt="$(SKILLS_DIR="$WORK/skills-context-guest" bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest)"
+check "context: home prints the thread-context channel"  yes "$(printf '%s' "$home_prompt" | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the thread-context channel" yes "$(printf '%s' "$guest_prompt" | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the summoner request block" yes "$(printf '%s' "$guest_prompt" | grep -q 'new-request-from-user' && echo yes || echo no)"
 # Lost-in-surgery tripwires (live-caught 2026-09-15: the guest-strip deletion
 # range swallowed two HOME steps; the audit then read the post-loss state as
 # ground truth and the wiring was removed as "vestigial"). These pin the
@@ -2205,9 +2564,11 @@ check "home: PR-head sessions scrub the workspace"     yes "$(grep -q 'Scrub wor
 # thread-context block - the entire fetched THREAD_CONTEXT was exported and
 # never printed; the placeholder-coverage check cannot see exported-but-
 # unconsumed channels). Both conversational modes MUST print the wrapper.
-check "context: home prints the thread-context channel"  yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply | grep -q '<thread_context>' && echo yes || echo no)"
-check "context: guest prints the thread-context channel" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q '<thread_context>' && echo yes || echo no)"
-check "context: guest prints the summoner request block" yes "$(bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest | grep -q 'new-request-from-user' && echo yes || echo no)"
+home_prompt="$(SKILLS_DIR="$WORK/skills-context-home" bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply)"
+guest_prompt="$(SKILLS_DIR="$WORK/skills-context-guest" bash "$SCRIPT_DIR/assemble-prompt.sh" bot-reply-guest)"
+check "context: home prints the thread-context channel"  yes "$(printf '%s' "$home_prompt" | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the thread-context channel" yes "$(printf '%s' "$guest_prompt" | grep -q '<thread_context>' && echo yes || echo no)"
+check "context: guest prints the summoner request block" yes "$(printf '%s' "$guest_prompt" | grep -q 'new-request-from-user' && echo yes || echo no)"
 # Lost-in-surgery tripwires (live-caught 2026-09-15: the guest-strip deletion
 # range swallowed two HOME steps; the audit then read the post-loss state as
 # ground truth and the wiring was removed as "vestigial"). These pin the
@@ -3527,6 +3888,40 @@ else
 section_begin "$SECTION_NAME"
 if [ "$SECTION_ACTIVE" = 1 ]; then
 sdk_section
+fi
+section_end
+fi
+
+# ---- label palette: one file, seeded and rendered ---------------------------
+SECTION_NAME='label palette (one file: seed, render, grade)'
+if [ "$PARALLEL" = 1 ]; then
+  ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
+labels_section
+  fi
+  echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
+  ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
+  SECTIONS_N=$((SECTIONS_N + 1))
+else
+section_begin "$SECTION_NAME"
+if [ "$SECTION_ACTIVE" = 1 ]; then
+labels_section
+fi
+section_end
+fi
+
+# ---- posting toolkit: footers, markers, diff-validated anchors --------------
+SECTION_NAME='posting toolkit (footers, markers, anchors)'
+if [ "$PARALLEL" = 1 ]; then
+  ( _P0=$PASS; _F0=$FAIL; section_begin "$SECTION_NAME"; if [ "$SECTION_ACTIVE" = 1 ]; then
+posting_section
+  fi
+  echo "$((PASS - _P0)) $((FAIL - _F0))" > "$WORK/.pl-$SECTIONS_N.cnt"
+  ) >> "$WORK/.pl-$SECTIONS_N.log" 2>&1 &
+  SECTIONS_N=$((SECTIONS_N + 1))
+else
+section_begin "$SECTION_NAME"
+if [ "$SECTION_ACTIVE" = 1 ]; then
+posting_section
 fi
 section_end
 fi

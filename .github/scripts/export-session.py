@@ -439,6 +439,34 @@ def main(argv: list[str]) -> int:
     n_msgs = sum(1 for e in exports.values() for m in (e.get("messages") or []) if isinstance(m, dict))
     print(f"exported: {n_msgs} messages across {len(family)} session(s)")
 
+    # Skill load report: the assembler writes the skills a run declared
+    # required; the session log says which were actually loaded. A required
+    # skill that never loaded is a silent quality drop, so it warns.
+    required_path = Path(os.environ.get("RUNNER_TEMP", "/tmp")) / "mirrobot-skills-required.txt"
+    required = []
+    if required_path.is_file():
+        required = sorted({
+            line.strip()
+            for line in required_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            if line.strip()
+        })
+    loaded = sorted({
+        name
+        for e in exports.values()
+        for m in (e.get("messages") or [])
+        if isinstance(m, dict)
+        for p in (m.get("parts") or [])
+        if isinstance(p, dict) and p.get("type") == "tool" and p.get("tool") == "skill"
+        for name in [((p.get("state") or {}).get("input") or {}).get("name")]
+        if isinstance(name, str) and name.startswith("mirrobot-")
+    })
+    print(f"skills loaded: {', '.join(loaded) if loaded else 'none'}")
+    never_loaded = [s for s in required if s not in loaded]
+    if never_loaded:
+        msg = "required skill(s) never loaded: " + ", ".join(never_loaded)
+        warnings.append(msg)
+        print(f"::warning::{msg}")
+
     workdir = Path(tempfile.mkdtemp(prefix="osh-passive-"))
     snapshot_html: str | None = None
     snapshot_src = None
@@ -469,6 +497,7 @@ def main(argv: list[str]) -> int:
         "session_id": sid,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         **({"live": live} if live else {"live": None}),
+        "skills": {"loaded": loaded, "required": required},
         "snapshot": snapshot_src,
         **({"snapshot_note": snapshot_note} if snapshot_note else {}),
         "exports": exports,
@@ -504,6 +533,7 @@ def main(argv: list[str]) -> int:
         f"MRB2 encrypted: {meta_blob}",
         f"artifact: {art.name}",
         f"context: {live_desc}, snapshot={snapshot_src or 'none'}",
+        f"skills loaded: {', '.join(loaded) if loaded else 'none'}",
     ]
     meta_lines += [f"WARNING: {w}" for w in warnings]
     meta.write_text("\n".join(meta_lines) + "\n", encoding="utf-8")

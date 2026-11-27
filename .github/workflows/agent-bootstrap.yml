@@ -136,10 +136,12 @@ jobs:
           fi
           echo "Bootstrap complete."
 
-      - name: Seed label vocabulary (create-if-missing)
+      - name: Seed label palette (create-if-missing)
         # Labels are public repo metadata (unlike variables) - naming what
-        # was created is fine and useful. Existing labels are NEVER touched:
-        # a repo's own label customs always win over the seeded palette.
+        # was created is fine and useful. The palette is ONE committed file,
+        # .github/labels.txt on the default branch. Existing labels are NEVER
+        # touched: one that differs from the palette is reported, not
+        # overwritten.
         env:
           GH_TOKEN: ${{ secrets.ACCOUNT_GH_TOKEN || steps.app_token.outputs.token }}
           REPO: ${{ github.repository }}
@@ -150,15 +152,32 @@ jobs:
             echo "::notice::No bot token available - labels not seeded (re-run bootstrap after adding a bot identity, or create them from the run summary's label table)."
             exit 0
           fi
-          # name|color|description (GitHub-standard labels keep their
-          # canonical colors/descriptions; the rest follow the prefix
-          # conventions of the agent's triage vocabulary). Quoted heredoc:
-          # descriptions may contain apostrophes.
-          EXISTING=$(gh label list -R "$REPO" --limit 200 --json name --jq '.[].name')
+          # This workflow has no checkout: read the palette through the API.
+          # No file = labeling is off. A malformed file is an error: seeding
+          # half a palette is worse than seeding none.
+          PALETTE="$RUNNER_TEMP/labels.txt"
+          DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq .default_branch)
+          { gh api "repos/$REPO/contents/.github/labels.txt?ref=$DEFAULT_BRANCH" --jq .content 2>/dev/null || true; } | base64 -d | tr -d '\r' > "$PALETTE"
+          if [ ! -s "$PALETTE" ]; then
+            echo "::notice::No .github/labels.txt on the default branch: no label palette to seed."
+            printf '%s\n\n%s\n' "### Labels" "No \`.github/labels.txt\` on the default branch: no label palette is configured, and the agent does not label." > "$RUNNER_TEMP/labels-summary.md"
+            exit 0
+          fi
+          if ! awk -F'|' '/^[ \t]*#/ || /^[ \t]*$/ { next } NF != 5 || $1 == "" || length($5) > 100 { print "  " $0; bad = 1 } END { exit bad }' "$PALETTE"; then
+            echo "::error::.github/labels.txt is malformed (each line: name|color|class|who|description; description at most 100 characters). No labels were touched."
+            exit 1
+          fi
+          # name|color|class|who|description
+          EXISTING=$(gh label list -R "$REPO" --limit 200 --json name,color,description)
           CREATED=0
-          while IFS='|' read -r name color desc; do
-            [ -z "$name" ] && continue
-            if printf '%s\n' "$EXISTING" | grep -qxF "$name"; then
+          DRIFT=""
+          while IFS='|' read -r name color class who desc || [ -n "${name:-}" ]; do
+            case "$name" in ''|'#'*) continue ;; esac
+            live=$(printf '%s' "$EXISTING" | jq -r --arg n "$name" '.[] | select(.name == $n) | "\(.color)|\(.description)"')
+            if [ -n "$live" ]; then
+              if [ "${live%%|*}" != "$(printf '%s' "$color" | tr 'A-F' 'a-f')" ] || [ "${live#*|}" != "$desc" ]; then
+                DRIFT="$DRIFT $name"
+              fi
               continue
             fi
             if gh label create "$name" -R "$REPO" --color "$color" --description "$desc" >/dev/null 2>&1; then
@@ -166,39 +185,32 @@ jobs:
             else
               LABEL_FAILED=1
             fi
-          done <<'LABELS_EOF'
-          bug|d73a4a|Something isn't working
-          duplicate|cfd3d7|This issue or pull request already exists
-          enhancement|a2eeef|New feature or request
-          documentation|0075ca|Improvements or additions to documentation
-          question|d876e3|Support ask or clarification
-          invalid|e4e669|This doesn't seem right
-          wontfix|ffffff|This will not be worked on
-          help wanted|008672|Extra attention is needed
-          good first issue|7057ff|Good for newcomers
-          severity: critical|b60205|Agent severity: critical
-          severity: major|ff7518|Agent severity: major
-          severity: minor|fbca04|Agent severity: minor
-          severity: info|1d76db|Agent severity: info
-          confirmed|0e8a16|Verified by the agent's analysis
-          as-designed|9e9e9e|Behavior is intended; not a bug
-          needs-info|fef2c0|Blocked on more information from the filer
-          needs-decision|d4c5f9|Awaiting a maintainer decision
-          already-fixed|bfd4f2|Fixed on a branch, PR, or release; nothing left to do here
-          accepted|207de5|Feature request evaluated and worth building
-          wish|bfe5bf|Not on the roadmap; maybe someday
-          Agent Monitored|5319e7|Collaborator-applied: PR watched by the agent (the agent never applies this)
-          LABELS_EOF
+          done < "$PALETTE"
+          if [ -n "$DRIFT" ]; then
+            echo "::notice::Label palette drift: these live labels differ from .github/labels.txt in color or description (left untouched; the file is the source):$DRIFT"
+          fi
           if [ "${LABEL_FAILED:-0}" = "1" ]; then
             echo "::warning::Some labels could not be added (token may lack label access). Existing labels were untouched."
           fi
           echo "Label seeding done. New labels: $CREATED (existing untouched)."
+          # The run summary's label table comes from the same file.
+          {
+            echo "### Labels"
+            echo
+            echo "One file, \`.github/labels.txt\` on the default branch, is the whole palette: edit it to change what is seeded and what the agent may apply. Agent Bootstrap creates missing labels and never overwrites existing ones."
+            echo
+            echo "| Label | Applied by | Meaning |"
+            echo "|---|---|---|"
+            awk -F'|' '/^[ \t]*#/ || /^[ \t]*$/ { next } { printf "| `%s` | %s | %s |\n", $1, ($4 == "agent" ? "the agent" : "maintainer only"), $5 }' "$PALETTE"
+          } > "$RUNNER_TEMP/labels-summary.md"
 
       - name: Static configuration checklist
         # STATIC documentation only - identical output on every repo, every
-        # run. Reveals nothing about actual state (by design AND by
-        # impossibility: the secrets API requires a user token no workflow
-        # here holds, so presence cannot be probed even if we wanted to).
+        # run (the label table is generated from the committed palette file,
+        # so it is static too). Reveals nothing about actual state (by
+        # design AND by impossibility: the secrets API requires a user token
+        # no workflow here holds, so presence cannot be probed even if we
+        # wanted to).
         if: always()
         run: |
           cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
@@ -246,15 +258,14 @@ jobs:
           gh secret set OPENCODE_MODEL        -R <owner>/<repo> --body "provider/model"   # only when the config has no "model"
           gh secret set OPENCODE_CONFIG_JSON  -R <owner>/<repo> < config.min.json
           ```
-
-          ### Labels
-
-          The bootstrap also seeds the triage label vocabulary (existing labels untouched — your repo's own labels always win). The issue-analysis agent applies these automatically; maintainers can use them freely:
-
-          - **Kind:** `bug` `duplicate` `enhancement` `documentation` `question` `invalid` `wontfix` (+ `help wanted`, `good first issue` for contributors)
-          - **Severity (agent-applied with the verdict):** `severity: critical` `severity: major` `severity: minor` `severity: info`
-          - **Triage state:** `confirmed` `as-designed` `needs-info` `needs-decision` `already-fixed` `accepted` `wish`
-          - **Collaborator-only:** `Agent Monitored` (marks PRs watched by the agent — the agent itself never applies it)
+          EOF
+          if [ -s "$RUNNER_TEMP/labels-summary.md" ]; then
+            cat "$RUNNER_TEMP/labels-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "### Labels" >> "$GITHUB_STEP_SUMMARY"
+            echo "The label palette (.github/labels.txt on the default branch) was not read in this run; see the seeding step above." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
 
           ### Manual variable seeding (if the seeding step could not run)
 

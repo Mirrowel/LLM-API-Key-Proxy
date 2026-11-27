@@ -1,0 +1,16 @@
+# Skills from content packs that this installation must not load.
+# One skill directory name per line; # comments allowed.
+# Missing file = nothing excluded. The installer reads this from the base
+# branch, before any PR-head checkout, so a pull request cannot change it.
+#
+# The exclusions are the skills that cannot work as an asynchronous GitHub
+# agent: browse needs the operator's own logged-in browser, grilling,
+# grill-with-docs and improve-codebase-architecture interview a human, and
+# domain-modeling and security-audit belong to their own workflows. Everything
+# else ships as-is.
+browse
+grilling
+grill-with-docs
+improve-codebase-architecture
+domain-modeling
+security-audit

@@ -24,7 +24,7 @@ Implement a change: fix, add, modify code. Complete only when the change is DELI
 3. **Implement** with file tools; conventional commits (`fix:`, `feat:`; subject says what, ideally why).
 4. **Self-review** the diff; run touched tests.
 5. **Commit & push:** at home, no completion without a successful push; as a guest, push only when a write key explicitly covers it (their fork's branch, asked for by name); otherwise the patch in the thread IS the completion.
-6. **PR from an issue** (`gh pr create --title ... --body-file /tmp/pr-body.md`, body links back `Closes #N`, stands alone: what/why/how-tested): home lanes; abroad, PR creation is a keyed write, not a default step.
+6. **PR from an issue** (title first line to `/tmp/pr-title.txt`, body to `/tmp/pr-body.md`, then `/tmp/post/create-pr.sh /tmp/pr-title.txt /tmp/pr-body.md`; body links back `Closes #N`, stands alone: what/why/how-tested): home lanes; abroad, PR creation is a keyed write, not a default step.
 7. **Report** with the deliverable link (PR/commit, or the patch's thread location); without a concrete deliverable the task is incomplete. Plus what changed, how verified, warnings.
 
 ## Boundaries
