@@ -127,7 +127,7 @@ THREAD_COMMENT_FETCH=$(( THREAD_COMMENT_FETCH * 3 )); [ "$THREAD_COMMENT_FETCH" 
 
 # Noise-filter configuration (repo variables; see header).
 CONTEXT_IGNORE_AUTHORS="${CONTEXT_IGNORE_AUTHORS:-}"
-DEFAULT_FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review"]'
+DEFAULT_FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review","<!-- coderabbit-ai-generated","This is an auto-generated comment","actionable comments posted","review in progress by","\\[vc\\]: #","<!-- linear-linkback"]'
 if [ -n "${CONTEXT_FILTER_PATTERNS_JSON:-}" ]; then
   if printf '%s' "$CONTEXT_FILTER_PATTERNS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
     FILTER_PATTERNS_JSON="$CONTEXT_FILTER_PATTERNS_JSON"
@@ -138,6 +138,18 @@ if [ -n "${CONTEXT_FILTER_PATTERNS_JSON:-}" ]; then
 else
   FILTER_PATTERNS_JSON="$DEFAULT_FILTER_PATTERNS_JSON"
 fi
+
+# Known AI code reviewers: their top-level summaries and review bodies are
+# collapsed to one line; their inline comments are the findings and stay.
+# bot-setup exports AI_REVIEWERS_JSON; this fallback keeps local runs and the
+# fixture harness working. Matching is case-insensitive and ignores a
+# trailing "[bot]".
+AI_REVIEWERS_JSON="${AI_REVIEWERS_JSON:-}"
+if ! printf '%s' "$AI_REVIEWERS_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  AI_REVIEWERS_JSON=$(printf '%s' "coderabbitai chatgpt-codex-connector copilot-pull-request-reviewer copilot greptile-apps greptile-ai cursor claude sourcery-ai sourcery-ai-experiments qodo-code-review qodo-free-for-open-source-projects qodo-merge qodo-merge-pro qodo-ai codium-pr-agent cubic-dev-ai gemini-code-assist" \
+    | tr ' ' '\n' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)')
+fi
+AI_SUMMARY_NOTE="[automated code-reviewer summary suppressed; its inline comments are kept - fetch the body only if it matters]"
 
 # QUERY_REPO: optional OWNER/NAME override for guest (foreign) PR threads -
 # same pattern as minimized-nodes.sh. Never override GITHUB_REPOSITORY itself
@@ -266,7 +278,7 @@ rv_short=$(printf '%s' "$pr_node" | jq --argjson agentbots "$BOT_NAMES_JSON" --a
   def is_own: ((.author.login? // "" | ascii_downcase) as $l | $agentbots | index($l)) != null;
   def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
   ([(.reviews.nodes // [])[] | select(is_own and (.isMinimized != true))] | length) as $own |
-  ([(.reviews.nodes // [])[] | select((is_own|not) and (.isMinimized != true) and (noisy|not) and ((((.author.login? // "unknown")|ascii_downcase) as $l | $ig | index($l))|not))] | length) as $other |
+  ([(.reviews.nodes // [])[] | select((is_own|not) and (.isMinimized != true) and ((((.author.login? // "unknown")|ascii_downcase) as $l | $ig | index($l))|not))] | length) as $other |
   if ($own < $limOwn or $other < $limReviews) then "short" else "ok" end')
 if [ "$rv_short" = "short" ] \
    && [ "$(printf '%s' "$pr_node" | jq '.reviews.nodes | length')" -ge "$REV_FETCH" ] \
@@ -284,12 +296,15 @@ fi
 thread_context=$(printf '%s' "$discussion_data" | jq -r \
   --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
   --argjson patterns "$FILTER_PATTERNS_JSON" \
+  --argjson ai "$AI_REVIEWERS_JSON" \
+  --arg aiNote "$AI_SUMMARY_NOTE" \
   --argjson limComments "$LIM_COMMENTS" \
   --argjson bodyChars "$LIM_BODY_CHARS" \
   --arg exclude_ids "$EXCLUDE_COMMENT_IDS" '
   ($ignore_authors | split(",") | map(select(length > 0))) as $ignored |
   def clip($s): if ($s | length) > $bodyChars then ($s[0:$bodyChars] + "\n[body truncated]") else $s end;
   def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
+  def is_ai: ((.author.login? // "" | ascii_downcase | sub("\\[bot\\]$"; "")) as $l | $ai | index($l)) != null;
   (.data.repository.pullRequest.comments.nodes // [])
   | map(select(
       (.isMinimized != true)
@@ -299,7 +314,7 @@ thread_context=$(printf '%s' "$discussion_data" | jq -r \
     ))
   | if length > $limComments then .[($limComments * -1):] else . end
   | if length > 0 then
-      map("- [id " + ((.databaseId // "?") | tostring) + "] " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + clip((.body // "") | tostring) + "\n")
+      map("- [id " + ((.databaseId // "?") | tostring) + "] " + (.author.login? // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + (if is_ai then $aiNote else clip((.body // "") | tostring) end) + "\n")
       | join("")
     else "No general comments."
     end
@@ -317,6 +332,8 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   --argjson agentbots "$BOT_NAMES_JSON" \
   --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
   --argjson patterns "$FILTER_PATTERNS_JSON" \
+  --argjson ai "$AI_REVIEWERS_JSON" \
+  --arg aiNote "$AI_SUMMARY_NOTE" \
   --argjson count "$ELEVATED_COUNT" \
   --argjson limReviews "$LIM_REVIEWS" \
   --argjson limOwn "$LIM_OWN" \
@@ -330,6 +347,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
   (.data.repository.pullRequest) as $pr |
   def is_own: ((.author.login? // "" | ascii_downcase) as $l | $agentbots | index($l)) != null;
+  def is_ai: ((.author.login? // "" | ascii_downcase | sub("\\[bot\\]$"; "")) as $l | $ai | index($l)) != null;
   # ---- flat comments with their thread context attached --------------------
   (($pr.reviewThreads.nodes // [])
     | to_entries
@@ -352,7 +370,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
   # present oldest-first, everywhere).
   (($pr.reviews.nodes // []) | sort_by(.submittedAt) | reverse) as $reviews_new |
   ([ $reviews_new[] | select(is_own and (.isMinimized != true)) ] | .[0:$limOwn]) as $own_sel |
-  ([ $reviews_new[] | select((is_own | not) and (.isMinimized != true) and (noisy | not) and (((.author.login? // "unknown" | ascii_downcase) as $login | $ignored | index($login)) | not)) ] | .[0:$limReviews]) as $other_sel |
+  ([ $reviews_new[] | select((is_own | not) and (.isMinimized != true) and (((.author.login? // "unknown" | ascii_downcase) as $login | $ignored | index($login)) | not)) ] | .[0:$limReviews]) as $other_sel |
   (($own_sel + $other_sel) | unique_by(.databaseId) | sort_by(.submittedAt) | reverse) as $selected_new |
   ($selected_new | sort_by(.submittedAt)) as $selected |
   ($selected_new | map(select(is_own))) as $agent_reviews_new |
@@ -406,7 +424,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     | . as $r
     | (rv_alloc($r.databaseId; false)) as $lines
     | "- " + (.author.login? // "unknown") + " at " + (.submittedAt // "N/A") + " - " + (.state // "UNKNOWN") + " <" + (.url // "") + ">\n"
-      + (clip((.body // "") | tostring) | if length > 0 then "  " + . + "\n" else "" end)
+      + ((if (is_ai or noisy) then $aiNote else clip((.body // "") | tostring) end) | if length > 0 then "  " + . + "\n" else "" end)
       + (if ($lines | length) > 0 then "  Inline comments:\n" + ($lines | map(fmt_c) | join("\n")) + "\n" else "  (no active inline comments)\n" end)
   ] | join("") as $othertext |
   ([ $allc[] | select((cmt_ok and (thread_ok and cmt_fresh)) | not) ] | length) as $n_filtered |
@@ -416,7 +434,7 @@ if ! agent_blocks=$(printf '%s' "$discussion_data" | jq -r \
     threadreviews: ((if ($othertext | length) > 0 then $othertext else "No formal reviews." end)
    + (if ($unlinked | length) > 0 then "\nStandalone inline comments (no review):\n" + ($unlinked | join("\n")) + "\n" else "" end)
    + (($selected | map(select(is_own | not))) | dismissed_note)),
-    filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, stale anchors, or minimized comments in active threads); hidden (minimized) content excluded everywhere, own reviews included; AI-reviewer noise posts (rate-limit/skip notices) and ignored authors dropped. The elevated block bypasses only the resolved/outdated filter, on purpose. Context budget (newest-N selected after filtering, rendered chronologically): " + ($limReviews | tostring) + " reviews + " + ($limOwn | tostring) + " own safeguard, " + ($limThreadsPerReview | tostring) + " threads/review, " + ($limThreadComments | tostring) + " replies/thread, " + ($limOrphanThreads | tostring) + " orphan threads.</filtering_summary>")
+    filter_summary: ("<filtering_summary>Context filtering applied: " + ($n_filtered | tostring) + " inline comment(s) excluded (resolved/outdated/hidden threads, stale anchors, or minimized comments in active threads); hidden (minimized) content excluded everywhere, own reviews included; AI-reviewer noise posts (rate-limit/skip notices) and ignored authors dropped; AI-reviewer summary bodies are collapsed to one line (their inline comments are kept). The elevated block bypasses only the resolved/outdated filter, on purpose. Context budget (newest-N selected after filtering, rendered chronologically): " + ($limReviews | tostring) + " reviews + " + ($limOwn | tostring) + " own safeguard, " + ($limThreadsPerReview | tostring) + " threads/review, " + ($limThreadComments | tostring) + " replies/thread, " + ($limOrphanThreads | tostring) + " orphan threads.</filtering_summary>")
   }
 '); then
   echo "::warning::Discussion block formatting failed for PR #$PR_NUMBER"

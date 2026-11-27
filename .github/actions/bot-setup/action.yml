@@ -371,6 +371,20 @@ runs:
         # jq . ~/.config/opencode/opencode.json
         # echo "----------------------------------------"
         echo "Successfully generated OpenCode configuration."
+        # Prompt assembly installs the skills its manifests declare. It is
+        # opt-in (a local preview must never write into a real config), and
+        # the target is the standard global config dir opencode scans.
+        {
+          echo "SKILLS_INSTALL=1"
+          echo "SKILLS_DIR=$HOME/.config/opencode/skills"
+        } >> "$GITHUB_ENV"
+        # Known AI code reviewers: the thread-context renderers collapse their
+        # summary bodies to one line and keep their inline comments (the
+        # findings). Registry-following list (CodeRabbit, Codex, Copilot,
+        # Greptile, Cursor/Bugbot, Claude, Sourcery, Qodo, cubic, Gemini);
+        # matching ignores a trailing "[bot]".
+        AI_REVIEWERS='coderabbitai chatgpt-codex-connector copilot-pull-request-reviewer copilot greptile-apps greptile-ai cursor claude sourcery-ai sourcery-ai-experiments qodo-code-review qodo-free-for-open-source-projects qodo-merge qodo-merge-pro qodo-ai codium-pr-agent cubic-dev-ai gemini-code-assist'
+        echo "AI_REVIEWERS_JSON=$(printf '%s' "$AI_REVIEWERS" | tr ' ' '\n' | awk 'NF' | jq -R . | jq -sc 'map(ascii_downcase)')" >> "$GITHUB_ENV"
 
     - name: Install content packs and mask credential leaves
       shell: bash

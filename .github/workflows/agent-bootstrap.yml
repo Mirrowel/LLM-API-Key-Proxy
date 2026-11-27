@@ -113,7 +113,7 @@ jobs:
             [BOT_IDENTITIES]="$IDENT_SEED"
             [BOT_TRIGGERS]="mirrobot, mirrobot-agent"
             [CONTEXT_LIMITS_JSON]='{"comments":30,"reviews":15,"own-reviews":5,"threads-per-review":25,"thread-comments":10,"orphan-threads":20,"orphan-thread-comments":10,"discussion-threads":40,"discussion-replies":30,"body-chars":4000}'
-            [CONTEXT_FILTER_PATTERNS_JSON]='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review"]'
+            [CONTEXT_FILTER_PATTERNS_JSON]='["rate limited by coderabbit\\.ai","No actionable comments","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review","<!-- coderabbit-ai-generated","This is an auto-generated comment","actionable comments posted","review in progress by","\\[vc\\]: #","<!-- linear-linkback"]'
             [FOREIGN_MENTIONS_ENABLED]="false"
             [OPENSHARE_PASSIVE]="true"
             [OPEN_TRIGGERING]="true"

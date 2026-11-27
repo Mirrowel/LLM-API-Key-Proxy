@@ -221,6 +221,7 @@ jobs:
         id: issue_details
         env:
           GH_TOKEN: ${{ steps.setup.outputs.token }}
+          CONTEXT_FILTER_PATTERNS_JSON: ${{ vars.CONTEXT_FILTER_PATTERNS_JSON }}
         run: |
           # Fetch all necessary data in one call
           issue_data=$(gh issue view $ISSUE_NUMBER --json author,title,body,createdAt,state,comments)
@@ -237,11 +238,28 @@ jobs:
           title=$(echo "$issue_data" | jq -r .title)
           body=$(echo "$issue_data" | jq -r '.body // "(No description provided)"')
 
-          # Prepare comments (exclude ignored bots)
+          # Prepare comments (ignored bots + AI-reviewer noise; AI summaries
+          # collapse to one line, their findings are the inline threads).
+          if ! printf '%s' "${CONTEXT_FILTER_PATTERNS_JSON:-}" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review","<!-- coderabbit-ai-generated","This is an auto-generated comment","actionable comments posted","review in progress by","\\[vc\\]: #","<!-- linear-linkback"]'
+          else
+            FILTER_PATTERNS_JSON="$CONTEXT_FILTER_PATTERNS_JSON"
+          fi
           total_issue_comments=$(echo "$issue_data" | jq '((.comments // []) | length)')
           echo "Debug: total issue comments before filtering = $total_issue_comments"
           comments_filter_err=$(mktemp 2>/dev/null || echo "/tmp/issue_comments_filter_err.log")
-          if comments=$(echo "$issue_data" | jq -r --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" 'if (((.comments // []) | length) > 0) then ((.comments[]? | select((.author.login // "" | ascii_downcase) as $login | ($ignore_authors | split(",") | map(select(length > 0)) | index($login)) | not)) | "- [id " + ((.id // "?") | tostring) + "] " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + ((.body // "") | tostring) + "\n") else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
+          if comments=$(echo "$issue_data" | jq -r \
+            --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
+            --argjson patterns "$FILTER_PATTERNS_JSON" \
+            --argjson ai "${AI_REVIEWERS_JSON:-[]}" \
+            --arg aiNote "[automated code-reviewer summary suppressed; its inline comments are kept - fetch the body only if it matters]" '
+            if (((.comments // []) | length) > 0) then
+              ((.comments[]?
+                | select((.author.login // "" | ascii_downcase) as $login | ($ignore_authors | split(",") | map(select(length > 0)) | index($login)) | not)
+                | select((((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0)) | not))
+                | . as $c
+                | "- [id " + (($c.id // "?") | tostring) + "] " + ($c.author.login // "unknown") + " at " + ($c.createdAt // "N/A") + ":\n" + (if ((($c.author.login? // "" | ascii_downcase | sub("\\[bot\\]$"; "")) as $l | $ai | index($l)) != null) then $aiNote else (($c.body // "") | tostring) end) + "\n")
+            else "No comments have been posted yet." end' 2>"$comments_filter_err"); then
             filtered_comments=$(echo "$comments" | grep -c "^- " || true)
             filtered_comments=${filtered_comments//[^0-9]/}
             [ -z "$filtered_comments" ] && filtered_comments=0
@@ -294,6 +312,7 @@ jobs:
           echo "$CONTEXT_DELIMITER" >> "$GITHUB_ENV"
           # Also export author for the acknowledgment comment
           echo "ISSUE_AUTHOR=$author" >> $GITHUB_ENV
+          echo "THREAD_IDENTITY=Issue #$ISSUE_NUMBER \"$(printf '%s' "$title" | tr -d '\r\n')\" by @$author in $GITHUB_REPOSITORY." >> "$GITHUB_ENV"
 
       - name: React (lifecycle start)
         # Eyes on the ISSUE itself - issue targets keep eyes by design
@@ -327,7 +346,7 @@ jobs:
         run: |
             set -o pipefail
             # Only substitute the variables we intend; leave example $vars and secrets intact
-            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${LABEL_PALETTE}'
+            VARS='${ISSUE_CONTEXT} ${ISSUE_NUMBER} ${ISSUE_AUTHOR} ${TRIGGER_MESSAGE} ${GITHUB_REPOSITORY} ${BOT_IDENTITY_LIST} ${BOT_IDENTITY_PRIMARY} ${LABEL_PALETTE} ${THREAD_IDENTITY}'
             # Config lifecycle: opencode reads config + plugins once at boot.
             # The share filter touches /tmp/.oc-booted on the first output
             # line (= boot complete, config consumed); this waiter deletes

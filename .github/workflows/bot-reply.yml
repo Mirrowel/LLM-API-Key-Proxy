@@ -427,6 +427,9 @@ jobs:
             echo "REACTION_SUBJECT_NODE=${trig_node}" >> "$GITHUB_ENV"
             echo "DISCUSSION_NODE_ID=$(printf '%s' "$disc_json" | jq -r '.id')" >> "$GITHUB_ENV"
             echo "DISCUSSION_TITLE=$(printf '%s' "$disc_json" | jq -r '.title')" >> "$GITHUB_ENV"
+            disc_title=$(printf '%s' "$disc_json" | jq -r '.title' | tr -d '\r\n')
+            disc_author=$(printf '%s' "$disc_json" | jq -r '.author.login // "?"')
+            echo "THREAD_IDENTITY=Discussion #$(printf '%s' "$disc_json" | jq -r '.number') \"$disc_title\" by @$disc_author in $GITHUB_REPOSITORY." >> "$GITHUB_ENV"
             if [ "$THREAD_TYPE" = "discussion" ] && [ -n "${COMMENT_ID_INPUT:-}" ]; then
               echo "RESOLVED_COMMENT_ID=${COMMENT_ID_INPUT}" >> "$GITHUB_ENV"
             else
@@ -748,6 +751,11 @@ jobs:
             references=$(echo "$timeline_data" | jq -r '.[] | select(.event == "cross-referenced") | .source.issue | "- Mentioned in \(.html_url | if contains("/pull/") then "PR" else "Issue" end): #\(.number) - \(.title)"')
             if [ -z "$references" ]; then references="This PR has not been mentioned in other issues or PRs."; fi
 
+            # Thread identity: the one fact every prompt needs and the agent
+            # must never spend a call rediscovering.
+            identity_title=$(printf '%s' "$title" | tr -d '\r\n')
+            echo "THREAD_IDENTITY=PR #$THREAD_NUMBER \"$identity_title\" by @$author in $GITHUB_REPOSITORY." >> "$GITHUB_ENV"
+
             # Metadata/body prefix handed to the shared script; it prepends
             # this verbatim to THREAD_CONTEXT.
             PREFIX_TEXT=$(printf 'Type: Pull Request\nPR Number: #%s\nTitle: %s\nAuthor: %s\nCreated At: %s\nBase Branch (target): %s\nHead Branch (source): %s\nState: %s\nAdditions: %s\nDeletions: %s\nTotal Commits: %s\nChanged Files: %s %s - per-file compact list: /tmp/kit/%s/changed-files.txt\n<pull_request_body>\n%s\n---\n%s\n</pull_request_body>\n<linked_issues>\n%s\n</linked_issues>\n<cross_references>\n%s\n</cross_references>' \
@@ -779,6 +787,7 @@ jobs:
             created_at=$(echo "$issue_data" | jq -r .createdAt)
             state=$(echo "$issue_data" | jq -r .state)
             title=$(echo "$issue_data" | jq -r .title)
+            echo "THREAD_IDENTITY=Issue #$THREAD_NUMBER \"$(printf '%s' "$title" | tr -d '\r\n')\" by @$author in $GITHUB_REPOSITORY." >> "$GITHUB_ENV"
             body=$(echo "$issue_data" | jq -r --argjson bc "$(printf '%s' "$CLJ" | jq -r '."body-chars" // 4000')" '(.body // "(No description provided)") | if length > $bc then .[0:$bc] + "\n[body truncated]" else . end')
             # Prepare comments - SAME discipline as fetch-pr-discussion.sh:
             # filter-before-cap (ignored authors + AI-reviewer noise patterns
@@ -786,24 +795,27 @@ jobs:
             # clip. gh's --json comments window is ~100; N comes from
             # CONTEXT_LIMITS_JSON .comments.
             if ! printf '%s' "${CONTEXT_FILTER_PATTERNS_JSON:-}" | jq -e 'type == "array"' >/dev/null 2>&1; then
-              FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments were generated","Review skipped","Too many files","<!-- greptile-status -->","Too many files changed for review"]'
+              FILTER_PATTERNS_JSON='["rate limited by coderabbit\\.ai","No actionable comments","Review skipped","Too many files","couldn'"'"'t start because sufficient usage credits","<!-- greptile-status -->","Too many files changed for review","<!-- coderabbit-ai-generated","This is an auto-generated comment","actionable comments posted","review in progress by","\\[vc\\]: #","<!-- linear-linkback"]'
             else
               FILTER_PATTERNS_JSON="$CONTEXT_FILTER_PATTERNS_JSON"
             fi
             comments=$(echo "$issue_data" | jq -r \
               --arg ignore_authors "$(printf '%s' "$CONTEXT_IGNORE_AUTHORS" | tr '[:upper:]' '[:lower:]')" \
               --argjson patterns "$FILTER_PATTERNS_JSON" \
+              --argjson ai "${AI_REVIEWERS_JSON:-[]}" \
+              --arg aiNote "[automated code-reviewer summary suppressed; its inline comments are kept - fetch the body only if it matters]" \
               --argjson limComments "$(printf '%s' "$CLJ" | jq -r '.comments // 30')" \
               --argjson bodyChars "$(printf '%s' "$CLJ" | jq -r '."body-chars" // 4000')" '
               ($ignore_authors | split(",") | map(select(length > 0))) as $ignored |
               def noisy: ((.body // "") as $b | [ $patterns[] | . as $p | select($b | test("(?i)" + $p)) ] | length > 0);
+              def is_ai: ((.author.login? // "" | ascii_downcase | sub("\\[bot\\]$"; "")) as $l | $ai | index($l)) != null;
               def clip($s): if ($s | length) > $bodyChars then ($s[0:$bodyChars] + "\n[body truncated]") else $s end;
               (.comments // [])
               | map(select(((.author.login // "" | ascii_downcase) as $login | ($ignored | index($login)) | not) and (noisy | not)))
               | map(select(.isMinimized != true))
               | if length > $limComments then .[($limComments * -1):] else . end
               | if length > 0 then
-                  map("- [id " + ((.id // "?") | tostring) + "] " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + clip((.body // "") | tostring) + "\n") | join("")
+                  map("- [id " + ((.id // "?") | tostring) + "] " + (.author.login // "unknown") + " at " + (.createdAt // "N/A") + ":\n" + (if is_ai then $aiNote else clip((.body // "") | tostring) end) + "\n") | join("")
                 else "No comments have been posted yet."
                 end')
 
@@ -1226,7 +1238,7 @@ jobs:
               INCREMENTAL_DIFF_PATH=""
               LAST_REVIEWED_SHA=""
             fi
-            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY $DISCUSSION_NODE_ID $DISCUSSION_REPLY_TO_NODE $DISCUSSION_TITLE $LABEL_PALETTE'
+            VARS='$THREAD_CONTEXT $NEW_COMMENT_AUTHOR $NEW_COMMENT_BODY $TRIGGER_MESSAGE $THREAD_NUMBER $GITHUB_REPOSITORY $THREAD_AUTHOR $PR_HEAD_SHA $IS_FIRST_REVIEW $FULL_DIFF_PATH $INCREMENTAL_DIFF_PATH $LAST_REVIEWED_SHA $PR_NUMBER $PREVIOUS_BOT_REVIEWS $AGENT_REVIEW_HISTORY $REVIEW_KIT_SUMMARY $BOT_IDENTITY_LIST $BOT_IDENTITY_PRIMARY $DISCUSSION_NODE_ID $DISCUSSION_REPLY_TO_NODE $DISCUSSION_TITLE $LABEL_PALETTE $THREAD_IDENTITY'
             # Prepend the security brief (with the verified requester and trust context lines);
             ( bash /tmp/opencode-cleanup.sh waiter ) &
             bash /tmp/live-share-announce.sh & ANNOUNCER=$!

@@ -46,6 +46,7 @@ export REBASE_CONTEXT='<rc>'
 export REVIEW_KIT_SUMMARY='PR #42: Review type: FOLLOW-UP | Instructions: /tmp/instructions/review-followup.md | Incremental diff: /tmp/kit/42/incremental_diff.patch (120 lines)'
 export BOT_IDENTITY_LIST='mirrobot-agent,mirrobot-agent[bot]' BOT_IDENTITY_PRIMARY='mirrobot-agent'
 export LABEL_PALETTE='<lp>'
+export THREAD_IDENTITY='PR #42 "a title" by @octocat in Own/repo, head abc123.'
 # Assemblies install the skills a manifest declares: keep them out of the
 # operator's real ~/.config and note required ones under the scratch dir.
 export SKILLS_DIR="$TMP/skills-install" SKILLS_REQUIRED_FILE="$TMP/skills-required.txt"
@@ -211,24 +212,30 @@ LABEL_PALETTE='<lp>' SKILLS_DIR="$TMP/inline/skills" SKILLS_ENVSUBST='${LABEL_PA
 check "skills: inline delivery renders the palette" yes "$(grep -qF '<lp>' "$TMP/inline/prompt.txt" && echo yes || echo no)"
 check "skills: inline delivery resolves the palette placeholder" no "$(grep -qF '${LABEL_PALETTE}' "$TMP/inline/prompt.txt" && echo yes || echo no)"
 check "skills: inline delivery installs nothing" "0" "$(find "$TMP/inline/skills" -maxdepth 1 -type d -name 'mirrobot-*' 2>/dev/null | wc -l | tr -d ' ')"
-check "skills: inline delivery emits no routing block" no "$(grep -qF '[SKILLS FOR THIS RUN]' "$TMP/inline/prompt.txt" && echo yes || echo no)"
+check "skills: no routing block is injected (opencode lists skills itself)" no "$(grep -qF '[SKILLS FOR THIS RUN]' "$TMP/inline/prompt.txt" && echo yes || echo no)"
 
-# skill delivery: installed, routed, rendered, namespaced; skip honored
+# installation is opt-in: a bare assembly (a local preview) touches no disk
+mkdir -p "$TMP/bare"
+LABEL_PALETTE='<lp>' SKILLS_DIR="$TMP/bare/skills" SKILLS_ENVSUBST='${LABEL_PALETTE}' \
+  bash .github/scripts/assemble-prompt.sh bot-reply >/dev/null 2>&1
+check "skills: a bare assembly installs nothing" "0" "$(find "$TMP/bare/skills" -maxdepth 1 -type d -name 'mirrobot-*' 2>/dev/null | wc -l | tr -d ' ')"
+
+# skill delivery: installed, namespaced, rendered; skip honored
 mkdir -p "$TMP/inst/skills/mirrobot-stale"
 INST="$TMP/inst/skills"
 LABEL_PALETTE='<lp>' SKILLS_DIR="$INST" SKILLS_REQUIRED_FILE="$TMP/inst/req.txt" \
-  SKILLS_ENVSUBST='${LABEL_PALETTE}' SKILL_INSTALL_SKIP='discussions' \
+  SKILLS_ENVSUBST='${LABEL_PALETTE}' SKILL_INSTALL_SKIP='discussions' SKILLS_INSTALL=1 \
   bash .github/scripts/assemble-prompt.sh bot-reply > "$TMP/inst/prompt.txt" 2>"$TMP/inst/err"
 check "skills: skill delivery removes stale mirrobot dirs" "0" "$([ -d "$INST/mirrobot-stale" ] && echo 1 || echo 0)"
 check "skills: the declared skill is installed" yes "$([ -f "$INST/mirrobot-labels/SKILL.md" ] && echo yes || echo no)"
 check "skills: a skipped skill is not installed" no "$([ -e "$INST/mirrobot-discussions" ] && echo yes || echo no)"
 check "skills: SKILL.md frontmatter names the skill" yes "$(head -1 "$INST/mirrobot-labels/SKILL.md" | grep -qx -- '---' && sed -n '2p' "$INST/mirrobot-labels/SKILL.md" | grep -qx 'name: mirrobot-labels' && echo yes || echo no)"
 check "skills: the description is a quoted single line" yes "$(sed -n '3p' "$INST/mirrobot-labels/SKILL.md" | grep -qE '^description: ".*"$' && echo yes || echo no)"
+check "skills: the installed description is the meta trigger" yes "$(sed -n '3p' "$INST/mirrobot-labels/SKILL.md" | grep -qF 'Use before stating a grade' && echo yes || echo no)"
 check "skills: the installed body is rendered" yes "$(grep -qF '<lp>' "$INST/mirrobot-labels/SKILL.md" && echo yes || echo no)"
 check "skills: the installed body has no unresolved placeholder" no "$(grep -qE '\$\{[A-Za-z_]+\}' "$INST/mirrobot-labels/SKILL.md" && echo yes || echo no)"
-check "skills: the routing block names the skill" yes "$(grep -qF 'mirrobot-labels' "$TMP/inst/prompt.txt" && echo yes || echo no)"
-check "skills: the routing block omits a skipped skill" no "$(grep -qF 'mirrobot-discussions' "$TMP/inst/prompt.txt" && echo yes || echo no)"
-check "skills: a skill is loaded only when the thread is a Discussion" yes "$(SKILLS_DIR="$TMP/inst/skills2" SKILL_INSTALL_SKIP='' SKILLS_ENVSUBST='${LABEL_PALETTE}' LABEL_PALETTE='<lp>' bash .github/scripts/assemble-prompt.sh bot-reply 2>/dev/null | grep -qF 'mirrobot-discussions' && [ -f "$TMP/inst/skills2/mirrobot-discussions/SKILL.md" ] && echo yes || echo no)"
+check "skills: skill delivery injects no routing block" no "$(grep -qF '[SKILLS FOR THIS RUN]' "$TMP/inst/prompt.txt" && echo yes || echo no)"
+check "skills: the Discussion skill installs only when not skipped" yes "$(SKILLS_DIR="$TMP/inst/skills2" SKILL_INSTALL_SKIP='' SKILLS_ENVSUBST='${LABEL_PALETTE}' LABEL_PALETTE='<lp>' SKILLS_INSTALL=1 bash .github/scripts/assemble-prompt.sh bot-reply 2>/dev/null >/dev/null && [ -f "$TMP/inst/skills2/mirrobot-discussions/SKILL.md" ] && echo yes || echo no)"
 
 # fail-closed: a broken skill must stop the run, not ship a short prompt
 mkdir -p "$TMP/sb"
@@ -237,17 +244,20 @@ cp -r "$SKILLS_SRC" "$TMP/sb/skills"
 cp .github/scripts/assemble-prompt.sh "$TMP/sb/"
 printf 'skill:labels\n' > "$TMP/sb/manifests/zz-skill.manifest"
 printf 'name: mirrobot-labels\n' > "$TMP/sb/skills/labels/meta.yml"
-SKILLS_DIR="$TMP/sb/skills-out" bash "$TMP/sb/assemble-prompt.sh" zz-skill >/dev/null 2>"$TMP/sb/err"
+SKILLS_DIR="$TMP/sb/skills-out" SKILLS_INSTALL=1 bash "$TMP/sb/assemble-prompt.sh" zz-skill >/dev/null 2>"$TMP/sb/err"
 check "skills: an invalid meta fails closed" "1" "$?"
 check "skills: the failure names the skill" yes "$(grep -q "skill 'labels'" "$TMP/sb/err" && echo yes || echo no)"
 printf 'name: mirrobot-labels\ndescription: test skill\n' > "$TMP/sb/skills/labels/meta.yml"
 printf 'Unresolved ${NOPE} placeholder.\n' > "$TMP/sb/skills/labels/body.md"
-SKILLS_DIR="$TMP/sb/skills-out" SKILLS_ENVSUBST='${LABEL_PALETTE}' LABEL_PALETTE=x \
+SKILLS_DIR="$TMP/sb/skills-out" SKILLS_ENVSUBST='${LABEL_PALETTE}' LABEL_PALETTE=x SKILLS_INSTALL=1 \
   bash "$TMP/sb/assemble-prompt.sh" zz-skill >/dev/null 2>"$TMP/sb/err2"
 check "skills: an unresolved placeholder fails closed" "1" "$?"
 check "skills: the failure names the placeholder" yes "$(grep -q 'NOPE' "$TMP/sb/err2" && echo yes || echo no)"
+SKILLS_DIR="$TMP/sb/skills-out" SKILLS_INSTALL=1 bash "$TMP/sb/assemble-prompt.sh" zz-skill >/dev/null 2>"$TMP/sb/err3"
+check "skills: an install without a render list fails on placeholders" "1" "$?"
+check "skills: that failure names the lane requirement" yes "$(grep -q 'SKILLS_ENVSUBST' "$TMP/sb/err3" && echo yes || echo no)"
 printf 'skill:nope\n' > "$TMP/sb/manifests/zz-skill.manifest"
-SKILLS_DIR="$TMP/sb/skills-out" bash "$TMP/sb/assemble-prompt.sh" zz-skill >/dev/null 2>&1
+SKILLS_DIR="$TMP/sb/skills-out" SKILLS_INSTALL=1 bash "$TMP/sb/assemble-prompt.sh" zz-skill >/dev/null 2>&1
 check "skills: a missing skill fails closed" "1" "$?"
 rm -rf "$TMP/sb"
 
