@@ -1145,7 +1145,46 @@ TIMEOUT_POOL=120
 
 The library handles provider idiosyncrasies through specialized "Provider" classes in `src/rotator_library/providers/`.
 
-### 3.1. Gemini CLI (`gemini_cli_provider.py`)
+### 3.1. MiniMax (`minimax_provider.py`)
+
+The MiniMax provider lists `MiniMax-M3.1-Flash` first, followed by `MiniMax-M3`.
+Explicit `MINIMAX_MODELS` definitions are appended without duplicates. Older
+models returned by upstream discovery are not added to the ordinary catalog;
+explicit legacy model requests and their metadata remain supported.
+Native model metadata includes context limits, pricing, input modalities,
+tool use, and interleaved thinking for the `/v1/models` and cost APIs.
+
+Flash has a 1,000,000-token context, a 524,288-token output limit, and adaptive-only
+thinking. The provider forwards `reasoning_effort` directly on the OpenAI route
+and maps it to `output_config.effort` on the Anthropic route, including saved
+model options. Supported efforts are `low`, `medium`, `high`, `xhigh`, and `max`;
+omitting effort leaves the service's `max` default in effect.
+Its input/output/cache-read prices are $0.15/$0.60/$0.015 per million
+tokens. M3 metadata uses the standard prices for inputs up to 512k:
+$0.30/$1.20/$0.06 per million tokens. Inputs above 512k cost
+$0.60/$2.40/$0.12, and priority requests cost 1.5 times the standard rate;
+the cost API's flat M3 estimate does not account for these surcharges.
+
+See the [MiniMax model documentation](https://platform.minimax.io/docs/guides/models-intro.md)
+and [pricing](https://platform.minimax.io/docs/guides/pricing-paygo.md).
+
+Configure the upstream region and protocol with these environment variables:
+
+```env
+MINIMAX_API_REGION="global_en"  # or cn_zh
+MINIMAX_API_PROTOCOL="openai"   # or anthropic
+
+MINIMAX_GLOBAL_OPENAI_BASE_URL="https://api.minimax.io/v1"
+MINIMAX_GLOBAL_ANTHROPIC_BASE_URL="https://api.minimax.io/anthropic"
+MINIMAX_CN_OPENAI_BASE_URL="https://api.minimaxi.com/v1"
+MINIMAX_CN_ANTHROPIC_BASE_URL="https://api.minimaxi.com/anthropic"
+```
+
+Anthropic-compatible base URLs must end with `/anthropic`. The adapter passes
+that base to the compatibility client, which appends `/v1/messages` for the
+Messages API request.
+
+### 3.2. Gemini CLI (`gemini_cli_provider.py`)
 
 The `GeminiCliProvider` is the most complex implementation, mimicking the Google Cloud Code extension.
 
@@ -1492,4 +1531,3 @@ The GUI modifies the same environment variables that the `RotatingClient` reads:
 3. **Proxy applies rules** → `get_available_models()` filters based on rules
 
 **Note**: The proxy must be restarted to pick up rule changes made via the GUI (or use the Launcher TUI's reload functionality if available).
-

@@ -3211,8 +3211,11 @@ class ModelFilterGUI(ctk.CTk):
 
     def _on_models_loaded(self, models: List[str]):
         """Handle successful model fetch."""
-        # Deduplicate while preserving order, then sort
-        self.models = sorted(list(dict.fromkeys(models)))
+        # Keep MiniMax's preferred model order; other providers remain alphabetical.
+        unique_models = list(dict.fromkeys(models))
+        self.models = (
+            unique_models if self.current_provider == "minimax" else sorted(unique_models)
+        )
 
         # Update filter engine counts
         self.filter_engine.update_affected_counts(self.models)

@@ -21,6 +21,13 @@ from .litellm_providers import (
     get_provider_api_key_var,
     get_provider_display_name,
 )
+from .minimax_config import (
+    ANTHROPIC_PROTOCOL,
+    CN_ZH,
+    GLOBAL_EN,
+    MINIMAX_ENDPOINTS,
+    OPENAI_PROTOCOL,
+)
 
 lib_logger = logging.getLogger("rotator_library")
 
@@ -93,8 +100,38 @@ LITELLM_PROVIDERS: Dict[str, Dict[str, Any]] = {
     },
     "minimax": {
         "category": "popular",
+        "note": (
+            "Set MINIMAX_API_REGION to global_en or cn_zh and "
+            "MINIMAX_API_PROTOCOL to openai or anthropic."
+        ),
         "extra_vars": [
-            ("MINIMAX_API_BASE", "API Base URL (optional)", None),
+            ("MINIMAX_API_REGION", "Endpoint region", GLOBAL_EN),
+            ("MINIMAX_API_PROTOCOL", "Upstream protocol", OPENAI_PROTOCOL),
+            (
+                "MINIMAX_API_BASE",
+                "OpenAI-compatible base override (optional)",
+                None,
+            ),
+            (
+                "MINIMAX_GLOBAL_OPENAI_BASE_URL",
+                "Global OpenAI-compatible base URL",
+                MINIMAX_ENDPOINTS[GLOBAL_EN][OPENAI_PROTOCOL],
+            ),
+            (
+                "MINIMAX_GLOBAL_ANTHROPIC_BASE_URL",
+                "Global Anthropic-compatible base URL",
+                MINIMAX_ENDPOINTS[GLOBAL_EN][ANTHROPIC_PROTOCOL],
+            ),
+            (
+                "MINIMAX_CN_OPENAI_BASE_URL",
+                "China OpenAI-compatible base URL",
+                MINIMAX_ENDPOINTS[CN_ZH][OPENAI_PROTOCOL],
+            ),
+            (
+                "MINIMAX_CN_ANTHROPIC_BASE_URL",
+                "China Anthropic-compatible base URL",
+                MINIMAX_ENDPOINTS[CN_ZH][ANTHROPIC_PROTOCOL],
+            ),
         ],
     },
     "xiaomi_mimo": {
@@ -710,6 +747,11 @@ class ProviderConfig:
         """
         model = kwargs.get("model")
         if not model:
+            return kwargs
+
+        # Provider hooks may select a protocol-specific endpoint. Preserve it
+        # instead of replacing it with a global provider override.
+        if kwargs.get("api_base") and kwargs.get("custom_llm_provider"):
             return kwargs
 
         # Extract provider from model string (e.g., "openai/gpt-4" → "openai")
