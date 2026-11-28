@@ -467,7 +467,7 @@ jobs:
             self_suffix=" (self-review: the author is you)"
           fi
           identity_title=$(printf '%s' "$title" | tr -d '\r\n')
-          echo "THREAD_IDENTITY=PR #$PR_NUMBER \"$identity_title\" by @$author in $GITHUB_REPOSITORY, head $PR_HEAD_SHA.$self_suffix" >> "$GITHUB_ENV"
+          echo "THREAD_IDENTITY=PR #$PR_NUMBER \"$identity_title\" by @$author in $GITHUB_REPOSITORY.$self_suffix" >> "$GITHUB_ENV"
 
           # Changed files: ONE summary line only. The inline per-file list
           # was ~5.5K tokens of prompt on a 359-file PR (plus the files

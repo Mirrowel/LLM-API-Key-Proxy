@@ -1226,6 +1226,9 @@ PYEOF
   check "skills: no routing block is generated" "0" "$(grep -c 'SKILLS FOR THIS RUN' "$SCRIPT_DIR/assemble-prompt.sh" || true)"
   check "identity: every primary prompt prints the thread identity" "7" "$(grep -l '^thread-identity$' "$SCRIPT_DIR"/../prompts/manifests/*.manifest | wc -l | tr -d ' ')"
   check "identity: every lane exports THREAD_IDENTITY" "5" "$(for w in pr-review bot-reply bot-reply-guest issue-comment compliance-check; do grep -q 'THREAD_IDENTITY=' "$SCRIPT_DIR/../workflows/$w.yml" && echo "$w"; done | wc -l | tr -d ' ')"
+  # The identity is composed before the PR head is resolved (live-caught:
+  # "head ."), so it must not read PR_HEAD_SHA there.
+  check "identity: the composed line reads no variable that is set later" "0" "$(grep 'THREAD_IDENTITY=' "$SCRIPT_DIR/../workflows/pr-review.yml" | grep -c 'PR_HEAD_SHA' || true)"
 
   # AI-reviewer noise: summaries collapse to one line, inline findings stay.
   check "noise: bot-setup exports the AI reviewer list" yes "$(grep -q 'AI_REVIEWERS_JSON=' "$ACTION" && echo yes || echo no)"
